@@ -1,0 +1,461 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>rpc.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/rpc/rpc.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;functional&gt;</a>
+<a name="ln36">#include &lt;string&gt;</a>
+<a name="ln37">#include &lt;thread&gt;</a>
+<a name="ln38"> </a>
+<a name="ln39">#include &quot;yb/gutil/basictypes.h&quot;</a>
+<a name="ln40">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln41"> </a>
+<a name="ln42">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln43">#include &quot;yb/rpc/rpc_header.pb.h&quot;</a>
+<a name="ln44"> </a>
+<a name="ln45">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln46">#include &quot;yb/util/random_util.h&quot;</a>
+<a name="ln47">#include &quot;yb/util/tsan_util.h&quot;</a>
+<a name="ln48"> </a>
+<a name="ln49">using namespace std::literals;</a>
+<a name="ln50">using namespace std::placeholders;</a>
+<a name="ln51"> </a>
+<a name="ln52">DEFINE_int64(rpcs_shutdown_timeout_ms, 15000 * yb::kTimeMultiplier,</a>
+<a name="ln53">             &quot;Timeout for a batch of multiple RPCs invoked in parallel to shutdown.&quot;);</a>
+<a name="ln54">DEFINE_int64(rpcs_shutdown_extra_delay_ms, 5000 * yb::kTimeMultiplier,</a>
+<a name="ln55">             &quot;Extra allowed time for a single RPC command to complete after its deadline.&quot;);</a>
+<a name="ln56">DEFINE_int32(min_backoff_ms_exponent, 7,</a>
+<a name="ln57">             &quot;Min amount of backoff delay if the server responds with TOO BUSY (default: 128ms). &quot;</a>
+<a name="ln58">             &quot;Set this to some amount, during which the server might have recovered.&quot;);</a>
+<a name="ln59">DEFINE_int32(max_backoff_ms_exponent, 16,</a>
+<a name="ln60">             &quot;Max amount of backoff delay if the server responds with TOO BUSY (default: 64 sec). &quot;</a>
+<a name="ln61">             &quot;Set this to some duration, past which you are okay having no backoff for a Ddos &quot;</a>
+<a name="ln62">             &quot;style build-up, during times when the server is overloaded, and unable to recover.&quot;);</a>
+<a name="ln63"> </a>
+<a name="ln64">DEFINE_int32(linear_backoff_ms, 1,</a>
+<a name="ln65">             &quot;Number of milliseconds added to delay while using linear backoff strategy.&quot;);</a>
+<a name="ln66"> </a>
+<a name="ln67">TAG_FLAG(min_backoff_ms_exponent, hidden);</a>
+<a name="ln68">TAG_FLAG(min_backoff_ms_exponent, advanced);</a>
+<a name="ln69">TAG_FLAG(max_backoff_ms_exponent, hidden);</a>
+<a name="ln70">TAG_FLAG(max_backoff_ms_exponent, advanced);</a>
+<a name="ln71"> </a>
+<a name="ln72">namespace yb {</a>
+<a name="ln73"> </a>
+<a name="ln74">using std::shared_ptr;</a>
+<a name="ln75">using strings::Substitute;</a>
+<a name="ln76">using strings::SubstituteAndAppend;</a>
+<a name="ln77"> </a>
+<a name="ln78">namespace rpc {</a>
+<a name="ln79"> </a>
+<a name="ln80">RpcRetrier::RpcRetrier(CoarseTimePoint deadline, Messenger* messenger, ProxyCache *proxy_cache)</a>
+<a name="ln81">    : start_(CoarseMonoClock::now()),</a>
+<a name="ln82">      deadline_(deadline),</a>
+<a name="ln83">      messenger_(messenger),</a>
+<a name="ln84">      proxy_cache_(*proxy_cache) {</a>
+<a name="ln85">  DCHECK(deadline != CoarseTimePoint());</a>
+<a name="ln86">}</a>
+<a name="ln87"> </a>
+<a name="ln88">bool RpcRetrier::HandleResponse(</a>
+<a name="ln89">    RpcCommand* rpc, Status* out_status, RetryWhenBusy retry_when_busy) {</a>
+<a name="ln90">  ignore_result(DCHECK_NOTNULL(rpc));</a>
+<a name="ln91">  ignore_result(DCHECK_NOTNULL(out_status));</a>
+<a name="ln92"> </a>
+<a name="ln93">  // Always retry a TOO_BUSY error.</a>
+<a name="ln94">  Status controller_status = controller_.status();</a>
+<a name="ln95">  if (controller_status.IsRemoteError() &amp;&amp; retry_when_busy) {</a>
+<a name="ln96">    const ErrorStatusPB* err = controller_.error_response();</a>
+<a name="ln97">    if (err &amp;&amp;</a>
+<a name="ln98">        err-&gt;has_code() &amp;&amp;</a>
+<a name="ln99">        err-&gt;code() == ErrorStatusPB::ERROR_SERVER_TOO_BUSY) {</a>
+<a name="ln100">      auto status = DelayedRetry(rpc, controller_status, BackoffStrategy::kExponential);</a>
+<a name="ln101">      if (!status.ok()) {</a>
+<a name="ln102">        *out_status = status;</a>
+<a name="ln103">        return false;</a>
+<a name="ln104">      }</a>
+<a name="ln105">      return true;</a>
+<a name="ln106">    }</a>
+<a name="ln107">  }</a>
+<a name="ln108"> </a>
+<a name="ln109">  *out_status = controller_status;</a>
+<a name="ln110">  return false;</a>
+<a name="ln111">}</a>
+<a name="ln112"> </a>
+<a name="ln113">Status RpcRetrier::DelayedRetry(</a>
+<a name="ln114">    RpcCommand* rpc, const Status&amp; why_status, BackoffStrategy strategy) {</a>
+<a name="ln115">  // Add some jitter to the retry delay.</a>
+<a name="ln116">  //</a>
+<a name="ln117">  // If the delay causes us to miss our deadline, RetryCb will fail the</a>
+<a name="ln118">  // RPC on our behalf.</a>
+<a name="ln119">  // makes the call redundant by then.</a>
+<a name="ln120">  if (strategy == BackoffStrategy::kExponential) {</a>
+<a name="ln121">    retry_delay_ = fit_bounds&lt;MonoDelta&gt;(</a>
+<a name="ln122">        retry_delay_ * 2,</a>
+<a name="ln123">        1ms * (1ULL &lt;&lt; (FLAGS_min_backoff_ms_exponent + 1)),</a>
+<a name="ln124">        1ms * (1ULL &lt;&lt; FLAGS_max_backoff_ms_exponent));</a>
+<a name="ln125">  } else {</a>
+<a name="ln126">    retry_delay_ += 1ms * FLAGS_linear_backoff_ms;</a>
+<a name="ln127">  }</a>
+<a name="ln128"> </a>
+<a name="ln129">  return DoDelayedRetry(rpc, why_status);</a>
+<a name="ln130">}</a>
+<a name="ln131"> </a>
+<a name="ln132">Status RpcRetrier::DelayedRetry(RpcCommand* rpc, const Status&amp; why_status, MonoDelta add_delay) {</a>
+<a name="ln133">  retry_delay_ += add_delay;</a>
+<a name="ln134">  return DoDelayedRetry(rpc, why_status);</a>
+<a name="ln135">}</a>
+<a name="ln136"> </a>
+<a name="ln137">Status RpcRetrier::DoDelayedRetry(RpcCommand* rpc, const Status&amp; why_status) {</a>
+<a name="ln138">  if (!why_status.ok() &amp;&amp; (last_error_.ok() || last_error_.IsTimedOut())) {</a>
+<a name="ln139">    last_error_ = why_status;</a>
+<a name="ln140">  }</a>
+<a name="ln141">  attempt_num_++;</a>
+<a name="ln142"> </a>
+<a name="ln143">  RpcRetrierState expected_state = RpcRetrierState::kIdle;</a>
+<a name="ln144">  while (!state_.compare_exchange_strong(expected_state, RpcRetrierState::kScheduling)) {</a>
+<a name="ln145">    if (expected_state == RpcRetrierState::kFinished) {</a>
+<a name="ln146">      auto result = STATUS_FORMAT(IllegalState, &quot;Retry of finished command: $0&quot;, rpc);</a>
+<a name="ln147">      LOG(WARNING) &lt;&lt; result;</a>
+<a name="ln148">      return result;</a>
+<a name="ln149">    }</a>
+<a name="ln150">    if (expected_state == RpcRetrierState::kWaiting) {</a>
+<a name="ln151">      auto result = STATUS_FORMAT(IllegalState, &quot;Retry of already waiting command: $0&quot;, rpc);</a>
+<a name="ln152">      LOG(WARNING) &lt;&lt; result;</a>
+<a name="ln153">      return result;</a>
+<a name="ln154">    }</a>
+<a name="ln155">  }</a>
+<a name="ln156"> </a>
+<a name="ln157">  auto retain_rpc = rpc-&gt;shared_from_this();</a>
+<a name="ln158">  task_id_ = messenger_-&gt;ScheduleOnReactor(</a>
+<a name="ln159">      std::bind(&amp;RpcRetrier::DoRetry, this, rpc, _1),</a>
+<a name="ln160">      retry_delay_ + MonoDelta::FromMilliseconds(RandomUniformInt(0, 4)),</a>
+<a name="ln161">      SOURCE_LOCATION(), messenger_);</a>
+<a name="ln162"> </a>
+<a name="ln163">  // Scheduling state can be changed only in this method, so we expected both</a>
+<a name="ln164">  // exchanges below to succeed.</a>
+<a name="ln165">  expected_state = RpcRetrierState::kScheduling;</a>
+<a name="ln166">  if (task_id_.load(std::memory_order_acquire) == kInvalidTaskId) {</a>
+<a name="ln167">    auto result = STATUS_FORMAT(Aborted, &quot;Failed to schedule: $0&quot;, rpc);</a>
+<a name="ln168">    LOG(WARNING) &lt;&lt; result;</a>
+<a name="ln169">    CHECK(state_.compare_exchange_strong(</a>
+<a name="ln170">        expected_state, RpcRetrierState::kFinished, std::memory_order_acq_rel));</a>
+<a name="ln171">    return result;</a>
+<a name="ln172">  }</a>
+<a name="ln173">  CHECK(state_.compare_exchange_strong(</a>
+<a name="ln174">      expected_state, RpcRetrierState::kWaiting, std::memory_order_acq_rel));</a>
+<a name="ln175">  return Status::OK();</a>
+<a name="ln176">}</a>
+<a name="ln177"> </a>
+<a name="ln178">void RpcRetrier::DoRetry(RpcCommand* rpc, const Status&amp; status) {</a>
+<a name="ln179">  auto retain_rpc = rpc-&gt;shared_from_this();</a>
+<a name="ln180"> </a>
+<a name="ln181">  RpcRetrierState expected_state = RpcRetrierState::kWaiting;</a>
+<a name="ln182">  bool run = state_.compare_exchange_strong(expected_state, RpcRetrierState::kRunning);</a>
+<a name="ln183">  // There is very rare case when we get here before switching from scheduling to waiting state.</a>
+<a name="ln184">  // It happens only during shutdown, when it invoked soon after we scheduled retry.</a>
+<a name="ln185">  // So we are doing busy wait here, to avoid overhead in general case.</a>
+<a name="ln186">  while (!run &amp;&amp; expected_state == RpcRetrierState::kScheduling) {</a>
+<a name="ln187">    expected_state = RpcRetrierState::kWaiting;</a>
+<a name="ln188">    run = state_.compare_exchange_strong(expected_state, RpcRetrierState::kRunning);</a>
+<a name="ln189">    if (run) {</a>
+<a name="ln190">      break;</a>
+<a name="ln191">    }</a>
+<a name="ln192">    std::this_thread::sleep_for(1ms);</a>
+<a name="ln193">  }</a>
+<a name="ln194">  task_id_ = kInvalidTaskId;</a>
+<a name="ln195">  if (!run) {</a>
+<a name="ln196">    rpc-&gt;Finished(STATUS_FORMAT(</a>
+<a name="ln197">        Aborted, &quot;$0 aborted: $1&quot;, rpc-&gt;ToString(), yb::rpc::ToString(expected_state)));</a>
+<a name="ln198">    return;</a>
+<a name="ln199">  }</a>
+<a name="ln200">  Status new_status = status;</a>
+<a name="ln201">  if (new_status.ok()) {</a>
+<a name="ln202">    // Has this RPC timed out?</a>
+<a name="ln203">    if (deadline_ != CoarseTimePoint::max()) {</a>
+<a name="ln204">      auto now = CoarseMonoClock::Now();</a>
+<a name="ln205">      if (deadline_ &lt; now) {</a>
+<a name="ln206">        string err_str = Format(</a>
+<a name="ln207">          &quot;$0 passed its deadline $1 (passed: $2)&quot;, *rpc, deadline_, now - start_);</a>
+<a name="ln208">        if (!last_error_.ok()) {</a>
+<a name="ln209">          SubstituteAndAppend(&amp;err_str, &quot;: $0&quot;, last_error_.ToString());</a>
+<a name="ln210">        }</a>
+<a name="ln211">        new_status = STATUS(TimedOut, err_str);</a>
+<a name="ln212">      }</a>
+<a name="ln213">    }</a>
+<a name="ln214">  }</a>
+<a name="ln215">  if (new_status.ok()) {</a>
+<a name="ln216">    controller_.Reset();</a>
+<a name="ln217">    rpc-&gt;SendRpc();</a>
+<a name="ln218">  } else {</a>
+<a name="ln219">    // Service unavailable here means that we failed to to schedule delayed task, i.e. reactor</a>
+<a name="ln220">    // is shutted down.</a>
+<a name="ln221">    if (new_status.IsServiceUnavailable()) {</a>
+<a name="ln222">      new_status = STATUS_FORMAT(Aborted, &quot;Aborted because of $0&quot;, new_status);</a>
+<a name="ln223">    }</a>
+<a name="ln224">    rpc-&gt;Finished(new_status);</a>
+<a name="ln225">  }</a>
+<a name="ln226">  expected_state = RpcRetrierState::kRunning;</a>
+<a name="ln227">  state_.compare_exchange_strong(expected_state, RpcRetrierState::kIdle);</a>
+<a name="ln228">}</a>
+<a name="ln229"> </a>
+<a name="ln230">RpcRetrier::~RpcRetrier() {</a>
+<a name="ln231">  auto task_id = task_id_.load(std::memory_order_acquire);</a>
+<a name="ln232">  auto state = state_.load(std::memory_order_acquire);</a>
+<a name="ln233"> </a>
+<a name="ln234">  LOG_IF(</a>
+<a name="ln235">      DFATAL,</a>
+<a name="ln236">      (kInvalidTaskId != task_id) ||</a>
+<a name="ln237">          (RpcRetrierState::kFinished != state &amp;&amp; RpcRetrierState::kIdle != state))</a>
+<a name="ln238">      &lt;&lt; &quot;Destroying RpcRetrier in invalid state: &quot; &lt;&lt; ToString();</a>
+<a name="ln239">}</a>
+<a name="ln240"> </a>
+<a name="ln241">void RpcRetrier::Abort() {</a>
+<a name="ln242">  RpcRetrierState expected_state = RpcRetrierState::kIdle;</a>
+<a name="ln243">  while (!state_.compare_exchange_weak(expected_state, RpcRetrierState::kFinished)) {</a>
+<a name="ln244">    if (expected_state == RpcRetrierState::kFinished) {</a>
+<a name="ln245">      break;</a>
+<a name="ln246">    }</a>
+<a name="ln247">    if (expected_state != RpcRetrierState::kWaiting) {</a>
+<a name="ln248">      expected_state = RpcRetrierState::kIdle;</a>
+<a name="ln249">    }</a>
+<a name="ln250">    std::this_thread::sleep_for(10ms);</a>
+<a name="ln251">  }</a>
+<a name="ln252">  for (;;) {</a>
+<a name="ln253">    auto task_id = task_id_.load(std::memory_order_acquire);</a>
+<a name="ln254">    if (task_id == kInvalidTaskId) {</a>
+<a name="ln255">      break;</a>
+<a name="ln256">    }</a>
+<a name="ln257">    messenger_-&gt;AbortOnReactor(task_id);</a>
+<a name="ln258">    std::this_thread::sleep_for(10ms);</a>
+<a name="ln259">  }</a>
+<a name="ln260">}</a>
+<a name="ln261"> </a>
+<a name="ln262">std::string RpcRetrier::ToString() const {</a>
+<a name="ln263">  return Format(&quot;{ task_id: $0 state: $1 deadline: $2 }&quot;,</a>
+<a name="ln264">                task_id_.load(std::memory_order_acquire),</a>
+<a name="ln265">                state_.load(std::memory_order_acquire),</a>
+<a name="ln266">                deadline_);</a>
+<a name="ln267">}</a>
+<a name="ln268"> </a>
+<a name="ln269">RpcController* RpcRetrier::PrepareController() {</a>
+<a name="ln270">  controller_.set_timeout(deadline_ - CoarseMonoClock::now());</a>
+<a name="ln271">  return &amp;controller_;</a>
+<a name="ln272">}</a>
+<a name="ln273"> </a>
+<a name="ln274">void Rpc::ScheduleRetry(const Status&amp; status) {</a>
+<a name="ln275">  auto retry_status = mutable_retrier()-&gt;DelayedRetry(this, status);</a>
+<a name="ln276">  if (!retry_status.ok()) {</a>
+<a name="ln277">    LOG(WARNING) &lt;&lt; &quot;Failed to schedule retry: &quot; &lt;&lt; retry_status;</a>
+<a name="ln278">    Finished(retry_status);</a>
+<a name="ln279">  }</a>
+<a name="ln280">}</a>
+<a name="ln281"> </a>
+<a name="ln282">Rpcs::Rpcs(std::mutex* mutex) {</a>
+<a name="ln283">  if (mutex) {</a>
+<a name="ln284">    mutex_ = mutex;</a>
+<a name="ln285">  } else {</a>
+<a name="ln286">    mutex_holder_.emplace();</a>
+<a name="ln287">    mutex_ = &amp;mutex_holder_.get();</a>
+<a name="ln288">  }</a>
+<a name="ln289">}</a>
+<a name="ln290"> </a>
+<a name="ln291">CoarseTimePoint Rpcs::DoRequestAbortAll(RequestShutdown shutdown) {</a>
+<a name="ln292">  std::vector&lt;Calls::value_type&gt; calls;</a>
+<a name="ln293">  {</a>
+<a name="ln294">    std::lock_guard&lt;std::mutex&gt; lock(*mutex_);</a>
+<a name="ln295">    if (!shutdown_) {</a>
+<a name="ln296">      shutdown_ = shutdown;</a>
+<a name="ln297">      calls.reserve(calls_.size());</a>
+<a name="ln298">      calls.assign(calls_.begin(), calls_.end());</a>
+<a name="ln299">    }</a>
+<a name="ln300">  }</a>
+<a name="ln301">  auto deadline = CoarseMonoClock::now() + FLAGS_rpcs_shutdown_timeout_ms * 1ms;</a>
+<a name="ln302">  // It takes some time to complete rpc command after its deadline has passed.</a>
+<a name="ln303">  // So we add extra time for it.</a>
+<a name="ln304">  auto single_call_extra_delay = std::chrono::milliseconds(FLAGS_rpcs_shutdown_extra_delay_ms);</a>
+<a name="ln305">  for (auto&amp; call : calls) {</a>
+<a name="ln306">    CHECK(call);</a>
+<a name="ln307">    call-&gt;Abort();</a>
+<a name="ln308">    deadline = std::max(deadline, call-&gt;deadline() + single_call_extra_delay);</a>
+<a name="ln309">  }</a>
+<a name="ln310"> </a>
+<a name="ln311">  return deadline;</a>
+<a name="ln312">}</a>
+<a name="ln313"> </a>
+<a name="ln314">void Rpcs::Shutdown() {</a>
+<a name="ln315">  auto deadline = DoRequestAbortAll(RequestShutdown::kTrue);</a>
+<a name="ln316">  {</a>
+<a name="ln317">    std::unique_lock&lt;std::mutex&gt; lock(*mutex_);</a>
+<a name="ln318">    while (!calls_.empty()) {</a>
+<a name="ln319">      LOG(INFO) &lt;&lt; &quot;Waiting calls: &quot; &lt;&lt; calls_.size();</a>
+<a name="ln320">      if (cond_.wait_until(lock, deadline) == std::cv_status::timeout) {</a>
+<a name="ln321">        break;</a>
+<a name="ln322">      }</a>
+<a name="ln323">    }</a>
+<a name="ln324">    CHECK(calls_.empty()) &lt;&lt; &quot;Calls: &quot; &lt;&lt; yb::ToString(calls_);</a>
+<a name="ln325">  }</a>
+<a name="ln326">}</a>
+<a name="ln327"> </a>
+<a name="ln328">void Rpcs::Register(RpcCommandPtr call, Handle* handle) {</a>
+<a name="ln329">  if (*handle == calls_.end()) {</a>
+<a name="ln330">    *handle = Register(std::move(call));</a>
+<a name="ln331">  }</a>
+<a name="ln332">}</a>
+<a name="ln333"> </a>
+<a name="ln334">Rpcs::Handle Rpcs::Register(RpcCommandPtr call) {</a>
+<a name="ln335">  std::lock_guard&lt;std::mutex&gt; lock(*mutex_);</a>
+<a name="ln336">  if (shutdown_) {</a>
+<a name="ln337">    call-&gt;Abort();</a>
+<a name="ln338">    return InvalidHandle();</a>
+<a name="ln339">  }</a>
+<a name="ln340">  calls_.push_back(std::move(call));</a>
+<a name="ln341">  return --calls_.end();</a>
+<a name="ln342">}</a>
+<a name="ln343"> </a>
+<a name="ln344">bool Rpcs::RegisterAndStart(RpcCommandPtr call, Handle* handle) {</a>
+<a name="ln345">  CHECK(*handle == calls_.end());</a>
+<a name="ln346">  Register(std::move(call), handle);</a>
+<a name="ln347">  if (*handle == InvalidHandle()) {</a>
+<a name="ln348">    return false;</a>
+<a name="ln349">  }</a>
+<a name="ln350"> </a>
+<a name="ln351">  (***handle).SendRpc();</a>
+<a name="ln352">  return true;</a>
+<a name="ln353">}</a>
+<a name="ln354"> </a>
+<a name="ln355">RpcCommandPtr Rpcs::Unregister(Handle* handle) {</a>
+<a name="ln356">  if (*handle == calls_.end()) {</a>
+<a name="ln357">    return RpcCommandPtr();</a>
+<a name="ln358">  }</a>
+<a name="ln359">  auto result = **handle;</a>
+<a name="ln360">  {</a>
+<a name="ln361">    std::lock_guard&lt;std::mutex&gt; lock(*mutex_);</a>
+<a name="ln362">    calls_.erase(*handle);</a>
+<a name="ln363">    cond_.notify_one();</a>
+<a name="ln364">  }</a>
+<a name="ln365">  *handle = calls_.end();</a>
+<a name="ln366">  return result;</a>
+<a name="ln367">}</a>
+<a name="ln368"> </a>
+<a name="ln369">Rpcs::Handle Rpcs::Prepare() {</a>
+<a name="ln370">  std::lock_guard&lt;std::mutex&gt; lock(*mutex_);</a>
+<a name="ln371">  if (shutdown_) {</a>
+<a name="ln372">    return InvalidHandle();</a>
+<a name="ln373">  }</a>
+<a name="ln374">  calls_.emplace_back();</a>
+<a name="ln375">  return --calls_.end();</a>
+<a name="ln376">}</a>
+<a name="ln377"> </a>
+<a name="ln378">void Rpcs::RequestAbortAll() {</a>
+<a name="ln379">  DoRequestAbortAll(RequestShutdown::kFalse);</a>
+<a name="ln380">}</a>
+<a name="ln381"> </a>
+<a name="ln382">void Rpcs::Abort(std::initializer_list&lt;Handle*&gt; list) {</a>
+<a name="ln383">  std::vector&lt;RpcCommandPtr&gt; to_abort;</a>
+<a name="ln384">  {</a>
+<a name="ln385">    std::lock_guard&lt;std::mutex&gt; lock(*mutex_);</a>
+<a name="ln386">    for (auto&amp; handle : list) {</a>
+<a name="ln387">      if (*handle != calls_.end()) {</a>
+<a name="ln388">        to_abort.push_back(**handle);</a>
+<a name="ln389">      }</a>
+<a name="ln390">    }</a>
+<a name="ln391">  }</a>
+<a name="ln392">  if (to_abort.empty()) {</a>
+<a name="ln393">    return;</a>
+<a name="ln394">  }</a>
+<a name="ln395">  for (auto&amp; rpc : to_abort) {</a>
+<a name="ln396">    rpc-&gt;Abort();</a>
+<a name="ln397">  }</a>
+<a name="ln398">  {</a>
+<a name="ln399">    std::unique_lock&lt;std::mutex&gt; lock(*mutex_);</a>
+<a name="ln400">    for (auto&amp; handle : list) {</a>
+<a name="ln401">      while (*handle != calls_.end()) {</a>
+<a name="ln402">        cond_.wait(lock);</a>
+<a name="ln403">      }</a>
+<a name="ln404">    }</a>
+<a name="ln405">  }</a>
+<a name="ln406">}</a>
+<a name="ln407"> </a>
+<a name="ln408">} // namespace rpc</a>
+<a name="ln409">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="85"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="169"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="173"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="234"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="306"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="324"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="345"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,1281 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>redis_parser.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;memory&gt;</a>
+<a name="ln15">#include &lt;string&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;boost/algorithm/string.hpp&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;boost/optional/optional.hpp&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln22">#include &quot;yb/client/yb_op.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;yb/common/redis_protocol.pb.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/yql/redis/redisserver/redis_constants.h&quot;</a>
+<a name="ln29">#include &quot;yb/yql/redis/redisserver/redis_parser.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &quot;yb/util/split.h&quot;</a>
+<a name="ln32">#include &quot;yb/util/status.h&quot;</a>
+<a name="ln33">#include &quot;yb/util/stol_utils.h&quot;</a>
+<a name="ln34">#include &quot;yb/util/string_case.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">namespace yb {</a>
+<a name="ln37">namespace redisserver {</a>
+<a name="ln38"> </a>
+<a name="ln39">using yb::client::YBTable;</a>
+<a name="ln40">using yb::client::YBRedisWriteOp;</a>
+<a name="ln41">using yb::client::YBRedisReadOp;</a>
+<a name="ln42">using std::vector;</a>
+<a name="ln43">using std::shared_ptr;</a>
+<a name="ln44">using std::string;</a>
+<a name="ln45"> </a>
+<a name="ln46">namespace {</a>
+<a name="ln47"> </a>
+<a name="ln48">constexpr size_t kMaxNumberOfArgs = 1 &lt;&lt; 20;</a>
+<a name="ln49">constexpr size_t kLineEndLength = 2;</a>
+<a name="ln50">constexpr size_t kMaxNumberLength = 25;</a>
+<a name="ln51">constexpr char kPositiveInfinity[] = &quot;+inf&quot;;</a>
+<a name="ln52">constexpr char kNegativeInfinity[] = &quot;-inf&quot;;</a>
+<a name="ln53"> </a>
+<a name="ln54">string to_lower_case(Slice slice) {</a>
+<a name="ln55">  return boost::to_lower_copy(slice.ToBuffer());</a>
+<a name="ln56">}</a>
+<a name="ln57"> </a>
+<a name="ln58">CHECKED_STATUS add_string_subkey(string subkey, RedisKeyValuePB* kv_pb) {</a>
+<a name="ln59">  kv_pb-&gt;add_subkey()-&gt;set_string_subkey(std::move(subkey));</a>
+<a name="ln60">  return Status::OK();</a>
+<a name="ln61">}</a>
+<a name="ln62"> </a>
+<a name="ln63">CHECKED_STATUS add_timestamp_subkey(const string &amp;subkey, RedisKeyValuePB *kv_pb) {</a>
+<a name="ln64">  auto timestamp = CheckedStoll(subkey);</a>
+<a name="ln65">  RETURN_NOT_OK(timestamp);</a>
+<a name="ln66">  kv_pb-&gt;add_subkey()-&gt;set_timestamp_subkey(*timestamp);</a>
+<a name="ln67">  return Status::OK();</a>
+<a name="ln68">}</a>
+<a name="ln69"> </a>
+<a name="ln70">CHECKED_STATUS add_double_subkey(const string &amp;subkey, RedisKeyValuePB *kv_pb) {</a>
+<a name="ln71">  auto double_key = CheckedStold(subkey);</a>
+<a name="ln72">  RETURN_NOT_OK(double_key);</a>
+<a name="ln73">  kv_pb-&gt;add_subkey()-&gt;set_double_subkey(*double_key);</a>
+<a name="ln74">  return Status::OK();</a>
+<a name="ln75">}</a>
+<a name="ln76"> </a>
+<a name="ln77">Result&lt;int64_t&gt; ParseInt64(const Slice&amp; slice, const char* field) {</a>
+<a name="ln78">  auto result = CheckedStoll(slice);</a>
+<a name="ln79">  if (!result.ok()) {</a>
+<a name="ln80">    return STATUS_SUBSTITUTE(InvalidArgument,</a>
+<a name="ln81">        &quot;$0 field $1 is not a valid number&quot;, field, slice.ToDebugString());</a>
+<a name="ln82">  }</a>
+<a name="ln83">  return *result;</a>
+<a name="ln84">}</a>
+<a name="ln85"> </a>
+<a name="ln86">Result&lt;int32_t&gt; ParseInt32(const Slice&amp; slice, const char* field) {</a>
+<a name="ln87">  auto val = ParseInt64(slice, field);</a>
+<a name="ln88">  if (!val.ok()) {</a>
+<a name="ln89">    return std::move(val.status());</a>
+<a name="ln90">  }</a>
+<a name="ln91">  if (*val &lt; std::numeric_limits&lt;int32_t&gt;::min() ||</a>
+<a name="ln92">      *val &gt; std::numeric_limits&lt;int32_t&gt;::max()) {</a>
+<a name="ln93">    return STATUS_SUBSTITUTE(InvalidArgument,</a>
+<a name="ln94">        &quot;$0 field $1 is not within valid bounds&quot;, field, slice.ToDebugString());</a>
+<a name="ln95">  }</a>
+<a name="ln96">  return static_cast&lt;int32_t&gt;(*val);</a>
+<a name="ln97">}</a>
+<a name="ln98"> </a>
+<a name="ln99">} // namespace</a>
+<a name="ln100"> </a>
+<a name="ln101">CHECKED_STATUS ParseSet(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln102">  if (args[1].empty()) {</a>
+<a name="ln103">    return STATUS_SUBSTITUTE(InvalidCommand,</a>
+<a name="ln104">        &quot;A SET request must have a non empty key field&quot;);</a>
+<a name="ln105">  }</a>
+<a name="ln106">  op-&gt;mutable_request()-&gt;mutable_set_request(); // Allocates new RedisSetRequestPB().</a>
+<a name="ln107">  const auto&amp; key = args[1];</a>
+<a name="ln108">  const auto&amp; value = args[2];</a>
+<a name="ln109">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln110">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;add_value(value.cdata(), value.size());</a>
+<a name="ln111">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(REDIS_TYPE_STRING);</a>
+<a name="ln112">  int idx = 3;</a>
+<a name="ln113">  while (idx &lt; args.size()) {</a>
+<a name="ln114">    string upper_arg;</a>
+<a name="ln115">    if (args[idx].size() == 2) {</a>
+<a name="ln116">      ToUpperCase(args[idx].ToBuffer(), &amp;upper_arg);</a>
+<a name="ln117">    }</a>
+<a name="ln118"> </a>
+<a name="ln119">    if (upper_arg == &quot;EX&quot; || upper_arg == &quot;PX&quot;) {</a>
+<a name="ln120">      if (args.size() &lt; idx + 2) {</a>
+<a name="ln121">        return STATUS_SUBSTITUTE(InvalidCommand,</a>
+<a name="ln122">            &quot;Expected TTL field after the EX flag, no value found&quot;);</a>
+<a name="ln123">      }</a>
+<a name="ln124">      auto ttl_val = ParseInt64(args[idx + 1], &quot;TTL&quot;);</a>
+<a name="ln125">      RETURN_NOT_OK(ttl_val);</a>
+<a name="ln126">      if (*ttl_val &lt; kRedisMinTtlSetExSeconds || *ttl_val &gt; kRedisMaxTtlSeconds) {</a>
+<a name="ln127">        return STATUS_FORMAT(InvalidCommand,</a>
+<a name="ln128">            &quot;TTL field $0 is not within valid bounds&quot;, args[idx + 1]);</a>
+<a name="ln129">      }</a>
+<a name="ln130">      const int64_t milliseconds_per_unit =</a>
+<a name="ln131">          upper_arg == &quot;EX&quot; ? MonoTime::kMillisecondsPerSecond : 1;</a>
+<a name="ln132">      op-&gt;mutable_request()-&gt;mutable_set_request()-&gt;set_ttl(*ttl_val * milliseconds_per_unit);</a>
+<a name="ln133">      idx += 2;</a>
+<a name="ln134">    } else if (upper_arg == &quot;XX&quot;) {</a>
+<a name="ln135">      op-&gt;mutable_request()-&gt;mutable_set_request()-&gt;set_mode(REDIS_WRITEMODE_UPDATE);</a>
+<a name="ln136">      idx += 1;</a>
+<a name="ln137">    } else if (upper_arg == &quot;NX&quot;) {</a>
+<a name="ln138">      op-&gt;mutable_request()-&gt;mutable_set_request()-&gt;set_mode(REDIS_WRITEMODE_INSERT);</a>
+<a name="ln139">      idx += 1;</a>
+<a name="ln140">    } else {</a>
+<a name="ln141">      return STATUS_FORMAT(InvalidCommand,</a>
+<a name="ln142">          &quot;Unidentified argument $0 found while parsing set command&quot;, args[idx]);</a>
+<a name="ln143">    }</a>
+<a name="ln144">  }</a>
+<a name="ln145">  return Status::OK();</a>
+<a name="ln146">}</a>
+<a name="ln147"> </a>
+<a name="ln148">CHECKED_STATUS ParseSetNX(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln149">  if (args[1].empty()) {</a>
+<a name="ln150">    return STATUS_SUBSTITUTE(InvalidCommand,</a>
+<a name="ln151">        &quot;A SETNX request must have a non empty key field&quot;);</a>
+<a name="ln152">  }</a>
+<a name="ln153"> </a>
+<a name="ln154">  const auto&amp; key = args[1];</a>
+<a name="ln155">  const auto&amp; value = args[2];</a>
+<a name="ln156"> </a>
+<a name="ln157">  auto key_value = op-&gt;mutable_request()-&gt;mutable_key_value();</a>
+<a name="ln158">  key_value-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln159">  key_value-&gt;add_value(value.cdata(), value.size());</a>
+<a name="ln160">  key_value-&gt;set_type(REDIS_TYPE_STRING);</a>
+<a name="ln161"> </a>
+<a name="ln162">  auto set_request = op-&gt;mutable_request()-&gt;mutable_set_request();</a>
+<a name="ln163">  set_request-&gt;set_mode(REDIS_WRITEMODE_INSERT);</a>
+<a name="ln164">  // SETNX returns 1 / 0 (instead of OK / (nil) in 'SET k v NX' command).</a>
+<a name="ln165">  set_request-&gt;set_expect_ok_response(false);</a>
+<a name="ln166">  return Status::OK();</a>
+<a name="ln167">}</a>
+<a name="ln168"> </a>
+<a name="ln169">// TODO: support MSET</a>
+<a name="ln170">CHECKED_STATUS ParseMSet(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln171">  if (args.size() &lt; 3 || args.size() % 2 == 0) {</a>
+<a name="ln172">    return STATUS_SUBSTITUTE(InvalidCommand,</a>
+<a name="ln173">        &quot;An MSET request must have at least 3, odd number of arguments, found $0&quot;, args.size());</a>
+<a name="ln174">  }</a>
+<a name="ln175">  return STATUS(InvalidCommand, &quot;MSET command not yet supported&quot;);</a>
+<a name="ln176">}</a>
+<a name="ln177"> </a>
+<a name="ln178">CHECKED_STATUS ParseHSet(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln179">  const auto&amp; key = args[1];</a>
+<a name="ln180">  const auto&amp; subkey = args[2];</a>
+<a name="ln181">  const auto&amp; value = args[3];</a>
+<a name="ln182"> </a>
+<a name="ln183">  op-&gt;mutable_request()-&gt;mutable_set_request(); // Allocates new RedisSetRequestPB().</a>
+<a name="ln184">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln185">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(REDIS_TYPE_HASH);</a>
+<a name="ln186">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;add_subkey()-&gt;set_string_subkey(subkey.cdata(),</a>
+<a name="ln187">                                                                              subkey.size());</a>
+<a name="ln188">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;add_value(value.cdata(), value.size());</a>
+<a name="ln189">  return Status::OK();</a>
+<a name="ln190">}</a>
+<a name="ln191"> </a>
+<a name="ln192"> </a>
+<a name="ln193">CHECKED_STATUS ParseHIncrBy(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln194">  const auto&amp; key = args[1];</a>
+<a name="ln195">  const auto&amp; subkey = args[2];</a>
+<a name="ln196">  const auto&amp; incr_by = ParseInt64(args[3], &quot;INCR_BY&quot;);</a>
+<a name="ln197">  RETURN_NOT_OK(incr_by);</a>
+<a name="ln198">  op-&gt;mutable_request()-&gt;mutable_incr_request()-&gt;set_increment_int(*incr_by);</a>
+<a name="ln199">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln200">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(REDIS_TYPE_HASH);</a>
+<a name="ln201">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;add_subkey()-&gt;set_string_subkey(subkey.cdata(),</a>
+<a name="ln202">                                                                              subkey.size());</a>
+<a name="ln203">  return Status::OK();</a>
+<a name="ln204">}</a>
+<a name="ln205"> </a>
+<a name="ln206">CHECKED_STATUS ParseZAddOptions(SortedSetOptionsPB *options,</a>
+<a name="ln207">                                const RedisClientCommand&amp; args, int *idx) {</a>
+<a name="ln208">  // While we keep seeing flags, set the appropriate field in options and increment idx. When</a>
+<a name="ln209">  // we finally stop seeing flags, the idx will be set to that token for later parsing.</a>
+<a name="ln210">  // Note that we can see duplicate flags, and it should have the same behavior as seeing the</a>
+<a name="ln211">  // flag once.</a>
+<a name="ln212">  while (*idx &lt; args.size()) {</a>
+<a name="ln213">    if (boost::iequals(args[*idx].ToBuffer(), kCH)) {</a>
+<a name="ln214">      options-&gt;set_ch(true);</a>
+<a name="ln215">    } else if (boost::iequals(args[*idx].ToBuffer(), kINCR)) {</a>
+<a name="ln216">      options-&gt;set_incr(true);</a>
+<a name="ln217">    } else if (boost::iequals(args[*idx].ToBuffer(), kNX)) {</a>
+<a name="ln218">      if (options-&gt;update_options() == SortedSetOptionsPB_UpdateOptions_XX) {</a>
+<a name="ln219">        return STATUS_SUBSTITUTE(InvalidArgument,</a>
+<a name="ln220">                                 &quot;XX and NX options at the same time are not compatible&quot;);</a>
+<a name="ln221">      }</a>
+<a name="ln222">      options-&gt;set_update_options(SortedSetOptionsPB_UpdateOptions_NX);</a>
+<a name="ln223">    } else if (boost::iequals(args[*idx].ToBuffer(), kXX)) {</a>
+<a name="ln224">      if (options-&gt;update_options() == SortedSetOptionsPB_UpdateOptions_NX) {</a>
+<a name="ln225">        return STATUS_SUBSTITUTE(InvalidArgument,</a>
+<a name="ln226">                                 &quot;XX and NX options at the same time are not compatible&quot;);</a>
+<a name="ln227">      }</a>
+<a name="ln228">      options-&gt;set_update_options(SortedSetOptionsPB_UpdateOptions_XX);</a>
+<a name="ln229">    } else {</a>
+<a name="ln230">      // We have encountered a non-option token, return.</a>
+<a name="ln231">      return Status::OK();</a>
+<a name="ln232">    }</a>
+<a name="ln233">    *idx = *idx + 1;</a>
+<a name="ln234">  }</a>
+<a name="ln235">  return Status::OK();</a>
+<a name="ln236">}</a>
+<a name="ln237"> </a>
+<a name="ln238">template &lt;typename AddSubKey&gt;</a>
+<a name="ln239">CHECKED_STATUS ParseHMSetLikeCommands(YBRedisWriteOp *op, const RedisClientCommand&amp; args,</a>
+<a name="ln240">                                      const RedisDataType&amp; type,</a>
+<a name="ln241">                                      AddSubKey add_sub_key) {</a>
+<a name="ln242">  if (args.size() &lt; 4 || (args.size() % 2 == 1 &amp;&amp; type == REDIS_TYPE_HASH)) {</a>
+<a name="ln243">    return STATUS_SUBSTITUTE(InvalidArgument,</a>
+<a name="ln244">                             &quot;wrong number of arguments: $0 for command: $1&quot;, args.size(),</a>
+<a name="ln245">                             string(args[0].cdata(), args[0].size()));</a>
+<a name="ln246">  }</a>
+<a name="ln247"> </a>
+<a name="ln248">  op-&gt;mutable_request()-&gt;mutable_set_request(); // Allocates new RedisSetRequestPB().</a>
+<a name="ln249">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(type);</a>
+<a name="ln250">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(args[1].cdata(), args[1].size());</a>
+<a name="ln251"> </a>
+<a name="ln252">  if (type == REDIS_TYPE_HASH) {</a>
+<a name="ln253">    op-&gt;mutable_request()-&gt;mutable_set_request()-&gt;set_expect_ok_response(true);</a>
+<a name="ln254">  }</a>
+<a name="ln255"> </a>
+<a name="ln256">  int start_idx = 2;</a>
+<a name="ln257">  if (type == REDIS_TYPE_SORTEDSET) {</a>
+<a name="ln258">    RETURN_NOT_OK(ParseZAddOptions(</a>
+<a name="ln259">        op-&gt;mutable_request()-&gt;mutable_set_request()-&gt;mutable_sorted_set_options(),</a>
+<a name="ln260">        args, &amp;start_idx));</a>
+<a name="ln261"> </a>
+<a name="ln262">    // If the INCR flag is set, can only have one [score member] pair.</a>
+<a name="ln263">    if (op-&gt;request().set_request().sorted_set_options().incr() &amp;&amp; (args.size() - start_idx) != 2) {</a>
+<a name="ln264">      return STATUS_SUBSTITUTE(InvalidArgument,</a>
+<a name="ln265">                               &quot;wrong number of tokens after INCR flag specified: Need 2 but found &quot;</a>
+<a name="ln266">                                   &quot;$0 for command: $1&quot;, args.size() - start_idx,</a>
+<a name="ln267">                               string(args[0].cdata(), args[0].size()));</a>
+<a name="ln268">    }</a>
+<a name="ln269">  }</a>
+<a name="ln270"> </a>
+<a name="ln271">  // Need [score member] to come in pairs.</a>
+<a name="ln272">  if ((args.size() - start_idx) % 2 == 1 || args.size() - start_idx == 0) {</a>
+<a name="ln273">    return STATUS_SUBSTITUTE(InvalidArgument,</a>
+<a name="ln274">                             &quot;Expect even and non-zero number of arguments &quot;</a>
+<a name="ln275">                             &quot;for command: $0, found $1&quot;,</a>
+<a name="ln276">                             string(args[0].cdata(), args[0].size()), args.size() - start_idx);</a>
+<a name="ln277">  }</a>
+<a name="ln278"> </a>
+<a name="ln279">  std::unordered_map&lt;string, string&gt; kv_map;</a>
+<a name="ln280">  for (int i = start_idx; i &lt; args.size(); i += 2) {</a>
+<a name="ln281">    // EXPIRE_AT/EXPIRE_IN only supported for redis timeseries currently.</a>
+<a name="ln282">    if (type == REDIS_TYPE_TIMESERIES) {</a>
+<a name="ln283">      string upper_arg;</a>
+<a name="ln284">      ToUpperCase(args[i].ToBuffer(), &amp;upper_arg);</a>
+<a name="ln285">      if (upper_arg == kExpireAt || upper_arg == kExpireIn) {</a>
+<a name="ln286">        if (i + 2 != args.size()) {</a>
+<a name="ln287">          return STATUS_SUBSTITUTE(InvalidCommand, &quot;$0 should be at the end of the command&quot;,</a>
+<a name="ln288">                                   string(args[i].cdata(), args[i].size()));</a>
+<a name="ln289">        }</a>
+<a name="ln290">        auto temp = CheckedStoll(args[i + 1]);</a>
+<a name="ln291">        RETURN_NOT_OK(temp);</a>
+<a name="ln292">        int64_t ttl = 0;</a>
+<a name="ln293">        if (upper_arg == kExpireIn) {</a>
+<a name="ln294">          ttl = *temp;</a>
+<a name="ln295">          if (ttl &gt; kRedisMaxTtlSeconds || ttl &lt; kRedisMinTtlSetExSeconds) {</a>
+<a name="ln296">            return STATUS_SUBSTITUTE(InvalidCommand, &quot;TTL: $0 needs be in the range [$1, $2]&quot;, ttl,</a>
+<a name="ln297">                                     kRedisMinTtlSetExSeconds, kRedisMaxTtlSeconds);</a>
+<a name="ln298">          }</a>
+<a name="ln299">        } else {</a>
+<a name="ln300">          auto current_time = GetCurrentTimeMicros() / MonoTime::kMicrosecondsPerSecond;</a>
+<a name="ln301">          ttl = *temp - current_time;</a>
+<a name="ln302">          if (ttl &gt; kRedisMaxTtlSeconds || ttl &lt; kRedisMinTtlSetExSeconds) {</a>
+<a name="ln303">            return STATUS_SUBSTITUTE(InvalidCommand, &quot;EXPIRE_AT: $0 needs be in the range [$1, $2]&quot;,</a>
+<a name="ln304">                                     *temp,</a>
+<a name="ln305">                                     kRedisMinTtlSetExSeconds + current_time,</a>
+<a name="ln306">                                     kRedisMaxTtlSeconds + current_time);</a>
+<a name="ln307">          }</a>
+<a name="ln308">        }</a>
+<a name="ln309"> </a>
+<a name="ln310">        // Need to pass ttl in milliseconds, user supplied values are in seconds.</a>
+<a name="ln311">        op-&gt;mutable_request()-&gt;mutable_set_request()-&gt;set_ttl(</a>
+<a name="ln312">            ttl * MonoTime::kMillisecondsPerSecond);</a>
+<a name="ln313">      } else {</a>
+<a name="ln314">        kv_map[args[i].ToBuffer()] = args[i + 1].ToBuffer();</a>
+<a name="ln315">      }</a>
+<a name="ln316">    } else if (type == REDIS_TYPE_SORTEDSET) {</a>
+<a name="ln317">      // For sorted sets, we store the mapping from values to scores, since values are distinct</a>
+<a name="ln318">      // but scores aren't.</a>
+<a name="ln319">      kv_map[args[i + 1].ToBuffer()] = args[i].ToBuffer();</a>
+<a name="ln320">    } else {</a>
+<a name="ln321">      kv_map[args[i].ToBuffer()] = args[i + 1].ToBuffer();</a>
+<a name="ln322">    }</a>
+<a name="ln323">  }</a>
+<a name="ln324"> </a>
+<a name="ln325">  for (const auto&amp; kv : kv_map) {</a>
+<a name="ln326">    auto req_kv = op-&gt;mutable_request()-&gt;mutable_key_value();</a>
+<a name="ln327">    if (type == REDIS_TYPE_SORTEDSET) {</a>
+<a name="ln328">      // Since the mapping is values to scores, need to reverse when creating the request.</a>
+<a name="ln329">      RETURN_NOT_OK(add_sub_key(kv.second, req_kv));</a>
+<a name="ln330">      req_kv-&gt;add_value(kv.first);</a>
+<a name="ln331">    } else {</a>
+<a name="ln332">      RETURN_NOT_OK(add_sub_key(kv.first, req_kv));</a>
+<a name="ln333">      req_kv-&gt;add_value(kv.second);</a>
+<a name="ln334">    }</a>
+<a name="ln335">  }</a>
+<a name="ln336">  return Status::OK();</a>
+<a name="ln337">}</a>
+<a name="ln338"> </a>
+<a name="ln339">CHECKED_STATUS ParseHMSet(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln340">  DCHECK_EQ(&quot;hmset&quot;, to_lower_case(args[0]))</a>
+<a name="ln341">      &lt;&lt; &quot;Parsing hmset request where first arg is not hmset.&quot;;</a>
+<a name="ln342">  return ParseHMSetLikeCommands(op, args, REDIS_TYPE_HASH, add_string_subkey);</a>
+<a name="ln343">}</a>
+<a name="ln344"> </a>
+<a name="ln345">CHECKED_STATUS ParseTsAdd(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln346">  DCHECK_EQ(&quot;tsadd&quot;, to_lower_case(args[0]))</a>
+<a name="ln347">    &lt;&lt; &quot;Parsing hmset request where first arg is not hmset.&quot;;</a>
+<a name="ln348">  return ParseHMSetLikeCommands(op, args, REDIS_TYPE_TIMESERIES,</a>
+<a name="ln349">                                add_timestamp_subkey);</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352">Status ParseZAdd(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln353">  DCHECK_EQ(&quot;zadd&quot;, to_lower_case(args[0]))</a>
+<a name="ln354">    &lt;&lt; &quot;Parsing zadd request where first arg is not zadd.&quot;;</a>
+<a name="ln355">  return ParseHMSetLikeCommands(op, args, REDIS_TYPE_SORTEDSET, add_double_subkey);</a>
+<a name="ln356">}</a>
+<a name="ln357"> </a>
+<a name="ln358">Status ParsePush(YBRedisWriteOp *op, const RedisClientCommand&amp; args, RedisSide side) {</a>
+<a name="ln359">  op-&gt;mutable_request()-&gt;mutable_push_request()-&gt;set_side(side);</a>
+<a name="ln360">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(args[1].cdata(), args[1].size());</a>
+<a name="ln361">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(REDIS_TYPE_LIST);</a>
+<a name="ln362"> </a>
+<a name="ln363">  auto mutable_key = op-&gt;mutable_request()-&gt;mutable_key_value();</a>
+<a name="ln364">  for (int i = 2; i &lt; args.size(); ++i) {</a>
+<a name="ln365">    mutable_key-&gt;add_value(args[i].cdata(), args[i].size());</a>
+<a name="ln366">  }</a>
+<a name="ln367">  return Status::OK();</a>
+<a name="ln368">}</a>
+<a name="ln369"> </a>
+<a name="ln370">Status ParseLPush(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln371">  return ParsePush(op, args, REDIS_SIDE_LEFT);</a>
+<a name="ln372">}</a>
+<a name="ln373"> </a>
+<a name="ln374">Status ParseRPush(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln375">  return ParsePush(op, args, REDIS_SIDE_RIGHT);</a>
+<a name="ln376">}</a>
+<a name="ln377"> </a>
+<a name="ln378">template &lt;typename YBRedisOp, typename AddSubKey&gt;</a>
+<a name="ln379">CHECKED_STATUS ParseCollection(YBRedisOp *op,</a>
+<a name="ln380">                               const RedisClientCommand&amp; args,</a>
+<a name="ln381">                               boost::optional&lt;RedisDataType&gt; type,</a>
+<a name="ln382">                               AddSubKey add_sub_key,</a>
+<a name="ln383">                               bool remove_duplicates = true) {</a>
+<a name="ln384">  const auto&amp; key = args[1];</a>
+<a name="ln385">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln386">  if (type) {</a>
+<a name="ln387">    op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(*type);</a>
+<a name="ln388">  }</a>
+<a name="ln389">  if (remove_duplicates) {</a>
+<a name="ln390">    // We remove duplicates from the subkeys here.</a>
+<a name="ln391">    std::set&lt;string&gt; subkey_set;</a>
+<a name="ln392">    for (size_t i = 2; i &lt; args.size(); i++) {</a>
+<a name="ln393">      subkey_set.insert(string(args[i].cdata(), args[i].size()));</a>
+<a name="ln394">    }</a>
+<a name="ln395">    op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;mutable_subkey()-&gt;Reserve(subkey_set.size());</a>
+<a name="ln396">    for (const auto &amp;val : subkey_set) {</a>
+<a name="ln397">      RETURN_NOT_OK(add_sub_key(val, op-&gt;mutable_request()-&gt;mutable_key_value()));</a>
+<a name="ln398">    }</a>
+<a name="ln399">  } else {</a>
+<a name="ln400">    op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;mutable_subkey()-&gt;Reserve(args.size() - 2);</a>
+<a name="ln401">    for (size_t i = 2; i &lt; args.size(); i++) {</a>
+<a name="ln402">      RETURN_NOT_OK(add_sub_key(string(args[i].cdata(), args[i].size()),</a>
+<a name="ln403">                                op-&gt;mutable_request()-&gt;mutable_key_value()));</a>
+<a name="ln404">    }</a>
+<a name="ln405">  }</a>
+<a name="ln406">  return Status::OK();</a>
+<a name="ln407">}</a>
+<a name="ln408"> </a>
+<a name="ln409">CHECKED_STATUS ParseHDel(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln410">  op-&gt;mutable_request()-&gt;mutable_del_request(); // Allocates new RedisDelRequestPB().</a>
+<a name="ln411">  return ParseCollection(op, args, REDIS_TYPE_HASH, add_string_subkey);</a>
+<a name="ln412">}</a>
+<a name="ln413"> </a>
+<a name="ln414">CHECKED_STATUS ParseTsRem(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln415">  op-&gt;mutable_request()-&gt;mutable_del_request(); // Allocates new RedisDelRequestPB().</a>
+<a name="ln416">  return ParseCollection(op, args, REDIS_TYPE_TIMESERIES, add_timestamp_subkey);</a>
+<a name="ln417">}</a>
+<a name="ln418"> </a>
+<a name="ln419">CHECKED_STATUS ParseZRem(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln420">  op-&gt;mutable_request()-&gt;mutable_del_request(); // Allocates new RedisDelRequestPB().</a>
+<a name="ln421">  return ParseCollection(op, args, REDIS_TYPE_SORTEDSET, add_string_subkey);</a>
+<a name="ln422">}</a>
+<a name="ln423"> </a>
+<a name="ln424">CHECKED_STATUS ParseSAdd(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln425">  op-&gt;mutable_request()-&gt;mutable_add_request(); // Allocates new RedisAddRequestPB().</a>
+<a name="ln426">  return ParseCollection(op, args, REDIS_TYPE_SET, add_string_subkey);</a>
+<a name="ln427">}</a>
+<a name="ln428"> </a>
+<a name="ln429">CHECKED_STATUS ParseSRem(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln430">  op-&gt;mutable_request()-&gt;mutable_del_request(); // Allocates new RedisDelRequestPB().</a>
+<a name="ln431">  return ParseCollection(op, args, REDIS_TYPE_SET, add_string_subkey);</a>
+<a name="ln432">}</a>
+<a name="ln433"> </a>
+<a name="ln434">CHECKED_STATUS ParsePop(YBRedisWriteOp *op, const RedisClientCommand&amp; args, RedisSide side) {</a>
+<a name="ln435">  op-&gt;mutable_request()-&gt;mutable_pop_request()-&gt;set_side(side);</a>
+<a name="ln436">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(args[1].cdata(), args[1].size());</a>
+<a name="ln437">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(REDIS_TYPE_LIST);</a>
+<a name="ln438">  return Status::OK();</a>
+<a name="ln439">}</a>
+<a name="ln440"> </a>
+<a name="ln441">CHECKED_STATUS ParseLPop(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln442">  return ParsePop(op, args, REDIS_SIDE_LEFT);</a>
+<a name="ln443">}</a>
+<a name="ln444"> </a>
+<a name="ln445">CHECKED_STATUS ParseRPop(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln446">  return ParsePop(op, args, REDIS_SIDE_RIGHT);</a>
+<a name="ln447">}</a>
+<a name="ln448"> </a>
+<a name="ln449">CHECKED_STATUS ParseGetSet(YBRedisWriteOp *op, const RedisClientCommand&amp; args) {</a>
+<a name="ln450">  const auto&amp; key = args[1];</a>
+<a name="ln451">  const auto&amp; value = args[2];</a>
+<a name="ln452">  op-&gt;mutable_request()-&gt;mutable_getset_request(); // Allocates new RedisGetSetRequestPB().</a>
+<a name="ln453">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln454">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;add_value(value.cdata(), value.size());</a>
+<a name="ln455">  return Status::OK();</a>
+<a name="ln456">}</a>
+<a name="ln457"> </a>
+<a name="ln458">CHECKED_STATUS ParseAppend(YBRedisWriteOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln459">  const auto&amp; key = args[1];</a>
+<a name="ln460">  const auto&amp; value = args[2];</a>
+<a name="ln461">  op-&gt;mutable_request()-&gt;mutable_append_request(); // Allocates new RedisAppendRequestPB().</a>
+<a name="ln462">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln463">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;add_value(value.cdata(), value.size());</a>
+<a name="ln464">  return Status::OK();</a>
+<a name="ln465">}</a>
+<a name="ln466"> </a>
+<a name="ln467">// Note: deleting only one key is supported using one command as of now.</a>
+<a name="ln468">CHECKED_STATUS ParseDel(YBRedisWriteOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln469">  const auto&amp; key = args[1];</a>
+<a name="ln470">  op-&gt;mutable_request()-&gt;mutable_del_request(); // Allocates new RedisDelRequestPB().</a>
+<a name="ln471">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln472">  // We should be able to delete all types of top level keys</a>
+<a name="ln473">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(REDIS_TYPE_NONE);</a>
+<a name="ln474">  return Status::OK();</a>
+<a name="ln475">}</a>
+<a name="ln476"> </a>
+<a name="ln477">CHECKED_STATUS ParseSetRange(YBRedisWriteOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln478">  const auto&amp; key = args[1];</a>
+<a name="ln479">  const auto&amp; value = args[3];</a>
+<a name="ln480">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln481">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;add_value(value.cdata(), value.size());</a>
+<a name="ln482"> </a>
+<a name="ln483">  auto offset = ParseInt32(args[2], &quot;offset&quot;);</a>
+<a name="ln484">  RETURN_NOT_OK(offset);</a>
+<a name="ln485">  // TODO: Should we have an upper bound?</a>
+<a name="ln486">  // A very large offset would allocate a lot of memory and maybe crash</a>
+<a name="ln487">  if (*offset &lt; 0) {</a>
+<a name="ln488">    return STATUS_SUBSTITUTE(InvalidArgument,</a>
+<a name="ln489">        &quot;offset field of SETRANGE must be non-negative, found: $0&quot;, *offset);</a>
+<a name="ln490">  }</a>
+<a name="ln491">  op-&gt;mutable_request()-&gt;mutable_set_range_request()-&gt;set_offset(*offset);</a>
+<a name="ln492"> </a>
+<a name="ln493">  return Status::OK();</a>
+<a name="ln494">}</a>
+<a name="ln495"> </a>
+<a name="ln496">CHECKED_STATUS ParseIncr(YBRedisWriteOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln497">  const auto&amp; key = args[1];</a>
+<a name="ln498">  op-&gt;mutable_request()-&gt;mutable_incr_request()-&gt;set_increment_int(1);</a>
+<a name="ln499">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln500">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(REDIS_TYPE_STRING);</a>
+<a name="ln501">  return Status::OK();</a>
+<a name="ln502">}</a>
+<a name="ln503"> </a>
+<a name="ln504">CHECKED_STATUS ParseIncrBy(YBRedisWriteOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln505">  const auto&amp; key = args[1];</a>
+<a name="ln506">  const auto&amp; incr_by = ParseInt64(args[2], &quot;INCR_BY&quot;);</a>
+<a name="ln507">  RETURN_NOT_OK(incr_by);</a>
+<a name="ln508">  op-&gt;mutable_request()-&gt;mutable_incr_request()-&gt;set_increment_int(*incr_by);</a>
+<a name="ln509">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln510">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(REDIS_TYPE_STRING);</a>
+<a name="ln511">  return Status::OK();</a>
+<a name="ln512">}</a>
+<a name="ln513"> </a>
+<a name="ln514">CHECKED_STATUS ParseGet(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln515">  const auto&amp; key = args[1];</a>
+<a name="ln516">  if (key.empty()) {</a>
+<a name="ln517">    return STATUS_SUBSTITUTE(InvalidCommand,</a>
+<a name="ln518">        &quot;A GET request must have non empty key field&quot;);</a>
+<a name="ln519">  }</a>
+<a name="ln520">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln521">  op-&gt;mutable_request()-&gt;mutable_get_request()-&gt;set_request_type(</a>
+<a name="ln522">      RedisGetRequestPB_GetRequestType_GET);</a>
+<a name="ln523">  return Status::OK();</a>
+<a name="ln524">}</a>
+<a name="ln525"> </a>
+<a name="ln526">//  Used for HGET/HSTRLEN/HEXISTS. Also for HMGet</a>
+<a name="ln527">//  CMD &lt;KEY&gt; [&lt;SUB-KEY&gt;]*</a>
+<a name="ln528">CHECKED_STATUS ParseHGetLikeCommands(YBRedisReadOp* op, const RedisClientCommand&amp; args,</a>
+<a name="ln529">                                     RedisGetRequestPB_GetRequestType request_type,</a>
+<a name="ln530">                                     bool remove_duplicates = false) {</a>
+<a name="ln531">  op-&gt;mutable_request()-&gt;mutable_get_request()-&gt;set_request_type(request_type);</a>
+<a name="ln532">  return ParseCollection(op, args, boost::none, add_string_subkey, remove_duplicates);</a>
+<a name="ln533">}</a>
+<a name="ln534"> </a>
+<a name="ln535">// TODO: Support MGET</a>
+<a name="ln536">CHECKED_STATUS ParseMGet(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln537">  return STATUS(InvalidCommand, &quot;MGET command not yet supported&quot;);</a>
+<a name="ln538">}</a>
+<a name="ln539"> </a>
+<a name="ln540">CHECKED_STATUS ParseHGet(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln541">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_HGET);</a>
+<a name="ln542">}</a>
+<a name="ln543"> </a>
+<a name="ln544">CHECKED_STATUS ParseTsBoundArg(const Slice&amp; slice, RedisSubKeyBoundPB* bound_pb,</a>
+<a name="ln545">                               RedisCollectionGetRangeRequestPB::GetRangeRequestType request_type,</a>
+<a name="ln546">                               bool exclusive) {</a>
+<a name="ln547">  string bound(slice.cdata(), slice.size());</a>
+<a name="ln548">  if (bound == kPositiveInfinity) {</a>
+<a name="ln549">    bound_pb-&gt;set_infinity_type(RedisSubKeyBoundPB_InfinityType_POSITIVE);</a>
+<a name="ln550">  } else if (bound == kNegativeInfinity) {</a>
+<a name="ln551">    bound_pb-&gt;set_infinity_type(RedisSubKeyBoundPB_InfinityType_NEGATIVE);</a>
+<a name="ln552">  } else {</a>
+<a name="ln553">    bound_pb-&gt;set_is_exclusive(exclusive);</a>
+<a name="ln554">    switch (request_type) {</a>
+<a name="ln555">      case RedisCollectionGetRangeRequestPB_GetRangeRequestType_TSREVRANGEBYTIME:</a>
+<a name="ln556">        FALLTHROUGH_INTENDED;</a>
+<a name="ln557">      case RedisCollectionGetRangeRequestPB_GetRangeRequestType_TSRANGEBYTIME: {</a>
+<a name="ln558">        auto ts_bound = CheckedStoll(slice);</a>
+<a name="ln559">        RETURN_NOT_OK(ts_bound);</a>
+<a name="ln560">        bound_pb-&gt;mutable_subkey_bound()-&gt;set_timestamp_subkey(*ts_bound);</a>
+<a name="ln561">        break;</a>
+<a name="ln562">      }</a>
+<a name="ln563">      case RedisCollectionGetRangeRequestPB_GetRangeRequestType_ZRANGEBYSCORE: {</a>
+<a name="ln564">        auto double_bound = CheckedStold(slice);</a>
+<a name="ln565">        RETURN_NOT_OK(double_bound);</a>
+<a name="ln566">        bound_pb-&gt;mutable_subkey_bound()-&gt;set_double_subkey(*double_bound);</a>
+<a name="ln567">        break;</a>
+<a name="ln568">      }</a>
+<a name="ln569">      default:</a>
+<a name="ln570">        return STATUS_SUBSTITUTE(InvalidArgument, &quot;Invalid request type: $0&quot;, request_type);</a>
+<a name="ln571">    }</a>
+<a name="ln572"> </a>
+<a name="ln573">  }</a>
+<a name="ln574">  return Status::OK();</a>
+<a name="ln575">}</a>
+<a name="ln576"> </a>
+<a name="ln577">CHECKED_STATUS</a>
+<a name="ln578">ParseIndexBoundArg(const Slice&amp; slice, RedisIndexBoundPB* bound_pb) {</a>
+<a name="ln579">  auto index_bound = CheckedStoll(slice);</a>
+<a name="ln580">  RETURN_NOT_OK(index_bound);</a>
+<a name="ln581">  bound_pb-&gt;set_index(*index_bound);</a>
+<a name="ln582">  return Status::OK();</a>
+<a name="ln583">}</a>
+<a name="ln584"> </a>
+<a name="ln585">CHECKED_STATUS</a>
+<a name="ln586">ParseTsSubKeyBound(const Slice&amp; slice, RedisSubKeyBoundPB* bound_pb,</a>
+<a name="ln587">                   RedisCollectionGetRangeRequestPB::GetRangeRequestType request_type) {</a>
+<a name="ln588">  if (slice.empty()) {</a>
+<a name="ln589">    return STATUS(InvalidCommand, &quot;range bound key cannot be empty&quot;);</a>
+<a name="ln590">  }</a>
+<a name="ln591"> </a>
+<a name="ln592">  if (slice[0] == '(' &amp;&amp; slice.size() &gt; 1) {</a>
+<a name="ln593">    auto slice_copy = slice;</a>
+<a name="ln594">    slice_copy.remove_prefix(1);</a>
+<a name="ln595">    RETURN_NOT_OK(ParseTsBoundArg(slice_copy, bound_pb, request_type, /* exclusive */ true));</a>
+<a name="ln596">  } else {</a>
+<a name="ln597">    RETURN_NOT_OK(ParseTsBoundArg(slice, bound_pb, request_type, /* exclusive */ false));</a>
+<a name="ln598">  }</a>
+<a name="ln599">  return Status::OK();</a>
+<a name="ln600">}</a>
+<a name="ln601"> </a>
+<a name="ln602">CHECKED_STATUS ParseIndexBound(const Slice&amp; slice, RedisIndexBoundPB* bound_pb) {</a>
+<a name="ln603">  if (slice.empty()) {</a>
+<a name="ln604">    return STATUS(InvalidArgument, &quot;range bound index cannot be empty&quot;);</a>
+<a name="ln605">  }</a>
+<a name="ln606">  RETURN_NOT_OK(ParseIndexBoundArg(slice, bound_pb));</a>
+<a name="ln607">  return Status::OK();</a>
+<a name="ln608">}</a>
+<a name="ln609"> </a>
+<a name="ln610">CHECKED_STATUS ParseTsCard(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln611">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_TSCARD);</a>
+<a name="ln612">}</a>
+<a name="ln613"> </a>
+<a name="ln614">CHECKED_STATUS ParseTsLastN(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln615">  // TSLastN is basically TSRangeByTime -INF, INF with a limit on number of entries. Note that</a>
+<a name="ln616">  // there is a subtle difference here since TSRangeByTime iterates on entries from highest to</a>
+<a name="ln617">  // lowest and hence we end up returning the highest N entries. This operation is more like</a>
+<a name="ln618">  // TSRevRangeByTime -INF, INF with a limit (Note that TSRevRangeByTime is not implemented).</a>
+<a name="ln619">  op-&gt;mutable_request()-&gt;mutable_get_collection_range_request()-&gt;set_request_type(</a>
+<a name="ln620">      RedisCollectionGetRangeRequestPB_GetRangeRequestType_TSRANGEBYTIME);</a>
+<a name="ln621">  const auto&amp; key = args[1];</a>
+<a name="ln622">  auto limit = ParseInt32(args[2], &quot;limit&quot;);</a>
+<a name="ln623">  RETURN_NOT_OK(limit);</a>
+<a name="ln624">  if ((*limit) &lt;= 0) {</a>
+<a name="ln625">    return STATUS_SUBSTITUTE(InvalidArgument,</a>
+<a name="ln626">        &quot;$0 field $1 is not within valid bounds&quot;, &quot;limit&quot;, args[2].ToDebugString());</a>
+<a name="ln627">  }</a>
+<a name="ln628">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.ToBuffer());</a>
+<a name="ln629">  op-&gt;mutable_request()-&gt;set_range_request_limit(*limit);</a>
+<a name="ln630">  op-&gt;mutable_request()-&gt;mutable_subkey_range()-&gt;mutable_lower_bound()-&gt;set_infinity_type</a>
+<a name="ln631">      (RedisSubKeyBoundPB_InfinityType_NEGATIVE);</a>
+<a name="ln632">  op-&gt;mutable_request()-&gt;mutable_subkey_range()-&gt;mutable_upper_bound()-&gt;set_infinity_type</a>
+<a name="ln633">      (RedisSubKeyBoundPB_InfinityType_POSITIVE);</a>
+<a name="ln634">  return Status::OK();</a>
+<a name="ln635">}</a>
+<a name="ln636"> </a>
+<a name="ln637">CHECKED_STATUS ParseTsRangeByTime(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln638">  op-&gt;mutable_request()-&gt;mutable_get_collection_range_request()-&gt;set_request_type(</a>
+<a name="ln639">      RedisCollectionGetRangeRequestPB_GetRangeRequestType_TSRANGEBYTIME);</a>
+<a name="ln640"> </a>
+<a name="ln641">  const auto&amp; key = args[1];</a>
+<a name="ln642">  RETURN_NOT_OK(ParseTsSubKeyBound(</a>
+<a name="ln643">      args[2],</a>
+<a name="ln644">      op-&gt;mutable_request()-&gt;mutable_subkey_range()-&gt;mutable_lower_bound(),</a>
+<a name="ln645">      RedisCollectionGetRangeRequestPB_GetRangeRequestType_TSRANGEBYTIME));</a>
+<a name="ln646">  RETURN_NOT_OK(ParseTsSubKeyBound(</a>
+<a name="ln647">      args[3],</a>
+<a name="ln648">      op-&gt;mutable_request()-&gt;mutable_subkey_range()-&gt;mutable_upper_bound(),</a>
+<a name="ln649">      RedisCollectionGetRangeRequestPB_GetRangeRequestType_TSRANGEBYTIME));</a>
+<a name="ln650"> </a>
+<a name="ln651">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.ToBuffer());</a>
+<a name="ln652">  return Status::OK();</a>
+<a name="ln653">}</a>
+<a name="ln654"> </a>
+<a name="ln655">CHECKED_STATUS ParseTsRevRangeByTime(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln656">  op-&gt;mutable_request()-&gt;mutable_get_collection_range_request()-&gt;set_request_type(</a>
+<a name="ln657">      RedisCollectionGetRangeRequestPB_GetRangeRequestType_TSREVRANGEBYTIME);</a>
+<a name="ln658"> </a>
+<a name="ln659">  const auto&amp; key = args[1];</a>
+<a name="ln660">      RETURN_NOT_OK(ParseTsSubKeyBound(</a>
+<a name="ln661">      args[2],</a>
+<a name="ln662">      op-&gt;mutable_request()-&gt;mutable_subkey_range()-&gt;mutable_lower_bound(),</a>
+<a name="ln663">      RedisCollectionGetRangeRequestPB_GetRangeRequestType_TSREVRANGEBYTIME));</a>
+<a name="ln664">      RETURN_NOT_OK(ParseTsSubKeyBound(</a>
+<a name="ln665">      args[3],</a>
+<a name="ln666">      op-&gt;mutable_request()-&gt;mutable_subkey_range()-&gt;mutable_upper_bound(),</a>
+<a name="ln667">      RedisCollectionGetRangeRequestPB_GetRangeRequestType_TSREVRANGEBYTIME));</a>
+<a name="ln668"> </a>
+<a name="ln669">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.ToBuffer());</a>
+<a name="ln670"> </a>
+<a name="ln671">  if (args.size() &gt; 4) {</a>
+<a name="ln672">    if (args.size() != 6) {</a>
+<a name="ln673">      return STATUS_SUBSTITUTE(InvalidCommand,</a>
+<a name="ln674">                               &quot;Invalid number of arguments. Command should have 4 or 6 arguments&quot;);</a>
+<a name="ln675">    }</a>
+<a name="ln676">    string upper_arg;</a>
+<a name="ln677">    ToUpperCase(args[4].ToBuffer(), &amp;upper_arg);</a>
+<a name="ln678">    if (upper_arg != &quot;LIMIT&quot;) {</a>
+<a name="ln679">      return STATUS_SUBSTITUTE(InvalidArgument,</a>
+<a name="ln680">                               &quot;Invalid argument $0. Expecting $1&quot;, args[4].ToBuffer(), &quot;limit&quot;);</a>
+<a name="ln681">    }</a>
+<a name="ln682">    auto limit = ParseInt32(args[5], &quot;limit&quot;);</a>
+<a name="ln683">    RETURN_NOT_OK(limit);</a>
+<a name="ln684">    if ((*limit) &lt;= 0) {</a>
+<a name="ln685">      return STATUS_SUBSTITUTE(InvalidArgument,</a>
+<a name="ln686">                               &quot;$0 field $1 is not within valid bounds&quot;, &quot;limit&quot;,</a>
+<a name="ln687">                               args[5].ToDebugString());</a>
+<a name="ln688">    }</a>
+<a name="ln689">    op-&gt;mutable_request()-&gt;set_range_request_limit(*limit);</a>
+<a name="ln690">  }</a>
+<a name="ln691"> </a>
+<a name="ln692">  return Status::OK();</a>
+<a name="ln693">}</a>
+<a name="ln694"> </a>
+<a name="ln695">CHECKED_STATUS ParseWithScores(const Slice&amp; slice, RedisCollectionGetRangeRequestPB* request) {</a>
+<a name="ln696">  if(!boost::iequals(slice.ToBuffer(), kWithScores)) {</a>
+<a name="ln697">    return STATUS_SUBSTITUTE(InvalidArgument, &quot;unexpected argument $0&quot;, slice.ToBuffer());</a>
+<a name="ln698">  }</a>
+<a name="ln699">  request-&gt;set_with_scores(true);</a>
+<a name="ln700">  return Status::OK();</a>
+<a name="ln701">}</a>
+<a name="ln702"> </a>
+<a name="ln703">CHECKED_STATUS ParseRangeByScoreOptions(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln704">  int i = 4;</a>
+<a name="ln705">  int args_size = args.size();</a>
+<a name="ln706">  while (i &lt; args_size) {</a>
+<a name="ln707">    string upper_arg;</a>
+<a name="ln708">    ToUpperCase(args[i].ToBuffer(), &amp;upper_arg);</a>
+<a name="ln709">    if (upper_arg == &quot;LIMIT&quot;) {</a>
+<a name="ln710">      if (i &gt;= args_size - 2) {</a>
+<a name="ln711">        return STATUS_SUBSTITUTE(InvalidArgument, &quot;Not enough args passed into LIMIT clause, &quot;</a>
+<a name="ln712">            &quot;expected 2 but found $0&quot;, args_size - (i + 1));</a>
+<a name="ln713">      }</a>
+<a name="ln714">      auto offset = VERIFY_RESULT(ParseInt64(args[++i], &quot;offset&quot;));</a>
+<a name="ln715">      auto limit = VERIFY_RESULT(ParseInt64(args[++i], &quot;count&quot;));</a>
+<a name="ln716">      op-&gt;mutable_request()-&gt;mutable_index_range()-&gt;mutable_lower_bound()-&gt;set_index(offset);</a>
+<a name="ln717">      op-&gt;mutable_request()-&gt;set_range_request_limit(limit);</a>
+<a name="ln718">    } else if (upper_arg == &quot;WITHSCORES&quot;) {</a>
+<a name="ln719">      op-&gt;mutable_request()-&gt;mutable_get_collection_range_request()-&gt;set_with_scores(true);</a>
+<a name="ln720">    } else {</a>
+<a name="ln721">      return STATUS_SUBSTITUTE(InvalidArgument, &quot;Invalid argument $0&quot;, args[i].ToBuffer());</a>
+<a name="ln722">    }</a>
+<a name="ln723">    i++;</a>
+<a name="ln724">  }</a>
+<a name="ln725">  return Status::OK();</a>
+<a name="ln726">}</a>
+<a name="ln727"> </a>
+<a name="ln728">CHECKED_STATUS ParseZRangeByScore(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln729">  op-&gt;mutable_request()-&gt;mutable_get_collection_range_request()-&gt;set_request_type(</a>
+<a name="ln730">      RedisCollectionGetRangeRequestPB_GetRangeRequestType_ZRANGEBYSCORE);</a>
+<a name="ln731"> </a>
+<a name="ln732">  const auto&amp; key = args[1];</a>
+<a name="ln733">  RETURN_NOT_OK(ParseTsSubKeyBound(</a>
+<a name="ln734">  args[2],</a>
+<a name="ln735">  op-&gt;mutable_request()-&gt;mutable_subkey_range()-&gt;mutable_lower_bound(),</a>
+<a name="ln736">  RedisCollectionGetRangeRequestPB_GetRangeRequestType_ZRANGEBYSCORE));</a>
+<a name="ln737">  RETURN_NOT_OK(ParseTsSubKeyBound(</a>
+<a name="ln738">  args[3],</a>
+<a name="ln739">  op-&gt;mutable_request()-&gt;mutable_subkey_range()-&gt;mutable_upper_bound(),</a>
+<a name="ln740">  RedisCollectionGetRangeRequestPB_GetRangeRequestType_ZRANGEBYSCORE));</a>
+<a name="ln741">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.ToBuffer());</a>
+<a name="ln742"> </a>
+<a name="ln743">  return ParseRangeByScoreOptions(op, args);</a>
+<a name="ln744">}</a>
+<a name="ln745"> </a>
+<a name="ln746">CHECKED_STATUS ParseIndexBasedQuery(</a>
+<a name="ln747">    YBRedisReadOp* op,</a>
+<a name="ln748">    const RedisClientCommand&amp; args,</a>
+<a name="ln749">    RedisCollectionGetRangeRequestPB::GetRangeRequestType request_type) {</a>
+<a name="ln750">  if (args.size() &lt;= 5) {</a>
+<a name="ln751">    op-&gt;mutable_request()-&gt;mutable_get_collection_range_request()-&gt;set_request_type(request_type);</a>
+<a name="ln752"> </a>
+<a name="ln753">    const auto&amp; key = args[1];</a>
+<a name="ln754">    RETURN_NOT_OK(ParseIndexBound(</a>
+<a name="ln755">    args[2],</a>
+<a name="ln756">    op-&gt;mutable_request()-&gt;mutable_index_range()-&gt;mutable_lower_bound()));</a>
+<a name="ln757">    RETURN_NOT_OK(ParseIndexBound(</a>
+<a name="ln758">    args[3],</a>
+<a name="ln759">    op-&gt;mutable_request()-&gt;mutable_index_range()-&gt;mutable_upper_bound()));</a>
+<a name="ln760">    op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.ToBuffer());</a>
+<a name="ln761">    if (args.size() == 5) {</a>
+<a name="ln762">      RETURN_NOT_OK(ParseWithScores(</a>
+<a name="ln763">      args[4],</a>
+<a name="ln764">      op-&gt;mutable_request()-&gt;mutable_get_collection_range_request()));</a>
+<a name="ln765">    }</a>
+<a name="ln766">    return Status::OK();</a>
+<a name="ln767">  }</a>
+<a name="ln768">  return STATUS(InvalidArgument, &quot;Expected at most 5 arguments, found $0&quot;,</a>
+<a name="ln769">                  std::to_string(args.size()));</a>
+<a name="ln770">}</a>
+<a name="ln771"> </a>
+<a name="ln772">CHECKED_STATUS ParseZRange(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln773">  return ParseIndexBasedQuery(</a>
+<a name="ln774">      op, args, RedisCollectionGetRangeRequestPB_GetRangeRequestType_ZRANGE);</a>
+<a name="ln775">}</a>
+<a name="ln776"> </a>
+<a name="ln777">CHECKED_STATUS ParseZRevRange(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln778">  return ParseIndexBasedQuery(</a>
+<a name="ln779">      op, args, RedisCollectionGetRangeRequestPB_GetRangeRequestType_ZREVRANGE);</a>
+<a name="ln780">}</a>
+<a name="ln781"> </a>
+<a name="ln782">CHECKED_STATUS ParseTsGet(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln783">  op-&gt;mutable_request()-&gt;mutable_get_request()-&gt;set_request_type(</a>
+<a name="ln784">      RedisGetRequestPB_GetRequestType_TSGET);</a>
+<a name="ln785"> </a>
+<a name="ln786">  const auto&amp; key = args[1];</a>
+<a name="ln787">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln788">  auto timestamp = CheckedStoll(args[2]);</a>
+<a name="ln789">  RETURN_NOT_OK(timestamp);</a>
+<a name="ln790">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;add_subkey()-&gt;set_timestamp_subkey(*timestamp);</a>
+<a name="ln791"> </a>
+<a name="ln792">  return Status::OK();</a>
+<a name="ln793">}</a>
+<a name="ln794"> </a>
+<a name="ln795">CHECKED_STATUS ParseZScore(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln796">  op-&gt;mutable_request()-&gt;mutable_get_request()-&gt;set_request_type(</a>
+<a name="ln797">      RedisGetRequestPB_GetRequestType_ZSCORE);</a>
+<a name="ln798"> </a>
+<a name="ln799">  const auto&amp; key = args[1];</a>
+<a name="ln800">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln801">  auto member = args[2].ToBuffer();</a>
+<a name="ln802">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;add_subkey()-&gt;set_string_subkey(member);</a>
+<a name="ln803"> </a>
+<a name="ln804">  return Status::OK();</a>
+<a name="ln805">}</a>
+<a name="ln806"> </a>
+<a name="ln807">CHECKED_STATUS ParseHStrLen(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln808">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_HSTRLEN);</a>
+<a name="ln809">}</a>
+<a name="ln810"> </a>
+<a name="ln811">CHECKED_STATUS ParseHExists(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln812">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_HEXISTS);</a>
+<a name="ln813">}</a>
+<a name="ln814"> </a>
+<a name="ln815">CHECKED_STATUS ParseHMGet(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln816">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_HMGET);</a>
+<a name="ln817">}</a>
+<a name="ln818"> </a>
+<a name="ln819">CHECKED_STATUS ParseHGetAll(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln820">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_HGETALL);</a>
+<a name="ln821">}</a>
+<a name="ln822"> </a>
+<a name="ln823">CHECKED_STATUS ParseHKeys(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln824">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_HKEYS);</a>
+<a name="ln825">}</a>
+<a name="ln826"> </a>
+<a name="ln827">CHECKED_STATUS ParseHVals(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln828">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_HVALS);</a>
+<a name="ln829">}</a>
+<a name="ln830"> </a>
+<a name="ln831">CHECKED_STATUS ParseHLen(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln832">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_HLEN);</a>
+<a name="ln833">}</a>
+<a name="ln834"> </a>
+<a name="ln835">CHECKED_STATUS ParseSMembers(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln836">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_SMEMBERS);</a>
+<a name="ln837">}</a>
+<a name="ln838"> </a>
+<a name="ln839">CHECKED_STATUS ParseSIsMember(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln840">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_SISMEMBER);</a>
+<a name="ln841">}</a>
+<a name="ln842"> </a>
+<a name="ln843">CHECKED_STATUS ParseSCard(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln844">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_SCARD);</a>
+<a name="ln845">}</a>
+<a name="ln846"> </a>
+<a name="ln847">CHECKED_STATUS ParseLLen(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln848">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_LLEN);</a>
+<a name="ln849">}</a>
+<a name="ln850"> </a>
+<a name="ln851">CHECKED_STATUS ParseZCard(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln852">  return ParseHGetLikeCommands(op, args, RedisGetRequestPB_GetRequestType_ZCARD);</a>
+<a name="ln853">}</a>
+<a name="ln854"> </a>
+<a name="ln855">CHECKED_STATUS ParseStrLen(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln856">  op-&gt;mutable_request()-&gt;mutable_strlen_request(); // Allocates new RedisStrLenRequestPB().</a>
+<a name="ln857">  const auto&amp; key = args[1];</a>
+<a name="ln858">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln859">  return Status::OK();</a>
+<a name="ln860">}</a>
+<a name="ln861"> </a>
+<a name="ln862">// Note: Checking existence of only one key is supported as of now.</a>
+<a name="ln863">CHECKED_STATUS ParseExists(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln864">  op-&gt;mutable_request()-&gt;mutable_exists_request(); // Allocates new RedisExistsRequestPB().</a>
+<a name="ln865">  const auto&amp; key = args[1];</a>
+<a name="ln866">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln867">  return Status::OK();</a>
+<a name="ln868">}</a>
+<a name="ln869"> </a>
+<a name="ln870">CHECKED_STATUS ParseGetRange(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln871">  const auto&amp; key = args[1];</a>
+<a name="ln872">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln873"> </a>
+<a name="ln874">  auto start = ParseInt32(args[2], &quot;Start&quot;);</a>
+<a name="ln875">  RETURN_NOT_OK(start);</a>
+<a name="ln876">  op-&gt;mutable_request()-&gt;mutable_get_range_request()-&gt;set_start(*start);</a>
+<a name="ln877"> </a>
+<a name="ln878">  auto end = ParseInt32(args[3], &quot;End&quot;);</a>
+<a name="ln879">  RETURN_NOT_OK(end);</a>
+<a name="ln880">  op-&gt;mutable_request()-&gt;mutable_get_range_request()-&gt;set_end(*end);</a>
+<a name="ln881"> </a>
+<a name="ln882">  return Status::OK();</a>
+<a name="ln883">}</a>
+<a name="ln884"> </a>
+<a name="ln885">CHECKED_STATUS ParseExpire(YBRedisWriteOp* op,</a>
+<a name="ln886">                           const RedisClientCommand&amp; args,</a>
+<a name="ln887">                           const bool using_millis) {</a>
+<a name="ln888">  const auto&amp; key = args[1];</a>
+<a name="ln889">  auto ttl = ParseInt64(args[2], &quot;TTL&quot;);</a>
+<a name="ln890">  RETURN_NOT_OK(ttl);</a>
+<a name="ln891">  // If the TTL is not positive, we immediately delete.</a>
+<a name="ln892">  if (*ttl &lt;= 0) {</a>
+<a name="ln893">      op-&gt;mutable_request()-&gt;mutable_del_request(); // Allocates new RedisDelRequestPB().</a>
+<a name="ln894">      op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln895">      op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(REDIS_TYPE_NONE);</a>
+<a name="ln896">      return Status::OK();</a>
+<a name="ln897">  }</a>
+<a name="ln898">  *ttl *= using_millis ? 1 : MonoTime::kMillisecondsPerSecond;</a>
+<a name="ln899">  if (*ttl &lt; kRedisMinTtlMillis || *ttl &gt; kRedisMaxTtlMillis) {</a>
+<a name="ln900">    return STATUS_FORMAT(InvalidCommand,</a>
+<a name="ln901">        &quot;TTL field $0 is not within valid bounds&quot;, args[2]);</a>
+<a name="ln902">  }</a>
+<a name="ln903">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln904">  op-&gt;mutable_request()-&gt;mutable_set_ttl_request()-&gt;set_ttl(*ttl);</a>
+<a name="ln905">  return Status::OK();</a>
+<a name="ln906">}</a>
+<a name="ln907"> </a>
+<a name="ln908">CHECKED_STATUS ParseExpire(YBRedisWriteOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln909">  return ParseExpire(op, args, false);</a>
+<a name="ln910">}</a>
+<a name="ln911"> </a>
+<a name="ln912">CHECKED_STATUS ParsePExpire(YBRedisWriteOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln913">  return ParseExpire(op, args, true);</a>
+<a name="ln914">}</a>
+<a name="ln915"> </a>
+<a name="ln916">CHECKED_STATUS ParsePersist(YBRedisWriteOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln917">  const auto&amp; key = args[1];</a>
+<a name="ln918">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln919">  op-&gt;mutable_request()-&gt;mutable_set_ttl_request()-&gt;set_ttl(-1);</a>
+<a name="ln920">  return Status::OK();</a>
+<a name="ln921">}</a>
+<a name="ln922"> </a>
+<a name="ln923">CHECKED_STATUS ParseExpireAt(YBRedisWriteOp* op,</a>
+<a name="ln924">                           const RedisClientCommand&amp; args,</a>
+<a name="ln925">                           const bool using_millis) {</a>
+<a name="ln926">  const auto&amp; key = args[1];</a>
+<a name="ln927">  auto expiration = VERIFY_RESULT(ParseInt64(args[2], &quot;expiration&quot;));</a>
+<a name="ln928">  // If the TTL is not positive, we immediately delete.</a>
+<a name="ln929">  if (expiration &lt;= 0) {</a>
+<a name="ln930">      op-&gt;mutable_request()-&gt;mutable_del_request(); // Allocates new RedisDelRequestPB().</a>
+<a name="ln931">      op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln932">      op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(REDIS_TYPE_NONE);</a>
+<a name="ln933">      return Status::OK();</a>
+<a name="ln934">  }</a>
+<a name="ln935">  expiration *= using_millis ? 1 : MonoTime::kMillisecondsPerSecond;</a>
+<a name="ln936">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln937">  op-&gt;mutable_request()-&gt;mutable_set_ttl_request()-&gt;set_absolute_time(expiration);</a>
+<a name="ln938">  return Status::OK();</a>
+<a name="ln939">}</a>
+<a name="ln940"> </a>
+<a name="ln941">CHECKED_STATUS ParseExpireAt(YBRedisWriteOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln942">  return ParseExpireAt(op, args, /* using_millis */ false);</a>
+<a name="ln943">}</a>
+<a name="ln944"> </a>
+<a name="ln945">CHECKED_STATUS ParsePExpireAt(YBRedisWriteOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln946">  return ParseExpireAt(op, args, /* using_millis */ true);</a>
+<a name="ln947">}</a>
+<a name="ln948"> </a>
+<a name="ln949">CHECKED_STATUS ParseSetEx(YBRedisWriteOp* op,</a>
+<a name="ln950">                          const RedisClientCommand&amp; args,</a>
+<a name="ln951">                          const bool using_millis) {</a>
+<a name="ln952">  const auto&amp; key = args[1];</a>
+<a name="ln953">  const auto value = args[3];</a>
+<a name="ln954">  auto ttl = VERIFY_RESULT(ParseInt64(args[2], &quot;TTL&quot;));</a>
+<a name="ln955">  if (ttl &lt;= 0) {</a>
+<a name="ln956">    op-&gt;mutable_request()-&gt;mutable_no_op_request(); // Allocates new RedisNoOpRequestPB().</a>
+<a name="ln957">    return Status::OK();</a>
+<a name="ln958">  }</a>
+<a name="ln959">  ttl *= using_millis ? 1 : MonoTime::kMillisecondsPerSecond;</a>
+<a name="ln960">  if (ttl &lt; kRedisMinTtlMillis || ttl &gt; kRedisMaxTtlMillis) {</a>
+<a name="ln961">    return STATUS_FORMAT(InvalidCommand,</a>
+<a name="ln962">        &quot;TTL field $0 is not within valid bounds&quot;, args[3]);</a>
+<a name="ln963">  }</a>
+<a name="ln964">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln965">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;add_value(value.cdata(), value.size());</a>
+<a name="ln966">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(REDIS_TYPE_STRING);</a>
+<a name="ln967">  op-&gt;mutable_request()-&gt;mutable_set_request()-&gt;set_ttl(ttl);</a>
+<a name="ln968">  return Status::OK();</a>
+<a name="ln969">}</a>
+<a name="ln970"> </a>
+<a name="ln971">CHECKED_STATUS ParseSetEx(YBRedisWriteOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln972">  return ParseSetEx(op, args, false);</a>
+<a name="ln973">}</a>
+<a name="ln974"> </a>
+<a name="ln975">CHECKED_STATUS ParsePSetEx(YBRedisWriteOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln976">  return ParseSetEx(op, args, true);</a>
+<a name="ln977">}</a>
+<a name="ln978"> </a>
+<a name="ln979">CHECKED_STATUS ParseTtl(YBRedisReadOp* op,</a>
+<a name="ln980">                        const RedisClientCommand&amp; args,</a>
+<a name="ln981">                        const bool return_seconds) {</a>
+<a name="ln982">  const auto&amp; key = args[1];</a>
+<a name="ln983">  op-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(key.cdata(), key.size());</a>
+<a name="ln984">  op-&gt;mutable_request()-&gt;mutable_get_ttl_request()-&gt;set_return_seconds(return_seconds);</a>
+<a name="ln985">  return Status::OK();</a>
+<a name="ln986">}</a>
+<a name="ln987"> </a>
+<a name="ln988">CHECKED_STATUS ParseTtl(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln989">  return ParseTtl(op, args, true);</a>
+<a name="ln990">}</a>
+<a name="ln991"> </a>
+<a name="ln992">CHECKED_STATUS ParsePTtl(YBRedisReadOp* op, const RedisClientCommand&amp; args) {</a>
+<a name="ln993">  return ParseTtl(op, args, false);</a>
+<a name="ln994">}</a>
+<a name="ln995"> </a>
+<a name="ln996">// Begin of input is going to be consumed, so we should adjust our pointers.</a>
+<a name="ln997">// Since the beginning of input is being consumed by shifting the remaining bytes to the</a>
+<a name="ln998">// beginning of the buffer.</a>
+<a name="ln999">void RedisParser::Consume(size_t count) {</a>
+<a name="ln1000">  pos_ -= count;</a>
+<a name="ln1001"> </a>
+<a name="ln1002">  if (token_begin_ != kNoToken) {</a>
+<a name="ln1003">    token_begin_ -= count;</a>
+<a name="ln1004">  }</a>
+<a name="ln1005">}</a>
+<a name="ln1006"> </a>
+<a name="ln1007">// New data arrived, so update the end of available bytes.</a>
+<a name="ln1008">void RedisParser::Update(const IoVecs&amp; data) {</a>
+<a name="ln1009">  source_ = data;</a>
+<a name="ln1010">  full_size_ = IoVecsFullSize(data);</a>
+<a name="ln1011">  DCHECK_LE(pos_, full_size_);</a>
+<a name="ln1012">}</a>
+<a name="ln1013"> </a>
+<a name="ln1014">// Parse next command.</a>
+<a name="ln1015">Result&lt;size_t&gt; RedisParser::NextCommand() {</a>
+<a name="ln1016">  while (pos_ != full_size_) {</a>
+<a name="ln1017">    incomplete_ = false;</a>
+<a name="ln1018">    Status status = AdvanceToNextToken();</a>
+<a name="ln1019">    if (!status.ok()) {</a>
+<a name="ln1020">      return status;</a>
+<a name="ln1021">    }</a>
+<a name="ln1022">    if (incomplete_) {</a>
+<a name="ln1023">      pos_ = full_size_;</a>
+<a name="ln1024">      return 0;</a>
+<a name="ln1025">    }</a>
+<a name="ln1026">    if (state_ == State::FINISHED) {</a>
+<a name="ln1027">      state_ = State::INITIAL;</a>
+<a name="ln1028">      return pos_;</a>
+<a name="ln1029">    }</a>
+<a name="ln1030">  }</a>
+<a name="ln1031">  return 0;</a>
+<a name="ln1032">}</a>
+<a name="ln1033"> </a>
+<a name="ln1034">CHECKED_STATUS RedisParser::AdvanceToNextToken() {</a>
+<a name="ln1035">  switch (state_) {</a>
+<a name="ln1036">    case State::INITIAL:</a>
+<a name="ln1037">      return Initial();</a>
+<a name="ln1038">    case State::SINGLE_LINE:</a>
+<a name="ln1039">      return SingleLine();</a>
+<a name="ln1040">    case State::BULK_HEADER:</a>
+<a name="ln1041">      return BulkHeader();</a>
+<a name="ln1042">    case State::BULK_ARGUMENT_SIZE:</a>
+<a name="ln1043">      return BulkArgumentSize();</a>
+<a name="ln1044">    case State::BULK_ARGUMENT_BODY:</a>
+<a name="ln1045">      return BulkArgumentBody();</a>
+<a name="ln1046">    case State::FINISHED:</a>
+<a name="ln1047">      return STATUS(IllegalState, &quot;Should not be in FINISHED state during NextToken&quot;);</a>
+<a name="ln1048">  }</a>
+<a name="ln1049">  LOG(FATAL) &lt;&lt; &quot;Unexpected parser state: &quot; &lt;&lt; to_underlying(state_);</a>
+<a name="ln1050">}</a>
+<a name="ln1051"> </a>
+<a name="ln1052">CHECKED_STATUS RedisParser::Initial() {</a>
+<a name="ln1053">  token_begin_ = pos_;</a>
+<a name="ln1054">  state_ = char_at_offset(pos_) == '*' ? State::BULK_HEADER : State::SINGLE_LINE;</a>
+<a name="ln1055">  return Status::OK();</a>
+<a name="ln1056">}</a>
+<a name="ln1057"> </a>
+<a name="ln1058">CHECKED_STATUS RedisParser::SingleLine() {</a>
+<a name="ln1059">  auto status = FindEndOfLine();</a>
+<a name="ln1060">  if (!status.ok() || incomplete_) {</a>
+<a name="ln1061">    return status;</a>
+<a name="ln1062">  }</a>
+<a name="ln1063">  auto start = token_begin_;</a>
+<a name="ln1064">  auto finish = pos_ - 2;</a>
+<a name="ln1065">  while (start &lt; finish &amp;&amp; isspace(char_at_offset(start))) {</a>
+<a name="ln1066">    ++start;</a>
+<a name="ln1067">  }</a>
+<a name="ln1068">  if (start &gt;= finish) {</a>
+<a name="ln1069">    return STATUS(InvalidArgument, &quot;Empty line&quot;);</a>
+<a name="ln1070">  }</a>
+<a name="ln1071">  if (args_) {</a>
+<a name="ln1072">    // Args is supported only when parsing from single block of data.</a>
+<a name="ln1073">    // Because we parse prepared call data in this case, that is contained in a single buffer.</a>
+<a name="ln1074">    DCHECK_EQ(source_.size(), 1);</a>
+<a name="ln1075">    RETURN_NOT_OK(util::SplitArgs(Slice(offset_to_pointer(start), finish - start), args_));</a>
+<a name="ln1076">  }</a>
+<a name="ln1077">  state_ = State::FINISHED;</a>
+<a name="ln1078">  return Status::OK();</a>
+<a name="ln1079">}</a>
+<a name="ln1080"> </a>
+<a name="ln1081">CHECKED_STATUS RedisParser::BulkHeader() {</a>
+<a name="ln1082">  auto status = FindEndOfLine();</a>
+<a name="ln1083">  if (!status.ok() || incomplete_) {</a>
+<a name="ln1084">    return status;</a>
+<a name="ln1085">  }</a>
+<a name="ln1086">  auto num_args = VERIFY_RESULT(ParseNumber(</a>
+<a name="ln1087">      '*', 1, kMaxNumberOfArgs, &quot;Number of lines in multiline&quot;));</a>
+<a name="ln1088">  if (args_) {</a>
+<a name="ln1089">    args_-&gt;clear();</a>
+<a name="ln1090">    args_-&gt;reserve(num_args);</a>
+<a name="ln1091">  }</a>
+<a name="ln1092">  state_ = State::BULK_ARGUMENT_SIZE;</a>
+<a name="ln1093">  token_begin_ = pos_;</a>
+<a name="ln1094">  arguments_left_ = num_args;</a>
+<a name="ln1095">  return Status::OK();</a>
+<a name="ln1096">}</a>
+<a name="ln1097"> </a>
+<a name="ln1098">CHECKED_STATUS RedisParser::BulkArgumentSize() {</a>
+<a name="ln1099">  auto status = FindEndOfLine();</a>
+<a name="ln1100">  if (!status.ok() || incomplete_) {</a>
+<a name="ln1101">    return status;</a>
+<a name="ln1102">  }</a>
+<a name="ln1103">  auto current_size = VERIFY_RESULT(ParseNumber('$', 0, kMaxRedisValueSize, &quot;Argument size&quot;));</a>
+<a name="ln1104">  state_ = State::BULK_ARGUMENT_BODY;</a>
+<a name="ln1105">  token_begin_ = pos_;</a>
+<a name="ln1106">  current_argument_size_ = current_size;</a>
+<a name="ln1107">  return Status::OK();</a>
+<a name="ln1108">}</a>
+<a name="ln1109"> </a>
+<a name="ln1110">CHECKED_STATUS RedisParser::BulkArgumentBody() {</a>
+<a name="ln1111">  auto desired_position = token_begin_ + current_argument_size_ + kLineEndLength;</a>
+<a name="ln1112">  if (desired_position &gt; full_size_) {</a>
+<a name="ln1113">    incomplete_ = true;</a>
+<a name="ln1114">    pos_ = full_size_;</a>
+<a name="ln1115">    return Status::OK();</a>
+<a name="ln1116">  }</a>
+<a name="ln1117">  if (char_at_offset(desired_position - 1) != '\n' ||</a>
+<a name="ln1118">      char_at_offset(desired_position - 2) != '\r') {</a>
+<a name="ln1119">    return STATUS(NetworkError, &quot;No \\r\\n after bulk&quot;);</a>
+<a name="ln1120">  }</a>
+<a name="ln1121">  if (args_) {</a>
+<a name="ln1122">    // Args is supported only when parsing from single block of data.</a>
+<a name="ln1123">    // Because we parse prepared call data in this case, that is contained in a single buffer.</a>
+<a name="ln1124">    DCHECK_EQ(source_.size(), 1);</a>
+<a name="ln1125">    args_-&gt;emplace_back(offset_to_pointer(token_begin_), current_argument_size_);</a>
+<a name="ln1126">  }</a>
+<a name="ln1127">  --arguments_left_;</a>
+<a name="ln1128">  pos_ = desired_position;</a>
+<a name="ln1129">  token_begin_ = pos_;</a>
+<a name="ln1130">  if (arguments_left_ == 0) {</a>
+<a name="ln1131">    state_ = State::FINISHED;</a>
+<a name="ln1132">  } else {</a>
+<a name="ln1133">    state_ = State::BULK_ARGUMENT_SIZE;</a>
+<a name="ln1134">  }</a>
+<a name="ln1135">  return Status::OK();</a>
+<a name="ln1136">}</a>
+<a name="ln1137"> </a>
+<a name="ln1138">CHECKED_STATUS RedisParser::FindEndOfLine() {</a>
+<a name="ln1139">  auto p = offset_to_idx_and_local_offset(pos_);</a>
+<a name="ln1140"> </a>
+<a name="ln1141">  size_t new_line_offset = pos_;</a>
+<a name="ln1142">  while (p.first != source_.size()) {</a>
+<a name="ln1143">    auto begin = IoVecBegin(source_[p.first]) + p.second;</a>
+<a name="ln1144">    auto new_line = static_cast&lt;const char*&gt;(memchr(</a>
+<a name="ln1145">        begin, '\n', IoVecEnd(source_[p.first]) - begin));</a>
+<a name="ln1146">    if (new_line) {</a>
+<a name="ln1147">      new_line_offset += new_line - begin;</a>
+<a name="ln1148">      break;</a>
+<a name="ln1149">    }</a>
+<a name="ln1150">    new_line_offset += source_[p.first].iov_len - p.second;</a>
+<a name="ln1151">    ++p.first;</a>
+<a name="ln1152">    p.second = 0;</a>
+<a name="ln1153">  }</a>
+<a name="ln1154"> </a>
+<a name="ln1155">  incomplete_ = p.first == source_.size();</a>
+<a name="ln1156">  if (!incomplete_) {</a>
+<a name="ln1157">    if (new_line_offset == token_begin_) {</a>
+<a name="ln1158">      return STATUS(NetworkError, &quot;End of line at the beginning of a Redis command&quot;);</a>
+<a name="ln1159">    }</a>
+<a name="ln1160">    if (char_at_offset(new_line_offset - 1) != '\r') {</a>
+<a name="ln1161">      return STATUS(NetworkError, &quot;\\n is not prefixed with \\r&quot;);</a>
+<a name="ln1162">    }</a>
+<a name="ln1163">    pos_ = ++new_line_offset;</a>
+<a name="ln1164">  }</a>
+<a name="ln1165">  return Status::OK();</a>
+<a name="ln1166">}</a>
+<a name="ln1167"> </a>
+<a name="ln1168">std::pair&lt;size_t, size_t&gt; RedisParser::offset_to_idx_and_local_offset(size_t offset) const {</a>
+<a name="ln1169">  // We assume that there are at most 2 blocks of data.</a>
+<a name="ln1170">  if (offset &lt; source_[0].iov_len) {</a>
+<a name="ln1171">    return std::pair&lt;size_t, size_t&gt;(0, offset);</a>
+<a name="ln1172">  }</a>
+<a name="ln1173"> </a>
+<a name="ln1174">  offset -= source_[0].iov_len;</a>
+<a name="ln1175">  size_t idx = offset / source_[1].iov_len;</a>
+<a name="ln1176">  offset -= idx * source_[1].iov_len;</a>
+<a name="ln1177"> </a>
+<a name="ln1178">  return std::pair&lt;size_t, size_t&gt;(idx + 1, offset);</a>
+<a name="ln1179">}</a>
+<a name="ln1180"> </a>
+<a name="ln1181">const char* RedisParser::offset_to_pointer(size_t offset) const {</a>
+<a name="ln1182">  auto p = offset_to_idx_and_local_offset(offset);</a>
+<a name="ln1183">  return IoVecBegin(source_[p.first]) + p.second;</a>
+<a name="ln1184">}</a>
+<a name="ln1185"> </a>
+<a name="ln1186">// Parses number with specified bounds.</a>
+<a name="ln1187">// Number is located in separate line, and contain prefix before actual number.</a>
+<a name="ln1188">// Line starts at token_begin_ and pos_ is a start of next line.</a>
+<a name="ln1189">Result&lt;ptrdiff_t&gt; RedisParser::ParseNumber(char prefix,</a>
+<a name="ln1190">                                           ptrdiff_t min,</a>
+<a name="ln1191">                                           ptrdiff_t max,</a>
+<a name="ln1192">                                           const char* name) {</a>
+<a name="ln1193">  if (char_at_offset(token_begin_) != prefix) {</a>
+<a name="ln1194">    return STATUS_FORMAT(Corruption,</a>
+<a name="ln1195">                         &quot;Invalid character before number, expected: $0, but found: $1&quot;,</a>
+<a name="ln1196">                         prefix, char_at_offset(token_begin_));</a>
+<a name="ln1197">  }</a>
+<a name="ln1198">  auto number_begin = token_begin_ + 1;</a>
+<a name="ln1199">  auto expected_stop = pos_ - kLineEndLength;</a>
+<a name="ln1200">  if (expected_stop - number_begin &gt; kMaxNumberLength) {</a>
+<a name="ln1201">    return STATUS_FORMAT(</a>
+<a name="ln1202">        Corruption, &quot;Too long $0 of length $1&quot;, name, expected_stop - number_begin);</a>
+<a name="ln1203">  }</a>
+<a name="ln1204">  number_buffer_.reserve(kMaxNumberLength);</a>
+<a name="ln1205">  IoVecsToBuffer(source_, number_begin, expected_stop, &amp;number_buffer_);</a>
+<a name="ln1206">  number_buffer_.push_back(0);</a>
+<a name="ln1207">  auto parsed_number = VERIFY_RESULT(CheckedStoll(</a>
+<a name="ln1208">      Slice(number_buffer_.data(), number_buffer_.size() - 1)));</a>
+<a name="ln1209">  static_assert(sizeof(parsed_number) == sizeof(ptrdiff_t), &quot;Expected size&quot;);</a>
+<a name="ln1210">  SCHECK_BOUNDS(parsed_number,</a>
+<a name="ln1211">                min,</a>
+<a name="ln1212">                max,</a>
+<a name="ln1213">                Corruption,</a>
+<a name="ln1214">                yb::Format(&quot;$0 out of expected range [$1, $2] : $3&quot;,</a>
+<a name="ln1215">                           name, min, max, parsed_number));</a>
+<a name="ln1216">  return static_cast&lt;ptrdiff_t&gt;(parsed_number);</a>
+<a name="ln1217">}</a>
+<a name="ln1218"> </a>
+<a name="ln1219">}  // namespace redisserver</a>
+<a name="ln1220">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="106"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_set_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="183"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_set_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="248"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_set_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="410"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_del_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="415"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_del_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="420"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_del_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="425"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_add_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="430"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_del_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="452"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_getset_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="461"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_append_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="470"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_del_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="856"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_strlen_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="864"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_exists_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="893"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_del_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="930"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_del_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="956"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_no_op_request' is required to be utilized. A memory leak is possible.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

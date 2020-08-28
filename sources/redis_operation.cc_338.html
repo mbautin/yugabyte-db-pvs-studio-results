@@ -1,0 +1,2026 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>redis_operation.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/docdb/redis_operation.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/docdb/doc_reader.h&quot;</a>
+<a name="ln17">#include &quot;yb/docdb/doc_ttl_util.h&quot;</a>
+<a name="ln18">#include &quot;yb/docdb/doc_write_batch.h&quot;</a>
+<a name="ln19">#include &quot;yb/docdb/doc_write_batch_cache.h&quot;</a>
+<a name="ln20">#include &quot;yb/docdb/docdb.h&quot;</a>
+<a name="ln21">#include &quot;yb/docdb/docdb_rocksdb_util.h&quot;</a>
+<a name="ln22">#include &quot;yb/docdb/subdocument.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;yb/util/stol_utils.h&quot;</a>
+<a name="ln25">#include &quot;yb/util/redis_util.h&quot;</a>
+<a name="ln26"> </a>
+<a name="ln27">DEFINE_bool(emulate_redis_responses,</a>
+<a name="ln28">    true,</a>
+<a name="ln29">    &quot;If emulate_redis_responses is false, we hope to get slightly better performance by just &quot;</a>
+<a name="ln30">    &quot;returning OK for commands that might require us to read additional records viz. SADD, HSET, &quot;</a>
+<a name="ln31">    &quot;and HDEL. If emulate_redis_responses is true, we read the required records to compute the &quot;</a>
+<a name="ln32">    &quot;response as specified by the official Redis API documentation. https://redis.io/commands&quot;);</a>
+<a name="ln33"> </a>
+<a name="ln34">namespace yb {</a>
+<a name="ln35">namespace docdb {</a>
+<a name="ln36"> </a>
+<a name="ln37">// A simple conversion from RedisDataTypes to ValueTypes</a>
+<a name="ln38">// Note: May run into issues if we want to support ttl on individual set elements,</a>
+<a name="ln39">// as they are represented by ValueType::kNullLow.</a>
+<a name="ln40">ValueType ValueTypeFromRedisType(RedisDataType dt) {</a>
+<a name="ln41">  switch(dt) {</a>
+<a name="ln42">  case RedisDataType::REDIS_TYPE_STRING:</a>
+<a name="ln43">    return ValueType::kString;</a>
+<a name="ln44">  case RedisDataType::REDIS_TYPE_SET:</a>
+<a name="ln45">    return ValueType::kRedisSet;</a>
+<a name="ln46">  case RedisDataType::REDIS_TYPE_HASH:</a>
+<a name="ln47">    return ValueType::kObject;</a>
+<a name="ln48">  case RedisDataType::REDIS_TYPE_SORTEDSET:</a>
+<a name="ln49">    return ValueType::kRedisSortedSet;</a>
+<a name="ln50">  case RedisDataType::REDIS_TYPE_TIMESERIES:</a>
+<a name="ln51">    return ValueType::kRedisTS;</a>
+<a name="ln52">  case RedisDataType::REDIS_TYPE_LIST:</a>
+<a name="ln53">    return ValueType::kRedisList;</a>
+<a name="ln54">  default:</a>
+<a name="ln55">    return ValueType::kInvalid;</a>
+<a name="ln56">  }</a>
+<a name="ln57">}</a>
+<a name="ln58"> </a>
+<a name="ln59">Status RedisWriteOperation::GetDocPaths(</a>
+<a name="ln60">    GetDocPathsMode mode, DocPathsToLock* paths, IsolationLevel *level) const {</a>
+<a name="ln61">  paths-&gt;push_back(DocKey::FromRedisKey(</a>
+<a name="ln62">      request_.key_value().hash_code(), request_.key_value().key()).EncodeAsRefCntPrefix());</a>
+<a name="ln63">  *level = IsolationLevel::SNAPSHOT_ISOLATION;</a>
+<a name="ln64"> </a>
+<a name="ln65">  return Status::OK();</a>
+<a name="ln66">}</a>
+<a name="ln67"> </a>
+<a name="ln68">namespace {</a>
+<a name="ln69"> </a>
+<a name="ln70">bool EmulateRedisResponse(const RedisDataType&amp; data_type) {</a>
+<a name="ln71">  return FLAGS_emulate_redis_responses &amp;&amp; data_type != REDIS_TYPE_TIMESERIES;</a>
+<a name="ln72">}</a>
+<a name="ln73"> </a>
+<a name="ln74">static const string wrong_type_message =</a>
+<a name="ln75">    &quot;WRONGTYPE Operation against a key holding the wrong kind of value&quot;;</a>
+<a name="ln76"> </a>
+<a name="ln77">CHECKED_STATUS PrimitiveValueFromSubKey(const RedisKeyValueSubKeyPB &amp;subkey_pb,</a>
+<a name="ln78">                                        PrimitiveValue *primitive_value) {</a>
+<a name="ln79">  switch (subkey_pb.subkey_case()) {</a>
+<a name="ln80">    case RedisKeyValueSubKeyPB::kStringSubkey:</a>
+<a name="ln81">      *primitive_value = PrimitiveValue(subkey_pb.string_subkey());</a>
+<a name="ln82">      break;</a>
+<a name="ln83">    case RedisKeyValueSubKeyPB::kTimestampSubkey:</a>
+<a name="ln84">      // We use descending order for the timestamp in the timeseries type so that the latest</a>
+<a name="ln85">      // value sorts on top.</a>
+<a name="ln86">      *primitive_value = PrimitiveValue(subkey_pb.timestamp_subkey(), SortOrder::kDescending);</a>
+<a name="ln87">      break;</a>
+<a name="ln88">    case RedisKeyValueSubKeyPB::kDoubleSubkey: {</a>
+<a name="ln89">      *primitive_value = PrimitiveValue::Double(subkey_pb.double_subkey());</a>
+<a name="ln90">      break;</a>
+<a name="ln91">    }</a>
+<a name="ln92">    default:</a>
+<a name="ln93">      return STATUS_SUBSTITUTE(IllegalState, &quot;Invalid enum value $0&quot;, subkey_pb.subkey_case());</a>
+<a name="ln94">  }</a>
+<a name="ln95">  return Status::OK();</a>
+<a name="ln96">}</a>
+<a name="ln97"> </a>
+<a name="ln98">// Stricter version of the above when we know the exact datatype to expect.</a>
+<a name="ln99">CHECKED_STATUS PrimitiveValueFromSubKeyStrict(const RedisKeyValueSubKeyPB &amp;subkey_pb,</a>
+<a name="ln100">                                              const RedisDataType &amp;data_type,</a>
+<a name="ln101">                                              PrimitiveValue *primitive_value) {</a>
+<a name="ln102">  switch (data_type) {</a>
+<a name="ln103">    case REDIS_TYPE_LIST: FALLTHROUGH_INTENDED;</a>
+<a name="ln104">    case REDIS_TYPE_SET: FALLTHROUGH_INTENDED;</a>
+<a name="ln105">    case REDIS_TYPE_HASH:</a>
+<a name="ln106">      if (!subkey_pb.has_string_subkey()) {</a>
+<a name="ln107">        return STATUS_SUBSTITUTE(InvalidArgument, &quot;subkey: $0 should be of string type&quot;,</a>
+<a name="ln108">                                 subkey_pb.ShortDebugString());</a>
+<a name="ln109">      }</a>
+<a name="ln110">      break;</a>
+<a name="ln111">    case REDIS_TYPE_TIMESERIES:</a>
+<a name="ln112">      if (!subkey_pb.has_timestamp_subkey()) {</a>
+<a name="ln113">        return STATUS_SUBSTITUTE(InvalidArgument, &quot;subkey: $0 should be of int64 type&quot;,</a>
+<a name="ln114">                                 subkey_pb.ShortDebugString());</a>
+<a name="ln115">      }</a>
+<a name="ln116">      break;</a>
+<a name="ln117">    case REDIS_TYPE_SORTEDSET:</a>
+<a name="ln118">      if (!subkey_pb.has_double_subkey()) {</a>
+<a name="ln119">        return STATUS_SUBSTITUTE(InvalidArgument, &quot;subkey: $0 should be of double type&quot;,</a>
+<a name="ln120">                             subkey_pb.ShortDebugString());</a>
+<a name="ln121">      }</a>
+<a name="ln122">      break;</a>
+<a name="ln123">    default:</a>
+<a name="ln124">      return STATUS_SUBSTITUTE(IllegalState, &quot;Invalid enum value $0&quot;, data_type);</a>
+<a name="ln125">  }</a>
+<a name="ln126">  return PrimitiveValueFromSubKey(subkey_pb, primitive_value);</a>
+<a name="ln127">}</a>
+<a name="ln128"> </a>
+<a name="ln129">Result&lt;RedisDataType&gt; GetRedisValueType(</a>
+<a name="ln130">    IntentAwareIterator* iterator,</a>
+<a name="ln131">    const RedisKeyValuePB &amp;key_value_pb,</a>
+<a name="ln132">    DocWriteBatch* doc_write_batch = nullptr,</a>
+<a name="ln133">    int subkey_index = kNilSubkeyIndex,</a>
+<a name="ln134">    bool always_override = false) {</a>
+<a name="ln135">  if (!key_value_pb.has_key()) {</a>
+<a name="ln136">    return STATUS(Corruption, &quot;Expected KeyValuePB&quot;);</a>
+<a name="ln137">  }</a>
+<a name="ln138">  KeyBytes encoded_subdoc_key;</a>
+<a name="ln139">  if (subkey_index == kNilSubkeyIndex) {</a>
+<a name="ln140">    encoded_subdoc_key = DocKey::EncodedFromRedisKey(key_value_pb.hash_code(), key_value_pb.key());</a>
+<a name="ln141">  } else {</a>
+<a name="ln142">    if (subkey_index &gt;= key_value_pb.subkey_size()) {</a>
+<a name="ln143">      return STATUS_SUBSTITUTE(InvalidArgument,</a>
+<a name="ln144">                               &quot;Size of subkeys ($0) must be larger than subkey_index ($1)&quot;,</a>
+<a name="ln145">                               key_value_pb.subkey_size(), subkey_index);</a>
+<a name="ln146">    }</a>
+<a name="ln147"> </a>
+<a name="ln148">    PrimitiveValue subkey_primitive;</a>
+<a name="ln149">    RETURN_NOT_OK(PrimitiveValueFromSubKey(key_value_pb.subkey(subkey_index), &amp;subkey_primitive));</a>
+<a name="ln150">    encoded_subdoc_key = DocKey::EncodedFromRedisKey(key_value_pb.hash_code(), key_value_pb.key());</a>
+<a name="ln151">    subkey_primitive.AppendToKey(&amp;encoded_subdoc_key);</a>
+<a name="ln152">  }</a>
+<a name="ln153">  SubDocument doc;</a>
+<a name="ln154">  bool doc_found = false;</a>
+<a name="ln155">  // Use the cached entry if possible to determine the value type.</a>
+<a name="ln156">  boost::optional&lt;DocWriteBatchCache::Entry&gt; cached_entry;</a>
+<a name="ln157">  if (doc_write_batch) {</a>
+<a name="ln158">    cached_entry = doc_write_batch-&gt;LookupCache(encoded_subdoc_key);</a>
+<a name="ln159">  }</a>
+<a name="ln160"> </a>
+<a name="ln161">  if (cached_entry) {</a>
+<a name="ln162">    doc_found = true;</a>
+<a name="ln163">    doc = SubDocument(cached_entry-&gt;value_type);</a>
+<a name="ln164">  } else {</a>
+<a name="ln165">    // TODO(dtxn) - pass correct transaction context when we implement cross-shard transactions</a>
+<a name="ln166">    // support for Redis.</a>
+<a name="ln167">    GetSubDocumentData data = { encoded_subdoc_key, &amp;doc, &amp;doc_found };</a>
+<a name="ln168">    data.return_type_only = true;</a>
+<a name="ln169">    data.exp.always_override = always_override;</a>
+<a name="ln170">    RETURN_NOT_OK(GetSubDocument(iterator, data, /* projection */ nullptr,</a>
+<a name="ln171">                                 SeekFwdSuffices::kFalse));</a>
+<a name="ln172">  }</a>
+<a name="ln173"> </a>
+<a name="ln174">  if (!doc_found) {</a>
+<a name="ln175">    return REDIS_TYPE_NONE;</a>
+<a name="ln176">  }</a>
+<a name="ln177"> </a>
+<a name="ln178">  switch (doc.value_type()) {</a>
+<a name="ln179">    case ValueType::kInvalid: FALLTHROUGH_INTENDED;</a>
+<a name="ln180">    case ValueType::kTombstone:</a>
+<a name="ln181">      return REDIS_TYPE_NONE;</a>
+<a name="ln182">    case ValueType::kObject:</a>
+<a name="ln183">      return REDIS_TYPE_HASH;</a>
+<a name="ln184">    case ValueType::kRedisSet:</a>
+<a name="ln185">      return REDIS_TYPE_SET;</a>
+<a name="ln186">    case ValueType::kRedisTS:</a>
+<a name="ln187">      return REDIS_TYPE_TIMESERIES;</a>
+<a name="ln188">    case ValueType::kRedisSortedSet:</a>
+<a name="ln189">      return REDIS_TYPE_SORTEDSET;</a>
+<a name="ln190">    case ValueType::kRedisList:</a>
+<a name="ln191">      return REDIS_TYPE_LIST;</a>
+<a name="ln192">    case ValueType::kNullLow: FALLTHROUGH_INTENDED; // This value is a set member.</a>
+<a name="ln193">    case ValueType::kString:</a>
+<a name="ln194">      return REDIS_TYPE_STRING;</a>
+<a name="ln195">    default:</a>
+<a name="ln196">      return STATUS_FORMAT(Corruption,</a>
+<a name="ln197">                           &quot;Unknown value type for redis record: $0&quot;,</a>
+<a name="ln198">                           static_cast&lt;char&gt;(doc.value_type()));</a>
+<a name="ln199">  }</a>
+<a name="ln200">}</a>
+<a name="ln201"> </a>
+<a name="ln202">Result&lt;RedisValue&gt; GetRedisValue(</a>
+<a name="ln203">    IntentAwareIterator* iterator,</a>
+<a name="ln204">    const RedisKeyValuePB &amp;key_value_pb,</a>
+<a name="ln205">    int subkey_index = kNilSubkeyIndex,</a>
+<a name="ln206">    bool always_override = false,</a>
+<a name="ln207">    Expiration* exp = nullptr) {</a>
+<a name="ln208">  if (!key_value_pb.has_key()) {</a>
+<a name="ln209">    return STATUS(Corruption, &quot;Expected KeyValuePB&quot;);</a>
+<a name="ln210">  }</a>
+<a name="ln211">  auto encoded_doc_key = DocKey::EncodedFromRedisKey(key_value_pb.hash_code(), key_value_pb.key());</a>
+<a name="ln212"> </a>
+<a name="ln213">  if (!key_value_pb.subkey().empty()) {</a>
+<a name="ln214">    if (key_value_pb.subkey().size() != 1 &amp;&amp; subkey_index == kNilSubkeyIndex) {</a>
+<a name="ln215">      return STATUS_SUBSTITUTE(Corruption,</a>
+<a name="ln216">                               &quot;Expected at most one subkey, got $0&quot;, key_value_pb.subkey().size());</a>
+<a name="ln217">    }</a>
+<a name="ln218">    PrimitiveValue subkey_primitive;</a>
+<a name="ln219">    RETURN_NOT_OK(PrimitiveValueFromSubKey(</a>
+<a name="ln220">        key_value_pb.subkey(subkey_index == kNilSubkeyIndex ? 0 : subkey_index),</a>
+<a name="ln221">        &amp;subkey_primitive));</a>
+<a name="ln222">    subkey_primitive.AppendToKey(&amp;encoded_doc_key);</a>
+<a name="ln223">  }</a>
+<a name="ln224"> </a>
+<a name="ln225">  SubDocument doc;</a>
+<a name="ln226">  bool doc_found = false;</a>
+<a name="ln227"> </a>
+<a name="ln228">  // TODO(dtxn) - pass correct transaction context when we implement cross-shard transactions</a>
+<a name="ln229">  // support for Redis.</a>
+<a name="ln230">  GetSubDocumentData data = { encoded_doc_key, &amp;doc, &amp;doc_found };</a>
+<a name="ln231">  data.exp.always_override = always_override;</a>
+<a name="ln232">  RETURN_NOT_OK(GetSubDocument(iterator, data, /* projection */ nullptr, SeekFwdSuffices::kFalse));</a>
+<a name="ln233">  if (!doc_found) {</a>
+<a name="ln234">    return RedisValue{REDIS_TYPE_NONE};</a>
+<a name="ln235">  }</a>
+<a name="ln236"> </a>
+<a name="ln237">  bool has_expired = false;</a>
+<a name="ln238">  CHECK_OK(HasExpiredTTL(data.exp.write_ht, data.exp.ttl,</a>
+<a name="ln239">                         iterator-&gt;read_time().read, &amp;has_expired));</a>
+<a name="ln240">  if (has_expired)</a>
+<a name="ln241">    return RedisValue{REDIS_TYPE_NONE};</a>
+<a name="ln242"> </a>
+<a name="ln243">  if (exp)</a>
+<a name="ln244">    *exp = data.exp;</a>
+<a name="ln245"> </a>
+<a name="ln246">  if (!doc.IsPrimitive()) {</a>
+<a name="ln247">    switch (doc.value_type()) {</a>
+<a name="ln248">      case ValueType::kObject:</a>
+<a name="ln249">        return RedisValue{REDIS_TYPE_HASH};</a>
+<a name="ln250">      case ValueType::kRedisTS:</a>
+<a name="ln251">        return RedisValue{REDIS_TYPE_TIMESERIES};</a>
+<a name="ln252">      case ValueType::kRedisSortedSet:</a>
+<a name="ln253">        return RedisValue{REDIS_TYPE_SORTEDSET};</a>
+<a name="ln254">      case ValueType::kRedisSet:</a>
+<a name="ln255">        return RedisValue{REDIS_TYPE_SET};</a>
+<a name="ln256">      case ValueType::kRedisList:</a>
+<a name="ln257">        return RedisValue{REDIS_TYPE_LIST};</a>
+<a name="ln258">      default:</a>
+<a name="ln259">        return STATUS_SUBSTITUTE(IllegalState, &quot;Invalid value type: $0&quot;,</a>
+<a name="ln260">                                 static_cast&lt;int&gt;(doc.value_type()));</a>
+<a name="ln261">    }</a>
+<a name="ln262">  }</a>
+<a name="ln263"> </a>
+<a name="ln264">  auto val = RedisValue{REDIS_TYPE_STRING, doc.GetString(), data.exp};</a>
+<a name="ln265">  return val;</a>
+<a name="ln266">}</a>
+<a name="ln267"> </a>
+<a name="ln268">YB_STRONGLY_TYPED_BOOL(VerifySuccessIfMissing);</a>
+<a name="ln269"> </a>
+<a name="ln270">// Set response based on the type match. Return whether the type matches what's expected.</a>
+<a name="ln271">bool VerifyTypeAndSetCode(</a>
+<a name="ln272">    const RedisDataType expected_type,</a>
+<a name="ln273">    const RedisDataType actual_type,</a>
+<a name="ln274">    RedisResponsePB *response,</a>
+<a name="ln275">    VerifySuccessIfMissing verify_success_if_missing = VerifySuccessIfMissing::kFalse) {</a>
+<a name="ln276">  if (actual_type == RedisDataType::REDIS_TYPE_NONE) {</a>
+<a name="ln277">    if (verify_success_if_missing) {</a>
+<a name="ln278">      response-&gt;set_code(RedisResponsePB::NIL);</a>
+<a name="ln279">    } else {</a>
+<a name="ln280">      response-&gt;set_code(RedisResponsePB::NOT_FOUND);</a>
+<a name="ln281">    }</a>
+<a name="ln282">    return verify_success_if_missing;</a>
+<a name="ln283">  }</a>
+<a name="ln284">  if (actual_type != expected_type) {</a>
+<a name="ln285">    response-&gt;set_code(RedisResponsePB::WRONG_TYPE);</a>
+<a name="ln286">    response-&gt;set_error_message(wrong_type_message);</a>
+<a name="ln287">    return false;</a>
+<a name="ln288">  }</a>
+<a name="ln289">  response-&gt;set_code(RedisResponsePB::OK);</a>
+<a name="ln290">  return true;</a>
+<a name="ln291">}</a>
+<a name="ln292"> </a>
+<a name="ln293">bool VerifyTypeAndSetCode(</a>
+<a name="ln294">    const docdb::ValueType expected_type,</a>
+<a name="ln295">    const docdb::ValueType actual_type,</a>
+<a name="ln296">    RedisResponsePB *response) {</a>
+<a name="ln297">  if (actual_type != expected_type) {</a>
+<a name="ln298">    response-&gt;set_code(RedisResponsePB::WRONG_TYPE);</a>
+<a name="ln299">    response-&gt;set_error_message(wrong_type_message);</a>
+<a name="ln300">    return false;</a>
+<a name="ln301">  }</a>
+<a name="ln302">  response-&gt;set_code(RedisResponsePB::OK);</a>
+<a name="ln303">  return true;</a>
+<a name="ln304">}</a>
+<a name="ln305"> </a>
+<a name="ln306">CHECKED_STATUS AddPrimitiveValueToResponseArray(const PrimitiveValue&amp; value,</a>
+<a name="ln307">                                                RedisArrayPB* redis_array) {</a>
+<a name="ln308">  switch (value.value_type()) {</a>
+<a name="ln309">    case ValueType::kString: FALLTHROUGH_INTENDED;</a>
+<a name="ln310">    case ValueType::kStringDescending: {</a>
+<a name="ln311">      redis_array-&gt;add_elements(value.GetString());</a>
+<a name="ln312">      return Status::OK();</a>
+<a name="ln313">    }</a>
+<a name="ln314">    case ValueType::kInt64: FALLTHROUGH_INTENDED;</a>
+<a name="ln315">    case ValueType::kInt64Descending: {</a>
+<a name="ln316">      redis_array-&gt;add_elements(std::to_string(value.GetInt64()));</a>
+<a name="ln317">      return Status::OK();</a>
+<a name="ln318">    }</a>
+<a name="ln319">    case ValueType::kDouble: FALLTHROUGH_INTENDED;</a>
+<a name="ln320">    case ValueType::kDoubleDescending: {</a>
+<a name="ln321">      redis_array-&gt;add_elements(std::to_string(value.GetDouble()));</a>
+<a name="ln322">      return Status::OK();</a>
+<a name="ln323">    }</a>
+<a name="ln324">    default:</a>
+<a name="ln325">      return STATUS_SUBSTITUTE(InvalidArgument, &quot;Invalid value type: $0&quot;,</a>
+<a name="ln326">                             static_cast&lt;int&gt;(value.value_type()));</a>
+<a name="ln327">  }</a>
+<a name="ln328">}</a>
+<a name="ln329"> </a>
+<a name="ln330">CHECKED_STATUS AddResponseValuesGeneric(const PrimitiveValue&amp; first,</a>
+<a name="ln331">                                        const PrimitiveValue&amp; second,</a>
+<a name="ln332">                                        RedisResponsePB* response,</a>
+<a name="ln333">                                        bool add_keys,</a>
+<a name="ln334">                                        bool add_values,</a>
+<a name="ln335">                                        bool reverse = false) {</a>
+<a name="ln336">  if (add_keys) {</a>
+<a name="ln337">    RETURN_NOT_OK(AddPrimitiveValueToResponseArray(first, response-&gt;mutable_array_response()));</a>
+<a name="ln338">  }</a>
+<a name="ln339">  if (add_values) {</a>
+<a name="ln340">    RETURN_NOT_OK(AddPrimitiveValueToResponseArray(second, response-&gt;mutable_array_response()));</a>
+<a name="ln341">  }</a>
+<a name="ln342">  return Status::OK();</a>
+<a name="ln343">}</a>
+<a name="ln344"> </a>
+<a name="ln345">// Populate the response array for sorted sets range queries.</a>
+<a name="ln346">// first refers to the score for the given values.</a>
+<a name="ln347">// second refers to a subdocument where each key is a value with the given score.</a>
+<a name="ln348">CHECKED_STATUS AddResponseValuesSortedSets(const PrimitiveValue&amp; first,</a>
+<a name="ln349">                                           const SubDocument&amp; second,</a>
+<a name="ln350">                                           RedisResponsePB* response,</a>
+<a name="ln351">                                           bool add_keys,</a>
+<a name="ln352">                                           bool add_values,</a>
+<a name="ln353">                                           bool reverse = false) {</a>
+<a name="ln354">  if (reverse) {</a>
+<a name="ln355">    for (auto it = second.object_container().rbegin();</a>
+<a name="ln356">         it != second.object_container().rend();</a>
+<a name="ln357">         it++) {</a>
+<a name="ln358">      const PrimitiveValue&amp; value = it-&gt;first;</a>
+<a name="ln359">      RETURN_NOT_OK(AddResponseValuesGeneric(value, first, response, add_values, add_keys));</a>
+<a name="ln360">    }</a>
+<a name="ln361">  } else {</a>
+<a name="ln362">    for (const auto&amp; kv : second.object_container()) {</a>
+<a name="ln363">      const PrimitiveValue&amp; value = kv.first;</a>
+<a name="ln364">      RETURN_NOT_OK(AddResponseValuesGeneric(value, first, response, add_values, add_keys));</a>
+<a name="ln365">    }</a>
+<a name="ln366">  }</a>
+<a name="ln367">  return Status::OK();</a>
+<a name="ln368">}</a>
+<a name="ln369"> </a>
+<a name="ln370">template &lt;typename T, typename AddResponseRow&gt;</a>
+<a name="ln371">CHECKED_STATUS PopulateRedisResponseFromInternal(T iter,</a>
+<a name="ln372">                                                 AddResponseRow add_response_row,</a>
+<a name="ln373">                                                 const T&amp; iter_end,</a>
+<a name="ln374">                                                 RedisResponsePB *response,</a>
+<a name="ln375">                                                 bool add_keys,</a>
+<a name="ln376">                                                 bool add_values,</a>
+<a name="ln377">                                                 bool reverse = false) {</a>
+<a name="ln378">  response-&gt;set_allocated_array_response(new RedisArrayPB());</a>
+<a name="ln379">  for (; iter != iter_end; iter++) {</a>
+<a name="ln380">    RETURN_NOT_OK(add_response_row(</a>
+<a name="ln381">        iter-&gt;first, iter-&gt;second, response, add_keys, add_values, reverse));</a>
+<a name="ln382">  }</a>
+<a name="ln383">  return Status::OK();</a>
+<a name="ln384">}</a>
+<a name="ln385"> </a>
+<a name="ln386">template &lt;typename AddResponseRow&gt;</a>
+<a name="ln387">CHECKED_STATUS PopulateResponseFrom(const SubDocument::ObjectContainer &amp;key_values,</a>
+<a name="ln388">                                    AddResponseRow add_response_row,</a>
+<a name="ln389">                                    RedisResponsePB *response,</a>
+<a name="ln390">                                    bool add_keys,</a>
+<a name="ln391">                                    bool add_values,</a>
+<a name="ln392">                                    bool reverse = false) {</a>
+<a name="ln393">  if (reverse) {</a>
+<a name="ln394">    return PopulateRedisResponseFromInternal(key_values.rbegin(), add_response_row,</a>
+<a name="ln395">                                             key_values.rend(), response, add_keys,</a>
+<a name="ln396">                                             add_values, reverse);</a>
+<a name="ln397">  } else {</a>
+<a name="ln398">    return PopulateRedisResponseFromInternal(key_values.begin(),  add_response_row,</a>
+<a name="ln399">                                             key_values.end(), response, add_keys,</a>
+<a name="ln400">                                             add_values, reverse);</a>
+<a name="ln401">  }</a>
+<a name="ln402">}</a>
+<a name="ln403"> </a>
+<a name="ln404">void SetOptionalInt(RedisDataType type, int64_t value, int64_t none_value,</a>
+<a name="ln405">                    RedisResponsePB* response) {</a>
+<a name="ln406">  if (type == RedisDataType::REDIS_TYPE_NONE) {</a>
+<a name="ln407">    response-&gt;set_code(RedisResponsePB::NIL);</a>
+<a name="ln408">    response-&gt;set_int_response(none_value);</a>
+<a name="ln409">  } else {</a>
+<a name="ln410">    response-&gt;set_code(RedisResponsePB::OK);</a>
+<a name="ln411">    response-&gt;set_int_response(value);</a>
+<a name="ln412">  }</a>
+<a name="ln413">}</a>
+<a name="ln414"> </a>
+<a name="ln415">void SetOptionalInt(RedisDataType type, int64_t value, RedisResponsePB* response) {</a>
+<a name="ln416">  SetOptionalInt(type, value, 0, response);</a>
+<a name="ln417">}</a>
+<a name="ln418"> </a>
+<a name="ln419">Result&lt;int64_t&gt; GetCardinality(IntentAwareIterator* iterator, const RedisKeyValuePB&amp; kv) {</a>
+<a name="ln420">  auto encoded_key_card = DocKey::EncodedFromRedisKey(kv.hash_code(), kv.key());</a>
+<a name="ln421">  PrimitiveValue(ValueType::kCounter).AppendToKey(&amp;encoded_key_card);</a>
+<a name="ln422">  SubDocument subdoc_card;</a>
+<a name="ln423"> </a>
+<a name="ln424">  bool subdoc_card_found = false;</a>
+<a name="ln425">  GetSubDocumentData data = { encoded_key_card, &amp;subdoc_card, &amp;subdoc_card_found };</a>
+<a name="ln426"> </a>
+<a name="ln427">  RETURN_NOT_OK(GetSubDocument(iterator, data, /* projection */ nullptr, SeekFwdSuffices::kFalse));</a>
+<a name="ln428"> </a>
+<a name="ln429">  return subdoc_card_found ? subdoc_card.GetInt64() : 0;</a>
+<a name="ln430">}</a>
+<a name="ln431"> </a>
+<a name="ln432">template &lt;typename AddResponseValues&gt;</a>
+<a name="ln433">CHECKED_STATUS GetAndPopulateResponseValues(</a>
+<a name="ln434">    IntentAwareIterator* iterator,</a>
+<a name="ln435">    AddResponseValues add_response_values,</a>
+<a name="ln436">    const GetSubDocumentData&amp; data,</a>
+<a name="ln437">    ValueType expected_type,</a>
+<a name="ln438">    const RedisReadRequestPB&amp; request,</a>
+<a name="ln439">    RedisResponsePB* response,</a>
+<a name="ln440">    bool add_keys, bool add_values, bool reverse) {</a>
+<a name="ln441"> </a>
+<a name="ln442">  RETURN_NOT_OK(GetSubDocument(iterator, data, /* projection */ nullptr, SeekFwdSuffices::kFalse));</a>
+<a name="ln443"> </a>
+<a name="ln444">  // Validate and populate response.</a>
+<a name="ln445">  response-&gt;set_allocated_array_response(new RedisArrayPB());</a>
+<a name="ln446">  if (!(*data.doc_found)) {</a>
+<a name="ln447">    response-&gt;set_code(RedisResponsePB::NIL);</a>
+<a name="ln448">    return Status::OK();</a>
+<a name="ln449">  }</a>
+<a name="ln450"> </a>
+<a name="ln451">  if (VerifyTypeAndSetCode(expected_type, data.result-&gt;value_type(), response)) {</a>
+<a name="ln452">      RETURN_NOT_OK(PopulateResponseFrom(data.result-&gt;object_container(),</a>
+<a name="ln453">                                         add_response_values,</a>
+<a name="ln454">                                         response, add_keys, add_values, reverse));</a>
+<a name="ln455">  }</a>
+<a name="ln456">  return Status::OK();</a>
+<a name="ln457">}</a>
+<a name="ln458"> </a>
+<a name="ln459">// Get normalized (with respect to card) upper and lower index bounds for reverse range scans.</a>
+<a name="ln460">void GetNormalizedBounds(int64 low_idx, int64 high_idx, int64 card, bool reverse,</a>
+<a name="ln461">                         int64* low_idx_normalized, int64* high_idx_normalized) {</a>
+<a name="ln462">  // Turn negative bounds positive.</a>
+<a name="ln463">  if (low_idx &lt; 0) {</a>
+<a name="ln464">    low_idx = card + low_idx;</a>
+<a name="ln465">  }</a>
+<a name="ln466">  if (high_idx &lt; 0) {</a>
+<a name="ln467">    high_idx = card + high_idx;</a>
+<a name="ln468">  }</a>
+<a name="ln469"> </a>
+<a name="ln470">  // Index from lower to upper instead of upper to lower.</a>
+<a name="ln471">  if (reverse) {</a>
+<a name="ln472">    *low_idx_normalized = card - high_idx - 1;</a>
+<a name="ln473">    *high_idx_normalized = card - low_idx - 1;</a>
+<a name="ln474">  } else {</a>
+<a name="ln475">    *low_idx_normalized = low_idx;</a>
+<a name="ln476">    *high_idx_normalized = high_idx;</a>
+<a name="ln477">  }</a>
+<a name="ln478"> </a>
+<a name="ln479">  // Fit bounds to range [0, card).</a>
+<a name="ln480">  if (*low_idx_normalized &lt; 0) {</a>
+<a name="ln481">    *low_idx_normalized = 0;</a>
+<a name="ln482">  }</a>
+<a name="ln483">  if (*high_idx_normalized &gt;= card) {</a>
+<a name="ln484">    *high_idx_normalized = card - 1;</a>
+<a name="ln485">  }</a>
+<a name="ln486">}</a>
+<a name="ln487"> </a>
+<a name="ln488">} // anonymous namespace</a>
+<a name="ln489"> </a>
+<a name="ln490">void RedisWriteOperation::InitializeIterator(const DocOperationApplyData&amp; data) {</a>
+<a name="ln491">  auto subdoc_key = SubDocKey(DocKey::FromRedisKey(</a>
+<a name="ln492">      request_.key_value().hash_code(), request_.key_value().key()));</a>
+<a name="ln493"> </a>
+<a name="ln494">  auto iter = CreateIntentAwareIterator(</a>
+<a name="ln495">      data.doc_write_batch-&gt;doc_db(),</a>
+<a name="ln496">      BloomFilterMode::USE_BLOOM_FILTER, subdoc_key.Encode().AsSlice(),</a>
+<a name="ln497">      redis_query_id(), /* txn_op_context */ boost::none, data.deadline, data.read_time);</a>
+<a name="ln498"> </a>
+<a name="ln499">  iterator_ = std::move(iter);</a>
+<a name="ln500">}</a>
+<a name="ln501"> </a>
+<a name="ln502">Status RedisWriteOperation::Apply(const DocOperationApplyData&amp; data) {</a>
+<a name="ln503">  switch (request_.request_case()) {</a>
+<a name="ln504">    case RedisWriteRequestPB::kSetRequest:</a>
+<a name="ln505">      return ApplySet(data);</a>
+<a name="ln506">    case RedisWriteRequestPB::kSetTtlRequest:</a>
+<a name="ln507">      return ApplySetTtl(data);</a>
+<a name="ln508">    case RedisWriteRequestPB::kGetsetRequest:</a>
+<a name="ln509">      return ApplyGetSet(data);</a>
+<a name="ln510">    case RedisWriteRequestPB::kAppendRequest:</a>
+<a name="ln511">      return ApplyAppend(data);</a>
+<a name="ln512">    case RedisWriteRequestPB::kDelRequest:</a>
+<a name="ln513">      return ApplyDel(data);</a>
+<a name="ln514">    case RedisWriteRequestPB::kSetRangeRequest:</a>
+<a name="ln515">      return ApplySetRange(data);</a>
+<a name="ln516">    case RedisWriteRequestPB::kIncrRequest:</a>
+<a name="ln517">      return ApplyIncr(data);</a>
+<a name="ln518">    case RedisWriteRequestPB::kPushRequest:</a>
+<a name="ln519">      return ApplyPush(data);</a>
+<a name="ln520">    case RedisWriteRequestPB::kInsertRequest:</a>
+<a name="ln521">      return ApplyInsert(data);</a>
+<a name="ln522">    case RedisWriteRequestPB::kPopRequest:</a>
+<a name="ln523">      return ApplyPop(data);</a>
+<a name="ln524">    case RedisWriteRequestPB::kAddRequest:</a>
+<a name="ln525">      return ApplyAdd(data);</a>
+<a name="ln526">    // TODO: Cut this short in doc_operation.</a>
+<a name="ln527">    case RedisWriteRequestPB::kNoOpRequest:</a>
+<a name="ln528">      return Status::OK();</a>
+<a name="ln529">    case RedisWriteRequestPB::REQUEST_NOT_SET: break;</a>
+<a name="ln530">  }</a>
+<a name="ln531">  return STATUS_FORMAT(Corruption, &quot;Unsupported redis read operation: $0&quot;, request_.request_case());</a>
+<a name="ln532">}</a>
+<a name="ln533"> </a>
+<a name="ln534">Result&lt;RedisDataType&gt; RedisWriteOperation::GetValueType(</a>
+<a name="ln535">    const DocOperationApplyData&amp; data, int subkey_index) {</a>
+<a name="ln536">  if (!iterator_) {</a>
+<a name="ln537">    InitializeIterator(data);</a>
+<a name="ln538">  }</a>
+<a name="ln539">  return GetRedisValueType(</a>
+<a name="ln540">      iterator_.get(), request_.key_value(), data.doc_write_batch, subkey_index);</a>
+<a name="ln541">}</a>
+<a name="ln542"> </a>
+<a name="ln543">Result&lt;RedisValue&gt; RedisWriteOperation::GetValue(</a>
+<a name="ln544">    const DocOperationApplyData&amp; data, int subkey_index, Expiration* ttl) {</a>
+<a name="ln545">  if (!iterator_) {</a>
+<a name="ln546">    InitializeIterator(data);</a>
+<a name="ln547">  }</a>
+<a name="ln548">  return GetRedisValue(iterator_.get(), request_.key_value(),</a>
+<a name="ln549">                       subkey_index, /* always_override */ false, ttl);</a>
+<a name="ln550">}</a>
+<a name="ln551"> </a>
+<a name="ln552">Status RedisWriteOperation::ApplySet(const DocOperationApplyData&amp; data) {</a>
+<a name="ln553">  const RedisKeyValuePB&amp; kv = request_.key_value();</a>
+<a name="ln554">  const MonoDelta ttl = request_.set_request().has_ttl() ?</a>
+<a name="ln555">      MonoDelta::FromMilliseconds(request_.set_request().ttl()) : Value::kMaxTtl;</a>
+<a name="ln556">  DocPath doc_path = DocPath::DocPathFromRedisKey(kv.hash_code(), kv.key());</a>
+<a name="ln557">  if (kv.subkey_size() &gt; 0) {</a>
+<a name="ln558">    RedisDataType data_type = VERIFY_RESULT(GetValueType(data));</a>
+<a name="ln559">    switch (kv.type()) {</a>
+<a name="ln560">      case REDIS_TYPE_TIMESERIES: FALLTHROUGH_INTENDED;</a>
+<a name="ln561">      case REDIS_TYPE_HASH: {</a>
+<a name="ln562">        if (data_type != kv.type() &amp;&amp; data_type != REDIS_TYPE_NONE) {</a>
+<a name="ln563">          response_.set_code(RedisResponsePB::WRONG_TYPE);</a>
+<a name="ln564">          response_.set_error_message(wrong_type_message);</a>
+<a name="ln565">          return Status::OK();</a>
+<a name="ln566">        }</a>
+<a name="ln567">        SubDocument kv_entries = SubDocument();</a>
+<a name="ln568">        for (int i = 0; i &lt; kv.subkey_size(); i++) {</a>
+<a name="ln569">          PrimitiveValue subkey_value;</a>
+<a name="ln570">          RETURN_NOT_OK(PrimitiveValueFromSubKeyStrict(kv.subkey(i), kv.type(), &amp;subkey_value));</a>
+<a name="ln571">          kv_entries.SetChild(subkey_value,</a>
+<a name="ln572">                              SubDocument(PrimitiveValue(kv.value(i))));</a>
+<a name="ln573">        }</a>
+<a name="ln574"> </a>
+<a name="ln575">        if (kv.type() == REDIS_TYPE_TIMESERIES) {</a>
+<a name="ln576">          RETURN_NOT_OK(kv_entries.ConvertToRedisTS());</a>
+<a name="ln577">        }</a>
+<a name="ln578"> </a>
+<a name="ln579">        // For an HSET command (which has only one subkey), we need to read the subkey to find out</a>
+<a name="ln580">        // if the key already existed, and return 0 or 1 accordingly. This read is unnecessary for</a>
+<a name="ln581">        // HMSET and TSADD.</a>
+<a name="ln582">        if (kv.subkey_size() == 1 &amp;&amp; EmulateRedisResponse(kv.type()) &amp;&amp;</a>
+<a name="ln583">            !request_.set_request().expect_ok_response()) {</a>
+<a name="ln584">          RedisDataType type = VERIFY_RESULT(GetValueType(data, 0));</a>
+<a name="ln585">          // For HSET/TSADD, we return 0 or 1 depending on if the key already existed.</a>
+<a name="ln586">          // If flag is false, no int response is returned.</a>
+<a name="ln587">          SetOptionalInt(type, 0, 1, &amp;response_);</a>
+<a name="ln588">        }</a>
+<a name="ln589">        if (data_type == REDIS_TYPE_NONE &amp;&amp; kv.type() == REDIS_TYPE_TIMESERIES) {</a>
+<a name="ln590">          // Need to insert the document instead of extending it.</a>
+<a name="ln591">          RETURN_NOT_OK(data.doc_write_batch-&gt;InsertSubDocument(</a>
+<a name="ln592">              doc_path, kv_entries, data.read_time, data.deadline, redis_query_id(), ttl,</a>
+<a name="ln593">              Value::kInvalidUserTimestamp, false /* init_marker_ttl */));</a>
+<a name="ln594">        } else {</a>
+<a name="ln595">          RETURN_NOT_OK(data.doc_write_batch-&gt;ExtendSubDocument(</a>
+<a name="ln596">              doc_path, kv_entries, data.read_time, data.deadline, redis_query_id(), ttl));</a>
+<a name="ln597">        }</a>
+<a name="ln598">        break;</a>
+<a name="ln599">      }</a>
+<a name="ln600">      case REDIS_TYPE_SORTEDSET: {</a>
+<a name="ln601">        if (data_type != kv.type() &amp;&amp; data_type != REDIS_TYPE_NONE) {</a>
+<a name="ln602">          response_.set_code(RedisResponsePB::WRONG_TYPE);</a>
+<a name="ln603">          response_.set_error_message(wrong_type_message);</a>
+<a name="ln604">          return Status::OK();</a>
+<a name="ln605">        }</a>
+<a name="ln606"> </a>
+<a name="ln607">        // The SubDocuments to be inserted for card, the forward mapping, and reverse mapping.</a>
+<a name="ln608">        SubDocument kv_entries_card;</a>
+<a name="ln609">        SubDocument kv_entries_forward;</a>
+<a name="ln610">        SubDocument kv_entries_reverse;</a>
+<a name="ln611"> </a>
+<a name="ln612">        // The top level mapping.</a>
+<a name="ln613">        SubDocument kv_entries;</a>
+<a name="ln614"> </a>
+<a name="ln615">        int new_elements_added = 0;</a>
+<a name="ln616">        int return_value = 0;</a>
+<a name="ln617">        for (int i = 0; i &lt; kv.subkey_size(); i++) {</a>
+<a name="ln618">          // Check whether the value is already in the document, if so delete it.</a>
+<a name="ln619">          SubDocKey key_reverse = SubDocKey(DocKey::FromRedisKey(kv.hash_code(), kv.key()),</a>
+<a name="ln620">                                            PrimitiveValue(ValueType::kSSReverse),</a>
+<a name="ln621">                                            PrimitiveValue(kv.value(i)));</a>
+<a name="ln622">          SubDocument subdoc_reverse;</a>
+<a name="ln623">          bool subdoc_reverse_found = false;</a>
+<a name="ln624">          auto encoded_key_reverse = key_reverse.EncodeWithoutHt();</a>
+<a name="ln625">          GetSubDocumentData get_data = { encoded_key_reverse, &amp;subdoc_reverse,</a>
+<a name="ln626">                                          &amp;subdoc_reverse_found };</a>
+<a name="ln627">          RETURN_NOT_OK(GetSubDocument(</a>
+<a name="ln628">              data.doc_write_batch-&gt;doc_db(),</a>
+<a name="ln629">              get_data, redis_query_id(), boost::none /* txn_op_context */, data.deadline,</a>
+<a name="ln630">              data.read_time));</a>
+<a name="ln631"> </a>
+<a name="ln632">          // Flag indicating whether we should add the given entry to the sorted set.</a>
+<a name="ln633">          bool should_add_entry = true;</a>
+<a name="ln634">          // Flag indicating whether we shoould remove an entry from the sorted set.</a>
+<a name="ln635">          bool should_remove_existing_entry = false;</a>
+<a name="ln636"> </a>
+<a name="ln637">          if (!subdoc_reverse_found) {</a>
+<a name="ln638">            // The value is not already in the document.</a>
+<a name="ln639">            switch (request_.set_request().sorted_set_options().update_options()) {</a>
+<a name="ln640">              case SortedSetOptionsPB::NX: FALLTHROUGH_INTENDED;</a>
+<a name="ln641">              case SortedSetOptionsPB::NONE: {</a>
+<a name="ln642">                // Both these options call for inserting new elements, increment return_value and</a>
+<a name="ln643">                // keep should_add_entry as true.</a>
+<a name="ln644">                return_value++;</a>
+<a name="ln645">                new_elements_added++;</a>
+<a name="ln646">                break;</a>
+<a name="ln647">              }</a>
+<a name="ln648">              default: {</a>
+<a name="ln649">                // XX option calls for no new elements, don't increment return_value and set</a>
+<a name="ln650">                // should_add_entry to false.</a>
+<a name="ln651">                should_add_entry = false;</a>
+<a name="ln652">                break;</a>
+<a name="ln653">              }</a>
+<a name="ln654">            }</a>
+<a name="ln655">          } else {</a>
+<a name="ln656">            // The value is already in the document.</a>
+<a name="ln657">            switch (request_.set_request().sorted_set_options().update_options()) {</a>
+<a name="ln658">              case SortedSetOptionsPB::XX:</a>
+<a name="ln659">              case SortedSetOptionsPB::NONE: {</a>
+<a name="ln660">                // First make sure that the new score is different from the old score.</a>
+<a name="ln661">                // Both these options call for updating existing elements, set</a>
+<a name="ln662">                // should_remove_existing_entry to true, and if the CH flag is on (return both</a>
+<a name="ln663">                // elements changed and elements added), increment return_value.</a>
+<a name="ln664">                double score_to_remove = subdoc_reverse.GetDouble();</a>
+<a name="ln665">                // If incr option is set, we add the increment to the existing score.</a>
+<a name="ln666">                double score_to_add = request_.set_request().sorted_set_options().incr() ?</a>
+<a name="ln667">                    score_to_remove + kv.subkey(i).double_subkey() : kv.subkey(i).double_subkey();</a>
+<a name="ln668">                if (score_to_remove != score_to_add) {</a>
+<a name="ln669">                  should_remove_existing_entry = true;</a>
+<a name="ln670">                  if (request_.set_request().sorted_set_options().ch()) {</a>
+<a name="ln671">                    return_value++;</a>
+<a name="ln672">                  }</a>
+<a name="ln673">                }</a>
+<a name="ln674">                break;</a>
+<a name="ln675">              }</a>
+<a name="ln676">              default: {</a>
+<a name="ln677">                // NX option calls for only new elements, set should_add_entry to false.</a>
+<a name="ln678">                should_add_entry = false;</a>
+<a name="ln679">                break;</a>
+<a name="ln680">              }</a>
+<a name="ln681">            }</a>
+<a name="ln682">          }</a>
+<a name="ln683"> </a>
+<a name="ln684">          if (should_remove_existing_entry) {</a>
+<a name="ln685">            double score_to_remove = subdoc_reverse.GetDouble();</a>
+<a name="ln686">            SubDocument subdoc_forward_tombstone;</a>
+<a name="ln687">            subdoc_forward_tombstone.SetChild(PrimitiveValue(kv.value(i)),</a>
+<a name="ln688">                                              SubDocument(ValueType::kTombstone));</a>
+<a name="ln689">            kv_entries_forward.SetChild(PrimitiveValue::Double(score_to_remove),</a>
+<a name="ln690">                                        SubDocument(subdoc_forward_tombstone));</a>
+<a name="ln691">          }</a>
+<a name="ln692"> </a>
+<a name="ln693">          if (should_add_entry) {</a>
+<a name="ln694">            // If the incr option is specified, we need insert the existing score + new score</a>
+<a name="ln695">            // instead of just the new score.</a>
+<a name="ln696">            double score_to_add = request_.set_request().sorted_set_options().incr() ?</a>
+<a name="ln697">                kv.subkey(i).double_subkey() + subdoc_reverse.GetDouble() :</a>
+<a name="ln698">                kv.subkey(i).double_subkey();</a>
+<a name="ln699"> </a>
+<a name="ln700">            // Add the forward mapping to the entries.</a>
+<a name="ln701">            SubDocument *forward_entry =</a>
+<a name="ln702">                kv_entries_forward.GetOrAddChild(PrimitiveValue::Double(score_to_add)).first;</a>
+<a name="ln703">            forward_entry-&gt;SetChild(PrimitiveValue(kv.value(i)),</a>
+<a name="ln704">                                    SubDocument(PrimitiveValue()));</a>
+<a name="ln705"> </a>
+<a name="ln706">            // Add the reverse mapping to the entries.</a>
+<a name="ln707">            kv_entries_reverse.SetChild(PrimitiveValue(kv.value(i)),</a>
+<a name="ln708">                                        SubDocument(PrimitiveValue::Double(score_to_add)));</a>
+<a name="ln709">          }</a>
+<a name="ln710">        }</a>
+<a name="ln711"> </a>
+<a name="ln712">        if (new_elements_added &gt; 0) {</a>
+<a name="ln713">          int64_t card = VERIFY_RESULT(GetCardinality(iterator_.get(), kv));</a>
+<a name="ln714">          // Insert card + new_elements_added back into the document for the updated card.</a>
+<a name="ln715">          kv_entries_card = SubDocument(PrimitiveValue(card + new_elements_added));</a>
+<a name="ln716">          kv_entries.SetChild(PrimitiveValue(ValueType::kCounter), SubDocument(kv_entries_card));</a>
+<a name="ln717">        }</a>
+<a name="ln718"> </a>
+<a name="ln719">        if (kv_entries_forward.object_num_keys() &gt; 0) {</a>
+<a name="ln720">          kv_entries.SetChild(PrimitiveValue(ValueType::kSSForward),</a>
+<a name="ln721">                              SubDocument(kv_entries_forward));</a>
+<a name="ln722">        }</a>
+<a name="ln723"> </a>
+<a name="ln724">        if (kv_entries_reverse.object_num_keys() &gt; 0) {</a>
+<a name="ln725">          kv_entries.SetChild(PrimitiveValue(ValueType::kSSReverse),</a>
+<a name="ln726">                              SubDocument(kv_entries_reverse));</a>
+<a name="ln727">        }</a>
+<a name="ln728"> </a>
+<a name="ln729">        if (kv_entries.object_num_keys() &gt; 0) {</a>
+<a name="ln730">          RETURN_NOT_OK(kv_entries.ConvertToRedisSortedSet());</a>
+<a name="ln731">          if (data_type == REDIS_TYPE_NONE) {</a>
+<a name="ln732">                RETURN_NOT_OK(data.doc_write_batch-&gt;InsertSubDocument(</a>
+<a name="ln733">                    doc_path, kv_entries, data.read_time, data.deadline, redis_query_id(), ttl));</a>
+<a name="ln734">          } else {</a>
+<a name="ln735">                RETURN_NOT_OK(data.doc_write_batch-&gt;ExtendSubDocument(</a>
+<a name="ln736">                    doc_path, kv_entries, data.read_time, data.deadline, redis_query_id(), ttl));</a>
+<a name="ln737">          }</a>
+<a name="ln738">        }</a>
+<a name="ln739">        response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln740">        response_.set_int_response(return_value);</a>
+<a name="ln741">        break;</a>
+<a name="ln742">    }</a>
+<a name="ln743">    case REDIS_TYPE_STRING: {</a>
+<a name="ln744">        return STATUS_SUBSTITUTE(InvalidCommand,</a>
+<a name="ln745">            &quot;Redis data type $0 in SET command should not have subkeys&quot;, kv.type());</a>
+<a name="ln746">      }</a>
+<a name="ln747">      default:</a>
+<a name="ln748">        return STATUS_SUBSTITUTE(InvalidCommand,</a>
+<a name="ln749">            &quot;Redis data type $0 not supported in SET command&quot;, kv.type());</a>
+<a name="ln750">    }</a>
+<a name="ln751">  } else {</a>
+<a name="ln752">    if (kv.type() != REDIS_TYPE_STRING) {</a>
+<a name="ln753">      return STATUS_SUBSTITUTE(InvalidCommand,</a>
+<a name="ln754">          &quot;Redis data type for SET must be string if subkey not present, found $0&quot;, kv.type());</a>
+<a name="ln755">    }</a>
+<a name="ln756">    if (kv.value_size() != 1) {</a>
+<a name="ln757">      return STATUS_SUBSTITUTE(InvalidCommand,</a>
+<a name="ln758">          &quot;There must be only one value in SET if there is only one key, found $0&quot;,</a>
+<a name="ln759">          kv.value_size());</a>
+<a name="ln760">    }</a>
+<a name="ln761">    const RedisWriteMode mode = request_.set_request().mode();</a>
+<a name="ln762">    if (mode != RedisWriteMode::REDIS_WRITEMODE_UPSERT) {</a>
+<a name="ln763">      RedisDataType data_type = VERIFY_RESULT(GetValueType(data));</a>
+<a name="ln764">      if ((mode == RedisWriteMode::REDIS_WRITEMODE_INSERT &amp;&amp; data_type != REDIS_TYPE_NONE)</a>
+<a name="ln765">          || (mode == RedisWriteMode::REDIS_WRITEMODE_UPDATE &amp;&amp; data_type == REDIS_TYPE_NONE)) {</a>
+<a name="ln766"> </a>
+<a name="ln767">        if (request_.set_request().has_expect_ok_response() &amp;&amp;</a>
+<a name="ln768">            !request_.set_request().expect_ok_response()) {</a>
+<a name="ln769">          // For SETNX we return 0 or 1 depending on if the key already existed.</a>
+<a name="ln770">          response_.set_int_response(0);</a>
+<a name="ln771">          response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln772">        } else {</a>
+<a name="ln773">          response_.set_code(RedisResponsePB::NIL);</a>
+<a name="ln774">        }</a>
+<a name="ln775">        return Status::OK();</a>
+<a name="ln776">      }</a>
+<a name="ln777">    }</a>
+<a name="ln778">    RETURN_NOT_OK(data.doc_write_batch-&gt;SetPrimitive(</a>
+<a name="ln779">        doc_path, Value(PrimitiveValue(kv.value(0)), ttl),</a>
+<a name="ln780">        data.read_time, data.deadline, redis_query_id()));</a>
+<a name="ln781">  }</a>
+<a name="ln782"> </a>
+<a name="ln783">  if (request_.set_request().has_expect_ok_response() &amp;&amp;</a>
+<a name="ln784">      !request_.set_request().expect_ok_response()) {</a>
+<a name="ln785">    // For SETNX we return 0 or 1 depending on if the key already existed.</a>
+<a name="ln786">    response_.set_int_response(1);</a>
+<a name="ln787">  }</a>
+<a name="ln788"> </a>
+<a name="ln789">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln790">  return Status::OK();</a>
+<a name="ln791">}</a>
+<a name="ln792"> </a>
+<a name="ln793">Status RedisWriteOperation::ApplySetTtl(const DocOperationApplyData&amp; data) {</a>
+<a name="ln794">  const RedisKeyValuePB&amp; kv = request_.key_value();</a>
+<a name="ln795"> </a>
+<a name="ln796">  // We only support setting TTLs on top-level keys.</a>
+<a name="ln797">  if (!kv.subkey().empty()) {</a>
+<a name="ln798">    return STATUS_SUBSTITUTE(Corruption,</a>
+<a name="ln799">                             &quot;Expected no subkeys, got $0&quot;, kv.subkey().size());</a>
+<a name="ln800">  }</a>
+<a name="ln801"> </a>
+<a name="ln802">  MonoDelta ttl;</a>
+<a name="ln803">  bool absolute_expiration = request_.set_ttl_request().has_absolute_time();</a>
+<a name="ln804"> </a>
+<a name="ln805">  // Handle ExpireAt</a>
+<a name="ln806">  if (absolute_expiration) {</a>
+<a name="ln807">    int64_t calc_ttl = request_.set_ttl_request().absolute_time() -</a>
+<a name="ln808">      server::HybridClock::GetPhysicalValueNanos(data.read_time.read) /</a>
+<a name="ln809">      MonoTime::kNanosecondsPerMillisecond;</a>
+<a name="ln810">    if (calc_ttl &lt;= 0) {</a>
+<a name="ln811">      return ApplyDel(data);</a>
+<a name="ln812">    }</a>
+<a name="ln813">    ttl = MonoDelta::FromMilliseconds(calc_ttl);</a>
+<a name="ln814">  }</a>
+<a name="ln815"> </a>
+<a name="ln816">  Expiration exp;</a>
+<a name="ln817">  auto value = VERIFY_RESULT(GetValue(data, kNilSubkeyIndex, &amp;exp));</a>
+<a name="ln818"> </a>
+<a name="ln819">  if (value.type == REDIS_TYPE_TIMESERIES) { // This command is not supported.</a>
+<a name="ln820">    return STATUS_SUBSTITUTE(InvalidCommand,</a>
+<a name="ln821">        &quot;Redis data type $0 not supported in EXPIRE and PERSIST commands&quot;, value.type);</a>
+<a name="ln822">  }</a>
+<a name="ln823"> </a>
+<a name="ln824">  if (value.type == REDIS_TYPE_NONE) { // Key does not exist.</a>
+<a name="ln825">    VLOG(1) &lt;&lt; &quot;TTL cannot be set because the key does not exist&quot;;</a>
+<a name="ln826">    response_.set_int_response(0);</a>
+<a name="ln827">    return Status::OK();</a>
+<a name="ln828">  }</a>
+<a name="ln829"> </a>
+<a name="ln830">  if (!absolute_expiration &amp;&amp; request_.set_ttl_request().ttl() == -1) { // Handle PERSIST.</a>
+<a name="ln831">    MonoDelta new_ttl = VERIFY_RESULT(exp.ComputeRelativeTtl(iterator_-&gt;read_time().read));</a>
+<a name="ln832">    if (new_ttl.IsNegative() || new_ttl == Value::kMaxTtl) {</a>
+<a name="ln833">      response_.set_int_response(0);</a>
+<a name="ln834">      return Status::OK();</a>
+<a name="ln835">    }</a>
+<a name="ln836">  }</a>
+<a name="ln837"> </a>
+<a name="ln838">  DocPath doc_path = DocPath::DocPathFromRedisKey(kv.hash_code(), kv.key());</a>
+<a name="ln839">  if (!absolute_expiration) {</a>
+<a name="ln840">    ttl = request_.set_ttl_request().ttl() == -1 ? Value::kMaxTtl :</a>
+<a name="ln841">      MonoDelta::FromMilliseconds(request_.set_ttl_request().ttl());</a>
+<a name="ln842">  }</a>
+<a name="ln843"> </a>
+<a name="ln844">  ValueType v_type = ValueTypeFromRedisType(value.type);</a>
+<a name="ln845">  if (v_type == ValueType::kInvalid)</a>
+<a name="ln846">    return STATUS(Corruption, &quot;Invalid value type.&quot;);</a>
+<a name="ln847"> </a>
+<a name="ln848">  RETURN_NOT_OK(data.doc_write_batch-&gt;SetPrimitive(</a>
+<a name="ln849">      doc_path, Value(PrimitiveValue(v_type), ttl, Value::kInvalidUserTimestamp, Value::kTtlFlag),</a>
+<a name="ln850">      data.read_time, data.deadline, redis_query_id()));</a>
+<a name="ln851">  VLOG(2) &lt;&lt; &quot;Set TTL successfully to &quot; &lt;&lt; ttl &lt;&lt; &quot; for key &quot; &lt;&lt; kv.key();</a>
+<a name="ln852">  response_.set_int_response(1);</a>
+<a name="ln853">  return Status::OK();</a>
+<a name="ln854">}</a>
+<a name="ln855"> </a>
+<a name="ln856">Status RedisWriteOperation::ApplyGetSet(const DocOperationApplyData&amp; data) {</a>
+<a name="ln857">  const RedisKeyValuePB&amp; kv = request_.key_value();</a>
+<a name="ln858"> </a>
+<a name="ln859">  if (kv.value_size() != 1) {</a>
+<a name="ln860">    return STATUS_SUBSTITUTE(Corruption,</a>
+<a name="ln861">        &quot;Getset kv should have 1 value, found $0&quot;, kv.value_size());</a>
+<a name="ln862">  }</a>
+<a name="ln863"> </a>
+<a name="ln864">  auto value = GetValue(data);</a>
+<a name="ln865">  RETURN_NOT_OK(value);</a>
+<a name="ln866"> </a>
+<a name="ln867">  if (!VerifyTypeAndSetCode(RedisDataType::REDIS_TYPE_STRING, value-&gt;type, &amp;response_,</a>
+<a name="ln868">      VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln869">    // We've already set the error code in the response.</a>
+<a name="ln870">    return Status::OK();</a>
+<a name="ln871">  }</a>
+<a name="ln872">  response_.set_string_response(value-&gt;value);</a>
+<a name="ln873"> </a>
+<a name="ln874">  return data.doc_write_batch-&gt;SetPrimitive(</a>
+<a name="ln875">      DocPath::DocPathFromRedisKey(kv.hash_code(), kv.key()),</a>
+<a name="ln876">      Value(PrimitiveValue(kv.value(0))), data.read_time, data.deadline, redis_query_id());</a>
+<a name="ln877">}</a>
+<a name="ln878"> </a>
+<a name="ln879">Status RedisWriteOperation::ApplyAppend(const DocOperationApplyData&amp; data) {</a>
+<a name="ln880">  const RedisKeyValuePB&amp; kv = request_.key_value();</a>
+<a name="ln881"> </a>
+<a name="ln882">  if (kv.value_size() != 1) {</a>
+<a name="ln883">    return STATUS_SUBSTITUTE(Corruption,</a>
+<a name="ln884">        &quot;Append kv should have 1 value, found $0&quot;, kv.value_size());</a>
+<a name="ln885">  }</a>
+<a name="ln886"> </a>
+<a name="ln887">  auto value = GetValue(data);</a>
+<a name="ln888">  RETURN_NOT_OK(value);</a>
+<a name="ln889"> </a>
+<a name="ln890">  if (!VerifyTypeAndSetCode(RedisDataType::REDIS_TYPE_STRING, value-&gt;type, &amp;response_,</a>
+<a name="ln891">                            VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln892">    // We've already set the error code in the response.</a>
+<a name="ln893">    return Status::OK();</a>
+<a name="ln894">  }</a>
+<a name="ln895"> </a>
+<a name="ln896">  value-&gt;value += kv.value(0);</a>
+<a name="ln897"> </a>
+<a name="ln898">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln899">  response_.set_int_response(value-&gt;value.length());</a>
+<a name="ln900"> </a>
+<a name="ln901">  // TODO: update the TTL with the write time rather than read time,</a>
+<a name="ln902">  // or store the expiration.</a>
+<a name="ln903">  return data.doc_write_batch-&gt;SetPrimitive(</a>
+<a name="ln904">      DocPath::DocPathFromRedisKey(kv.hash_code(), kv.key()),</a>
+<a name="ln905">      Value(PrimitiveValue(value-&gt;value),</a>
+<a name="ln906">            VERIFY_RESULT(value-&gt;exp.ComputeRelativeTtl(iterator_-&gt;read_time().read))),</a>
+<a name="ln907">      data.read_time,</a>
+<a name="ln908">      data.deadline,</a>
+<a name="ln909">      redis_query_id());</a>
+<a name="ln910">}</a>
+<a name="ln911"> </a>
+<a name="ln912">// TODO (akashnil): Actually check if the value existed, return 0 if not. handle multidel in future.</a>
+<a name="ln913">//                  See ENG-807</a>
+<a name="ln914">Status RedisWriteOperation::ApplyDel(const DocOperationApplyData&amp; data) {</a>
+<a name="ln915">  const RedisKeyValuePB&amp; kv = request_.key_value();</a>
+<a name="ln916">  RedisDataType data_type = VERIFY_RESULT(GetValueType(data));</a>
+<a name="ln917">  if (data_type != REDIS_TYPE_NONE &amp;&amp; data_type != kv.type() &amp;&amp; kv.type() != REDIS_TYPE_NONE) {</a>
+<a name="ln918">    response_.set_code(RedisResponsePB::WRONG_TYPE);</a>
+<a name="ln919">    response_.set_error_message(wrong_type_message);</a>
+<a name="ln920">    return Status::OK();</a>
+<a name="ln921">  }</a>
+<a name="ln922"> </a>
+<a name="ln923">  SubDocument values;</a>
+<a name="ln924">  // Number of distinct keys being removed.</a>
+<a name="ln925">  int num_keys = 0;</a>
+<a name="ln926">  switch (kv.type()) {</a>
+<a name="ln927">    case REDIS_TYPE_NONE: {</a>
+<a name="ln928">      values = SubDocument(ValueType::kTombstone);</a>
+<a name="ln929">      num_keys = data_type == REDIS_TYPE_NONE ? 0 : 1;</a>
+<a name="ln930">      break;</a>
+<a name="ln931">    }</a>
+<a name="ln932">    case REDIS_TYPE_TIMESERIES: {</a>
+<a name="ln933">      if (data_type == REDIS_TYPE_NONE) {</a>
+<a name="ln934">        return Status::OK();</a>
+<a name="ln935">      }</a>
+<a name="ln936">      for (int i = 0; i &lt; kv.subkey_size(); i++) {</a>
+<a name="ln937">        PrimitiveValue primitive_value;</a>
+<a name="ln938">        RETURN_NOT_OK(PrimitiveValueFromSubKeyStrict(kv.subkey(i), data_type, &amp;primitive_value));</a>
+<a name="ln939">        values.SetChild(primitive_value, SubDocument(ValueType::kTombstone));</a>
+<a name="ln940">      }</a>
+<a name="ln941">      num_keys = kv.subkey_size();</a>
+<a name="ln942">      break;</a>
+<a name="ln943">    }</a>
+<a name="ln944">    case REDIS_TYPE_SORTEDSET: {</a>
+<a name="ln945">      SubDocument values_card;</a>
+<a name="ln946">      SubDocument values_forward;</a>
+<a name="ln947">      SubDocument values_reverse;</a>
+<a name="ln948">      num_keys = kv.subkey_size();</a>
+<a name="ln949">      for (int i = 0; i &lt; kv.subkey_size(); i++) {</a>
+<a name="ln950">        // Check whether the value is already in the document.</a>
+<a name="ln951">        SubDocument doc_reverse;</a>
+<a name="ln952">        bool doc_reverse_found = false;</a>
+<a name="ln953">        SubDocKey subdoc_key_reverse = SubDocKey(DocKey::FromRedisKey(kv.hash_code(), kv.key()),</a>
+<a name="ln954">                                                 PrimitiveValue(ValueType::kSSReverse),</a>
+<a name="ln955">                                                 PrimitiveValue(kv.subkey(i).string_subkey()));</a>
+<a name="ln956">        // Todo(Rahul): Add values to the write batch cache and then do an additional check.</a>
+<a name="ln957">        // As of now, we only check to see if a value is in rocksdb, and we should also check</a>
+<a name="ln958">        // the write batch.</a>
+<a name="ln959">        auto encoded_subdoc_key_reverse = subdoc_key_reverse.EncodeWithoutHt();</a>
+<a name="ln960">        GetSubDocumentData get_data = { encoded_subdoc_key_reverse, &amp;doc_reverse,</a>
+<a name="ln961">                                        &amp;doc_reverse_found };</a>
+<a name="ln962">        RETURN_NOT_OK(GetSubDocument(</a>
+<a name="ln963">            data.doc_write_batch-&gt;doc_db(),</a>
+<a name="ln964">            get_data, redis_query_id(), boost::none /* txn_op_context */, data.deadline,</a>
+<a name="ln965">            data.read_time));</a>
+<a name="ln966">        if (doc_reverse_found &amp;&amp; doc_reverse.value_type() != ValueType::kTombstone) {</a>
+<a name="ln967">          // The value is already in the doc, needs to be removed.</a>
+<a name="ln968">          values_reverse.SetChild(PrimitiveValue(kv.subkey(i).string_subkey()),</a>
+<a name="ln969">                          SubDocument(ValueType::kTombstone));</a>
+<a name="ln970">          // For sorted sets, the forward mapping also needs to be deleted.</a>
+<a name="ln971">          SubDocument doc_forward;</a>
+<a name="ln972">          doc_forward.SetChild(PrimitiveValue(kv.subkey(i).string_subkey()),</a>
+<a name="ln973">                               SubDocument(ValueType::kTombstone));</a>
+<a name="ln974">          values_forward.SetChild(PrimitiveValue::Double(doc_reverse.GetDouble()),</a>
+<a name="ln975">                          SubDocument(doc_forward));</a>
+<a name="ln976">        } else {</a>
+<a name="ln977">          // If the key is absent, it doesn't contribute to the count of keys being deleted.</a>
+<a name="ln978">          num_keys--;</a>
+<a name="ln979">        }</a>
+<a name="ln980">      }</a>
+<a name="ln981">      int64_t card = VERIFY_RESULT(GetCardinality(iterator_.get(), kv));</a>
+<a name="ln982">      // The new cardinality is card - num_keys.</a>
+<a name="ln983">      values_card = SubDocument(PrimitiveValue(card - num_keys));</a>
+<a name="ln984"> </a>
+<a name="ln985">      values.SetChild(PrimitiveValue(ValueType::kCounter), SubDocument(values_card));</a>
+<a name="ln986">      values.SetChild(PrimitiveValue(ValueType::kSSForward), SubDocument(values_forward));</a>
+<a name="ln987">      values.SetChild(PrimitiveValue(ValueType::kSSReverse), SubDocument(values_reverse));</a>
+<a name="ln988"> </a>
+<a name="ln989">      break;</a>
+<a name="ln990">    }</a>
+<a name="ln991">    default: {</a>
+<a name="ln992">      num_keys = kv.subkey_size(); // We know the subkeys are distinct.</a>
+<a name="ln993">      // Avoid reads for redis timeseries type.</a>
+<a name="ln994">      if (EmulateRedisResponse(kv.type())) {</a>
+<a name="ln995">        for (int i = 0; i &lt; kv.subkey_size(); i++) {</a>
+<a name="ln996">          RedisDataType type = VERIFY_RESULT(GetValueType(data, i));</a>
+<a name="ln997">          if (type == REDIS_TYPE_STRING) {</a>
+<a name="ln998">            values.SetChild(PrimitiveValue(kv.subkey(i).string_subkey()),</a>
+<a name="ln999">                            SubDocument(ValueType::kTombstone));</a>
+<a name="ln1000">          } else {</a>
+<a name="ln1001">            // If the key is absent, it doesn't contribute to the count of keys being deleted.</a>
+<a name="ln1002">            num_keys--;</a>
+<a name="ln1003">          }</a>
+<a name="ln1004">        }</a>
+<a name="ln1005">      }</a>
+<a name="ln1006">      break;</a>
+<a name="ln1007">    }</a>
+<a name="ln1008">  }</a>
+<a name="ln1009"> </a>
+<a name="ln1010">  if (num_keys != 0) {</a>
+<a name="ln1011">    DocPath doc_path = DocPath::DocPathFromRedisKey(kv.hash_code(), kv.key());</a>
+<a name="ln1012">    RETURN_NOT_OK(data.doc_write_batch-&gt;ExtendSubDocument(doc_path, values,</a>
+<a name="ln1013">        data.read_time, data.deadline, redis_query_id()));</a>
+<a name="ln1014">  }</a>
+<a name="ln1015"> </a>
+<a name="ln1016">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1017">  if (EmulateRedisResponse(kv.type())) {</a>
+<a name="ln1018">    // If the flag is true, we respond with the number of keys actually being deleted. We don't</a>
+<a name="ln1019">    // report this number for the redis timeseries type to avoid reads.</a>
+<a name="ln1020">    response_.set_int_response(num_keys);</a>
+<a name="ln1021">  }</a>
+<a name="ln1022">  return Status::OK();</a>
+<a name="ln1023">}</a>
+<a name="ln1024"> </a>
+<a name="ln1025">Status RedisWriteOperation::ApplySetRange(const DocOperationApplyData&amp; data) {</a>
+<a name="ln1026">  const RedisKeyValuePB&amp; kv = request_.key_value();</a>
+<a name="ln1027">  if (kv.value_size() != 1) {</a>
+<a name="ln1028">    return STATUS_SUBSTITUTE(Corruption,</a>
+<a name="ln1029">        &quot;SetRange kv should have 1 value, found $0&quot;, kv.value_size());</a>
+<a name="ln1030">  }</a>
+<a name="ln1031"> </a>
+<a name="ln1032">  auto value = GetValue(data);</a>
+<a name="ln1033">  RETURN_NOT_OK(value);</a>
+<a name="ln1034"> </a>
+<a name="ln1035">  if (!VerifyTypeAndSetCode(RedisDataType::REDIS_TYPE_STRING, value-&gt;type, &amp;response_,</a>
+<a name="ln1036">        VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1037">    // We've already set the error code in the response.</a>
+<a name="ln1038">    return Status::OK();</a>
+<a name="ln1039">  }</a>
+<a name="ln1040"> </a>
+<a name="ln1041">  if (request_.set_range_request().offset() &gt; value-&gt;value.length()) {</a>
+<a name="ln1042">    value-&gt;value.resize(request_.set_range_request().offset(), 0);</a>
+<a name="ln1043">  }</a>
+<a name="ln1044">  value-&gt;value.replace(request_.set_range_request().offset(), kv.value(0).length(), kv.value(0));</a>
+<a name="ln1045">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1046">  response_.set_int_response(value-&gt;value.length());</a>
+<a name="ln1047"> </a>
+<a name="ln1048">  // TODO: update the TTL with the write time rather than read time,</a>
+<a name="ln1049">  // or store the expiration.</a>
+<a name="ln1050">  Value new_val = Value(PrimitiveValue(value-&gt;value),</a>
+<a name="ln1051">        VERIFY_RESULT(value-&gt;exp.ComputeRelativeTtl(iterator_-&gt;read_time().read)));</a>
+<a name="ln1052">  return data.doc_write_batch-&gt;SetPrimitive(</a>
+<a name="ln1053">      DocPath::DocPathFromRedisKey(kv.hash_code(), kv.key()), new_val, std::move(iterator_));</a>
+<a name="ln1054">}</a>
+<a name="ln1055"> </a>
+<a name="ln1056">Status RedisWriteOperation::ApplyIncr(const DocOperationApplyData&amp; data) {</a>
+<a name="ln1057">  const RedisKeyValuePB&amp; kv = request_.key_value();</a>
+<a name="ln1058">  const int64_t incr = request_.incr_request().increment_int();</a>
+<a name="ln1059"> </a>
+<a name="ln1060">  if (kv.type() != REDIS_TYPE_HASH &amp;&amp; kv.type() != REDIS_TYPE_STRING) {</a>
+<a name="ln1061">    return STATUS_SUBSTITUTE(InvalidCommand,</a>
+<a name="ln1062">                             &quot;Redis data type $0 not supported in Incr command&quot;, kv.type());</a>
+<a name="ln1063">  }</a>
+<a name="ln1064"> </a>
+<a name="ln1065">  RedisDataType container_type = VERIFY_RESULT(GetValueType(data));</a>
+<a name="ln1066">  if (!VerifyTypeAndSetCode(kv.type(), container_type, &amp;response_,</a>
+<a name="ln1067">                            VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1068">    // We've already set the error code in the response.</a>
+<a name="ln1069">    return Status::OK();</a>
+<a name="ln1070">  }</a>
+<a name="ln1071"> </a>
+<a name="ln1072">  int subkey = (kv.type() == REDIS_TYPE_HASH ? 0 : -1);</a>
+<a name="ln1073">  auto value = GetValue(data, subkey);</a>
+<a name="ln1074">  RETURN_NOT_OK(value);</a>
+<a name="ln1075"> </a>
+<a name="ln1076">  if (!VerifyTypeAndSetCode(RedisDataType::REDIS_TYPE_STRING, value-&gt;type, &amp;response_,</a>
+<a name="ln1077">      VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1078">    response_.set_code(RedisResponsePB::WRONG_TYPE);</a>
+<a name="ln1079">    response_.set_error_message(wrong_type_message);</a>
+<a name="ln1080">    return Status::OK();</a>
+<a name="ln1081">  }</a>
+<a name="ln1082"> </a>
+<a name="ln1083">  // If no value is present, 0 is the default.</a>
+<a name="ln1084">  int64_t old_value = 0, new_value;</a>
+<a name="ln1085">  if (value-&gt;type != REDIS_TYPE_NONE) {</a>
+<a name="ln1086">    auto old = CheckedStoll(value-&gt;value);</a>
+<a name="ln1087">    if (!old.ok()) {</a>
+<a name="ln1088">      // This can happen if there are leading or trailing spaces, or the value</a>
+<a name="ln1089">      // is out of range.</a>
+<a name="ln1090">      response_.set_code(RedisResponsePB::WRONG_TYPE);</a>
+<a name="ln1091">      response_.set_error_message(&quot;ERR value is not an integer or out of range&quot;);</a>
+<a name="ln1092">      return Status::OK();</a>
+<a name="ln1093">    }</a>
+<a name="ln1094">    old_value = *old;</a>
+<a name="ln1095">  }</a>
+<a name="ln1096"> </a>
+<a name="ln1097">  if ((incr &lt; 0 &amp;&amp; old_value &lt; 0 &amp;&amp; incr &lt; numeric_limits&lt;int64_t&gt;::min() - old_value) ||</a>
+<a name="ln1098">      (incr &gt; 0 &amp;&amp; old_value &gt; 0 &amp;&amp; incr &gt; numeric_limits&lt;int64_t&gt;::max() - old_value)) {</a>
+<a name="ln1099">    response_.set_code(RedisResponsePB::WRONG_TYPE);</a>
+<a name="ln1100">    response_.set_error_message(&quot;Increment would overflow&quot;);</a>
+<a name="ln1101">    return Status::OK();</a>
+<a name="ln1102">  }</a>
+<a name="ln1103">  new_value = old_value + incr;</a>
+<a name="ln1104">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1105">  response_.set_int_response(new_value);</a>
+<a name="ln1106"> </a>
+<a name="ln1107">  DocPath doc_path = DocPath::DocPathFromRedisKey(kv.hash_code(), kv.key());</a>
+<a name="ln1108">  PrimitiveValue new_pvalue = PrimitiveValue(std::to_string(new_value));</a>
+<a name="ln1109">  if (kv.type() == REDIS_TYPE_HASH) {</a>
+<a name="ln1110">    SubDocument kv_entries = SubDocument();</a>
+<a name="ln1111">    PrimitiveValue subkey_value;</a>
+<a name="ln1112">    RETURN_NOT_OK(PrimitiveValueFromSubKeyStrict(kv.subkey(0), kv.type(), &amp;subkey_value));</a>
+<a name="ln1113">    kv_entries.SetChild(subkey_value, SubDocument(new_pvalue));</a>
+<a name="ln1114">    return data.doc_write_batch-&gt;ExtendSubDocument(</a>
+<a name="ln1115">        doc_path, kv_entries, data.read_time, data.deadline, redis_query_id());</a>
+<a name="ln1116">  } else {  // kv.type() == REDIS_TYPE_STRING</a>
+<a name="ln1117">    // TODO: update the TTL with the write time rather than read time,</a>
+<a name="ln1118">    // or store the expiration.</a>
+<a name="ln1119">    Value new_val = Value(new_pvalue,</a>
+<a name="ln1120">        VERIFY_RESULT(value-&gt;exp.ComputeRelativeTtl(iterator_-&gt;read_time().read)));</a>
+<a name="ln1121">    return data.doc_write_batch-&gt;SetPrimitive(doc_path, new_val, std::move(iterator_));</a>
+<a name="ln1122">  }</a>
+<a name="ln1123">}</a>
+<a name="ln1124"> </a>
+<a name="ln1125">Status RedisWriteOperation::ApplyPush(const DocOperationApplyData&amp; data) {</a>
+<a name="ln1126">  const RedisKeyValuePB&amp; kv = request_.key_value();</a>
+<a name="ln1127">  DocPath doc_path = DocPath::DocPathFromRedisKey(kv.hash_code(), kv.key());</a>
+<a name="ln1128">  RedisDataType data_type = VERIFY_RESULT(GetValueType(data));</a>
+<a name="ln1129">  if (data_type != REDIS_TYPE_LIST &amp;&amp; data_type != REDIS_TYPE_NONE) {</a>
+<a name="ln1130">    response_.set_code(RedisResponsePB::WRONG_TYPE);</a>
+<a name="ln1131">    response_.set_error_message(wrong_type_message);</a>
+<a name="ln1132">    return Status::OK();</a>
+<a name="ln1133">  }</a>
+<a name="ln1134"> </a>
+<a name="ln1135">  SubDocument list;</a>
+<a name="ln1136">  int64_t card = VERIFY_RESULT(GetCardinality(iterator_.get(), kv)) + kv.value_size();</a>
+<a name="ln1137">  list.SetChild(PrimitiveValue(ValueType::kCounter), SubDocument(PrimitiveValue(card)));</a>
+<a name="ln1138"> </a>
+<a name="ln1139">  SubDocument elements(request_.push_request().side() == REDIS_SIDE_LEFT ?</a>
+<a name="ln1140">                   ListExtendOrder::PREPEND : ListExtendOrder::APPEND);</a>
+<a name="ln1141">  for (auto val : kv.value()) {</a>
+<a name="ln1142">    elements.AddListElement(SubDocument(PrimitiveValue(val)));</a>
+<a name="ln1143">  }</a>
+<a name="ln1144">  list.SetChild(PrimitiveValue(ValueType::kArray), std::move(elements));</a>
+<a name="ln1145">  RETURN_NOT_OK(list.ConvertToRedisList());</a>
+<a name="ln1146"> </a>
+<a name="ln1147">  if (data_type == REDIS_TYPE_NONE) {</a>
+<a name="ln1148">    RETURN_NOT_OK(data.doc_write_batch-&gt;InsertSubDocument(</a>
+<a name="ln1149">        DocPath::DocPathFromRedisKey(kv.hash_code(), kv.key()), list,</a>
+<a name="ln1150">        data.read_time, data.deadline, redis_query_id()));</a>
+<a name="ln1151">  } else {</a>
+<a name="ln1152">    RETURN_NOT_OK(data.doc_write_batch-&gt;ExtendSubDocument(</a>
+<a name="ln1153">        DocPath::DocPathFromRedisKey(kv.hash_code(), kv.key()), list,</a>
+<a name="ln1154">        data.read_time, data.deadline, redis_query_id()));</a>
+<a name="ln1155">  }</a>
+<a name="ln1156"> </a>
+<a name="ln1157">  response_.set_int_response(card);</a>
+<a name="ln1158">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1159">  return Status::OK();</a>
+<a name="ln1160">}</a>
+<a name="ln1161"> </a>
+<a name="ln1162">Status RedisWriteOperation::ApplyInsert(const DocOperationApplyData&amp; data) {</a>
+<a name="ln1163">  return STATUS(NotSupported, &quot;Redis operation has not been implemented&quot;);</a>
+<a name="ln1164">}</a>
+<a name="ln1165"> </a>
+<a name="ln1166">Status RedisWriteOperation::ApplyPop(const DocOperationApplyData&amp; data) {</a>
+<a name="ln1167">  const RedisKeyValuePB&amp; kv = request_.key_value();</a>
+<a name="ln1168">  DocPath doc_path = DocPath::DocPathFromRedisKey(kv.hash_code(), kv.key());</a>
+<a name="ln1169">  RedisDataType data_type = VERIFY_RESULT(GetValueType(data));</a>
+<a name="ln1170"> </a>
+<a name="ln1171">  if (!VerifyTypeAndSetCode(kv.type(), data_type, &amp;response_, VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1172">    // We already set the error code in the function.</a>
+<a name="ln1173">    return Status::OK();</a>
+<a name="ln1174">  }</a>
+<a name="ln1175"> </a>
+<a name="ln1176">  SubDocument list;</a>
+<a name="ln1177">  int64_t card = VERIFY_RESULT(GetCardinality(iterator_.get(), kv));</a>
+<a name="ln1178"> </a>
+<a name="ln1179">  if (!card) {</a>
+<a name="ln1180">    response_.set_code(RedisResponsePB::NIL);</a>
+<a name="ln1181">    return Status::OK();</a>
+<a name="ln1182">  }</a>
+<a name="ln1183"> </a>
+<a name="ln1184">  std::vector&lt;int&gt; indices;</a>
+<a name="ln1185">  std::vector&lt;SubDocument&gt; new_value = {SubDocument(PrimitiveValue(ValueType::kTombstone))};</a>
+<a name="ln1186">  std::vector&lt;std::string&gt; value;</a>
+<a name="ln1187"> </a>
+<a name="ln1188">  if (request_.pop_request().side() == REDIS_SIDE_LEFT) {</a>
+<a name="ln1189">    indices.push_back(1);</a>
+<a name="ln1190">    RETURN_NOT_OK(data.doc_write_batch-&gt;ReplaceInList(doc_path, indices, new_value,</a>
+<a name="ln1191">        data.read_time, data.deadline, redis_query_id(), Direction::kForward, 0, &amp;value));</a>
+<a name="ln1192">  } else {</a>
+<a name="ln1193">    indices.push_back(card);</a>
+<a name="ln1194">    RETURN_NOT_OK(data.doc_write_batch-&gt;ReplaceInList(doc_path, indices, new_value,</a>
+<a name="ln1195">        data.read_time, data.deadline, redis_query_id(), Direction::kBackward, card + 1, &amp;value));</a>
+<a name="ln1196">  }</a>
+<a name="ln1197"> </a>
+<a name="ln1198">  list.SetChild(PrimitiveValue(ValueType::kCounter), SubDocument(PrimitiveValue(--card)));</a>
+<a name="ln1199">  RETURN_NOT_OK(list.ConvertToRedisList());</a>
+<a name="ln1200">  RETURN_NOT_OK(data.doc_write_batch-&gt;ExtendSubDocument(</a>
+<a name="ln1201">        doc_path, list, data.read_time, data.deadline, redis_query_id()));</a>
+<a name="ln1202"> </a>
+<a name="ln1203">  if (value.size() != 1)</a>
+<a name="ln1204">    return STATUS_SUBSTITUTE(Corruption,</a>
+<a name="ln1205">                             &quot;Expected one popped value, got $0&quot;, value.size());</a>
+<a name="ln1206"> </a>
+<a name="ln1207">  response_.set_string_response(value[0]);</a>
+<a name="ln1208">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1209">  return Status::OK();</a>
+<a name="ln1210">}</a>
+<a name="ln1211"> </a>
+<a name="ln1212">Status RedisWriteOperation::ApplyAdd(const DocOperationApplyData&amp; data) {</a>
+<a name="ln1213">  const RedisKeyValuePB&amp; kv = request_.key_value();</a>
+<a name="ln1214">  RedisDataType data_type = VERIFY_RESULT(GetValueType(data));</a>
+<a name="ln1215"> </a>
+<a name="ln1216">  if (data_type != REDIS_TYPE_SET &amp;&amp; data_type != REDIS_TYPE_NONE) {</a>
+<a name="ln1217">    response_.set_code(RedisResponsePB::WRONG_TYPE);</a>
+<a name="ln1218">    response_.set_error_message(wrong_type_message);</a>
+<a name="ln1219">    return Status::OK();</a>
+<a name="ln1220">  }</a>
+<a name="ln1221"> </a>
+<a name="ln1222">  DocPath doc_path = DocPath::DocPathFromRedisKey(kv.hash_code(), kv.key());</a>
+<a name="ln1223"> </a>
+<a name="ln1224">  if (kv.subkey_size() == 0) {</a>
+<a name="ln1225">    return STATUS(InvalidCommand, &quot;SADD request has no subkeys set&quot;);</a>
+<a name="ln1226">  }</a>
+<a name="ln1227"> </a>
+<a name="ln1228">  int num_keys_found = 0;</a>
+<a name="ln1229"> </a>
+<a name="ln1230">  SubDocument set_entries = SubDocument();</a>
+<a name="ln1231"> </a>
+<a name="ln1232">  for (int i = 0 ; i &lt; kv.subkey_size(); i++) { // We know that each subkey is distinct.</a>
+<a name="ln1233">    if (FLAGS_emulate_redis_responses) {</a>
+<a name="ln1234">      RedisDataType type = VERIFY_RESULT(GetValueType(data, i));</a>
+<a name="ln1235">      if (type != REDIS_TYPE_NONE) {</a>
+<a name="ln1236">        num_keys_found++;</a>
+<a name="ln1237">      }</a>
+<a name="ln1238">    }</a>
+<a name="ln1239"> </a>
+<a name="ln1240">    set_entries.SetChild(</a>
+<a name="ln1241">        PrimitiveValue(kv.subkey(i).string_subkey()),</a>
+<a name="ln1242">        SubDocument(PrimitiveValue(ValueType::kNullLow)));</a>
+<a name="ln1243">  }</a>
+<a name="ln1244"> </a>
+<a name="ln1245">  RETURN_NOT_OK(set_entries.ConvertToRedisSet());</a>
+<a name="ln1246"> </a>
+<a name="ln1247">  Status s;</a>
+<a name="ln1248"> </a>
+<a name="ln1249">  if (data_type == REDIS_TYPE_NONE) {</a>
+<a name="ln1250">    RETURN_NOT_OK(data.doc_write_batch-&gt;InsertSubDocument(</a>
+<a name="ln1251">        doc_path, set_entries, data.read_time, data.deadline, redis_query_id()));</a>
+<a name="ln1252">  } else {</a>
+<a name="ln1253">    RETURN_NOT_OK(data.doc_write_batch-&gt;ExtendSubDocument(</a>
+<a name="ln1254">        doc_path, set_entries, data.read_time, data.deadline, redis_query_id()));</a>
+<a name="ln1255">  }</a>
+<a name="ln1256"> </a>
+<a name="ln1257">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1258">  if (FLAGS_emulate_redis_responses) {</a>
+<a name="ln1259">    // If flag is set, the actual number of new keys added is sent as response.</a>
+<a name="ln1260">    response_.set_int_response(kv.subkey_size() - num_keys_found);</a>
+<a name="ln1261">  }</a>
+<a name="ln1262">  return Status::OK();</a>
+<a name="ln1263">}</a>
+<a name="ln1264"> </a>
+<a name="ln1265">Status RedisWriteOperation::ApplyRemove(const DocOperationApplyData&amp; data) {</a>
+<a name="ln1266">  return STATUS(NotSupported, &quot;Redis operation has not been implemented&quot;);</a>
+<a name="ln1267">}</a>
+<a name="ln1268"> </a>
+<a name="ln1269">Status RedisReadOperation::Execute() {</a>
+<a name="ln1270">  SimulateTimeoutIfTesting(&amp;deadline_);</a>
+<a name="ln1271">  // If we have a KEYS command, we don't specify any key for the iterator. Therefore, don't use</a>
+<a name="ln1272">  // bloom filters for this command.</a>
+<a name="ln1273">  SubDocKey doc_key(</a>
+<a name="ln1274">      DocKey::FromRedisKey(request_.key_value().hash_code(), request_.key_value().key()));</a>
+<a name="ln1275">  auto bloom_filter_mode = request_.has_keys_request() ?</a>
+<a name="ln1276">      BloomFilterMode::DONT_USE_BLOOM_FILTER : BloomFilterMode::USE_BLOOM_FILTER;</a>
+<a name="ln1277">  auto iter = yb::docdb::CreateIntentAwareIterator(</a>
+<a name="ln1278">      doc_db_, bloom_filter_mode,</a>
+<a name="ln1279">      doc_key.Encode().AsSlice(),</a>
+<a name="ln1280">      redis_query_id(), /* txn_op_context */ boost::none, deadline_, read_time_);</a>
+<a name="ln1281">  iterator_ = std::move(iter);</a>
+<a name="ln1282">  deadline_info_.emplace(deadline_);</a>
+<a name="ln1283"> </a>
+<a name="ln1284">  switch (request_.request_case()) {</a>
+<a name="ln1285">    case RedisReadRequestPB::kGetForRenameRequest:</a>
+<a name="ln1286">      return ExecuteGetForRename();</a>
+<a name="ln1287">    case RedisReadRequestPB::kGetRequest:</a>
+<a name="ln1288">      return ExecuteGet();</a>
+<a name="ln1289">    case RedisReadRequestPB::kGetTtlRequest:</a>
+<a name="ln1290">      return ExecuteGetTtl();</a>
+<a name="ln1291">    case RedisReadRequestPB::kStrlenRequest:</a>
+<a name="ln1292">      return ExecuteStrLen();</a>
+<a name="ln1293">    case RedisReadRequestPB::kExistsRequest:</a>
+<a name="ln1294">      return ExecuteExists();</a>
+<a name="ln1295">    case RedisReadRequestPB::kGetRangeRequest:</a>
+<a name="ln1296">      return ExecuteGetRange();</a>
+<a name="ln1297">    case RedisReadRequestPB::kGetCollectionRangeRequest:</a>
+<a name="ln1298">      return ExecuteCollectionGetRange();</a>
+<a name="ln1299">    case RedisReadRequestPB::kKeysRequest:</a>
+<a name="ln1300">      return ExecuteKeys();</a>
+<a name="ln1301">    default:</a>
+<a name="ln1302">      return STATUS_FORMAT(</a>
+<a name="ln1303">          Corruption, &quot;Unsupported redis read operation: $0&quot;, request_.request_case());</a>
+<a name="ln1304">  }</a>
+<a name="ln1305">}</a>
+<a name="ln1306"> </a>
+<a name="ln1307">int RedisReadOperation::ApplyIndex(int32_t index, const int32_t len) {</a>
+<a name="ln1308">  if (index &lt; 0) index += len;</a>
+<a name="ln1309">  if (index &lt; 0) index = 0;</a>
+<a name="ln1310">  if (index &gt; len) index = len;</a>
+<a name="ln1311">  return index;</a>
+<a name="ln1312">}</a>
+<a name="ln1313"> </a>
+<a name="ln1314">Status RedisReadOperation::ExecuteHGetAllLikeCommands(ValueType value_type,</a>
+<a name="ln1315">                                                      bool add_keys,</a>
+<a name="ln1316">                                                      bool add_values) {</a>
+<a name="ln1317">  SubDocKey doc_key(</a>
+<a name="ln1318">      DocKey::FromRedisKey(request_.key_value().hash_code(), request_.key_value().key()));</a>
+<a name="ln1319">  SubDocument doc;</a>
+<a name="ln1320">  bool doc_found = false;</a>
+<a name="ln1321">  auto encoded_doc_key = doc_key.EncodeWithoutHt();</a>
+<a name="ln1322"> </a>
+<a name="ln1323">  // TODO(dtxn) - pass correct transaction context when we implement cross-shard transactions</a>
+<a name="ln1324">  // support for Redis.</a>
+<a name="ln1325">  GetSubDocumentData data = { encoded_doc_key, &amp;doc, &amp;doc_found };</a>
+<a name="ln1326">  data.deadline_info = deadline_info_.get_ptr();</a>
+<a name="ln1327"> </a>
+<a name="ln1328">  bool has_cardinality_subkey = value_type == ValueType::kRedisSortedSet ||</a>
+<a name="ln1329">                                value_type == ValueType::kRedisList;</a>
+<a name="ln1330">  bool return_array_response = add_keys || add_values;</a>
+<a name="ln1331"> </a>
+<a name="ln1332">  if (has_cardinality_subkey) {</a>
+<a name="ln1333">    data.return_type_only = !return_array_response;</a>
+<a name="ln1334">  } else {</a>
+<a name="ln1335">    data.count_only = !return_array_response;</a>
+<a name="ln1336">  }</a>
+<a name="ln1337"> </a>
+<a name="ln1338">  RETURN_NOT_OK(GetSubDocument(iterator_.get(), data, /* projection */ nullptr,</a>
+<a name="ln1339">                               SeekFwdSuffices::kFalse));</a>
+<a name="ln1340">  if (return_array_response)</a>
+<a name="ln1341">    response_.set_allocated_array_response(new RedisArrayPB());</a>
+<a name="ln1342"> </a>
+<a name="ln1343">  if (!doc_found) {</a>
+<a name="ln1344">    response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1345">    if (!return_array_response)</a>
+<a name="ln1346">      response_.set_int_response(0);</a>
+<a name="ln1347">    return Status::OK();</a>
+<a name="ln1348">  }</a>
+<a name="ln1349"> </a>
+<a name="ln1350">  if (VerifyTypeAndSetCode(value_type, doc.value_type(), &amp;response_)) {</a>
+<a name="ln1351">    if (return_array_response) {</a>
+<a name="ln1352">      RETURN_NOT_OK(PopulateResponseFrom(doc.object_container(), AddResponseValuesGeneric,</a>
+<a name="ln1353">                                         &amp;response_, add_keys, add_values));</a>
+<a name="ln1354">    } else {</a>
+<a name="ln1355">      int64_t card = has_cardinality_subkey ?</a>
+<a name="ln1356">        VERIFY_RESULT(GetCardinality(iterator_.get(), request_.key_value())) :</a>
+<a name="ln1357">        data.record_count;</a>
+<a name="ln1358">      response_.set_int_response(card);</a>
+<a name="ln1359">      response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1360">    }</a>
+<a name="ln1361">  }</a>
+<a name="ln1362">  return Status::OK();</a>
+<a name="ln1363">}</a>
+<a name="ln1364"> </a>
+<a name="ln1365">Status RedisReadOperation::ExecuteCollectionGetRangeByBounds(</a>
+<a name="ln1366">    RedisCollectionGetRangeRequestPB::GetRangeRequestType request_type, bool add_keys) {</a>
+<a name="ln1367">  RedisSubKeyBoundPB lower_bound;</a>
+<a name="ln1368">  lower_bound.set_infinity_type(RedisSubKeyBoundPB::NEGATIVE);</a>
+<a name="ln1369">  RedisSubKeyBoundPB upper_bound;</a>
+<a name="ln1370">  upper_bound.set_infinity_type(RedisSubKeyBoundPB::POSITIVE);</a>
+<a name="ln1371">  return ExecuteCollectionGetRangeByBounds(request_type, lower_bound, upper_bound, add_keys);</a>
+<a name="ln1372">}</a>
+<a name="ln1373"> </a>
+<a name="ln1374">Status RedisReadOperation::ExecuteCollectionGetRangeByBounds(</a>
+<a name="ln1375">    RedisCollectionGetRangeRequestPB::GetRangeRequestType request_type,</a>
+<a name="ln1376">    const RedisSubKeyBoundPB&amp; lower_bound, const RedisSubKeyBoundPB&amp; upper_bound, bool add_keys) {</a>
+<a name="ln1377">  if ((lower_bound.has_infinity_type() &amp;&amp;</a>
+<a name="ln1378">       lower_bound.infinity_type() == RedisSubKeyBoundPB::POSITIVE) ||</a>
+<a name="ln1379">      (upper_bound.has_infinity_type() &amp;&amp;</a>
+<a name="ln1380">       upper_bound.infinity_type() == RedisSubKeyBoundPB::NEGATIVE)) {</a>
+<a name="ln1381">    // Return empty response.</a>
+<a name="ln1382">    response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1383">    RETURN_NOT_OK(PopulateResponseFrom(</a>
+<a name="ln1384">        SubDocument::ObjectContainer(), AddResponseValuesGeneric, &amp;response_, /* add_keys */ true,</a>
+<a name="ln1385">        /* add_values */ true));</a>
+<a name="ln1386">    return Status::OK();</a>
+<a name="ln1387">  }</a>
+<a name="ln1388"> </a>
+<a name="ln1389">  if (request_type == RedisCollectionGetRangeRequestPB::ZRANGEBYSCORE) {</a>
+<a name="ln1390">    auto type = VERIFY_RESULT(GetValueType());</a>
+<a name="ln1391">    auto expected_type = REDIS_TYPE_SORTEDSET;</a>
+<a name="ln1392">    if (!VerifyTypeAndSetCode(expected_type, type, &amp;response_, VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1393">      return Status::OK();</a>
+<a name="ln1394">    }</a>
+<a name="ln1395">    auto encoded_doc_key =</a>
+<a name="ln1396">        DocKey::EncodedFromRedisKey(request_.key_value().hash_code(), request_.key_value().key());</a>
+<a name="ln1397">    PrimitiveValue(ValueType::kSSForward).AppendToKey(&amp;encoded_doc_key);</a>
+<a name="ln1398">    double low_double = lower_bound.subkey_bound().double_subkey();</a>
+<a name="ln1399">    double high_double = upper_bound.subkey_bound().double_subkey();</a>
+<a name="ln1400"> </a>
+<a name="ln1401">    KeyBytes low_sub_key_bound;</a>
+<a name="ln1402">    KeyBytes high_sub_key_bound;</a>
+<a name="ln1403"> </a>
+<a name="ln1404">    SliceKeyBound low_subkey;</a>
+<a name="ln1405">    if (!lower_bound.has_infinity_type()) {</a>
+<a name="ln1406">      low_sub_key_bound = encoded_doc_key;</a>
+<a name="ln1407">      PrimitiveValue::Double(low_double).AppendToKey(&amp;low_sub_key_bound);</a>
+<a name="ln1408">      low_subkey = SliceKeyBound(low_sub_key_bound, LowerBound(lower_bound.is_exclusive()));</a>
+<a name="ln1409">    }</a>
+<a name="ln1410">    SliceKeyBound high_subkey;</a>
+<a name="ln1411">    if (!upper_bound.has_infinity_type()) {</a>
+<a name="ln1412">      high_sub_key_bound = encoded_doc_key;</a>
+<a name="ln1413">      PrimitiveValue::Double(high_double).AppendToKey(&amp;high_sub_key_bound);</a>
+<a name="ln1414">      high_subkey = SliceKeyBound(high_sub_key_bound, UpperBound(upper_bound.is_exclusive()));</a>
+<a name="ln1415">    }</a>
+<a name="ln1416"> </a>
+<a name="ln1417">    SubDocument doc;</a>
+<a name="ln1418">    bool doc_found = false;</a>
+<a name="ln1419">    GetSubDocumentData data = {encoded_doc_key, &amp;doc, &amp;doc_found};</a>
+<a name="ln1420">    data.deadline_info = deadline_info_.get_ptr();</a>
+<a name="ln1421">    data.low_subkey = &amp;low_subkey;</a>
+<a name="ln1422">    data.high_subkey = &amp;high_subkey;</a>
+<a name="ln1423"> </a>
+<a name="ln1424">    IndexBound low_index;</a>
+<a name="ln1425">    IndexBound high_index;</a>
+<a name="ln1426">    if (request_.has_range_request_limit()) {</a>
+<a name="ln1427">      int32_t offset = request_.index_range().lower_bound().index();</a>
+<a name="ln1428">      int32_t limit = request_.range_request_limit();</a>
+<a name="ln1429"> </a>
+<a name="ln1430">      if (offset &lt; 0 || limit == 0) {</a>
+<a name="ln1431">        // Return an empty response.</a>
+<a name="ln1432">        response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1433">        RETURN_NOT_OK(PopulateResponseFrom(</a>
+<a name="ln1434">            SubDocument::ObjectContainer(), AddResponseValuesGeneric, &amp;response_,</a>
+<a name="ln1435">            /* add_keys */ true, /* add_values */ true));</a>
+<a name="ln1436">        return Status::OK();</a>
+<a name="ln1437">      }</a>
+<a name="ln1438"> </a>
+<a name="ln1439">      low_index = IndexBound(offset, true /* is_lower */);</a>
+<a name="ln1440">      data.low_index = &amp;low_index;</a>
+<a name="ln1441">      if (limit &gt; 0) {</a>
+<a name="ln1442">        // Only define upper bound if limit is positive.</a>
+<a name="ln1443">        high_index = IndexBound(offset + limit - 1, false /* is_lower */);</a>
+<a name="ln1444">        data.high_index = &amp;high_index;</a>
+<a name="ln1445">      }</a>
+<a name="ln1446">    }</a>
+<a name="ln1447">    RETURN_NOT_OK(GetAndPopulateResponseValues(</a>
+<a name="ln1448">        iterator_.get(), AddResponseValuesSortedSets, data, ValueType::kObject, request_,</a>
+<a name="ln1449">        &amp;response_,</a>
+<a name="ln1450">        /* add_keys */ add_keys, /* add_values */ true, /* reverse */ false));</a>
+<a name="ln1451">  } else {</a>
+<a name="ln1452">    auto encoded_doc_key =</a>
+<a name="ln1453">        DocKey::EncodedFromRedisKey(request_.key_value().hash_code(), request_.key_value().key());</a>
+<a name="ln1454">    int64_t low_timestamp = lower_bound.subkey_bound().timestamp_subkey();</a>
+<a name="ln1455">    int64_t high_timestamp = upper_bound.subkey_bound().timestamp_subkey();</a>
+<a name="ln1456"> </a>
+<a name="ln1457">    KeyBytes low_sub_key_bound;</a>
+<a name="ln1458">    KeyBytes high_sub_key_bound;</a>
+<a name="ln1459"> </a>
+<a name="ln1460">    SliceKeyBound low_subkey;</a>
+<a name="ln1461">    // Need to switch the order since we store the timestamps in descending order.</a>
+<a name="ln1462">    if (!upper_bound.has_infinity_type()) {</a>
+<a name="ln1463">      low_sub_key_bound = encoded_doc_key;</a>
+<a name="ln1464">      PrimitiveValue(high_timestamp, SortOrder::kDescending).AppendToKey(&amp;low_sub_key_bound);</a>
+<a name="ln1465">      low_subkey = SliceKeyBound(low_sub_key_bound, LowerBound(upper_bound.is_exclusive()));</a>
+<a name="ln1466">    }</a>
+<a name="ln1467">    SliceKeyBound high_subkey;</a>
+<a name="ln1468">    if (!lower_bound.has_infinity_type()) {</a>
+<a name="ln1469">      high_sub_key_bound = encoded_doc_key;</a>
+<a name="ln1470">      PrimitiveValue(low_timestamp, SortOrder::kDescending).AppendToKey(&amp;high_sub_key_bound);</a>
+<a name="ln1471">      high_subkey = SliceKeyBound(high_sub_key_bound, UpperBound(lower_bound.is_exclusive()));</a>
+<a name="ln1472">    }</a>
+<a name="ln1473"> </a>
+<a name="ln1474">    SubDocument doc;</a>
+<a name="ln1475">    bool doc_found = false;</a>
+<a name="ln1476">    GetSubDocumentData data = {encoded_doc_key, &amp;doc, &amp;doc_found};</a>
+<a name="ln1477">    data.deadline_info = deadline_info_.get_ptr();</a>
+<a name="ln1478">    data.low_subkey = &amp;low_subkey;</a>
+<a name="ln1479">    data.high_subkey = &amp;high_subkey;</a>
+<a name="ln1480">    data.limit = request_.range_request_limit();</a>
+<a name="ln1481">    bool is_reverse = true;</a>
+<a name="ln1482">    if (request_type == RedisCollectionGetRangeRequestPB::TSREVRANGEBYTIME) {</a>
+<a name="ln1483">      // If reverse is false, newest element is the first element returned.</a>
+<a name="ln1484">      is_reverse = false;</a>
+<a name="ln1485">    }</a>
+<a name="ln1486">    RETURN_NOT_OK(GetAndPopulateResponseValues(</a>
+<a name="ln1487">        iterator_.get(), AddResponseValuesGeneric, data, ValueType::kRedisTS, request_, &amp;response_,</a>
+<a name="ln1488">        /* add_keys */ true, /* add_values */ true, is_reverse));</a>
+<a name="ln1489">  }</a>
+<a name="ln1490">  return Status::OK();</a>
+<a name="ln1491">}</a>
+<a name="ln1492"> </a>
+<a name="ln1493">Status RedisReadOperation::ExecuteCollectionGetRange() {</a>
+<a name="ln1494">  const RedisKeyValuePB&amp; key_value = request_.key_value();</a>
+<a name="ln1495">  if (!request_.has_key_value() || !key_value.has_key()) {</a>
+<a name="ln1496">    return STATUS(InvalidArgument, &quot;Need to specify the key&quot;);</a>
+<a name="ln1497">  }</a>
+<a name="ln1498"> </a>
+<a name="ln1499">  const auto request_type = request_.get_collection_range_request().request_type();</a>
+<a name="ln1500">  switch (request_type) {</a>
+<a name="ln1501">    case RedisCollectionGetRangeRequestPB::TSREVRANGEBYTIME:</a>
+<a name="ln1502">      FALLTHROUGH_INTENDED;</a>
+<a name="ln1503">    case RedisCollectionGetRangeRequestPB::ZRANGEBYSCORE: FALLTHROUGH_INTENDED;</a>
+<a name="ln1504">    case RedisCollectionGetRangeRequestPB::TSRANGEBYTIME: {</a>
+<a name="ln1505">      if(!request_.has_subkey_range() || !request_.subkey_range().has_lower_bound() ||</a>
+<a name="ln1506">          !request_.subkey_range().has_upper_bound()) {</a>
+<a name="ln1507">        return STATUS(InvalidArgument, &quot;Need to specify the subkey range&quot;);</a>
+<a name="ln1508">      }</a>
+<a name="ln1509">      const RedisSubKeyBoundPB&amp; lower_bound = request_.subkey_range().lower_bound();</a>
+<a name="ln1510">      const RedisSubKeyBoundPB&amp; upper_bound = request_.subkey_range().upper_bound();</a>
+<a name="ln1511">      const bool add_keys = request_.get_collection_range_request().with_scores();</a>
+<a name="ln1512">      return ExecuteCollectionGetRangeByBounds(request_type, lower_bound, upper_bound, add_keys);</a>
+<a name="ln1513">    }</a>
+<a name="ln1514">    case RedisCollectionGetRangeRequestPB::ZRANGE: FALLTHROUGH_INTENDED;</a>
+<a name="ln1515">    case RedisCollectionGetRangeRequestPB::ZREVRANGE: {</a>
+<a name="ln1516">      if(!request_.has_index_range() || !request_.index_range().has_lower_bound() ||</a>
+<a name="ln1517">          !request_.index_range().has_upper_bound()) {</a>
+<a name="ln1518">        return STATUS(InvalidArgument, &quot;Need to specify the index range&quot;);</a>
+<a name="ln1519">      }</a>
+<a name="ln1520"> </a>
+<a name="ln1521">      // First make sure is of type sorted set or none.</a>
+<a name="ln1522">      RedisDataType type = VERIFY_RESULT(GetValueType());</a>
+<a name="ln1523">      auto expected_type = RedisDataType::REDIS_TYPE_SORTEDSET;</a>
+<a name="ln1524">      if (!VerifyTypeAndSetCode(expected_type, type, &amp;response_, VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1525">        return Status::OK();</a>
+<a name="ln1526">      }</a>
+<a name="ln1527"> </a>
+<a name="ln1528">      int64_t card = VERIFY_RESULT(GetCardinality(iterator_.get(), request_.key_value()));</a>
+<a name="ln1529"> </a>
+<a name="ln1530">      const RedisIndexBoundPB&amp; low_index_bound = request_.index_range().lower_bound();</a>
+<a name="ln1531">      const RedisIndexBoundPB&amp; high_index_bound = request_.index_range().upper_bound();</a>
+<a name="ln1532"> </a>
+<a name="ln1533">      int64 low_idx_normalized, high_idx_normalized;</a>
+<a name="ln1534"> </a>
+<a name="ln1535">      int64 low_idx = low_index_bound.index();</a>
+<a name="ln1536">      int64 high_idx = high_index_bound.index();</a>
+<a name="ln1537">      // Normalize the bounds to be positive and go from low to high index.</a>
+<a name="ln1538">      bool reverse = false;</a>
+<a name="ln1539">      if (request_type == RedisCollectionGetRangeRequestPB::ZREVRANGE) {</a>
+<a name="ln1540">        reverse = true;</a>
+<a name="ln1541">      }</a>
+<a name="ln1542">      GetNormalizedBounds(</a>
+<a name="ln1543">          low_idx, high_idx, card, reverse, &amp;low_idx_normalized, &amp;high_idx_normalized);</a>
+<a name="ln1544"> </a>
+<a name="ln1545">      if (high_idx_normalized &lt; low_idx_normalized) {</a>
+<a name="ln1546">        // Return empty response.</a>
+<a name="ln1547">        response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1548">        RETURN_NOT_OK(PopulateResponseFrom(SubDocument::ObjectContainer(),</a>
+<a name="ln1549">                                           AddResponseValuesGeneric,</a>
+<a name="ln1550">                                           &amp;response_, /* add_keys */</a>
+<a name="ln1551">                                           true, /* add_values */</a>
+<a name="ln1552">                                           true));</a>
+<a name="ln1553">        return Status::OK();</a>
+<a name="ln1554">      }</a>
+<a name="ln1555">      auto encoded_doc_key = DocKey::EncodedFromRedisKey(</a>
+<a name="ln1556">          request_.key_value().hash_code(), request_.key_value().key());</a>
+<a name="ln1557">      PrimitiveValue(ValueType::kSSForward).AppendToKey(&amp;encoded_doc_key);</a>
+<a name="ln1558"> </a>
+<a name="ln1559">      bool add_keys = request_.get_collection_range_request().with_scores();</a>
+<a name="ln1560"> </a>
+<a name="ln1561">      IndexBound low_bound = IndexBound(low_idx_normalized, true /* is_lower */);</a>
+<a name="ln1562">      IndexBound high_bound = IndexBound(high_idx_normalized, false /* is_lower */);</a>
+<a name="ln1563"> </a>
+<a name="ln1564">      SubDocument doc;</a>
+<a name="ln1565">      bool doc_found = false;</a>
+<a name="ln1566">      GetSubDocumentData data = { encoded_doc_key, &amp;doc, &amp;doc_found};</a>
+<a name="ln1567">      data.deadline_info = deadline_info_.get_ptr();</a>
+<a name="ln1568">      data.low_index = &amp;low_bound;</a>
+<a name="ln1569">      data.high_index = &amp;high_bound;</a>
+<a name="ln1570"> </a>
+<a name="ln1571">      RETURN_NOT_OK(GetAndPopulateResponseValues(</a>
+<a name="ln1572">          iterator_.get(), AddResponseValuesSortedSets, data, ValueType::kObject, request_,</a>
+<a name="ln1573">          &amp;response_, add_keys, /* add_values */ true, reverse));</a>
+<a name="ln1574">      break;</a>
+<a name="ln1575">    }</a>
+<a name="ln1576">    case RedisCollectionGetRangeRequestPB::UNKNOWN:</a>
+<a name="ln1577">      return STATUS(InvalidCommand, &quot;Unknown Collection Get Range Request not supported&quot;);</a>
+<a name="ln1578">  }</a>
+<a name="ln1579"> </a>
+<a name="ln1580">  return Status::OK();</a>
+<a name="ln1581">}</a>
+<a name="ln1582"> </a>
+<a name="ln1583">Result&lt;RedisDataType&gt; RedisReadOperation::GetValueType(int subkey_index) {</a>
+<a name="ln1584">  return GetRedisValueType(iterator_.get(), request_.key_value(),</a>
+<a name="ln1585">                           nullptr /* doc_write_batch */, subkey_index);</a>
+<a name="ln1586">}</a>
+<a name="ln1587"> </a>
+<a name="ln1588">Result&lt;RedisValue&gt; RedisReadOperation::GetOverrideValue(int subkey_index) {</a>
+<a name="ln1589">  return GetRedisValue(iterator_.get(), request_.key_value(),</a>
+<a name="ln1590">                       subkey_index, /* always_override */ true);</a>
+<a name="ln1591">}</a>
+<a name="ln1592"> </a>
+<a name="ln1593">Result&lt;RedisValue&gt; RedisReadOperation::GetValue(int subkey_index) {</a>
+<a name="ln1594">    return GetRedisValue(iterator_.get(), request_.key_value(), subkey_index);</a>
+<a name="ln1595">}</a>
+<a name="ln1596"> </a>
+<a name="ln1597">namespace {</a>
+<a name="ln1598"> </a>
+<a name="ln1599">// Note: Do not use if also retrieving other value, as some work will be repeated.</a>
+<a name="ln1600">// Assumes every value has a TTL, and the TTL is stored in the row with this key.</a>
+<a name="ln1601">// Also observe that tombstone checking only works because we assume the key has</a>
+<a name="ln1602">// no ancestors.</a>
+<a name="ln1603">Result&lt;boost::optional&lt;Expiration&gt;&gt; GetTtl(</a>
+<a name="ln1604">    const Slice&amp; encoded_subdoc_key, IntentAwareIterator* iter) {</a>
+<a name="ln1605">  auto dockey_size =</a>
+<a name="ln1606">    VERIFY_RESULT(DocKey::EncodedSize(encoded_subdoc_key, DocKeyPart::kWholeDocKey));</a>
+<a name="ln1607">  Slice key_slice(encoded_subdoc_key.data(), dockey_size);</a>
+<a name="ln1608">  iter-&gt;Seek(key_slice);</a>
+<a name="ln1609">  if (!iter-&gt;valid())</a>
+<a name="ln1610">    return boost::none;</a>
+<a name="ln1611">  auto key_data = VERIFY_RESULT(iter-&gt;FetchKey());</a>
+<a name="ln1612">  if (!key_data.key.compare(key_slice)) {</a>
+<a name="ln1613">    Value doc_value = Value(PrimitiveValue(ValueType::kInvalid));</a>
+<a name="ln1614">    RETURN_NOT_OK(doc_value.Decode(iter-&gt;value()));</a>
+<a name="ln1615">    if (doc_value.value_type() != ValueType::kTombstone) {</a>
+<a name="ln1616">      return Expiration(key_data.write_time.hybrid_time(), doc_value.ttl());</a>
+<a name="ln1617">    }</a>
+<a name="ln1618">  }</a>
+<a name="ln1619">  return boost::none;</a>
+<a name="ln1620">}</a>
+<a name="ln1621"> </a>
+<a name="ln1622">} // namespace</a>
+<a name="ln1623"> </a>
+<a name="ln1624">Status RedisReadOperation::ExecuteGetTtl() {</a>
+<a name="ln1625">  const RedisKeyValuePB&amp; kv = request_.key_value();</a>
+<a name="ln1626">  if (!kv.has_key()) {</a>
+<a name="ln1627">    return STATUS(Corruption, &quot;Expected KeyValuePB&quot;);</a>
+<a name="ln1628">  }</a>
+<a name="ln1629">  // We currently only support getting and setting TTL on top level keys.</a>
+<a name="ln1630">  if (!kv.subkey().empty()) {</a>
+<a name="ln1631">    return STATUS_SUBSTITUTE(Corruption,</a>
+<a name="ln1632">                             &quot;Expected no subkeys, got $0&quot;, kv.subkey().size());</a>
+<a name="ln1633">  }</a>
+<a name="ln1634"> </a>
+<a name="ln1635">  auto encoded_doc_key = DocKey::EncodedFromRedisKey(kv.hash_code(), kv.key());</a>
+<a name="ln1636">  auto maybe_ttl_exp = VERIFY_RESULT(GetTtl(encoded_doc_key.AsSlice(), iterator_.get()));</a>
+<a name="ln1637"> </a>
+<a name="ln1638">  if (!maybe_ttl_exp.has_value()) {</a>
+<a name="ln1639">    response_.set_int_response(-2);</a>
+<a name="ln1640">    return Status::OK();</a>
+<a name="ln1641">  }</a>
+<a name="ln1642"> </a>
+<a name="ln1643">  auto exp = maybe_ttl_exp.get();</a>
+<a name="ln1644">  if (exp.ttl.Equals(Value::kMaxTtl)) {</a>
+<a name="ln1645">    response_.set_int_response(-1);</a>
+<a name="ln1646">    return Status::OK();</a>
+<a name="ln1647">  }</a>
+<a name="ln1648"> </a>
+<a name="ln1649">  MonoDelta ttl = VERIFY_RESULT(exp.ComputeRelativeTtl(iterator_-&gt;read_time().read));</a>
+<a name="ln1650">  if (ttl.IsNegative()) {</a>
+<a name="ln1651">    // The value has expired.</a>
+<a name="ln1652">    response_.set_int_response(-2);</a>
+<a name="ln1653">    return Status::OK();</a>
+<a name="ln1654">  }</a>
+<a name="ln1655"> </a>
+<a name="ln1656">  response_.set_int_response(request_.get_ttl_request().return_seconds() ?</a>
+<a name="ln1657">                             (int64_t) std::round(ttl.ToSeconds()) :</a>
+<a name="ln1658">                             ttl.ToMilliseconds());</a>
+<a name="ln1659">  return Status::OK();</a>
+<a name="ln1660">}</a>
+<a name="ln1661"> </a>
+<a name="ln1662">Status RedisReadOperation::ExecuteGetForRename() {</a>
+<a name="ln1663">  RedisDataType type = VERIFY_RESULT(GetValueType());</a>
+<a name="ln1664">  response_.set_type(type);</a>
+<a name="ln1665">  switch (type) {</a>
+<a name="ln1666">    case RedisDataType::REDIS_TYPE_STRING: {</a>
+<a name="ln1667">      return ExecuteGet(RedisGetRequestPB::GET);</a>
+<a name="ln1668">    }</a>
+<a name="ln1669"> </a>
+<a name="ln1670">    case RedisDataType::REDIS_TYPE_HASH: {</a>
+<a name="ln1671">      return ExecuteGet(RedisGetRequestPB::HGETALL);</a>
+<a name="ln1672">    }</a>
+<a name="ln1673"> </a>
+<a name="ln1674">    case RedisDataType::REDIS_TYPE_SET: {</a>
+<a name="ln1675">      return ExecuteGet(RedisGetRequestPB::SMEMBERS);</a>
+<a name="ln1676">    }</a>
+<a name="ln1677"> </a>
+<a name="ln1678">    case RedisDataType::REDIS_TYPE_SORTEDSET: {</a>
+<a name="ln1679">      return ExecuteCollectionGetRangeByBounds(</a>
+<a name="ln1680">          RedisCollectionGetRangeRequestPB::ZRANGEBYSCORE, true);</a>
+<a name="ln1681">    }</a>
+<a name="ln1682"> </a>
+<a name="ln1683">    case RedisDataType::REDIS_TYPE_TIMESERIES: {</a>
+<a name="ln1684">      return ExecuteCollectionGetRangeByBounds(</a>
+<a name="ln1685">          RedisCollectionGetRangeRequestPB::TSRANGEBYTIME, true);</a>
+<a name="ln1686">    }</a>
+<a name="ln1687"> </a>
+<a name="ln1688">    case RedisDataType::REDIS_TYPE_NONE: {</a>
+<a name="ln1689">      response_.set_code(RedisResponsePB::NOT_FOUND);</a>
+<a name="ln1690">      return Status::OK();</a>
+<a name="ln1691">    }</a>
+<a name="ln1692"> </a>
+<a name="ln1693">    case RedisDataType::REDIS_TYPE_LIST:</a>
+<a name="ln1694">    default: {</a>
+<a name="ln1695">      LOG(DFATAL) &lt;&lt; &quot;Unhandled Redis Data Type &quot; &lt;&lt; type;</a>
+<a name="ln1696">    }</a>
+<a name="ln1697">  }</a>
+<a name="ln1698">  return Status::OK();</a>
+<a name="ln1699">}</a>
+<a name="ln1700"> </a>
+<a name="ln1701">Status RedisReadOperation::ExecuteGet(RedisGetRequestPB::GetRequestType type) {</a>
+<a name="ln1702">  RedisGetRequestPB request;</a>
+<a name="ln1703">  request.set_request_type(type);</a>
+<a name="ln1704">  return ExecuteGet(request);</a>
+<a name="ln1705">}</a>
+<a name="ln1706"> </a>
+<a name="ln1707">Status RedisReadOperation::ExecuteGet() { return ExecuteGet(request_.get_request()); }</a>
+<a name="ln1708"> </a>
+<a name="ln1709">Status RedisReadOperation::ExecuteGet(const RedisGetRequestPB&amp; get_request) {</a>
+<a name="ln1710">  auto request_type = get_request.request_type();</a>
+<a name="ln1711">  RedisDataType expected_type = REDIS_TYPE_NONE;</a>
+<a name="ln1712">  switch (request_type) {</a>
+<a name="ln1713">    case RedisGetRequestPB::GET:</a>
+<a name="ln1714">      expected_type = REDIS_TYPE_STRING; break;</a>
+<a name="ln1715">    case RedisGetRequestPB::TSGET:</a>
+<a name="ln1716">      expected_type = REDIS_TYPE_TIMESERIES; break;</a>
+<a name="ln1717">    case RedisGetRequestPB::HGET: FALLTHROUGH_INTENDED;</a>
+<a name="ln1718">    case RedisGetRequestPB::HEXISTS:</a>
+<a name="ln1719">      expected_type = REDIS_TYPE_HASH; break;</a>
+<a name="ln1720">    case RedisGetRequestPB::SISMEMBER:</a>
+<a name="ln1721">      expected_type = REDIS_TYPE_SET; break;</a>
+<a name="ln1722">    case RedisGetRequestPB::ZSCORE:</a>
+<a name="ln1723">      expected_type = REDIS_TYPE_SORTEDSET; break;</a>
+<a name="ln1724">    default:</a>
+<a name="ln1725">      expected_type = REDIS_TYPE_NONE;</a>
+<a name="ln1726">  }</a>
+<a name="ln1727">  switch (request_type) {</a>
+<a name="ln1728">    case RedisGetRequestPB::GET: FALLTHROUGH_INTENDED;</a>
+<a name="ln1729">    case RedisGetRequestPB::TSGET: FALLTHROUGH_INTENDED;</a>
+<a name="ln1730">    case RedisGetRequestPB::HGET: {</a>
+<a name="ln1731">      RedisDataType type = VERIFY_RESULT(GetValueType());</a>
+<a name="ln1732">      // TODO: this is primarily glue for the Timeseries bug where the parent</a>
+<a name="ln1733">      // may get compacted due to an outdated TTL even though the children</a>
+<a name="ln1734">      // have longer TTL's and thus still exist. When fixing, take note that</a>
+<a name="ln1735">      // GetValueType finds the value type of the parent, so if the parent</a>
+<a name="ln1736">      // does not have the maximum TTL, it will return REDIS_TYPE_NONE when it</a>
+<a name="ln1737">      // should not.</a>
+<a name="ln1738">      if (expected_type == REDIS_TYPE_TIMESERIES &amp;&amp; type == REDIS_TYPE_NONE) {</a>
+<a name="ln1739">        type = expected_type;</a>
+<a name="ln1740">      }</a>
+<a name="ln1741">      // If wrong type, we set the error code in the response.</a>
+<a name="ln1742">      if (VerifyTypeAndSetCode(expected_type, type, &amp;response_, VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1743">        auto value = request_type == RedisGetRequestPB::TSGET ? GetOverrideValue() : GetValue();</a>
+<a name="ln1744">        RETURN_NOT_OK(value);</a>
+<a name="ln1745">        if (VerifyTypeAndSetCode(RedisDataType::REDIS_TYPE_STRING, value-&gt;type, &amp;response_,</a>
+<a name="ln1746">            VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1747">          response_.set_string_response(value-&gt;value);</a>
+<a name="ln1748">        }</a>
+<a name="ln1749">      }</a>
+<a name="ln1750">      return Status::OK();</a>
+<a name="ln1751">    }</a>
+<a name="ln1752">    case RedisGetRequestPB::ZSCORE: {</a>
+<a name="ln1753">      RedisDataType type = VERIFY_RESULT(GetValueType());</a>
+<a name="ln1754">      // If wrong type, we set the error code in the response.</a>
+<a name="ln1755">      if (!VerifyTypeAndSetCode(expected_type, type, &amp;response_, VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1756">        return Status::OK();</a>
+<a name="ln1757">      }</a>
+<a name="ln1758">      SubDocKey key_reverse = SubDocKey(</a>
+<a name="ln1759">          DocKey::FromRedisKey(request_.key_value().hash_code(), request_.key_value().key()),</a>
+<a name="ln1760">          PrimitiveValue(ValueType::kSSReverse),</a>
+<a name="ln1761">          PrimitiveValue(request_.key_value().subkey(0).string_subkey()));</a>
+<a name="ln1762">      SubDocument subdoc_reverse;</a>
+<a name="ln1763">      bool subdoc_reverse_found = false;</a>
+<a name="ln1764">      auto encoded_key_reverse = key_reverse.EncodeWithoutHt();</a>
+<a name="ln1765">      GetSubDocumentData get_data = { encoded_key_reverse, &amp;subdoc_reverse, &amp;subdoc_reverse_found };</a>
+<a name="ln1766">      RETURN_NOT_OK(GetSubDocument(doc_db_, get_data, redis_query_id(),</a>
+<a name="ln1767">                                   boost::none /* txn_op_context */, deadline_, read_time_));</a>
+<a name="ln1768">      if (subdoc_reverse_found) {</a>
+<a name="ln1769">        double score = subdoc_reverse.GetDouble();</a>
+<a name="ln1770">        response_.set_string_response(std::to_string(score));</a>
+<a name="ln1771">      } else {</a>
+<a name="ln1772">        response_.set_code(RedisResponsePB::NIL);</a>
+<a name="ln1773">      }</a>
+<a name="ln1774">      return Status::OK();</a>
+<a name="ln1775">    }</a>
+<a name="ln1776">    case RedisGetRequestPB::HEXISTS: FALLTHROUGH_INTENDED;</a>
+<a name="ln1777">    case RedisGetRequestPB::SISMEMBER: {</a>
+<a name="ln1778">      RedisDataType type = VERIFY_RESULT(GetValueType());</a>
+<a name="ln1779">      if (VerifyTypeAndSetCode(expected_type, type, &amp;response_, VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1780">        RedisDataType subtype = VERIFY_RESULT(GetValueType(0));</a>
+<a name="ln1781">        SetOptionalInt(subtype, 1, &amp;response_);</a>
+<a name="ln1782">        response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1783">      }</a>
+<a name="ln1784">      return Status::OK();</a>
+<a name="ln1785">    }</a>
+<a name="ln1786">    case RedisGetRequestPB::HSTRLEN: {</a>
+<a name="ln1787">      RedisDataType type = VERIFY_RESULT(GetValueType());</a>
+<a name="ln1788">      if (VerifyTypeAndSetCode(RedisDataType::REDIS_TYPE_HASH, type, &amp;response_,</a>
+<a name="ln1789">                               VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1790">        auto value = GetValue();</a>
+<a name="ln1791">        RETURN_NOT_OK(value);</a>
+<a name="ln1792">        SetOptionalInt(value-&gt;type, value-&gt;value.length(), &amp;response_);</a>
+<a name="ln1793">        response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1794">      }</a>
+<a name="ln1795">      return Status::OK();</a>
+<a name="ln1796">    }</a>
+<a name="ln1797">    case RedisGetRequestPB::MGET: {</a>
+<a name="ln1798">      return STATUS(NotSupported, &quot;MGET not yet supported&quot;);</a>
+<a name="ln1799">    }</a>
+<a name="ln1800">    case RedisGetRequestPB::HMGET: {</a>
+<a name="ln1801">      RedisDataType type = VERIFY_RESULT(GetValueType());</a>
+<a name="ln1802">      if (!VerifyTypeAndSetCode(RedisDataType::REDIS_TYPE_HASH, type, &amp;response_,</a>
+<a name="ln1803">                                VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1804">        return Status::OK();</a>
+<a name="ln1805">      }</a>
+<a name="ln1806"> </a>
+<a name="ln1807">      response_.set_allocated_array_response(new RedisArrayPB());</a>
+<a name="ln1808">      const auto&amp; req_kv = request_.key_value();</a>
+<a name="ln1809">      size_t num_subkeys = req_kv.subkey_size();</a>
+<a name="ln1810">      vector&lt;int&gt; indices(num_subkeys);</a>
+<a name="ln1811">      for (int i = 0; i &lt; num_subkeys; ++i) {</a>
+<a name="ln1812">        indices[i] = i;</a>
+<a name="ln1813">      }</a>
+<a name="ln1814">      std::sort(indices.begin(), indices.end(), [&amp;req_kv](int i, int j) {</a>
+<a name="ln1815">            return req_kv.subkey(i).string_subkey() &lt; req_kv.subkey(j).string_subkey();</a>
+<a name="ln1816">          });</a>
+<a name="ln1817"> </a>
+<a name="ln1818">      string current_value = &quot;&quot;;</a>
+<a name="ln1819">      response_.mutable_array_response()-&gt;mutable_elements()-&gt;Reserve(num_subkeys);</a>
+<a name="ln1820">      for (int i = 0; i &lt; num_subkeys; ++i) {</a>
+<a name="ln1821">        response_.mutable_array_response()-&gt;add_elements();</a>
+<a name="ln1822">      }</a>
+<a name="ln1823">      for (int i = 0; i &lt; num_subkeys; ++i) {</a>
+<a name="ln1824">        if (i == 0 ||</a>
+<a name="ln1825">            req_kv.subkey(indices[i]).string_subkey() !=</a>
+<a name="ln1826">            req_kv.subkey(indices[i - 1]).string_subkey()) {</a>
+<a name="ln1827">          // If the condition above is false, we encountered the same key again, no need to call</a>
+<a name="ln1828">          // GetValue() once more, current_value is already correct.</a>
+<a name="ln1829">          auto value = GetValue(indices[i]);</a>
+<a name="ln1830">          RETURN_NOT_OK(value);</a>
+<a name="ln1831">          if (value-&gt;type == REDIS_TYPE_STRING) {</a>
+<a name="ln1832">            current_value = std::move(value-&gt;value);</a>
+<a name="ln1833">          } else {</a>
+<a name="ln1834">            current_value = &quot;&quot;; // Empty string is nil response.</a>
+<a name="ln1835">          }</a>
+<a name="ln1836">        }</a>
+<a name="ln1837">        *response_.mutable_array_response()-&gt;mutable_elements(indices[i]) = current_value;</a>
+<a name="ln1838">      }</a>
+<a name="ln1839"> </a>
+<a name="ln1840">      response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1841">      return Status::OK();</a>
+<a name="ln1842">    }</a>
+<a name="ln1843">    case RedisGetRequestPB::HGETALL:</a>
+<a name="ln1844">      return ExecuteHGetAllLikeCommands(ValueType::kObject, true, true);</a>
+<a name="ln1845">    case RedisGetRequestPB::HKEYS:</a>
+<a name="ln1846">      return ExecuteHGetAllLikeCommands(ValueType::kObject, true, false);</a>
+<a name="ln1847">    case RedisGetRequestPB::HVALS:</a>
+<a name="ln1848">      return ExecuteHGetAllLikeCommands(ValueType::kObject, false, true);</a>
+<a name="ln1849">    case RedisGetRequestPB::HLEN:</a>
+<a name="ln1850">      return ExecuteHGetAllLikeCommands(ValueType::kObject, false, false);</a>
+<a name="ln1851">    case RedisGetRequestPB::SMEMBERS:</a>
+<a name="ln1852">      return ExecuteHGetAllLikeCommands(ValueType::kRedisSet, true, false);</a>
+<a name="ln1853">    case RedisGetRequestPB::SCARD:</a>
+<a name="ln1854">      return ExecuteHGetAllLikeCommands(ValueType::kRedisSet, false, false);</a>
+<a name="ln1855">    case RedisGetRequestPB::TSCARD:</a>
+<a name="ln1856">      return ExecuteHGetAllLikeCommands(ValueType::kRedisTS, false, false);</a>
+<a name="ln1857">    case RedisGetRequestPB::ZCARD:</a>
+<a name="ln1858">      return ExecuteHGetAllLikeCommands(ValueType::kRedisSortedSet, false, false);</a>
+<a name="ln1859">    case RedisGetRequestPB::LLEN:</a>
+<a name="ln1860">      return ExecuteHGetAllLikeCommands(ValueType::kRedisList, false, false);</a>
+<a name="ln1861">    case RedisGetRequestPB::UNKNOWN: {</a>
+<a name="ln1862">      return STATUS(InvalidCommand, &quot;Unknown Get Request not supported&quot;);</a>
+<a name="ln1863">    }</a>
+<a name="ln1864">  }</a>
+<a name="ln1865">  return Status::OK();</a>
+<a name="ln1866">}</a>
+<a name="ln1867"> </a>
+<a name="ln1868">Status RedisReadOperation::ExecuteStrLen() {</a>
+<a name="ln1869">  auto value = GetValue();</a>
+<a name="ln1870">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1871">  RETURN_NOT_OK(value);</a>
+<a name="ln1872"> </a>
+<a name="ln1873">  if (VerifyTypeAndSetCode(RedisDataType::REDIS_TYPE_STRING, value-&gt;type, &amp;response_,</a>
+<a name="ln1874">        VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1875">    SetOptionalInt(value-&gt;type, value-&gt;value.length(), &amp;response_);</a>
+<a name="ln1876">  }</a>
+<a name="ln1877">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1878"> </a>
+<a name="ln1879">  return Status::OK();</a>
+<a name="ln1880">}</a>
+<a name="ln1881"> </a>
+<a name="ln1882">Status RedisReadOperation::ExecuteExists() {</a>
+<a name="ln1883">  auto value = GetValue();</a>
+<a name="ln1884">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1885">  RETURN_NOT_OK(value);</a>
+<a name="ln1886"> </a>
+<a name="ln1887">  // We only support exist command with one argument currently.</a>
+<a name="ln1888">  SetOptionalInt(value-&gt;type, 1, &amp;response_);</a>
+<a name="ln1889">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1890"> </a>
+<a name="ln1891">  return Status::OK();</a>
+<a name="ln1892">}</a>
+<a name="ln1893"> </a>
+<a name="ln1894">Status RedisReadOperation::ExecuteGetRange() {</a>
+<a name="ln1895">  auto value = GetValue();</a>
+<a name="ln1896">  RETURN_NOT_OK(value);</a>
+<a name="ln1897"> </a>
+<a name="ln1898">  if (!VerifyTypeAndSetCode(RedisDataType::REDIS_TYPE_STRING, value-&gt;type, &amp;response_,</a>
+<a name="ln1899">      VerifySuccessIfMissing::kTrue)) {</a>
+<a name="ln1900">    // We've already set the error code in the response.</a>
+<a name="ln1901">    return Status::OK();</a>
+<a name="ln1902">  }</a>
+<a name="ln1903"> </a>
+<a name="ln1904">  const int32_t len = value-&gt;value.length();</a>
+<a name="ln1905">  int32_t exclusive_end = request_.get_range_request().end() + 1;</a>
+<a name="ln1906">  if (exclusive_end == 0) {</a>
+<a name="ln1907">    exclusive_end = len;</a>
+<a name="ln1908">  }</a>
+<a name="ln1909"> </a>
+<a name="ln1910">  // We treat negative indices to refer backwards from the end of the string.</a>
+<a name="ln1911">  const int32_t start = ApplyIndex(request_.get_range_request().start(), len);</a>
+<a name="ln1912">  int32_t end = ApplyIndex(exclusive_end, len);</a>
+<a name="ln1913">  if (end &lt; start) {</a>
+<a name="ln1914">    end = start;</a>
+<a name="ln1915">  }</a>
+<a name="ln1916"> </a>
+<a name="ln1917">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1918">  response_.set_string_response(value-&gt;value.c_str() + start, end - start);</a>
+<a name="ln1919">  return Status::OK();</a>
+<a name="ln1920">}</a>
+<a name="ln1921"> </a>
+<a name="ln1922">Status RedisReadOperation::ExecuteKeys() {</a>
+<a name="ln1923">  iterator_-&gt;Seek(DocKey());</a>
+<a name="ln1924">  int threshold = request_.keys_request().threshold();</a>
+<a name="ln1925"> </a>
+<a name="ln1926">  bool doc_found;</a>
+<a name="ln1927">  SubDocument result;</a>
+<a name="ln1928"> </a>
+<a name="ln1929">  while (iterator_-&gt;valid()) {</a>
+<a name="ln1930">    if (deadline_info_.get_ptr() &amp;&amp; deadline_info_-&gt;CheckAndSetDeadlinePassed()) {</a>
+<a name="ln1931">      return STATUS(Expired, &quot;Deadline for query passed.&quot;);</a>
+<a name="ln1932">    }</a>
+<a name="ln1933">    auto key = VERIFY_RESULT(iterator_-&gt;FetchKey()).key;</a>
+<a name="ln1934"> </a>
+<a name="ln1935">    // Key could be invalidated because we could move iterator, so back it up.</a>
+<a name="ln1936">    KeyBytes key_copy(key);</a>
+<a name="ln1937">    key = key_copy.AsSlice();</a>
+<a name="ln1938"> </a>
+<a name="ln1939">    DocKey doc_key;</a>
+<a name="ln1940">    RETURN_NOT_OK(doc_key.FullyDecodeFrom(key));</a>
+<a name="ln1941">    const PrimitiveValue&amp; key_primitive = doc_key.hashed_group().front();</a>
+<a name="ln1942">    if (!key_primitive.IsString() ||</a>
+<a name="ln1943">        !RedisUtil::RedisPatternMatch(request_.keys_request().pattern(),</a>
+<a name="ln1944">                                     key_primitive.GetString(),</a>
+<a name="ln1945">                                     false /* ignore_case */)) {</a>
+<a name="ln1946">      iterator_-&gt;SeekOutOfSubDoc(key);</a>
+<a name="ln1947">      continue;</a>
+<a name="ln1948">    }</a>
+<a name="ln1949"> </a>
+<a name="ln1950">    GetSubDocumentData data = {key, &amp;result, &amp;doc_found};</a>
+<a name="ln1951">    data.deadline_info = deadline_info_.get_ptr();</a>
+<a name="ln1952">    data.return_type_only = true;</a>
+<a name="ln1953">    RETURN_NOT_OK(GetSubDocument(iterator_.get(), data, /* projection */ nullptr,</a>
+<a name="ln1954">                                 SeekFwdSuffices::kFalse));</a>
+<a name="ln1955"> </a>
+<a name="ln1956">    if (doc_found) {</a>
+<a name="ln1957">      if (--threshold &lt; 0) {</a>
+<a name="ln1958">        response_.clear_array_response();</a>
+<a name="ln1959">        response_.set_code(RedisResponsePB::SERVER_ERROR);</a>
+<a name="ln1960">        response_.set_error_message(&quot;Too many keys in the database.&quot;);</a>
+<a name="ln1961">        return Status::OK();</a>
+<a name="ln1962">      }</a>
+<a name="ln1963">      RETURN_NOT_OK(AddPrimitiveValueToResponseArray(key_primitive,</a>
+<a name="ln1964">                                                     response_.mutable_array_response()));</a>
+<a name="ln1965">    }</a>
+<a name="ln1966">    iterator_-&gt;SeekOutOfSubDoc(key);</a>
+<a name="ln1967">  }</a>
+<a name="ln1968"> </a>
+<a name="ln1969">  response_.set_code(RedisResponsePB::OK);</a>
+<a name="ln1970">  return Status::OK();</a>
+<a name="ln1971">}</a>
+<a name="ln1972"> </a>
+<a name="ln1973">const RedisResponsePB&amp; RedisReadOperation::response() {</a>
+<a name="ln1974">  return response_;</a>
+<a name="ln1975">}</a>
+<a name="ln1976"> </a>
+<a name="ln1977">}  // namespace docdb</a>
+<a name="ln1978">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="238"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="825"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="851"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,447 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>cql_service.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/yql/cql/cqlserver/cql_service.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;openssl/sha.h&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;mutex&gt;</a>
+<a name="ln19">#include &lt;thread&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;boost/compute/detail/lru_cache.hpp&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/client/meta_data_cache.h&quot;</a>
+<a name="ln24">#include &quot;yb/client/transaction_pool.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/gutil/strings/join.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/yql/cql/cqlserver/cql_processor.h&quot;</a>
+<a name="ln29">#include &quot;yb/yql/cql/cqlserver/cql_rpc.h&quot;</a>
+<a name="ln30">#include &quot;yb/yql/cql/cqlserver/cql_server.h&quot;</a>
+<a name="ln31">#include &quot;yb/yql/cql/cqlserver/system_query_cache.h&quot;</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln34">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln35">#include &quot;yb/rpc/rpc_context.h&quot;</a>
+<a name="ln36">#include &quot;yb/tserver/tablet_server.h&quot;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &quot;yb/util/bytes_formatter.h&quot;</a>
+<a name="ln39">#include &quot;yb/util/crypt.h&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41">#include &quot;yb/util/mem_tracker.h&quot;</a>
+<a name="ln42"> </a>
+<a name="ln43">using namespace std::placeholders;</a>
+<a name="ln44">using namespace yb::size_literals;</a>
+<a name="ln45"> </a>
+<a name="ln46">DECLARE_bool(use_cassandra_authentication);</a>
+<a name="ln47">DECLARE_int32(cql_update_system_query_cache_msecs);</a>
+<a name="ln48"> </a>
+<a name="ln49">DEFINE_int64(cql_service_max_prepared_statement_size_bytes, 128_MB,</a>
+<a name="ln50">             &quot;The maximum amount of memory the CQL proxy should use to maintain prepared &quot;</a>
+<a name="ln51">             &quot;statements. 0 or negative means unlimited.&quot;);</a>
+<a name="ln52">DEFINE_int32(cql_ybclient_reactor_threads, 24,</a>
+<a name="ln53">             &quot;The number of reactor threads to be used for processing ybclient &quot;</a>
+<a name="ln54">             &quot;requests originating in the cql layer&quot;);</a>
+<a name="ln55">DEFINE_int32(password_hash_cache_size, 64, &quot;Number of password hashes to cache. 0 or &quot;</a>
+<a name="ln56">             &quot;negative disables caching.&quot;);</a>
+<a name="ln57">DEFINE_int64(cql_processors_limit, -4000,</a>
+<a name="ln58">             &quot;Limit number of CQL processors. Positive means absolute limit. &quot;</a>
+<a name="ln59">             &quot;Negative means number of processors per 1GB of root mem tracker memory limit. &quot;</a>
+<a name="ln60">             &quot;0 - unlimited.&quot;);</a>
+<a name="ln61"> </a>
+<a name="ln62">namespace yb {</a>
+<a name="ln63">namespace cqlserver {</a>
+<a name="ln64"> </a>
+<a name="ln65">const char* const kRoleColumnNameSaltedHash = &quot;salted_hash&quot;;</a>
+<a name="ln66">const char* const kRoleColumnNameCanLogin = &quot;can_login&quot;;</a>
+<a name="ln67"> </a>
+<a name="ln68">using std::shared_ptr;</a>
+<a name="ln69">using std::string;</a>
+<a name="ln70">using std::unique_ptr;</a>
+<a name="ln71">using std::vector;</a>
+<a name="ln72">using strings::Substitute;</a>
+<a name="ln73">using yb::client::YBSchema;</a>
+<a name="ln74">using yb::client::YBSession;</a>
+<a name="ln75">using yb::client::YBMetaDataCache;</a>
+<a name="ln76">using yb::rpc::InboundCall;</a>
+<a name="ln77"> </a>
+<a name="ln78">class ParserFactory {</a>
+<a name="ln79"> public:</a>
+<a name="ln80">  explicit ParserFactory(CQLMetrics* metrics) : metrics_(metrics) {}</a>
+<a name="ln81"> </a>
+<a name="ln82">  ql::Parser* operator()() const {</a>
+<a name="ln83">    metrics_-&gt;parsers_created_-&gt;Increment();</a>
+<a name="ln84">    metrics_-&gt;parsers_alive_-&gt;Increment();</a>
+<a name="ln85">    return new ql::Parser;</a>
+<a name="ln86">  }</a>
+<a name="ln87"> </a>
+<a name="ln88"> private:</a>
+<a name="ln89">  CQLMetrics* metrics_;</a>
+<a name="ln90">};</a>
+<a name="ln91"> </a>
+<a name="ln92">class ParserDeleter {</a>
+<a name="ln93"> public:</a>
+<a name="ln94">  explicit ParserDeleter(CQLMetrics* metrics) : metrics_(metrics) {}</a>
+<a name="ln95"> </a>
+<a name="ln96">  void operator()(ql::Parser* parser) const {</a>
+<a name="ln97">    metrics_-&gt;parsers_alive_-&gt;Decrement();</a>
+<a name="ln98">    delete parser;</a>
+<a name="ln99">  }</a>
+<a name="ln100"> </a>
+<a name="ln101"> private:</a>
+<a name="ln102">  CQLMetrics* metrics_;</a>
+<a name="ln103">};</a>
+<a name="ln104"> </a>
+<a name="ln105">int64_t CQLProcessorsLimit() {</a>
+<a name="ln106">  auto value = FLAGS_cql_processors_limit;</a>
+<a name="ln107">  if (value &gt; 0) {</a>
+<a name="ln108">    return value;</a>
+<a name="ln109">  }</a>
+<a name="ln110">  if (value == 0) {</a>
+<a name="ln111">    return std::numeric_limits&lt;int64_t&gt;::max();</a>
+<a name="ln112">  }</a>
+<a name="ln113">  return (-value * MemTracker::GetRootTracker()-&gt;limit()) &gt;&gt; 30;</a>
+<a name="ln114">}</a>
+<a name="ln115"> </a>
+<a name="ln116">CQLServiceImpl::CQLServiceImpl(CQLServer* server, const CQLServerOptions&amp; opts)</a>
+<a name="ln117">    : CQLServerServiceIf(server-&gt;metric_entity()),</a>
+<a name="ln118">      server_(server),</a>
+<a name="ln119">      next_available_processor_(processors_.end()),</a>
+<a name="ln120">      password_cache_(FLAGS_password_hash_cache_size),</a>
+<a name="ln121">      // TODO(ENG-446): Handle metrics for all the methods individually.</a>
+<a name="ln122">      cql_metrics_(std::make_shared&lt;CQLMetrics&gt;(server-&gt;metric_entity())),</a>
+<a name="ln123">      parser_pool_(ParserFactory(cql_metrics_.get()), ParserDeleter(cql_metrics_.get())),</a>
+<a name="ln124">      messenger_(server-&gt;messenger()) {</a>
+<a name="ln125"> </a>
+<a name="ln126">  // Setup prepared statements' memory tracker. Add garbage-collect function to delete least</a>
+<a name="ln127">  // recently used statements when limit is hit.</a>
+<a name="ln128">  prepared_stmts_mem_tracker_ = MemTracker::CreateTracker(</a>
+<a name="ln129">      FLAGS_cql_service_max_prepared_statement_size_bytes &gt; 0 ?</a>
+<a name="ln130">      FLAGS_cql_service_max_prepared_statement_size_bytes : -1,</a>
+<a name="ln131">      &quot;CQL prepared statements&quot;, server-&gt;mem_tracker());</a>
+<a name="ln132"> </a>
+<a name="ln133">  LOG(INFO) &lt;&lt; &quot;CQL processors limit: &quot; &lt;&lt; CQLProcessorsLimit();</a>
+<a name="ln134"> </a>
+<a name="ln135">  processors_mem_tracker_ = MemTracker::CreateTracker(&quot;CQL processors&quot;, server-&gt;mem_tracker());</a>
+<a name="ln136"> </a>
+<a name="ln137">  auth_prepared_stmt_ = std::make_shared&lt;ql::Statement&gt;(</a>
+<a name="ln138">      &quot;&quot;,</a>
+<a name="ln139">      Substitute(&quot;SELECT $0, $1 FROM system_auth.roles WHERE role = ?&quot;,</a>
+<a name="ln140">                 kRoleColumnNameSaltedHash, kRoleColumnNameCanLogin));</a>
+<a name="ln141"> </a>
+<a name="ln142">  if (FLAGS_cql_update_system_query_cache_msecs &gt; 0) {</a>
+<a name="ln143">    system_cache_ = std::make_shared&lt;SystemQueryCache&gt;(this);</a>
+<a name="ln144">  } else {</a>
+<a name="ln145">    VLOG(1) &lt;&lt; &quot;System query cache disabled.&quot;;</a>
+<a name="ln146">  }</a>
+<a name="ln147">}</a>
+<a name="ln148"> </a>
+<a name="ln149">CQLServiceImpl::~CQLServiceImpl() {</a>
+<a name="ln150">}</a>
+<a name="ln151"> </a>
+<a name="ln152">client::YBClient* CQLServiceImpl::client() const {</a>
+<a name="ln153">  auto client = server_-&gt;tserver()-&gt;client();</a>
+<a name="ln154">  if (client &amp;&amp; !is_metadata_initialized_.load(std::memory_order_acquire)) {</a>
+<a name="ln155">    std::lock_guard&lt;std::mutex&gt; l(metadata_init_mutex_);</a>
+<a name="ln156">    if (!is_metadata_initialized_.load(std::memory_order_acquire)) {</a>
+<a name="ln157">      // Create and save the metadata cache object.</a>
+<a name="ln158">      metadata_cache_ = std::make_shared&lt;YBMetaDataCache&gt;(client,</a>
+<a name="ln159">                                                          FLAGS_use_cassandra_authentication);</a>
+<a name="ln160">      is_metadata_initialized_.store(true, std::memory_order_release);</a>
+<a name="ln161">    }</a>
+<a name="ln162">  }</a>
+<a name="ln163">  return client;</a>
+<a name="ln164">}</a>
+<a name="ln165"> </a>
+<a name="ln166">const std::shared_ptr&lt;client::YBMetaDataCache&gt;&amp; CQLServiceImpl::metadata_cache() const {</a>
+<a name="ln167">  // Call client to wait for client and initialize metadata_cache if not already done.</a>
+<a name="ln168">  (void)client();</a>
+<a name="ln169">  return metadata_cache_;</a>
+<a name="ln170">}</a>
+<a name="ln171"> </a>
+<a name="ln172">void CQLServiceImpl::CompleteInit() {</a>
+<a name="ln173">  prepared_stmts_mem_tracker_-&gt;AddGarbageCollector(shared_from_this());</a>
+<a name="ln174">}</a>
+<a name="ln175"> </a>
+<a name="ln176">void CQLServiceImpl::Shutdown() {</a>
+<a name="ln177">  decltype(processors_) processors;</a>
+<a name="ln178">  {</a>
+<a name="ln179">    std::lock_guard&lt;std::mutex&gt; guard(processors_mutex_);</a>
+<a name="ln180">    processors.swap(processors_);</a>
+<a name="ln181">  }</a>
+<a name="ln182">  for (const auto&amp; processor : processors) {</a>
+<a name="ln183">    processor-&gt;Shutdown();</a>
+<a name="ln184">  }</a>
+<a name="ln185"> </a>
+<a name="ln186">  auto client = this-&gt;client();</a>
+<a name="ln187">  if (client) {</a>
+<a name="ln188">    client-&gt;messenger()-&gt;Shutdown();</a>
+<a name="ln189">  }</a>
+<a name="ln190">}</a>
+<a name="ln191"> </a>
+<a name="ln192">void CQLServiceImpl::Handle(yb::rpc::InboundCallPtr inbound_call) {</a>
+<a name="ln193">  TRACE(&quot;Handling the CQL call&quot;);</a>
+<a name="ln194">  // Collect the call.</a>
+<a name="ln195">  CQLInboundCall* cql_call = down_cast&lt;CQLInboundCall*&gt;(CHECK_NOTNULL(inbound_call.get()));</a>
+<a name="ln196">  DVLOG(4) &lt;&lt; &quot;Handling &quot; &lt;&lt; cql_call-&gt;ToString();</a>
+<a name="ln197"> </a>
+<a name="ln198">  // Process the call.</a>
+<a name="ln199">  MonoTime start = MonoTime::Now();</a>
+<a name="ln200"> </a>
+<a name="ln201">  Result&lt;CQLProcessor*&gt; processor = GetProcessor();</a>
+<a name="ln202">  if (!processor.ok()) {</a>
+<a name="ln203">    inbound_call-&gt;RespondFailure(rpc::ErrorStatusPB::ERROR_SERVER_TOO_BUSY, processor.status());</a>
+<a name="ln204">    return;</a>
+<a name="ln205">  }</a>
+<a name="ln206">  MonoTime got_processor = MonoTime::Now();</a>
+<a name="ln207">  cql_metrics_-&gt;time_to_get_cql_processor_-&gt;Increment(</a>
+<a name="ln208">      got_processor.GetDeltaSince(start).ToMicroseconds());</a>
+<a name="ln209">  (**processor).ProcessCall(std::move(inbound_call));</a>
+<a name="ln210">}</a>
+<a name="ln211"> </a>
+<a name="ln212">Result&lt;CQLProcessor*&gt; CQLServiceImpl::GetProcessor() {</a>
+<a name="ln213">  CQLProcessorListPos pos;</a>
+<a name="ln214">  {</a>
+<a name="ln215">    // Retrieve the next available processor. If none is available, allocate a new slot in the list.</a>
+<a name="ln216">    // Then create the processor outside the mutex below.</a>
+<a name="ln217">    std::lock_guard&lt;std::mutex&gt; guard(processors_mutex_);</a>
+<a name="ln218">    if (next_available_processor_ != processors_.end()) {</a>
+<a name="ln219">      return (next_available_processor_++)-&gt;get();</a>
+<a name="ln220">    }</a>
+<a name="ln221"> </a>
+<a name="ln222">    auto limit = CQLProcessorsLimit();</a>
+<a name="ln223">    if (num_allocated_processors_ &gt;= limit) {</a>
+<a name="ln224">      return STATUS_FORMAT(ServiceUnavailable,</a>
+<a name="ln225">                           &quot;Unable to allocate CQL processor, already allocated $0 of $1&quot;,</a>
+<a name="ln226">                           num_allocated_processors_, limit);</a>
+<a name="ln227">    }</a>
+<a name="ln228">    ++num_allocated_processors_;</a>
+<a name="ln229">    pos = processors_.emplace(processors_.end());</a>
+<a name="ln230">  }</a>
+<a name="ln231"> </a>
+<a name="ln232">  *pos = std::make_unique&lt;CQLProcessor&gt;(this, pos);</a>
+<a name="ln233">  return pos-&gt;get();</a>
+<a name="ln234">}</a>
+<a name="ln235"> </a>
+<a name="ln236">void CQLServiceImpl::ReturnProcessor(const CQLProcessorListPos&amp; pos) {</a>
+<a name="ln237">  // Put the processor back before the next available one.</a>
+<a name="ln238">  std::lock_guard&lt;std::mutex&gt; guard(processors_mutex_);</a>
+<a name="ln239">  processors_.splice(next_available_processor_, processors_, pos);</a>
+<a name="ln240">  next_available_processor_ = pos;</a>
+<a name="ln241">}</a>
+<a name="ln242"> </a>
+<a name="ln243">shared_ptr&lt;CQLStatement&gt; CQLServiceImpl::AllocatePreparedStatement(</a>
+<a name="ln244">    const CQLMessage::QueryId&amp; query_id, const string&amp; keyspace, const string&amp; query) {</a>
+<a name="ln245">  // Get exclusive lock before allocating a prepared statement and updating the LRU list.</a>
+<a name="ln246">  std::lock_guard&lt;std::mutex&gt; guard(prepared_stmts_mutex_);</a>
+<a name="ln247"> </a>
+<a name="ln248">  shared_ptr&lt;CQLStatement&gt; stmt;</a>
+<a name="ln249">  const auto itr = prepared_stmts_map_.find(query_id);</a>
+<a name="ln250">  if (itr == prepared_stmts_map_.end()) {</a>
+<a name="ln251">    // Allocate the prepared statement placeholder that multiple clients trying to prepare the same</a>
+<a name="ln252">    // statement to contend on. The statement will then be prepared by one client while the rest</a>
+<a name="ln253">    // wait for the results.</a>
+<a name="ln254">    stmt = prepared_stmts_map_.emplace(</a>
+<a name="ln255">        query_id, std::make_shared&lt;CQLStatement&gt;(</a>
+<a name="ln256">            keyspace, query, prepared_stmts_list_.end())).first-&gt;second;</a>
+<a name="ln257">    InsertLruPreparedStatementUnlocked(stmt);</a>
+<a name="ln258">  } else {</a>
+<a name="ln259">    // Return existing statement if found.</a>
+<a name="ln260">    stmt = itr-&gt;second;</a>
+<a name="ln261">    MoveLruPreparedStatementUnlocked(stmt);</a>
+<a name="ln262">  }</a>
+<a name="ln263"> </a>
+<a name="ln264">  VLOG(1) &lt;&lt; &quot;InsertPreparedStatement: CQL prepared statement cache count = &quot;</a>
+<a name="ln265">          &lt;&lt; prepared_stmts_map_.size() &lt;&lt; &quot;/&quot; &lt;&lt; prepared_stmts_list_.size()</a>
+<a name="ln266">          &lt;&lt; &quot;, memory usage = &quot; &lt;&lt; prepared_stmts_mem_tracker_-&gt;consumption();</a>
+<a name="ln267"> </a>
+<a name="ln268">  return stmt;</a>
+<a name="ln269">}</a>
+<a name="ln270"> </a>
+<a name="ln271">shared_ptr&lt;const CQLStatement&gt; CQLServiceImpl::GetPreparedStatement(</a>
+<a name="ln272">    const CQLMessage::QueryId&amp; query_id) {</a>
+<a name="ln273">  // Get exclusive lock before looking up a prepared statement and updating the LRU list.</a>
+<a name="ln274">  std::lock_guard&lt;std::mutex&gt; guard(prepared_stmts_mutex_);</a>
+<a name="ln275"> </a>
+<a name="ln276">  const auto itr = prepared_stmts_map_.find(query_id);</a>
+<a name="ln277">  if (itr == prepared_stmts_map_.end()) {</a>
+<a name="ln278">    return nullptr;</a>
+<a name="ln279">  }</a>
+<a name="ln280"> </a>
+<a name="ln281">  shared_ptr&lt;CQLStatement&gt; stmt = itr-&gt;second;</a>
+<a name="ln282"> </a>
+<a name="ln283">  // If the statement has not finished preparing, do not return it.</a>
+<a name="ln284">  if (stmt-&gt;unprepared()) {</a>
+<a name="ln285">    return nullptr;</a>
+<a name="ln286">  }</a>
+<a name="ln287">  // If the statement is stale, delete it.</a>
+<a name="ln288">  if (stmt-&gt;stale()) {</a>
+<a name="ln289">    DeletePreparedStatementUnlocked(stmt);</a>
+<a name="ln290">    return nullptr;</a>
+<a name="ln291">  }</a>
+<a name="ln292"> </a>
+<a name="ln293">  MoveLruPreparedStatementUnlocked(stmt);</a>
+<a name="ln294">  return stmt;</a>
+<a name="ln295">}</a>
+<a name="ln296"> </a>
+<a name="ln297">void CQLServiceImpl::DeletePreparedStatement(const shared_ptr&lt;const CQLStatement&gt;&amp; stmt) {</a>
+<a name="ln298">  // Get exclusive lock before deleting the prepared statement.</a>
+<a name="ln299">  std::lock_guard&lt;std::mutex&gt; guard(prepared_stmts_mutex_);</a>
+<a name="ln300"> </a>
+<a name="ln301">  DeletePreparedStatementUnlocked(stmt);</a>
+<a name="ln302"> </a>
+<a name="ln303">  VLOG(1) &lt;&lt; &quot;DeletePreparedStatement: CQL prepared statement cache count = &quot;</a>
+<a name="ln304">          &lt;&lt; prepared_stmts_map_.size() &lt;&lt; &quot;/&quot; &lt;&lt; prepared_stmts_list_.size()</a>
+<a name="ln305">          &lt;&lt; &quot;, memory usage = &quot; &lt;&lt; prepared_stmts_mem_tracker_-&gt;consumption();</a>
+<a name="ln306">}</a>
+<a name="ln307"> </a>
+<a name="ln308">bool CQLServiceImpl::CheckPassword(</a>
+<a name="ln309">    const std::string plain,</a>
+<a name="ln310">    const std::string expected_bcrypt_hash) {</a>
+<a name="ln311">  if (FLAGS_password_hash_cache_size &lt;= 0) {</a>
+<a name="ln312">    return util::bcrypt_checkpw(plain.c_str(), expected_bcrypt_hash.c_str()) == 0;</a>
+<a name="ln313">  }</a>
+<a name="ln314"> </a>
+<a name="ln315">  std::string sha_hash(SHA256_DIGEST_LENGTH, '\0');</a>
+<a name="ln316">  {</a>
+<a name="ln317">    SHA256_CTX ctx;</a>
+<a name="ln318">    SHA256_Init(&amp;ctx);</a>
+<a name="ln319">    SHA256_Update(&amp;ctx, plain.c_str(), plain.length());</a>
+<a name="ln320">    SHA256_Final((unsigned char*) &amp;sha_hash[0], &amp;ctx);</a>
+<a name="ln321">  }</a>
+<a name="ln322">  // bcrypt can generate multiple hashes from a single key, since a salt is</a>
+<a name="ln323">  // randomly generated each time a password is set. Using a compound key allows</a>
+<a name="ln324">  // the same plaintext to be associated with different hashes.</a>
+<a name="ln325">  std::string key = sha_hash + &quot;:&quot; + expected_bcrypt_hash;</a>
+<a name="ln326"> </a>
+<a name="ln327">  {</a>
+<a name="ln328">    std::lock_guard&lt;std::mutex&gt; guard(password_cache_mutex_);</a>
+<a name="ln329">    auto entry = password_cache_.get(key);</a>
+<a name="ln330">    if (entry) {</a>
+<a name="ln331">      return true;</a>
+<a name="ln332">    }</a>
+<a name="ln333">  }</a>
+<a name="ln334"> </a>
+<a name="ln335">  // bcrypt_checkpw has stringcmp semantics.</a>
+<a name="ln336">  bool correct = util::bcrypt_checkpw(plain.c_str(), expected_bcrypt_hash.c_str()) == 0;</a>
+<a name="ln337">  if (correct) {</a>
+<a name="ln338">    std::lock_guard&lt;std::mutex&gt; guard(password_cache_mutex_);</a>
+<a name="ln339">    // Boost's LRU cache interprets insertion of a duplicate key as a no-op, so</a>
+<a name="ln340">    // even if two threads successfully log in to the same account, there should</a>
+<a name="ln341">    // not be a race condition here.</a>
+<a name="ln342">    password_cache_.insert(key, true);</a>
+<a name="ln343">  }</a>
+<a name="ln344">  return correct;</a>
+<a name="ln345">}</a>
+<a name="ln346"> </a>
+<a name="ln347">void CQLServiceImpl::InsertLruPreparedStatementUnlocked(const shared_ptr&lt;CQLStatement&gt;&amp; stmt) {</a>
+<a name="ln348">  // Insert the statement at the front of the LRU list.</a>
+<a name="ln349">  stmt-&gt;set_pos(prepared_stmts_list_.insert(prepared_stmts_list_.begin(), stmt));</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352">void CQLServiceImpl::MoveLruPreparedStatementUnlocked(const shared_ptr&lt;CQLStatement&gt;&amp; stmt) {</a>
+<a name="ln353">  // Move the statement to the front of the LRU list.</a>
+<a name="ln354">  prepared_stmts_list_.splice(prepared_stmts_list_.begin(), prepared_stmts_list_, stmt-&gt;pos());</a>
+<a name="ln355">}</a>
+<a name="ln356"> </a>
+<a name="ln357">void CQLServiceImpl::DeletePreparedStatementUnlocked(</a>
+<a name="ln358">    const std::shared_ptr&lt;const CQLStatement&gt; stmt) {</a>
+<a name="ln359">  // Remove statement from cache by looking it up by query ID and only when it is same statement</a>
+<a name="ln360">  // object. Note that the &quot;stmt&quot; parameter above is not a ref (&quot;&amp;&quot;) intentionally so that we have</a>
+<a name="ln361">  // a separate copy of the shared_ptr and not the very shared_ptr in prepared_stmts_map_ or</a>
+<a name="ln362">  // prepared_stmt_list_ we are deleting.</a>
+<a name="ln363">  const auto itr = prepared_stmts_map_.find(stmt-&gt;query_id());</a>
+<a name="ln364">  if (itr != prepared_stmts_map_.end() &amp;&amp; itr-&gt;second == stmt) {</a>
+<a name="ln365">    prepared_stmts_map_.erase(itr);</a>
+<a name="ln366">  }</a>
+<a name="ln367">  // Remove statement from LRU list only when it is in the list, i.e. pos() != end().</a>
+<a name="ln368">  if (stmt-&gt;pos() != prepared_stmts_list_.end()) {</a>
+<a name="ln369">    prepared_stmts_list_.erase(stmt-&gt;pos());</a>
+<a name="ln370">    stmt-&gt;set_pos(prepared_stmts_list_.end());</a>
+<a name="ln371">  }</a>
+<a name="ln372">}</a>
+<a name="ln373"> </a>
+<a name="ln374">void CQLServiceImpl::CollectGarbage(size_t required) {</a>
+<a name="ln375">  // Get exclusive lock before deleting the least recently used statement at the end of the LRU</a>
+<a name="ln376">  // list from the cache.</a>
+<a name="ln377">  std::lock_guard&lt;std::mutex&gt; guard(prepared_stmts_mutex_);</a>
+<a name="ln378"> </a>
+<a name="ln379">  if (!prepared_stmts_list_.empty()) {</a>
+<a name="ln380">    DeletePreparedStatementUnlocked(prepared_stmts_list_.back());</a>
+<a name="ln381">  }</a>
+<a name="ln382"> </a>
+<a name="ln383">  VLOG(1) &lt;&lt; &quot;DeleteLruPreparedStatement: CQL prepared statement cache count = &quot;</a>
+<a name="ln384">          &lt;&lt; prepared_stmts_map_.size() &lt;&lt; &quot;/&quot; &lt;&lt; prepared_stmts_list_.size()</a>
+<a name="ln385">          &lt;&lt; &quot;, memory usage = &quot; &lt;&lt; prepared_stmts_mem_tracker_-&gt;consumption();</a>
+<a name="ln386">}</a>
+<a name="ln387"> </a>
+<a name="ln388">client::TransactionPool* CQLServiceImpl::TransactionPool() {</a>
+<a name="ln389">  return server_-&gt;tserver()-&gt;TransactionPool();</a>
+<a name="ln390">}</a>
+<a name="ln391"> </a>
+<a name="ln392">server::Clock* CQLServiceImpl::clock() {</a>
+<a name="ln393">  return server_-&gt;clock();</a>
+<a name="ln394">}</a>
+<a name="ln395"> </a>
+<a name="ln396">}  // namespace cqlserver</a>
+<a name="ln397">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="145"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="196"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="264"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="303"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="383"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

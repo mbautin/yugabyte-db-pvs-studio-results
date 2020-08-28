@@ -1,0 +1,217 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>binary_call_parser.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/rpc/binary_call_parser.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/gutil/endian.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/rpc/connection.h&quot;</a>
+<a name="ln19">#include &quot;yb/rpc/stream.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln22">#include &quot;yb/util/size_literals.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">using yb::operator&quot;&quot; _MB;</a>
+<a name="ln25"> </a>
+<a name="ln26">DEFINE_bool(</a>
+<a name="ln27">    binary_call_parser_reject_on_mem_tracker_hard_limit, true,</a>
+<a name="ln28">    &quot;Whether to reject/ignore calls on hitting mem tracker hard limit.&quot;);</a>
+<a name="ln29"> </a>
+<a name="ln30">DEFINE_int32(</a>
+<a name="ln31">    rpc_throttle_threshold_bytes, 1048576,</a>
+<a name="ln32">    &quot;Throttle inbound RPC calls larger than specified size on hitting mem tracker soft limit. &quot;</a>
+<a name="ln33">    &quot;Throttling is disabled if negative value is specified.&quot;);</a>
+<a name="ln34"> </a>
+<a name="ln35">DECLARE_int32(memory_limit_warn_threshold_percentage);</a>
+<a name="ln36"> </a>
+<a name="ln37">namespace yb {</a>
+<a name="ln38">namespace rpc {</a>
+<a name="ln39"> </a>
+<a name="ln40">bool ShouldThrottleRpc(</a>
+<a name="ln41">    const MemTrackerPtr&amp; throttle_tracker, size_t call_data_size, const char* throttle_message) {</a>
+<a name="ln42">  return (FLAGS_rpc_throttle_threshold_bytes &gt;= 0 &amp;&amp;</a>
+<a name="ln43">      call_data_size &gt; FLAGS_rpc_throttle_threshold_bytes &amp;&amp;</a>
+<a name="ln44">      !CheckMemoryPressureWithLogging(throttle_tracker, 0 /* score */, throttle_message));</a>
+<a name="ln45">}</a>
+<a name="ln46"> </a>
+<a name="ln47">BinaryCallParser::BinaryCallParser(</a>
+<a name="ln48">    const MemTrackerPtr&amp; parent_tracker, size_t header_size, size_t size_offset,</a>
+<a name="ln49">    size_t max_message_length, IncludeHeader include_header, SkipEmptyMessages skip_empty_messages,</a>
+<a name="ln50">    BinaryCallParserListener* listener)</a>
+<a name="ln51">    : call_header_buffer_(header_size),</a>
+<a name="ln52">      size_offset_(size_offset),</a>
+<a name="ln53">      max_message_length_(max_message_length),</a>
+<a name="ln54">      include_header_(include_header),</a>
+<a name="ln55">      skip_empty_messages_(skip_empty_messages),</a>
+<a name="ln56">      listener_(listener) {</a>
+<a name="ln57">  buffer_tracker_ = MemTracker::FindOrCreateTracker(&quot;Reading&quot;, parent_tracker);</a>
+<a name="ln58">}</a>
+<a name="ln59"> </a>
+<a name="ln60">Result&lt;ProcessDataResult&gt; BinaryCallParser::Parse(</a>
+<a name="ln61">    const rpc::ConnectionPtr&amp; connection, const IoVecs&amp; data, ReadBufferFull read_buffer_full,</a>
+<a name="ln62">    const MemTrackerPtr* tracker_for_throttle) {</a>
+<a name="ln63">  if (call_data_.should_reject()) {</a>
+<a name="ln64">    // We can't properly respond with error, because we don't have enough call data since we</a>
+<a name="ln65">    // have ignored it. So, we will just ignore this call and client will have timeout.</a>
+<a name="ln66">    // We can implement partial higher level call header parsing to be able to respond with proper</a>
+<a name="ln67">    // error if we will need to detect case when server is hitting memory limit at client side.</a>
+<a name="ln68">    call_data_.Reset();</a>
+<a name="ln69">    call_data_consumption_ = ScopedTrackedConsumption();</a>
+<a name="ln70">  } else if (!call_data_.empty()) {</a>
+<a name="ln71">    RETURN_NOT_OK(listener_-&gt;HandleCall(connection, &amp;call_data_));</a>
+<a name="ln72">    call_data_.Reset();</a>
+<a name="ln73">    call_data_consumption_ = ScopedTrackedConsumption();</a>
+<a name="ln74">  }</a>
+<a name="ln75"> </a>
+<a name="ln76">  const auto full_input_size = IoVecsFullSize(data);</a>
+<a name="ln77">  VLOG(4) &lt;&lt; &quot;BinaryCallParser::Parse, full_input_size: &quot; &lt;&lt; full_input_size;</a>
+<a name="ln78">  size_t consumed = 0;</a>
+<a name="ln79">  const size_t header_size = call_header_buffer_.size();</a>
+<a name="ln80">  const size_t body_offset = include_header_ ? 0 : header_size;</a>
+<a name="ln81">  VLOG(4) &lt;&lt; &quot;BinaryCallParser::Parse, header_size: &quot; &lt;&lt; header_size</a>
+<a name="ln82">          &lt;&lt; &quot; body_offset: &quot; &lt;&lt; body_offset;</a>
+<a name="ln83">  while (full_input_size &gt;= consumed + header_size) {</a>
+<a name="ln84">    IoVecsToBuffer(data, consumed, consumed + header_size, &amp;call_header_buffer_);</a>
+<a name="ln85"> </a>
+<a name="ln86">    const size_t data_length = NetworkByteOrder::Load32(call_header_buffer_.data() + size_offset_);</a>
+<a name="ln87">    const size_t total_length = data_length + header_size;</a>
+<a name="ln88">    VLOG(4) &lt;&lt; &quot;BinaryCallParser::Parse, consumed: &quot; &lt;&lt; consumed &lt;&lt; &quot; data_length: &quot; &lt;&lt; data_length</a>
+<a name="ln89">            &lt;&lt; &quot; total_length: &quot; &lt;&lt; total_length;</a>
+<a name="ln90">    if (total_length &gt; max_message_length_) {</a>
+<a name="ln91">      return STATUS_FORMAT(</a>
+<a name="ln92">          NetworkError,</a>
+<a name="ln93">          &quot;The frame had a length of $0, but we only support messages up to $1 bytes long.&quot;,</a>
+<a name="ln94">          total_length, max_message_length_);</a>
+<a name="ln95">    }</a>
+<a name="ln96">    const size_t call_data_size = total_length - body_offset;</a>
+<a name="ln97">    VLOG(4) &lt;&lt; &quot;BinaryCallParser::Parse, call_data_size: &quot; &lt;&lt; call_data_size;</a>
+<a name="ln98">    if (consumed + total_length &gt; full_input_size) {</a>
+<a name="ln99">      // `data` only contains beginning of the current call. Here we allocate memory buffer for the</a>
+<a name="ln100">      // whole call data and fill beginning with `data`, the rest of the data for the call will be</a>
+<a name="ln101">      // received and appended by the caller into the same buffer.</a>
+<a name="ln102">      const size_t call_received_size = full_input_size - (consumed + body_offset);</a>
+<a name="ln103">      VLOG(4) &lt;&lt; &quot;BinaryCallParser::Parse, call_received_size: &quot; &lt;&lt; call_received_size;</a>
+<a name="ln104"> </a>
+<a name="ln105">      if (tracker_for_throttle) {</a>
+<a name="ln106">        VLOG(4) &lt;&lt; &quot;BinaryCallParser::Parse, tracker_for_throttle memory usage: &quot;</a>
+<a name="ln107">                &lt;&lt; (*tracker_for_throttle)-&gt;LogUsage(&quot;&quot;);</a>
+<a name="ln108">        if (ShouldThrottleRpc(*tracker_for_throttle, call_data_size, &quot;Ignoring RPC call: &quot;)) {</a>
+<a name="ln109">          call_data_ = CallData(call_data_size, ShouldReject::kTrue);</a>
+<a name="ln110">          return ProcessDataResult{ full_input_size, Slice(), call_data_size - call_received_size };</a>
+<a name="ln111">        }</a>
+<a name="ln112">      }</a>
+<a name="ln113"> </a>
+<a name="ln114">      MemTracker* blocking_mem_tracker = nullptr;</a>
+<a name="ln115">      if (buffer_tracker_-&gt;TryConsume(call_data_size, &amp;blocking_mem_tracker)) {</a>
+<a name="ln116">        call_data_consumption_ = ScopedTrackedConsumption(</a>
+<a name="ln117">            buffer_tracker_, call_data_size, AlreadyConsumed::kTrue);</a>
+<a name="ln118">        call_data_ = CallData(call_data_size);</a>
+<a name="ln119">        IoVecsToBuffer(data, consumed + body_offset, full_input_size, call_data_.data());</a>
+<a name="ln120">        Slice buffer(call_data_.data() + call_received_size, call_data_size - call_received_size);</a>
+<a name="ln121">        VLOG(4) &lt;&lt; &quot;BinaryCallParser::Parse, consumed: &quot; &lt;&lt; consumed</a>
+<a name="ln122">                &lt;&lt; &quot; returning: { full_input_size: &quot; &lt;&lt; full_input_size</a>
+<a name="ln123">                &lt;&lt; &quot; buffer.size(): &quot; &lt;&lt; buffer.size() &lt;&lt; &quot; }&quot;;</a>
+<a name="ln124">        return ProcessDataResult{full_input_size, buffer};</a>
+<a name="ln125">      } else if (read_buffer_full &amp;&amp; consumed == 0) {</a>
+<a name="ln126">        auto consumption = blocking_mem_tracker ? blocking_mem_tracker-&gt;consumption() : -1;</a>
+<a name="ln127">        auto limit = blocking_mem_tracker ? blocking_mem_tracker-&gt;limit() : -1;</a>
+<a name="ln128">        if (FLAGS_binary_call_parser_reject_on_mem_tracker_hard_limit) {</a>
+<a name="ln129">          YB_LOG_EVERY_N_SECS(WARNING, 3)</a>
+<a name="ln130">              &lt;&lt; &quot;Unable to allocate read buffer because of limit, required: &quot; &lt;&lt; call_data_size</a>
+<a name="ln131">              &lt;&lt; &quot;, blocked by: &quot; &lt;&lt; AsString(blocking_mem_tracker)</a>
+<a name="ln132">              &lt;&lt; &quot;, consumption: &quot; &lt;&lt; consumption &lt;&lt; &quot; of &quot; &lt;&lt; limit &lt;&lt; &quot;. Call will be ignored.\n&quot;</a>
+<a name="ln133">              &lt;&lt; DumpMemoryUsage();</a>
+<a name="ln134">          call_data_ = CallData(call_data_size, ShouldReject::kTrue);</a>
+<a name="ln135">          return ProcessDataResult{full_input_size, Slice(), call_data_size - call_received_size};</a>
+<a name="ln136">        } else {</a>
+<a name="ln137">          // For backward compatibility in behavior until we fix</a>
+<a name="ln138">          // https://github.com/yugabyte/yugabyte-db/issues/2563.</a>
+<a name="ln139">          LOG(WARNING) &lt;&lt; &quot;Unable to allocate read buffer because of limit, required: &quot;</a>
+<a name="ln140">                       &lt;&lt; call_data_size &lt;&lt; &quot;, blocked by: &quot; &lt;&lt; AsString(blocking_mem_tracker)</a>
+<a name="ln141">                       &lt;&lt; &quot;, consumption: &quot; &lt;&lt; consumption &lt;&lt; &quot; of &quot; &lt;&lt; limit &lt;&lt; &quot;\n&quot;</a>
+<a name="ln142">                       &lt;&lt; DumpMemoryUsage();</a>
+<a name="ln143">        }</a>
+<a name="ln144">      }</a>
+<a name="ln145">      break;</a>
+<a name="ln146">    }</a>
+<a name="ln147"> </a>
+<a name="ln148">    // We might need to skip empty messages (we use them as low level heartbeats for inter-YB RPC</a>
+<a name="ln149">    // connections, don't confuse with RAFT heartbeats which are higher level non-empty messages).</a>
+<a name="ln150">    if (!skip_empty_messages_ || data_length &gt; 0) {</a>
+<a name="ln151">      connection-&gt;UpdateLastActivity();</a>
+<a name="ln152">      CallData call_data(call_data_size);</a>
+<a name="ln153">      IoVecsToBuffer(data, consumed + body_offset, consumed + total_length, call_data.data());</a>
+<a name="ln154">      RETURN_NOT_OK(listener_-&gt;HandleCall(connection, &amp;call_data));</a>
+<a name="ln155">    }</a>
+<a name="ln156"> </a>
+<a name="ln157">    consumed += total_length;</a>
+<a name="ln158">  }</a>
+<a name="ln159">  VLOG(4) &lt;&lt; &quot;BinaryCallParser::Parse, returning: { consumed: &quot; &lt;&lt; consumed &lt;&lt; &quot; buffer: empty }&quot;;</a>
+<a name="ln160">  return ProcessDataResult{ consumed, Slice() };</a>
+<a name="ln161">}</a>
+<a name="ln162"> </a>
+<a name="ln163">} // namespace rpc</a>
+<a name="ln164">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="77"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="81"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="88"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="97"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="103"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="106"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="121"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="159"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

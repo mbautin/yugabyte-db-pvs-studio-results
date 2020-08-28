@@ -1,0 +1,479 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>running_transaction.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/tablet/running_transaction.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/client/transaction_rpc.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/common/pgsql_error.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln21">#include &quot;yb/util/yb_pg_errcodes.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">using namespace std::placeholders;</a>
+<a name="ln24">using namespace std::literals;</a>
+<a name="ln25"> </a>
+<a name="ln26">DEFINE_test_flag(uint64, transaction_delay_status_reply_usec_in_tests, 0,</a>
+<a name="ln27">                 &quot;For tests only. Delay handling status reply by specified amount of usec.&quot;);</a>
+<a name="ln28"> </a>
+<a name="ln29">namespace yb {</a>
+<a name="ln30">namespace tablet {</a>
+<a name="ln31"> </a>
+<a name="ln32">RunningTransaction::RunningTransaction(TransactionMetadata metadata,</a>
+<a name="ln33">                                       const TransactionalBatchData&amp; last_batch_data,</a>
+<a name="ln34">                                       OneWayBitmap&amp;&amp; replicated_batches,</a>
+<a name="ln35">                                       RunningTransactionContext* context)</a>
+<a name="ln36">    : metadata_(std::move(metadata)),</a>
+<a name="ln37">      last_batch_data_(last_batch_data),</a>
+<a name="ln38">      replicated_batches_(std::move(replicated_batches)),</a>
+<a name="ln39">      context_(*context),</a>
+<a name="ln40">      remove_intents_task_(&amp;context-&gt;applier_, &amp;context-&gt;participant_context_, context,</a>
+<a name="ln41">                           metadata_.transaction_id),</a>
+<a name="ln42">      get_status_handle_(context-&gt;rpcs_.InvalidHandle()),</a>
+<a name="ln43">      abort_handle_(context-&gt;rpcs_.InvalidHandle()),</a>
+<a name="ln44">      apply_intents_task_(&amp;context-&gt;applier_, context, &amp;apply_data_) {</a>
+<a name="ln45">}</a>
+<a name="ln46"> </a>
+<a name="ln47">RunningTransaction::~RunningTransaction() {</a>
+<a name="ln48">  context_.rpcs_.Abort({&amp;get_status_handle_, &amp;abort_handle_});</a>
+<a name="ln49">}</a>
+<a name="ln50"> </a>
+<a name="ln51">void RunningTransaction::AddReplicatedBatch(</a>
+<a name="ln52">  size_t batch_idx, boost::container::small_vector_base&lt;uint8_t&gt;* encoded_replicated_batches) {</a>
+<a name="ln53">  VLOG_WITH_PREFIX(4) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; batch_idx &lt;&lt; &quot;)&quot;;</a>
+<a name="ln54">  replicated_batches_.Set(batch_idx);</a>
+<a name="ln55">  encoded_replicated_batches-&gt;push_back(docdb::ValueTypeAsChar::kBitSet);</a>
+<a name="ln56">  replicated_batches_.EncodeTo(encoded_replicated_batches);</a>
+<a name="ln57">}</a>
+<a name="ln58"> </a>
+<a name="ln59">void RunningTransaction::BatchReplicated(const TransactionalBatchData&amp; value) {</a>
+<a name="ln60">  VLOG_WITH_PREFIX(4) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; value.ToString() &lt;&lt; &quot;)&quot;;</a>
+<a name="ln61">  last_batch_data_ = value;</a>
+<a name="ln62">}</a>
+<a name="ln63"> </a>
+<a name="ln64">void RunningTransaction::SetLocalCommitTime(HybridTime time) {</a>
+<a name="ln65">  local_commit_time_ = time;</a>
+<a name="ln66">}</a>
+<a name="ln67"> </a>
+<a name="ln68">void RunningTransaction::Aborted() {</a>
+<a name="ln69">  last_known_status_ = TransactionStatus::ABORTED;</a>
+<a name="ln70">  last_known_status_hybrid_time_ = HybridTime::kMax;</a>
+<a name="ln71">}</a>
+<a name="ln72"> </a>
+<a name="ln73">void RunningTransaction::RequestStatusAt(const StatusRequest&amp; request,</a>
+<a name="ln74">                                         std::unique_lock&lt;std::mutex&gt;* lock) {</a>
+<a name="ln75">  DCHECK_LE(request.global_limit_ht, HybridTime::kMax);</a>
+<a name="ln76">  DCHECK_LE(request.read_ht, request.global_limit_ht);</a>
+<a name="ln77"> </a>
+<a name="ln78">  if (last_known_status_hybrid_time_ &gt; HybridTime::kMin) {</a>
+<a name="ln79">    auto transaction_status =</a>
+<a name="ln80">        GetStatusAt(request.global_limit_ht, last_known_status_hybrid_time_, last_known_status_);</a>
+<a name="ln81">    // If we don't have status at global_limit_ht, then we should request updated status.</a>
+<a name="ln82">    if (transaction_status) {</a>
+<a name="ln83">      HybridTime last_known_status_hybrid_time = last_known_status_hybrid_time_;</a>
+<a name="ln84">      lock-&gt;unlock();</a>
+<a name="ln85">      request.callback(</a>
+<a name="ln86">          TransactionStatusResult{*transaction_status, last_known_status_hybrid_time});</a>
+<a name="ln87">      return;</a>
+<a name="ln88">    }</a>
+<a name="ln89">  }</a>
+<a name="ln90">  bool was_empty = status_waiters_.empty();</a>
+<a name="ln91">  status_waiters_.push_back(request);</a>
+<a name="ln92">  if (!was_empty) {</a>
+<a name="ln93">    return;</a>
+<a name="ln94">  }</a>
+<a name="ln95">  auto request_id = context_.NextRequestIdUnlocked();</a>
+<a name="ln96">  auto shared_self = shared_from_this();</a>
+<a name="ln97"> </a>
+<a name="ln98">  VLOG_WITH_PREFIX(4) &lt;&lt; Format(</a>
+<a name="ln99">      &quot;Existing status knowledge ($0, $1) does not satisfy requested: $2, sending: $3&quot;,</a>
+<a name="ln100">      TransactionStatus_Name(last_known_status_), last_known_status_hybrid_time_, request,</a>
+<a name="ln101">      request_id);</a>
+<a name="ln102"> </a>
+<a name="ln103">  lock-&gt;unlock();</a>
+<a name="ln104">  SendStatusRequest(request_id, shared_self);</a>
+<a name="ln105">}</a>
+<a name="ln106"> </a>
+<a name="ln107">bool RunningTransaction::WasAborted() const {</a>
+<a name="ln108">  return last_known_status_ == TransactionStatus::ABORTED;</a>
+<a name="ln109">}</a>
+<a name="ln110"> </a>
+<a name="ln111">CHECKED_STATUS RunningTransaction::CheckAborted() const {</a>
+<a name="ln112">  if (WasAborted()) {</a>
+<a name="ln113">    return MakeAbortedStatus(id());</a>
+<a name="ln114">  }</a>
+<a name="ln115">  return Status::OK();</a>
+<a name="ln116">}</a>
+<a name="ln117"> </a>
+<a name="ln118">void RunningTransaction::Abort(client::YBClient* client,</a>
+<a name="ln119">                               TransactionStatusCallback callback,</a>
+<a name="ln120">                               std::unique_lock&lt;std::mutex&gt;* lock) {</a>
+<a name="ln121">  if (last_known_status_ == TransactionStatus::ABORTED ||</a>
+<a name="ln122">      last_known_status_ == TransactionStatus::COMMITTED) {</a>
+<a name="ln123">    // Transaction is already in final state, so no reason to send abort request.</a>
+<a name="ln124">    VLOG_WITH_PREFIX(3) &lt;&lt; &quot;Abort shortcut: &quot; &lt;&lt; last_known_status_;</a>
+<a name="ln125">    TransactionStatusResult status{last_known_status_, last_known_status_hybrid_time_};</a>
+<a name="ln126">    lock-&gt;unlock();</a>
+<a name="ln127">    callback(status);</a>
+<a name="ln128">    return;</a>
+<a name="ln129">  }</a>
+<a name="ln130">  bool was_empty = abort_waiters_.empty();</a>
+<a name="ln131">  abort_waiters_.push_back(std::move(callback));</a>
+<a name="ln132">  lock-&gt;unlock();</a>
+<a name="ln133">  VLOG_WITH_PREFIX(3) &lt;&lt; &quot;Abort request: &quot; &lt;&lt; was_empty;</a>
+<a name="ln134">  if (!was_empty) {</a>
+<a name="ln135">    return;</a>
+<a name="ln136">  }</a>
+<a name="ln137">  tserver::AbortTransactionRequestPB req;</a>
+<a name="ln138">  req.set_tablet_id(metadata_.status_tablet);</a>
+<a name="ln139">  req.set_transaction_id(metadata_.transaction_id.data(), metadata_.transaction_id.size());</a>
+<a name="ln140">  req.set_propagated_hybrid_time(context_.participant_context_.Now().ToUint64());</a>
+<a name="ln141">  context_.rpcs_.RegisterAndStart(</a>
+<a name="ln142">      client::AbortTransaction(</a>
+<a name="ln143">          TransactionRpcDeadline(),</a>
+<a name="ln144">          nullptr /* tablet */,</a>
+<a name="ln145">          client,</a>
+<a name="ln146">          &amp;req,</a>
+<a name="ln147">          std::bind(&amp;RunningTransaction::AbortReceived, this, _1, _2, shared_from_this())),</a>
+<a name="ln148">      &amp;abort_handle_);</a>
+<a name="ln149">}</a>
+<a name="ln150"> </a>
+<a name="ln151">std::string RunningTransaction::ToString() const {</a>
+<a name="ln152">  return Format(&quot;{ metadata: $0 last_batch_data: $1 replicated_batches: $2 local_commit_time: $3 &quot;</a>
+<a name="ln153">                    &quot;last_known_status: $4 last_known_status_hybrid_time: $5 }&quot;,</a>
+<a name="ln154">                metadata_, last_batch_data_, replicated_batches_, local_commit_time_,</a>
+<a name="ln155">                TransactionStatus_Name(last_known_status_), last_known_status_hybrid_time_);</a>
+<a name="ln156">}</a>
+<a name="ln157"> </a>
+<a name="ln158">void RunningTransaction::ScheduleRemoveIntents(const RunningTransactionPtr&amp; shared_self) {</a>
+<a name="ln159">  if (remove_intents_task_.Prepare(shared_self)) {</a>
+<a name="ln160">    context_.participant_context_.StrandEnqueue(&amp;remove_intents_task_);</a>
+<a name="ln161">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Intents should be removed asynchronously&quot;;</a>
+<a name="ln162">  }</a>
+<a name="ln163">}</a>
+<a name="ln164"> </a>
+<a name="ln165">boost::optional&lt;TransactionStatus&gt; RunningTransaction::GetStatusAt(</a>
+<a name="ln166">    HybridTime time,</a>
+<a name="ln167">    HybridTime last_known_status_hybrid_time,</a>
+<a name="ln168">    TransactionStatus last_known_status) {</a>
+<a name="ln169">  switch (last_known_status) {</a>
+<a name="ln170">    case TransactionStatus::ABORTED:</a>
+<a name="ln171">      return TransactionStatus::ABORTED;</a>
+<a name="ln172">    case TransactionStatus::COMMITTED:</a>
+<a name="ln173">      return last_known_status_hybrid_time &gt; time</a>
+<a name="ln174">          ? TransactionStatus::PENDING</a>
+<a name="ln175">          : TransactionStatus::COMMITTED;</a>
+<a name="ln176">    case TransactionStatus::PENDING:</a>
+<a name="ln177">      if (last_known_status_hybrid_time &gt;= time) {</a>
+<a name="ln178">        return TransactionStatus::PENDING;</a>
+<a name="ln179">      }</a>
+<a name="ln180">      return boost::none;</a>
+<a name="ln181">    default:</a>
+<a name="ln182">      FATAL_INVALID_ENUM_VALUE(TransactionStatus, last_known_status);</a>
+<a name="ln183">  }</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186">void RunningTransaction::SendStatusRequest(</a>
+<a name="ln187">    int64_t serial_no, const RunningTransactionPtr&amp; shared_self) {</a>
+<a name="ln188">  tserver::GetTransactionStatusRequestPB req;</a>
+<a name="ln189">  req.set_tablet_id(metadata_.status_tablet);</a>
+<a name="ln190">  req.add_transaction_id()-&gt;assign(</a>
+<a name="ln191">      pointer_cast&lt;const char*&gt;(metadata_.transaction_id.data()), metadata_.transaction_id.size());</a>
+<a name="ln192">  req.set_propagated_hybrid_time(context_.participant_context_.Now().ToUint64());</a>
+<a name="ln193">  context_.rpcs_.RegisterAndStart(</a>
+<a name="ln194">      client::GetTransactionStatus(</a>
+<a name="ln195">          TransactionRpcDeadline(),</a>
+<a name="ln196">          nullptr /* tablet */,</a>
+<a name="ln197">          context_.participant_context_.client_future().get(),</a>
+<a name="ln198">          &amp;req,</a>
+<a name="ln199">          std::bind(&amp;RunningTransaction::StatusReceived, this, _1, _2, serial_no, shared_self)),</a>
+<a name="ln200">      &amp;get_status_handle_);</a>
+<a name="ln201">}</a>
+<a name="ln202"> </a>
+<a name="ln203">void RunningTransaction::StatusReceived(</a>
+<a name="ln204">    const Status&amp; status,</a>
+<a name="ln205">    const tserver::GetTransactionStatusResponsePB&amp; response,</a>
+<a name="ln206">    int64_t serial_no,</a>
+<a name="ln207">    const RunningTransactionPtr&amp; shared_self) {</a>
+<a name="ln208">  auto delay_usec = FLAGS_TEST_transaction_delay_status_reply_usec_in_tests;</a>
+<a name="ln209">  if (delay_usec &gt; 0) {</a>
+<a name="ln210">    context_.delayer().Delay(</a>
+<a name="ln211">        MonoTime::Now() + MonoDelta::FromMicroseconds(delay_usec),</a>
+<a name="ln212">        std::bind(&amp;RunningTransaction::DoStatusReceived, this, status, response,</a>
+<a name="ln213">                  serial_no, shared_self));</a>
+<a name="ln214">  } else {</a>
+<a name="ln215">    DoStatusReceived(status, response, serial_no, shared_self);</a>
+<a name="ln216">  }</a>
+<a name="ln217">}</a>
+<a name="ln218"> </a>
+<a name="ln219">void RunningTransaction::DoStatusReceived(const Status&amp; status,</a>
+<a name="ln220">                                          const tserver::GetTransactionStatusResponsePB&amp; response,</a>
+<a name="ln221">                                          int64_t serial_no,</a>
+<a name="ln222">                                          const RunningTransactionPtr&amp; shared_self) {</a>
+<a name="ln223">  if (response.has_propagated_hybrid_time()) {</a>
+<a name="ln224">    context_.participant_context_.UpdateClock(HybridTime(response.propagated_hybrid_time()));</a>
+<a name="ln225">  }</a>
+<a name="ln226"> </a>
+<a name="ln227">  context_.rpcs_.Unregister(&amp;get_status_handle_);</a>
+<a name="ln228">  decltype(status_waiters_) status_waiters;</a>
+<a name="ln229">  HybridTime time_of_status;</a>
+<a name="ln230">  TransactionStatus transaction_status;</a>
+<a name="ln231">  const bool ok = status.ok();</a>
+<a name="ln232">  int64_t new_request_id = -1;</a>
+<a name="ln233">  {</a>
+<a name="ln234">    MinRunningNotifier min_running_notifier(&amp;context_.applier_);</a>
+<a name="ln235">    std::unique_lock&lt;std::mutex&gt; lock(context_.mutex_);</a>
+<a name="ln236">    if (!ok) {</a>
+<a name="ln237">      status_waiters_.swap(status_waiters);</a>
+<a name="ln238">      lock.unlock();</a>
+<a name="ln239">      for (const auto&amp; waiter : status_waiters) {</a>
+<a name="ln240">        waiter.callback(status);</a>
+<a name="ln241">      }</a>
+<a name="ln242">      return;</a>
+<a name="ln243">    }</a>
+<a name="ln244"> </a>
+<a name="ln245">    if (response.status_hybrid_time().size() == 1) {</a>
+<a name="ln246">      time_of_status = HybridTime(response.status_hybrid_time()[0]);</a>
+<a name="ln247">    } else {</a>
+<a name="ln248">      LOG(DFATAL) &lt;&lt; &quot;Wrong number of status hybrid time entries, exactly one entry expected: &quot;</a>
+<a name="ln249">                  &lt;&lt; response.ShortDebugString();</a>
+<a name="ln250">      time_of_status = HybridTime::kMin;</a>
+<a name="ln251">    }</a>
+<a name="ln252"> </a>
+<a name="ln253">    // Check for local_commit_time_ is not required for correctness, but useful for optimization.</a>
+<a name="ln254">    // So we could avoid unnecessary actions.</a>
+<a name="ln255">    if (local_commit_time_.is_valid()) {</a>
+<a name="ln256">      last_known_status_hybrid_time_ = local_commit_time_;</a>
+<a name="ln257">      last_known_status_ = TransactionStatus::COMMITTED;</a>
+<a name="ln258">    } else if (response.status().size() == 1) {</a>
+<a name="ln259">      if (last_known_status_hybrid_time_ &lt;= time_of_status) {</a>
+<a name="ln260">        last_known_status_hybrid_time_ = time_of_status;</a>
+<a name="ln261">        last_known_status_ = response.status(0);</a>
+<a name="ln262">        if (response.status(0) == TransactionStatus::ABORTED) {</a>
+<a name="ln263">          context_.EnqueueRemoveUnlocked(id(), &amp;min_running_notifier);</a>
+<a name="ln264">        }</a>
+<a name="ln265">      }</a>
+<a name="ln266">    } else {</a>
+<a name="ln267">      LOG(DFATAL) &lt;&lt; &quot;Wrong number of status entries, exactly one entry expected: &quot;</a>
+<a name="ln268">                  &lt;&lt; response.ShortDebugString();</a>
+<a name="ln269">    }</a>
+<a name="ln270"> </a>
+<a name="ln271">    time_of_status = last_known_status_hybrid_time_;</a>
+<a name="ln272">    transaction_status = last_known_status_;</a>
+<a name="ln273"> </a>
+<a name="ln274">    status_waiters = ExtractFinishedStatusWaitersUnlocked(</a>
+<a name="ln275">        serial_no, time_of_status, transaction_status);</a>
+<a name="ln276">    if (!status_waiters_.empty()) {</a>
+<a name="ln277">      new_request_id = context_.NextRequestIdUnlocked();</a>
+<a name="ln278">      VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Waiters still present, send new status request: &quot; &lt;&lt; new_request_id;</a>
+<a name="ln279">    }</a>
+<a name="ln280">  }</a>
+<a name="ln281">  if (new_request_id &gt;= 0) {</a>
+<a name="ln282">    SendStatusRequest(new_request_id, shared_self);</a>
+<a name="ln283">  }</a>
+<a name="ln284">  NotifyWaiters(serial_no, time_of_status, transaction_status, status_waiters);</a>
+<a name="ln285">}</a>
+<a name="ln286"> </a>
+<a name="ln287">std::vector&lt;StatusRequest&gt; RunningTransaction::ExtractFinishedStatusWaitersUnlocked(</a>
+<a name="ln288">    int64_t serial_no, HybridTime time_of_status, TransactionStatus transaction_status) {</a>
+<a name="ln289">  if (transaction_status == TransactionStatus::ABORTED) {</a>
+<a name="ln290">    return std::move(status_waiters_);</a>
+<a name="ln291">  }</a>
+<a name="ln292">  std::vector&lt;StatusRequest&gt; result;</a>
+<a name="ln293">  result.reserve(status_waiters_.size());</a>
+<a name="ln294">  auto w = status_waiters_.begin();</a>
+<a name="ln295">  for (auto it = status_waiters_.begin(); it != status_waiters_.end(); ++it) {</a>
+<a name="ln296">    if (it-&gt;serial_no &lt;= serial_no ||</a>
+<a name="ln297">        GetStatusAt(it-&gt;global_limit_ht, time_of_status, transaction_status) ||</a>
+<a name="ln298">        time_of_status &lt; it-&gt;read_ht) {</a>
+<a name="ln299">      result.push_back(std::move(*it));</a>
+<a name="ln300">    } else {</a>
+<a name="ln301">      if (w != it) {</a>
+<a name="ln302">        *w = std::move(*it);</a>
+<a name="ln303">      }</a>
+<a name="ln304">      ++w;</a>
+<a name="ln305">    }</a>
+<a name="ln306">  }</a>
+<a name="ln307">  status_waiters_.erase(w, status_waiters_.end());</a>
+<a name="ln308">  return result;</a>
+<a name="ln309">}</a>
+<a name="ln310"> </a>
+<a name="ln311">void RunningTransaction::NotifyWaiters(int64_t serial_no, HybridTime time_of_status,</a>
+<a name="ln312">                                       TransactionStatus transaction_status,</a>
+<a name="ln313">                                       const std::vector&lt;StatusRequest&gt;&amp; status_waiters) {</a>
+<a name="ln314">  for (const auto&amp; waiter : status_waiters) {</a>
+<a name="ln315">    auto status_for_waiter = GetStatusAt(</a>
+<a name="ln316">        waiter.global_limit_ht, time_of_status, transaction_status);</a>
+<a name="ln317">    if (status_for_waiter) {</a>
+<a name="ln318">      // We know status at global_limit_ht, so could notify waiter.</a>
+<a name="ln319">      waiter.callback(TransactionStatusResult{*status_for_waiter, time_of_status});</a>
+<a name="ln320">    } else if (time_of_status &gt;= waiter.read_ht) {</a>
+<a name="ln321">      // It means that between read_ht and global_limit_ht transaction was pending.</a>
+<a name="ln322">      // It implies that transaction was not committed before request was sent.</a>
+<a name="ln323">      // We could safely respond PENDING to caller.</a>
+<a name="ln324">      LOG_IF_WITH_PREFIX(DFATAL, waiter.serial_no &gt; serial_no)</a>
+<a name="ln325">          &lt;&lt; &quot;Notify waiter with request id greater than id of status request: &quot;</a>
+<a name="ln326">          &lt;&lt; waiter.serial_no &lt;&lt; &quot; vs &quot; &lt;&lt; serial_no;</a>
+<a name="ln327">      waiter.callback(TransactionStatusResult{TransactionStatus::PENDING, time_of_status});</a>
+<a name="ln328">    } else {</a>
+<a name="ln329">      waiter.callback(STATUS(TryAgain,</a>
+<a name="ln330">          Format(&quot;Cannot determine transaction status with read_ht $0, and global_limit_ht $1, &quot;</a>
+<a name="ln331">                 &quot;last known: $2 at $3&quot;, waiter.read_ht, waiter.global_limit_ht,</a>
+<a name="ln332">                 TransactionStatus_Name(transaction_status), time_of_status), Slice(),</a>
+<a name="ln333">          PgsqlError(YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE) ));</a>
+<a name="ln334">    }</a>
+<a name="ln335">  }</a>
+<a name="ln336">}</a>
+<a name="ln337"> </a>
+<a name="ln338">Result&lt;TransactionStatusResult&gt; RunningTransaction::MakeAbortResult(</a>
+<a name="ln339">    const Status&amp; status,</a>
+<a name="ln340">    const tserver::AbortTransactionResponsePB&amp; response) {</a>
+<a name="ln341">  if (!status.ok()) {</a>
+<a name="ln342">    return status;</a>
+<a name="ln343">  }</a>
+<a name="ln344"> </a>
+<a name="ln345">  HybridTime status_time = response.has_status_hybrid_time()</a>
+<a name="ln346">       ? HybridTime(response.status_hybrid_time())</a>
+<a name="ln347">       : HybridTime::kInvalid;</a>
+<a name="ln348">  return TransactionStatusResult{response.status(), status_time};</a>
+<a name="ln349">}</a>
+<a name="ln350"> </a>
+<a name="ln351">void RunningTransaction::AbortReceived(const Status&amp; status,</a>
+<a name="ln352">                                       const tserver::AbortTransactionResponsePB&amp; response,</a>
+<a name="ln353">                                       const RunningTransactionPtr&amp; shared_self) {</a>
+<a name="ln354">  if (response.has_propagated_hybrid_time()) {</a>
+<a name="ln355">    context_.participant_context_.UpdateClock(HybridTime(response.propagated_hybrid_time()));</a>
+<a name="ln356">  }</a>
+<a name="ln357"> </a>
+<a name="ln358">  decltype(abort_waiters_) abort_waiters;</a>
+<a name="ln359">  auto result = MakeAbortResult(status, response);</a>
+<a name="ln360"> </a>
+<a name="ln361">  VLOG_WITH_PREFIX(3) &lt;&lt; &quot;AbortReceived: &quot; &lt;&lt; yb::ToString(result);</a>
+<a name="ln362"> </a>
+<a name="ln363">  {</a>
+<a name="ln364">    std::lock_guard&lt;std::mutex&gt; lock(context_.mutex_);</a>
+<a name="ln365">    context_.rpcs_.Unregister(&amp;abort_handle_);</a>
+<a name="ln366">    abort_waiters_.swap(abort_waiters);</a>
+<a name="ln367">    // kMax status_time means taht this status is not yet replicated and could be rejected.</a>
+<a name="ln368">    // So we could use it as reply to Abort, but cannot store it as transaction status.</a>
+<a name="ln369">    if (result.ok() &amp;&amp; result-&gt;status_time != HybridTime::kMax) {</a>
+<a name="ln370">      last_known_status_ = result-&gt;status;</a>
+<a name="ln371">      last_known_status_hybrid_time_ = result-&gt;status_time;</a>
+<a name="ln372">    }</a>
+<a name="ln373">  }</a>
+<a name="ln374">  for (const auto&amp; waiter : abort_waiters) {</a>
+<a name="ln375">    waiter(result);</a>
+<a name="ln376">  }</a>
+<a name="ln377">}</a>
+<a name="ln378"> </a>
+<a name="ln379">std::string RunningTransaction::LogPrefix() const {</a>
+<a name="ln380">  return Format(</a>
+<a name="ln381">      &quot;$0 ID $1: &quot;, context_.LogPrefix().substr(0, context_.LogPrefix().length() - 2), id());</a>
+<a name="ln382">}</a>
+<a name="ln383"> </a>
+<a name="ln384">Status MakeAbortedStatus(const TransactionId&amp; id) {</a>
+<a name="ln385">  return STATUS(</a>
+<a name="ln386">      TryAgain, Format(&quot;Transaction aborted: $0&quot;, id), Slice(),</a>
+<a name="ln387">      PgsqlError(YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE));</a>
+<a name="ln388">}</a>
+<a name="ln389"> </a>
+<a name="ln390">void RunningTransaction::SetApplyData(const docdb::ApplyTransactionState&amp; apply_state,</a>
+<a name="ln391">                                      const TransactionApplyData* data) {</a>
+<a name="ln392">  apply_state_ = apply_state;</a>
+<a name="ln393">  bool active = apply_state_.active();</a>
+<a name="ln394"> </a>
+<a name="ln395">  if (data) {</a>
+<a name="ln396">    apply_data_ = *data;</a>
+<a name="ln397">    apply_data_.apply_state = &amp;apply_state_;</a>
+<a name="ln398"> </a>
+<a name="ln399">    LOG_IF_WITH_PREFIX(DFATAL, local_commit_time_ != data-&gt;commit_ht)</a>
+<a name="ln400">        &lt;&lt; &quot;Commit time does not match: &quot; &lt;&lt; local_commit_time_ &lt;&lt; &quot; vs &quot; &lt;&lt; data-&gt;commit_ht;</a>
+<a name="ln401"> </a>
+<a name="ln402">    if (apply_intents_task_.Prepare(shared_from_this())) {</a>
+<a name="ln403">      context_.participant_context_.StrandEnqueue(&amp;apply_intents_task_);</a>
+<a name="ln404">    } else {</a>
+<a name="ln405">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Unable to prepare apply intents task&quot;;</a>
+<a name="ln406">    }</a>
+<a name="ln407">  }</a>
+<a name="ln408"> </a>
+<a name="ln409">  if (!active) {</a>
+<a name="ln410">    VLOG_WITH_PREFIX(3) &lt;&lt; &quot;Finished applying intents&quot;;</a>
+<a name="ln411"> </a>
+<a name="ln412">    MinRunningNotifier min_running_notifier(&amp;context_.applier_);</a>
+<a name="ln413">    std::lock_guard&lt;std::mutex&gt; lock(context_.mutex_);</a>
+<a name="ln414">    context_.RemoveUnlocked(id(), &quot;applied large&quot;s, &amp;min_running_notifier);</a>
+<a name="ln415">  }</a>
+<a name="ln416">}</a>
+<a name="ln417"> </a>
+<a name="ln418">bool RunningTransaction::ProcessingApply() const {</a>
+<a name="ln419">  return apply_state_.active();</a>
+<a name="ln420">}</a>
+<a name="ln421"> </a>
+<a name="ln422">} // namespace tablet</a>
+<a name="ln423">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="53"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="60"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="98"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="124"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="133"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="161"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="278"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="324"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="361"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="399"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="410"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

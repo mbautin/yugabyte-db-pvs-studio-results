@@ -1,0 +1,1605 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>redis_service.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/yql/redis/redisserver/redis_service.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;iostream&gt;</a>
+<a name="ln17">#include &lt;thread&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;boost/algorithm/string/case_conv.hpp&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;boost/lockfree/queue.hpp&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;boost/logic/tribool.hpp&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;yb/gutil/strings/join.h&quot;</a>
+<a name="ln28">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;yb/client/async_rpc.h&quot;</a>
+<a name="ln31">#include &quot;yb/client/callbacks.h&quot;</a>
+<a name="ln32">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln33">#include &quot;yb/client/client_builder-internal.h&quot;</a>
+<a name="ln34">#include &quot;yb/client/client-internal.h&quot;</a>
+<a name="ln35">#include &quot;yb/client/error.h&quot;</a>
+<a name="ln36">#include &quot;yb/client/meta_data_cache.h&quot;</a>
+<a name="ln37">#include &quot;yb/client/meta_cache.h&quot;</a>
+<a name="ln38">#include &quot;yb/client/session.h&quot;</a>
+<a name="ln39">#include &quot;yb/client/table.h&quot;</a>
+<a name="ln40">#include &quot;yb/client/yb_op.h&quot;</a>
+<a name="ln41"> </a>
+<a name="ln42">#include &quot;yb/common/redis_protocol.pb.h&quot;</a>
+<a name="ln43"> </a>
+<a name="ln44">#include &quot;yb/yql/redis/redisserver/redis_commands.h&quot;</a>
+<a name="ln45">#include &quot;yb/yql/redis/redisserver/redis_constants.h&quot;</a>
+<a name="ln46">#include &quot;yb/yql/redis/redisserver/redis_encoding.h&quot;</a>
+<a name="ln47">#include &quot;yb/yql/redis/redisserver/redis_parser.h&quot;</a>
+<a name="ln48">#include &quot;yb/yql/redis/redisserver/redis_rpc.h&quot;</a>
+<a name="ln49"> </a>
+<a name="ln50">#include &quot;yb/rpc/connection.h&quot;</a>
+<a name="ln51">#include &quot;yb/rpc/rpc_context.h&quot;</a>
+<a name="ln52">#include &quot;yb/rpc/rpc_introspection.pb.h&quot;</a>
+<a name="ln53"> </a>
+<a name="ln54">#include &quot;yb/tserver/tablet_server.h&quot;</a>
+<a name="ln55">#include &quot;yb/tserver/tserver_service.proxy.h&quot;</a>
+<a name="ln56"> </a>
+<a name="ln57">#include &quot;yb/util/bytes_formatter.h&quot;</a>
+<a name="ln58">#include &quot;yb/util/locks.h&quot;</a>
+<a name="ln59">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln60">#include &quot;yb/util/memory/mc_types.h&quot;</a>
+<a name="ln61">#include &quot;yb/util/redis_util.h&quot;</a>
+<a name="ln62">#include &quot;yb/util/size_literals.h&quot;</a>
+<a name="ln63">#include &quot;yb/util/stol_utils.h&quot;</a>
+<a name="ln64">#include &quot;yb/util/shared_lock.h&quot;</a>
+<a name="ln65"> </a>
+<a name="ln66">using yb::operator&quot;&quot; _MB;</a>
+<a name="ln67">using namespace std::literals;</a>
+<a name="ln68">using namespace std::placeholders;</a>
+<a name="ln69">using yb::client::YBMetaDataCache;</a>
+<a name="ln70">using strings::Substitute;</a>
+<a name="ln71">using yb::rpc::Connection;</a>
+<a name="ln72"> </a>
+<a name="ln73">DEFINE_REDIS_histogram_EX(error,</a>
+<a name="ln74">                          &quot;yb.redisserver.RedisServerService.AnyMethod RPC Time&quot;,</a>
+<a name="ln75">                          &quot;yb.redisserver.RedisServerService.ErrorUnsupportedMethod()&quot;);</a>
+<a name="ln76">DEFINE_REDIS_histogram_EX(get_internal,</a>
+<a name="ln77">                          &quot;yb.redisserver.RedisServerService.Get RPC Time&quot;,</a>
+<a name="ln78">                          &quot;in yb.client.Get&quot;);</a>
+<a name="ln79">DEFINE_REDIS_histogram_EX(set_internal,</a>
+<a name="ln80">                          &quot;yb.redisserver.RedisServerService.Set RPC Time&quot;,</a>
+<a name="ln81">                          &quot;in yb.client.Set&quot;);</a>
+<a name="ln82"> </a>
+<a name="ln83">#define DEFINE_REDIS_SESSION_GAUGE(state) \</a>
+<a name="ln84">  METRIC_DEFINE_gauge_uint64( \</a>
+<a name="ln85">      server, \</a>
+<a name="ln86">      BOOST_PP_CAT(redis_, BOOST_PP_CAT(state, _sessions)), \</a>
+<a name="ln87">      &quot;Number of &quot; BOOST_PP_STRINGIZE(state) &quot; sessions&quot;, \</a>
+<a name="ln88">      yb::MetricUnit::kUnits, \</a>
+<a name="ln89">      &quot;Number of sessions &quot; BOOST_PP_STRINGIZE(state) &quot; by Redis service.&quot;) \</a>
+<a name="ln90">      /**/</a>
+<a name="ln91"> </a>
+<a name="ln92">DEFINE_REDIS_SESSION_GAUGE(allocated);</a>
+<a name="ln93">DEFINE_REDIS_SESSION_GAUGE(available);</a>
+<a name="ln94"> </a>
+<a name="ln95">METRIC_DEFINE_gauge_uint64(</a>
+<a name="ln96">    server, redis_monitoring_clients, &quot;Number of clients running monitor&quot;, yb::MetricUnit::kUnits,</a>
+<a name="ln97">    &quot;Number of clients running monitor &quot;);</a>
+<a name="ln98"> </a>
+<a name="ln99">#if defined(THREAD_SANITIZER) || defined(ADDRESS_SANITIZER)</a>
+<a name="ln100">constexpr int32_t kDefaultRedisServiceTimeoutMs = 600000;</a>
+<a name="ln101">#else</a>
+<a name="ln102">constexpr int32_t kDefaultRedisServiceTimeoutMs = 3000;</a>
+<a name="ln103">#endif</a>
+<a name="ln104"> </a>
+<a name="ln105">DEFINE_int32(redis_service_yb_client_timeout_millis, kDefaultRedisServiceTimeoutMs,</a>
+<a name="ln106">             &quot;Timeout in milliseconds for RPC calls from Redis service to master/tserver&quot;);</a>
+<a name="ln107"> </a>
+<a name="ln108">// In order to support up to three 64MB strings along with other strings,</a>
+<a name="ln109">// we have the total size of a redis command at 253_MB, which is less than the consensus size</a>
+<a name="ln110">// to account for the headers in the consensus layer.</a>
+<a name="ln111">DEFINE_int32(redis_max_command_size, 253_MB,</a>
+<a name="ln112">             &quot;Maximum size of the command in redis&quot;);</a>
+<a name="ln113"> </a>
+<a name="ln114">// Maximum value size is 64MB</a>
+<a name="ln115">DEFINE_int32(redis_max_value_size, 64_MB,</a>
+<a name="ln116">             &quot;Maximum size of the value in redis&quot;);</a>
+<a name="ln117">DEFINE_int32(redis_callbacks_threadpool_size, 64,</a>
+<a name="ln118">             &quot;The maximum size for the threadpool which handles callbacks from the ybclient layer&quot;);</a>
+<a name="ln119"> </a>
+<a name="ln120">DEFINE_int32(redis_password_caching_duration_ms, 5000,</a>
+<a name="ln121">             &quot;The duration for which we will cache the redis passwords. 0 to disable.&quot;);</a>
+<a name="ln122"> </a>
+<a name="ln123">DEFINE_bool(redis_safe_batch, true, &quot;Use safe batching with Redis service&quot;);</a>
+<a name="ln124">DEFINE_bool(enable_redis_auth, true, &quot;Enable AUTH for the Redis service&quot;);</a>
+<a name="ln125"> </a>
+<a name="ln126">DECLARE_string(placement_cloud);</a>
+<a name="ln127">DECLARE_string(placement_region);</a>
+<a name="ln128">DECLARE_string(placement_zone);</a>
+<a name="ln129"> </a>
+<a name="ln130">using yb::client::YBRedisOp;</a>
+<a name="ln131">using yb::client::YBRedisReadOp;</a>
+<a name="ln132">using yb::client::YBRedisWriteOp;</a>
+<a name="ln133">using yb::client::YBClientBuilder;</a>
+<a name="ln134">using yb::client::YBSchema;</a>
+<a name="ln135">using yb::client::YBSession;</a>
+<a name="ln136">using yb::client::YBStatusCallback;</a>
+<a name="ln137">using yb::client::YBTable;</a>
+<a name="ln138">using yb::client::YBTableName;</a>
+<a name="ln139">using yb::rpc::ConnectionPtr;</a>
+<a name="ln140">using yb::rpc::ConnectionWeakPtr;</a>
+<a name="ln141">using yb::rpc::OutboundData;</a>
+<a name="ln142">using yb::rpc::OutboundDataPtr;</a>
+<a name="ln143">using yb::RedisResponsePB;</a>
+<a name="ln144"> </a>
+<a name="ln145">namespace yb {</a>
+<a name="ln146">namespace redisserver {</a>
+<a name="ln147"> </a>
+<a name="ln148">typedef boost::container::small_vector_base&lt;Slice&gt; RedisKeyList;</a>
+<a name="ln149"> </a>
+<a name="ln150">namespace {</a>
+<a name="ln151"> </a>
+<a name="ln152">YB_DEFINE_ENUM(OperationType, (kNone)(kRead)(kWrite)(kLocal));</a>
+<a name="ln153"> </a>
+<a name="ln154">// Returns opposite operation type for specified type. Write for read, read for write.</a>
+<a name="ln155">OperationType Opposite(OperationType type) {</a>
+<a name="ln156">  switch (type) {</a>
+<a name="ln157">    case OperationType::kRead:</a>
+<a name="ln158">      return OperationType::kWrite;</a>
+<a name="ln159">    case OperationType::kWrite:</a>
+<a name="ln160">      return OperationType::kRead;</a>
+<a name="ln161">    case OperationType::kNone: FALLTHROUGH_INTENDED;</a>
+<a name="ln162">    case OperationType::kLocal:</a>
+<a name="ln163">      FATAL_INVALID_ENUM_VALUE(OperationType, type);</a>
+<a name="ln164">  }</a>
+<a name="ln165">  FATAL_INVALID_ENUM_VALUE(OperationType, type);</a>
+<a name="ln166">}</a>
+<a name="ln167"> </a>
+<a name="ln168">class Operation {</a>
+<a name="ln169"> public:</a>
+<a name="ln170">  template &lt;class Op&gt;</a>
+<a name="ln171">  Operation(const std::shared_ptr&lt;RedisInboundCall&gt;&amp; call,</a>
+<a name="ln172">            size_t index,</a>
+<a name="ln173">            std::shared_ptr&lt;Op&gt; operation,</a>
+<a name="ln174">            const rpc::RpcMethodMetrics&amp; metrics)</a>
+<a name="ln175">    : type_(std::is_same&lt;Op, YBRedisReadOp&gt;::value ? OperationType::kRead : OperationType::kWrite),</a>
+<a name="ln176">      call_(call),</a>
+<a name="ln177">      index_(index),</a>
+<a name="ln178">      operation_(std::move(operation)),</a>
+<a name="ln179">      metrics_(metrics),</a>
+<a name="ln180">      manual_response_(ManualResponse::kFalse) {</a>
+<a name="ln181">    auto status = operation_-&gt;GetPartitionKey(&amp;partition_key_);</a>
+<a name="ln182">    if (!status.ok()) {</a>
+<a name="ln183">      Respond(status);</a>
+<a name="ln184">    }</a>
+<a name="ln185">  }</a>
+<a name="ln186"> </a>
+<a name="ln187">  Operation(const std::shared_ptr&lt;RedisInboundCall&gt;&amp; call,</a>
+<a name="ln188">            size_t index,</a>
+<a name="ln189">            std::function&lt;bool(client::YBSession*, const StatusFunctor&amp;)&gt; functor,</a>
+<a name="ln190">            std::string partition_key,</a>
+<a name="ln191">            const rpc::RpcMethodMetrics&amp; metrics,</a>
+<a name="ln192">            ManualResponse manual_response)</a>
+<a name="ln193">    : type_(OperationType::kLocal),</a>
+<a name="ln194">      call_(call),</a>
+<a name="ln195">      index_(index),</a>
+<a name="ln196">      functor_(std::move(functor)),</a>
+<a name="ln197">      partition_key_(std::move(partition_key)),</a>
+<a name="ln198">      metrics_(metrics),</a>
+<a name="ln199">      manual_response_(manual_response) {</a>
+<a name="ln200">  }</a>
+<a name="ln201"> </a>
+<a name="ln202">  bool responded() const {</a>
+<a name="ln203">    return responded_.load(std::memory_order_acquire);</a>
+<a name="ln204">  }</a>
+<a name="ln205"> </a>
+<a name="ln206">  size_t index() const {</a>
+<a name="ln207">    return index_;</a>
+<a name="ln208">  }</a>
+<a name="ln209"> </a>
+<a name="ln210">  OperationType type() const {</a>
+<a name="ln211">    return type_;</a>
+<a name="ln212">  }</a>
+<a name="ln213"> </a>
+<a name="ln214">  const YBRedisOp&amp; operation() const {</a>
+<a name="ln215">    return *operation_;</a>
+<a name="ln216">  }</a>
+<a name="ln217"> </a>
+<a name="ln218">  bool has_operation() const {</a>
+<a name="ln219">    return operation_ != nullptr;</a>
+<a name="ln220">  }</a>
+<a name="ln221"> </a>
+<a name="ln222">  size_t space_used_by_request() const {</a>
+<a name="ln223">    return operation_ ? operation_-&gt;space_used_by_request() : 0;</a>
+<a name="ln224">  }</a>
+<a name="ln225"> </a>
+<a name="ln226">  RedisResponsePB&amp; response() {</a>
+<a name="ln227">    switch (type_) {</a>
+<a name="ln228">      case OperationType::kRead:</a>
+<a name="ln229">        return *down_cast&lt;YBRedisReadOp*&gt;(operation_.get())-&gt;mutable_response();</a>
+<a name="ln230">      case OperationType::kWrite:</a>
+<a name="ln231">        return *down_cast&lt;YBRedisWriteOp*&gt;(operation_.get())-&gt;mutable_response();</a>
+<a name="ln232">      case OperationType::kNone: FALLTHROUGH_INTENDED;</a>
+<a name="ln233">      case OperationType::kLocal:</a>
+<a name="ln234">        FATAL_INVALID_ENUM_VALUE(OperationType, type_);</a>
+<a name="ln235">    }</a>
+<a name="ln236">    FATAL_INVALID_ENUM_VALUE(OperationType, type_);</a>
+<a name="ln237">  }</a>
+<a name="ln238"> </a>
+<a name="ln239">  const rpc::RpcMethodMetrics&amp; metrics() const {</a>
+<a name="ln240">    return metrics_;</a>
+<a name="ln241">  }</a>
+<a name="ln242"> </a>
+<a name="ln243">  const std::string&amp; partition_key() const {</a>
+<a name="ln244">    return partition_key_;</a>
+<a name="ln245">  }</a>
+<a name="ln246"> </a>
+<a name="ln247">  void SetTablet(const client::internal::RemoteTabletPtr&amp; tablet) {</a>
+<a name="ln248">    if (operation_) {</a>
+<a name="ln249">      operation_-&gt;SetTablet(tablet);</a>
+<a name="ln250">    }</a>
+<a name="ln251">    tablet_ = tablet;</a>
+<a name="ln252">  }</a>
+<a name="ln253"> </a>
+<a name="ln254">  void ResetTable(std::shared_ptr&lt;client::YBTable&gt; table) {</a>
+<a name="ln255">    if (operation_) {</a>
+<a name="ln256">      operation_-&gt;ResetTable(table);</a>
+<a name="ln257">    }</a>
+<a name="ln258">    tablet_.reset();</a>
+<a name="ln259">  }</a>
+<a name="ln260"> </a>
+<a name="ln261">  const client::internal::RemoteTabletPtr&amp; tablet() const {</a>
+<a name="ln262">    return tablet_;</a>
+<a name="ln263">  }</a>
+<a name="ln264"> </a>
+<a name="ln265">  RedisInboundCall&amp; call() const {</a>
+<a name="ln266">    return *call_;</a>
+<a name="ln267">  }</a>
+<a name="ln268"> </a>
+<a name="ln269">  void GetKeys(RedisKeyList* keys) const {</a>
+<a name="ln270">    if (FLAGS_redis_safe_batch) {</a>
+<a name="ln271">      keys-&gt;emplace_back(operation_ ? operation_-&gt;GetKey() : Slice());</a>
+<a name="ln272">    }</a>
+<a name="ln273">  }</a>
+<a name="ln274"> </a>
+<a name="ln275">  bool Apply(client::YBSession* session, const StatusFunctor&amp; callback, bool* applied_operations) {</a>
+<a name="ln276">    // We should destroy functor after this call.</a>
+<a name="ln277">    // Because it could hold references to other objects.</a>
+<a name="ln278">    // So we more it to temp variable.</a>
+<a name="ln279">    auto functor = std::move(functor_);</a>
+<a name="ln280"> </a>
+<a name="ln281">    if (call_-&gt;aborted()) {</a>
+<a name="ln282">      Respond(STATUS(Aborted, &quot;&quot;));</a>
+<a name="ln283">      return false;</a>
+<a name="ln284">    }</a>
+<a name="ln285"> </a>
+<a name="ln286">    // Used for DebugSleep</a>
+<a name="ln287">    if (functor) {</a>
+<a name="ln288">      return functor(session, callback);</a>
+<a name="ln289">    }</a>
+<a name="ln290"> </a>
+<a name="ln291">    auto status = session-&gt;Apply(operation_);</a>
+<a name="ln292">    if (!status.ok()) {</a>
+<a name="ln293">      Respond(status);</a>
+<a name="ln294">      return false;</a>
+<a name="ln295">    }</a>
+<a name="ln296">    *applied_operations = true;</a>
+<a name="ln297">    return true;</a>
+<a name="ln298">  }</a>
+<a name="ln299"> </a>
+<a name="ln300">  void Respond(const Status&amp; status) {</a>
+<a name="ln301">    responded_.store(true, std::memory_order_release);</a>
+<a name="ln302">    if (manual_response_) {</a>
+<a name="ln303">      return;</a>
+<a name="ln304">    }</a>
+<a name="ln305"> </a>
+<a name="ln306">    if (status.ok()) {</a>
+<a name="ln307">      if (operation_) {</a>
+<a name="ln308">        call_-&gt;RespondSuccess(index_, metrics_, &amp;response());</a>
+<a name="ln309">      } else {</a>
+<a name="ln310">        RedisResponsePB resp;</a>
+<a name="ln311">        call_-&gt;RespondSuccess(index_, metrics_, &amp;resp);</a>
+<a name="ln312">      }</a>
+<a name="ln313">    } else if ((type_ == OperationType::kRead || type_ == OperationType::kWrite) &amp;&amp;</a>
+<a name="ln314">               response().code() == RedisResponsePB_RedisStatusCode_SERVER_ERROR) {</a>
+<a name="ln315">      call_-&gt;Respond(index_, false, &amp;response());</a>
+<a name="ln316">    } else {</a>
+<a name="ln317">      call_-&gt;RespondFailure(index_, status);</a>
+<a name="ln318">    }</a>
+<a name="ln319">  }</a>
+<a name="ln320"> </a>
+<a name="ln321">  std::string ToString() const {</a>
+<a name="ln322">    return Format(&quot;{ index: $0, operation: $1 }&quot;, index_, operation_);</a>
+<a name="ln323">  }</a>
+<a name="ln324"> </a>
+<a name="ln325"> private:</a>
+<a name="ln326">  OperationType type_;</a>
+<a name="ln327">  std::shared_ptr&lt;RedisInboundCall&gt; call_;</a>
+<a name="ln328">  size_t index_;</a>
+<a name="ln329">  std::shared_ptr&lt;YBRedisOp&gt; operation_;</a>
+<a name="ln330">  std::function&lt;bool(client::YBSession*, const StatusFunctor&amp;)&gt; functor_;</a>
+<a name="ln331">  std::string partition_key_;</a>
+<a name="ln332">  rpc::RpcMethodMetrics metrics_;</a>
+<a name="ln333">  ManualResponse manual_response_;</a>
+<a name="ln334">  client::internal::RemoteTabletPtr tablet_;</a>
+<a name="ln335">  std::atomic&lt;bool&gt; responded_{false};</a>
+<a name="ln336">};</a>
+<a name="ln337"> </a>
+<a name="ln338">class SessionPool {</a>
+<a name="ln339"> public:</a>
+<a name="ln340">  void Init(client::YBClient* client,</a>
+<a name="ln341">            const scoped_refptr&lt;MetricEntity&gt;&amp; metric_entity) {</a>
+<a name="ln342">    client_ = client;</a>
+<a name="ln343">    auto* proto = &amp;METRIC_redis_allocated_sessions;</a>
+<a name="ln344">    allocated_sessions_metric_ = proto-&gt;Instantiate(metric_entity, 0);</a>
+<a name="ln345">    proto = &amp;METRIC_redis_available_sessions;</a>
+<a name="ln346">    available_sessions_metric_ = proto-&gt;Instantiate(metric_entity, 0);</a>
+<a name="ln347">  }</a>
+<a name="ln348"> </a>
+<a name="ln349">  std::shared_ptr&lt;client::YBSession&gt; Take() {</a>
+<a name="ln350">    client::YBSession* result = nullptr;</a>
+<a name="ln351">    if (!queue_.pop(result)) {</a>
+<a name="ln352">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln353">      auto session = client_-&gt;NewSession();</a>
+<a name="ln354">      session-&gt;SetTimeout(</a>
+<a name="ln355">          MonoDelta::FromMilliseconds(FLAGS_redis_service_yb_client_timeout_millis));</a>
+<a name="ln356">      sessions_.push_back(session);</a>
+<a name="ln357">      allocated_sessions_metric_-&gt;IncrementBy(1);</a>
+<a name="ln358">      return session;</a>
+<a name="ln359">    }</a>
+<a name="ln360">    available_sessions_metric_-&gt;DecrementBy(1);</a>
+<a name="ln361">    return result-&gt;shared_from_this();</a>
+<a name="ln362">  }</a>
+<a name="ln363"> </a>
+<a name="ln364">  void Release(const std::shared_ptr&lt;client::YBSession&gt;&amp; session) {</a>
+<a name="ln365">    available_sessions_metric_-&gt;IncrementBy(1);</a>
+<a name="ln366">    queue_.push(session.get());</a>
+<a name="ln367">  }</a>
+<a name="ln368"> private:</a>
+<a name="ln369">  client::YBClient* client_;</a>
+<a name="ln370">  std::mutex mutex_;</a>
+<a name="ln371">  std::vector&lt;std::shared_ptr&lt;client::YBSession&gt;&gt; sessions_;</a>
+<a name="ln372">  boost::lockfree::queue&lt;client::YBSession*&gt; queue_{30};</a>
+<a name="ln373">  scoped_refptr&lt;AtomicGauge&lt;uint64_t&gt;&gt; allocated_sessions_metric_;</a>
+<a name="ln374">  scoped_refptr&lt;AtomicGauge&lt;uint64_t&gt;&gt; available_sessions_metric_;</a>
+<a name="ln375">};</a>
+<a name="ln376"> </a>
+<a name="ln377">class Block;</a>
+<a name="ln378">typedef std::shared_ptr&lt;Block&gt; BlockPtr;</a>
+<a name="ln379"> </a>
+<a name="ln380">class Block : public std::enable_shared_from_this&lt;Block&gt; {</a>
+<a name="ln381"> public:</a>
+<a name="ln382">  typedef MCVector&lt;Operation*&gt; Ops;</a>
+<a name="ln383"> </a>
+<a name="ln384">  Block(const BatchContextPtr&amp; context,</a>
+<a name="ln385">        Ops::allocator_type allocator,</a>
+<a name="ln386">        rpc::RpcMethodMetrics metrics_internal)</a>
+<a name="ln387">      : context_(context),</a>
+<a name="ln388">        ops_(allocator),</a>
+<a name="ln389">        metrics_internal_(std::move(metrics_internal)),</a>
+<a name="ln390">        start_(MonoTime::Now()) {</a>
+<a name="ln391">  }</a>
+<a name="ln392"> </a>
+<a name="ln393">  Block(const Block&amp;) = delete;</a>
+<a name="ln394">  void operator=(const Block&amp;) = delete;</a>
+<a name="ln395"> </a>
+<a name="ln396">  void AddOperation(Operation* operation) {</a>
+<a name="ln397">    ops_.push_back(operation);</a>
+<a name="ln398">  }</a>
+<a name="ln399"> </a>
+<a name="ln400">  void Launch(SessionPool* session_pool, bool allow_local_calls_in_curr_thread = true) {</a>
+<a name="ln401">    session_pool_ = session_pool;</a>
+<a name="ln402">    session_ = session_pool-&gt;Take();</a>
+<a name="ln403">    bool has_ok = false;</a>
+<a name="ln404">    bool applied_operations = false;</a>
+<a name="ln405">    // Supposed to be called only once.</a>
+<a name="ln406">    StatusFunctor callback = BlockCallback(shared_from_this());</a>
+<a name="ln407">    for (auto* op : ops_) {</a>
+<a name="ln408">      has_ok = op-&gt;Apply(session_.get(), callback, &amp;applied_operations) || has_ok;</a>
+<a name="ln409">    }</a>
+<a name="ln410">    if (has_ok) {</a>
+<a name="ln411">      if (applied_operations) {</a>
+<a name="ln412">        // Allow local calls in this thread only if no one is waiting behind us.</a>
+<a name="ln413">        session_-&gt;set_allow_local_calls_in_curr_thread(</a>
+<a name="ln414">            allow_local_calls_in_curr_thread &amp;&amp; this-&gt;next_ == nullptr);</a>
+<a name="ln415">        session_-&gt;FlushAsync(std::move(callback));</a>
+<a name="ln416">      }</a>
+<a name="ln417">    } else {</a>
+<a name="ln418">      Processed();</a>
+<a name="ln419">    }</a>
+<a name="ln420">  }</a>
+<a name="ln421"> </a>
+<a name="ln422">  BlockPtr SetNext(const BlockPtr&amp; next) {</a>
+<a name="ln423">    BlockPtr result = std::move(next_);</a>
+<a name="ln424">    next_ = next;</a>
+<a name="ln425">    return result;</a>
+<a name="ln426">  }</a>
+<a name="ln427"> </a>
+<a name="ln428">  std::string ToString() const {</a>
+<a name="ln429">    return Format(&quot;{ ops: $0 context: $1 next: $2 }&quot;,</a>
+<a name="ln430">                  ops_, static_cast&lt;void*&gt;(context_.get()), next_);</a>
+<a name="ln431">  }</a>
+<a name="ln432"> </a>
+<a name="ln433"> private:</a>
+<a name="ln434">  class BlockCallback {</a>
+<a name="ln435">   public:</a>
+<a name="ln436">    explicit BlockCallback(BlockPtr block) : block_(std::move(block)) {}</a>
+<a name="ln437"> </a>
+<a name="ln438">    void operator()(const Status&amp; status) {</a>
+<a name="ln439">      // Block context owns the arena upon which this block is created.</a>
+<a name="ln440">      // Done is going to free up block's reference to context. So, unless we ensure that</a>
+<a name="ln441">      // the context lives beyond the block_.reset() we might get an error while updating the</a>
+<a name="ln442">      // ref-count for the block_ (in the area of arena owned by the context).</a>
+<a name="ln443">      auto context = block_-&gt;context_;</a>
+<a name="ln444">      DCHECK(context != nullptr) &lt;&lt; block_.get();</a>
+<a name="ln445">      block_-&gt;Done(status);</a>
+<a name="ln446">      block_.reset();</a>
+<a name="ln447">    }</a>
+<a name="ln448">   private:</a>
+<a name="ln449">    BlockPtr block_;</a>
+<a name="ln450">  };</a>
+<a name="ln451"> </a>
+<a name="ln452">  friend class BlockCallback;</a>
+<a name="ln453"> </a>
+<a name="ln454">  void Done(const Status&amp; status) {</a>
+<a name="ln455">    MonoTime now = MonoTime::Now();</a>
+<a name="ln456">    metrics_internal_.handler_latency-&gt;Increment(now.GetDeltaSince(start_).ToMicroseconds());</a>
+<a name="ln457">    VLOG(3) &lt;&lt; &quot;Received status from call &quot; &lt;&lt; status.ToString(true);</a>
+<a name="ln458"> </a>
+<a name="ln459">    std::unordered_map&lt;const client::YBOperation*, Status&gt; op_errors;</a>
+<a name="ln460">    bool tablet_not_found = false;</a>
+<a name="ln461">    if (!status.ok()) {</a>
+<a name="ln462">      if (session_ != nullptr) {</a>
+<a name="ln463">        for (const auto&amp; error : session_-&gt;GetPendingErrors()) {</a>
+<a name="ln464">          if (error-&gt;status().IsNotFound()) {</a>
+<a name="ln465">            tablet_not_found = true;</a>
+<a name="ln466">          }</a>
+<a name="ln467">          op_errors[&amp;error-&gt;failed_op()] = std::move(error-&gt;status());</a>
+<a name="ln468">          YB_LOG_EVERY_N_SECS(WARNING, 1) &lt;&lt; &quot;Explicit error while inserting: &quot;</a>
+<a name="ln469">                                          &lt;&lt; error-&gt;status().ToString();</a>
+<a name="ln470">        }</a>
+<a name="ln471">      }</a>
+<a name="ln472">    }</a>
+<a name="ln473"> </a>
+<a name="ln474">    if (tablet_not_found &amp;&amp; Retrying()) {</a>
+<a name="ln475">        // We will retry and not mark the ops as failed.</a>
+<a name="ln476">        return;</a>
+<a name="ln477">    }</a>
+<a name="ln478"> </a>
+<a name="ln479">    for (auto* op : ops_) {</a>
+<a name="ln480">      if (op-&gt;has_operation() &amp;&amp; op_errors.find(&amp;op-&gt;operation()) != op_errors.end()) {</a>
+<a name="ln481">        // Could check here for NotFound either.</a>
+<a name="ln482">        auto s = op_errors[&amp;op-&gt;operation()];</a>
+<a name="ln483">        op-&gt;Respond(s);</a>
+<a name="ln484">      } else {</a>
+<a name="ln485">        op-&gt;Respond(Status::OK());</a>
+<a name="ln486">      }</a>
+<a name="ln487">    }</a>
+<a name="ln488"> </a>
+<a name="ln489">    Processed();</a>
+<a name="ln490">  }</a>
+<a name="ln491"> </a>
+<a name="ln492">  void Processed() {</a>
+<a name="ln493">    auto allow_local_calls_in_curr_thread = false;</a>
+<a name="ln494">    if (session_) {</a>
+<a name="ln495">      allow_local_calls_in_curr_thread = session_-&gt;allow_local_calls_in_curr_thread();</a>
+<a name="ln496">      session_pool_-&gt;Release(session_);</a>
+<a name="ln497">      session_.reset();</a>
+<a name="ln498">    }</a>
+<a name="ln499">    if (next_) {</a>
+<a name="ln500">      next_-&gt;Launch(session_pool_, allow_local_calls_in_curr_thread);</a>
+<a name="ln501">    }</a>
+<a name="ln502">    context_.reset();</a>
+<a name="ln503">  }</a>
+<a name="ln504"> </a>
+<a name="ln505">  bool Retrying() {</a>
+<a name="ln506">    auto old_table = context_-&gt;table();</a>
+<a name="ln507">    context_-&gt;CleanYBTableFromCache();</a>
+<a name="ln508"> </a>
+<a name="ln509">    const int kMaxRetries = 2;</a>
+<a name="ln510">    if (num_retries_ &gt;= kMaxRetries) {</a>
+<a name="ln511">      VLOG(3) &lt;&lt; &quot;Not retrying because we are past kMaxRetries. num_retries_ = &quot; &lt;&lt; num_retries_</a>
+<a name="ln512">              &lt;&lt; &quot; kMaxRetries = &quot; &lt;&lt; kMaxRetries;</a>
+<a name="ln513">      return false;</a>
+<a name="ln514">    }</a>
+<a name="ln515">    num_retries_++;</a>
+<a name="ln516"> </a>
+<a name="ln517">    auto allow_local_calls_in_curr_thread = false;</a>
+<a name="ln518">    if (session_) {</a>
+<a name="ln519">      allow_local_calls_in_curr_thread = session_-&gt;allow_local_calls_in_curr_thread();</a>
+<a name="ln520">      session_pool_-&gt;Release(session_);</a>
+<a name="ln521">      session_.reset();</a>
+<a name="ln522">    }</a>
+<a name="ln523"> </a>
+<a name="ln524">    auto table = context_-&gt;table();</a>
+<a name="ln525">    if (!table || table-&gt;id() == old_table-&gt;id()) {</a>
+<a name="ln526">      VLOG(3) &lt;&lt; &quot;Not retrying because new table is : &quot; &lt;&lt; (table ? table-&gt;id() : &quot;nullptr&quot;)</a>
+<a name="ln527">              &lt;&lt; &quot; old table was &quot; &lt;&lt; old_table-&gt;id();</a>
+<a name="ln528">      return false;</a>
+<a name="ln529">    }</a>
+<a name="ln530"> </a>
+<a name="ln531">    // Swap out ops with the newer version of the ops referring to the newly created table.</a>
+<a name="ln532">    for (auto* op : ops_) {</a>
+<a name="ln533">      op-&gt;ResetTable(context_-&gt;table());</a>
+<a name="ln534">    }</a>
+<a name="ln535">    Launch(session_pool_, allow_local_calls_in_curr_thread);</a>
+<a name="ln536">    VLOG(3) &lt;&lt; &quot; Retrying with table : &quot; &lt;&lt; table-&gt;id() &lt;&lt; &quot; old table was &quot; &lt;&lt; old_table-&gt;id();</a>
+<a name="ln537">    return true;</a>
+<a name="ln538">  }</a>
+<a name="ln539"> </a>
+<a name="ln540"> private:</a>
+<a name="ln541">  BatchContextPtr context_;</a>
+<a name="ln542">  Ops ops_;</a>
+<a name="ln543">  rpc::RpcMethodMetrics metrics_internal_;</a>
+<a name="ln544">  MonoTime start_;</a>
+<a name="ln545">  SessionPool* session_pool_;</a>
+<a name="ln546">  std::shared_ptr&lt;client::YBSession&gt; session_;</a>
+<a name="ln547">  BlockPtr next_;</a>
+<a name="ln548">  int num_retries_ = 1;</a>
+<a name="ln549">};</a>
+<a name="ln550"> </a>
+<a name="ln551">typedef std::array&lt;rpc::RpcMethodMetrics, kOperationTypeMapSize&gt; InternalMetrics;</a>
+<a name="ln552"> </a>
+<a name="ln553">struct BlockData {</a>
+<a name="ln554">  explicit BlockData(Arena* arena) : used_keys(UsedKeys::allocator_type(arena)) {}</a>
+<a name="ln555"> </a>
+<a name="ln556">  std::string ToString() const {</a>
+<a name="ln557">    return Format(&quot;{ used_keys: $0 block: $1 count: $2 }&quot;, used_keys, block, count);</a>
+<a name="ln558">  }</a>
+<a name="ln559"> </a>
+<a name="ln560">  typedef MCUnorderedSet&lt;Slice, Slice::Hash&gt; UsedKeys;</a>
+<a name="ln561">  UsedKeys used_keys;</a>
+<a name="ln562">  BlockPtr block;</a>
+<a name="ln563">  size_t count = 0;</a>
+<a name="ln564">};</a>
+<a name="ln565"> </a>
+<a name="ln566">class TabletOperations {</a>
+<a name="ln567"> public:</a>
+<a name="ln568">  explicit TabletOperations(Arena* arena)</a>
+<a name="ln569">      : read_data_(arena), write_data_(arena) {</a>
+<a name="ln570">  }</a>
+<a name="ln571"> </a>
+<a name="ln572">  BlockData&amp; data(OperationType type) {</a>
+<a name="ln573">    switch (type) {</a>
+<a name="ln574">      case OperationType::kRead:</a>
+<a name="ln575">        return read_data_;</a>
+<a name="ln576">      case OperationType::kWrite:</a>
+<a name="ln577">        return write_data_;</a>
+<a name="ln578">      case OperationType::kNone: FALLTHROUGH_INTENDED;</a>
+<a name="ln579">      case OperationType::kLocal:</a>
+<a name="ln580">        FATAL_INVALID_ENUM_VALUE(OperationType, type);</a>
+<a name="ln581">    }</a>
+<a name="ln582">    FATAL_INVALID_ENUM_VALUE(OperationType, type);</a>
+<a name="ln583">  }</a>
+<a name="ln584"> </a>
+<a name="ln585">  void Done(SessionPool* session_pool, bool allow_local_calls_in_curr_thread) {</a>
+<a name="ln586">    if (flush_head_) {</a>
+<a name="ln587">      flush_head_-&gt;Launch(session_pool, allow_local_calls_in_curr_thread);</a>
+<a name="ln588">    } else {</a>
+<a name="ln589">      if (read_data_.block) {</a>
+<a name="ln590">        read_data_.block-&gt;Launch(session_pool, allow_local_calls_in_curr_thread);</a>
+<a name="ln591">      }</a>
+<a name="ln592">      if (write_data_.block) {</a>
+<a name="ln593">        write_data_.block-&gt;Launch(session_pool, allow_local_calls_in_curr_thread);</a>
+<a name="ln594">      }</a>
+<a name="ln595">    }</a>
+<a name="ln596">  }</a>
+<a name="ln597"> </a>
+<a name="ln598">  void Process(const BatchContextPtr&amp; context,</a>
+<a name="ln599">               Arena* arena,</a>
+<a name="ln600">               Operation* operation,</a>
+<a name="ln601">               const InternalMetrics&amp; metrics_internal) {</a>
+<a name="ln602">    auto type = operation-&gt;type();</a>
+<a name="ln603">    if (type == OperationType::kLocal) {</a>
+<a name="ln604">      ProcessLocalOperation(context, arena, operation, metrics_internal);</a>
+<a name="ln605">      return;</a>
+<a name="ln606">    }</a>
+<a name="ln607">    boost::container::small_vector&lt;Slice, RedisClientCommand::static_capacity&gt; keys;</a>
+<a name="ln608">    operation-&gt;GetKeys(&amp;keys);</a>
+<a name="ln609">    CheckConflicts(type, keys);</a>
+<a name="ln610">    auto&amp; data = this-&gt;data(type);</a>
+<a name="ln611">    if (!data.block) {</a>
+<a name="ln612">      ArenaAllocator&lt;Block&gt; alloc(arena);</a>
+<a name="ln613">      data.block = std::allocate_shared&lt;Block&gt;(</a>
+<a name="ln614">          alloc, context, alloc, metrics_internal[static_cast&lt;size_t&gt;(OperationType::kRead)]);</a>
+<a name="ln615">      if (last_conflict_type_ == OperationType::kLocal) {</a>
+<a name="ln616">        last_local_block_-&gt;SetNext(data.block);</a>
+<a name="ln617">        last_conflict_type_ = type;</a>
+<a name="ln618">      } else if (type == last_conflict_type_) {</a>
+<a name="ln619">        auto old_value = this-&gt;data(Opposite(type)).block-&gt;SetNext(data.block);</a>
+<a name="ln620">        if (old_value) {</a>
+<a name="ln621">          LOG(DFATAL) &lt;&lt; &quot;Opposite already had next block: &quot;</a>
+<a name="ln622">                      &lt;&lt; operation-&gt;call().serialized_request().ToDebugString();</a>
+<a name="ln623">        }</a>
+<a name="ln624">      }</a>
+<a name="ln625">    }</a>
+<a name="ln626">    data.block-&gt;AddOperation(operation);</a>
+<a name="ln627">    RememberKeys(type, &amp;keys);</a>
+<a name="ln628">  }</a>
+<a name="ln629"> </a>
+<a name="ln630">  std::string ToString() const {</a>
+<a name="ln631">    return Format(&quot;{ read_data: $0 write_data: $1 flush_head: $2 last_local_block: $3 &quot;</a>
+<a name="ln632">                  &quot;last_conflict_type: $4 }&quot;,</a>
+<a name="ln633">                  read_data_, write_data_, flush_head_, last_local_block_, last_conflict_type_);</a>
+<a name="ln634">  }</a>
+<a name="ln635"> </a>
+<a name="ln636"> private:</a>
+<a name="ln637">  void ProcessLocalOperation(const BatchContextPtr&amp; context,</a>
+<a name="ln638">                             Arena* arena,</a>
+<a name="ln639">                             Operation* operation,</a>
+<a name="ln640">                             const InternalMetrics&amp; metrics_internal) {</a>
+<a name="ln641">    ArenaAllocator&lt;Block&gt; alloc(arena);</a>
+<a name="ln642">    auto block = std::allocate_shared&lt;Block&gt;(</a>
+<a name="ln643">        alloc, context, alloc, metrics_internal[static_cast&lt;size_t&gt;(OperationType::kLocal)]);</a>
+<a name="ln644">    switch (last_conflict_type_) {</a>
+<a name="ln645">      case OperationType::kNone:</a>
+<a name="ln646">        if (read_data_.block) {</a>
+<a name="ln647">          flush_head_ = read_data_.block;</a>
+<a name="ln648">          if (write_data_.block) {</a>
+<a name="ln649">            read_data_.block-&gt;SetNext(write_data_.block);</a>
+<a name="ln650">            write_data_.block-&gt;SetNext(block);</a>
+<a name="ln651">          } else {</a>
+<a name="ln652">            read_data_.block-&gt;SetNext(block);</a>
+<a name="ln653">          }</a>
+<a name="ln654">        } else if (write_data_.block) {</a>
+<a name="ln655">          flush_head_ = write_data_.block;</a>
+<a name="ln656">          write_data_.block-&gt;SetNext(block);</a>
+<a name="ln657">        } else {</a>
+<a name="ln658">          flush_head_ = block;</a>
+<a name="ln659">        }</a>
+<a name="ln660">        break;</a>
+<a name="ln661">      case OperationType::kRead:</a>
+<a name="ln662">        read_data_.block-&gt;SetNext(block);</a>
+<a name="ln663">        break;</a>
+<a name="ln664">      case OperationType::kWrite:</a>
+<a name="ln665">        write_data_.block-&gt;SetNext(block);</a>
+<a name="ln666">        break;</a>
+<a name="ln667">      case OperationType::kLocal:</a>
+<a name="ln668">        last_local_block_-&gt;SetNext(block);</a>
+<a name="ln669">        break;</a>
+<a name="ln670">    }</a>
+<a name="ln671">    read_data_.block = nullptr;</a>
+<a name="ln672">    read_data_.used_keys.clear();</a>
+<a name="ln673">    write_data_.block = nullptr;</a>
+<a name="ln674">    write_data_.used_keys.clear();</a>
+<a name="ln675">    last_local_block_ = block;</a>
+<a name="ln676">    last_conflict_type_ = OperationType::kLocal;</a>
+<a name="ln677">    block-&gt;AddOperation(operation);</a>
+<a name="ln678">  }</a>
+<a name="ln679"> </a>
+<a name="ln680">  void ConflictFound(OperationType type) {</a>
+<a name="ln681">    auto&amp; data = this-&gt;data(type);</a>
+<a name="ln682">    auto&amp; opposite_data = this-&gt;data(Opposite(type));</a>
+<a name="ln683"> </a>
+<a name="ln684">    switch (last_conflict_type_) {</a>
+<a name="ln685">      case OperationType::kNone:</a>
+<a name="ln686">        flush_head_ = opposite_data.block;</a>
+<a name="ln687">        opposite_data.block-&gt;SetNext(data.block);</a>
+<a name="ln688">        break;</a>
+<a name="ln689">      case OperationType::kWrite:</a>
+<a name="ln690">      case OperationType::kRead:</a>
+<a name="ln691">        data.block = nullptr;</a>
+<a name="ln692">        data.used_keys.clear();</a>
+<a name="ln693">        break;</a>
+<a name="ln694">      case OperationType::kLocal:</a>
+<a name="ln695">        last_local_block_-&gt;SetNext(data.block);</a>
+<a name="ln696">        break;</a>
+<a name="ln697">    }</a>
+<a name="ln698">    last_conflict_type_ = type;</a>
+<a name="ln699">  }</a>
+<a name="ln700"> </a>
+<a name="ln701">  void CheckConflicts(OperationType type, const RedisKeyList&amp; keys) {</a>
+<a name="ln702">    if (last_conflict_type_ == type) {</a>
+<a name="ln703">      return;</a>
+<a name="ln704">    }</a>
+<a name="ln705">    if (last_conflict_type_ == OperationType::kLocal) {</a>
+<a name="ln706">      return;</a>
+<a name="ln707">    }</a>
+<a name="ln708">    auto&amp; opposite = data(Opposite(type));</a>
+<a name="ln709">    bool conflict = false;</a>
+<a name="ln710">    for (const auto&amp; key : keys) {</a>
+<a name="ln711">      if (opposite.used_keys.count(key)) {</a>
+<a name="ln712">        conflict = true;</a>
+<a name="ln713">        break;</a>
+<a name="ln714">      }</a>
+<a name="ln715">    }</a>
+<a name="ln716">    if (conflict) {</a>
+<a name="ln717">      ConflictFound(type);</a>
+<a name="ln718">    }</a>
+<a name="ln719">  }</a>
+<a name="ln720"> </a>
+<a name="ln721">  void RememberKeys(OperationType type, RedisKeyList* keys) {</a>
+<a name="ln722">    BlockData* dest;</a>
+<a name="ln723">    switch (type) {</a>
+<a name="ln724">      case OperationType::kRead:</a>
+<a name="ln725">        dest = &amp;read_data_;</a>
+<a name="ln726">        break;</a>
+<a name="ln727">      case OperationType::kWrite:</a>
+<a name="ln728">        dest = &amp;write_data_;</a>
+<a name="ln729">        break;</a>
+<a name="ln730">      case OperationType::kNone: FALLTHROUGH_INTENDED;</a>
+<a name="ln731">      case OperationType::kLocal:</a>
+<a name="ln732">        FATAL_INVALID_ENUM_VALUE(OperationType, type);</a>
+<a name="ln733">    }</a>
+<a name="ln734">    for (auto&amp; key : *keys) {</a>
+<a name="ln735">      dest-&gt;used_keys.insert(std::move(key));</a>
+<a name="ln736">    }</a>
+<a name="ln737">  }</a>
+<a name="ln738"> </a>
+<a name="ln739">  BlockData read_data_;</a>
+<a name="ln740">  BlockData write_data_;</a>
+<a name="ln741">  BlockPtr flush_head_;</a>
+<a name="ln742">  BlockPtr last_local_block_;</a>
+<a name="ln743"> </a>
+<a name="ln744">  // Type of command that caused last conflict between reads and writes.</a>
+<a name="ln745">  OperationType last_conflict_type_ = OperationType::kNone;</a>
+<a name="ln746">};</a>
+<a name="ln747"> </a>
+<a name="ln748">YB_STRONGLY_TYPED_BOOL(IsMonitorMessage);</a>
+<a name="ln749"> </a>
+<a name="ln750">struct RedisServiceImplData : public RedisServiceData {</a>
+<a name="ln751">  RedisServiceImplData(RedisServer* server, string&amp;&amp; yb_tier_master_addresses);</a>
+<a name="ln752"> </a>
+<a name="ln753">  void AppendToMonitors(Connection* conn) override;</a>
+<a name="ln754">  void RemoveFromMonitors(Connection* conn) override;</a>
+<a name="ln755">  void LogToMonitors(const string&amp; end, const string&amp; db, const RedisClientCommand&amp; cmd) override;</a>
+<a name="ln756">  yb::Result&lt;std::shared_ptr&lt;client::YBTable&gt;&gt; GetYBTableForDB(const string&amp; db_name) override;</a>
+<a name="ln757"> </a>
+<a name="ln758">  void CleanYBTableFromCacheForDB(const string&amp; table);</a>
+<a name="ln759"> </a>
+<a name="ln760">  void AppendToSubscribers(</a>
+<a name="ln761">      AsPattern type, const std::vector&lt;std::string&gt;&amp; channels, rpc::Connection* conn,</a>
+<a name="ln762">      std::vector&lt;int&gt;* subs) override;</a>
+<a name="ln763">  void RemoveFromSubscribers(</a>
+<a name="ln764">      AsPattern type, const std::vector&lt;std::string&gt;&amp; channels, rpc::Connection* conn,</a>
+<a name="ln765">      std::vector&lt;int&gt;* subs) override;</a>
+<a name="ln766">  void CleanUpSubscriptions(Connection* conn) override;</a>
+<a name="ln767">  int NumSubscribers(AsPattern type, const std::string&amp; channel) override;</a>
+<a name="ln768">  std::unordered_set&lt;std::string&gt; GetSubscriptions(AsPattern type, rpc::Connection* conn) override;</a>
+<a name="ln769">  std::unordered_set&lt;std::string&gt; GetAllSubscriptions(AsPattern type) override;</a>
+<a name="ln770">  int Publish(const string&amp; channel, const string&amp; message);</a>
+<a name="ln771">  void ForwardToInterestedProxies(</a>
+<a name="ln772">      const string&amp; channel, const string&amp; message, const IntFunctor&amp; f) override;</a>
+<a name="ln773">  int PublishToLocalClients(IsMonitorMessage mode, const string&amp; channel, const string&amp; message);</a>
+<a name="ln774">  Result&lt;vector&lt;HostPortPB&gt;&gt; GetServerAddrsForChannel(const string&amp; channel);</a>
+<a name="ln775">  int NumSubscriptionsUnlocked(Connection* conn);</a>
+<a name="ln776"> </a>
+<a name="ln777">  CHECKED_STATUS GetRedisPasswords(vector&lt;string&gt;* passwords) override;</a>
+<a name="ln778">  CHECKED_STATUS Initialize();</a>
+<a name="ln779">  bool initialized() const { return initialized_.load(std::memory_order_relaxed); }</a>
+<a name="ln780"> </a>
+<a name="ln781">  // yb::Result&lt;std::shared_ptr&lt;client::YBTable&gt;&gt; GetYBTableForDB(const string&amp; db_name);</a>
+<a name="ln782"> </a>
+<a name="ln783">  std::string yb_tier_master_addresses_;</a>
+<a name="ln784"> </a>
+<a name="ln785">  yb::rpc::RpcMethodMetrics metrics_error_;</a>
+<a name="ln786">  InternalMetrics metrics_internal_;</a>
+<a name="ln787"> </a>
+<a name="ln788">  // Mutex that protects the creation of client_ and populating db_to_opened_table_.</a>
+<a name="ln789">  std::mutex yb_mutex_;</a>
+<a name="ln790">  std::atomic&lt;bool&gt; initialized_;</a>
+<a name="ln791">  client::YBClient* client_;</a>
+<a name="ln792">  SessionPool session_pool_;</a>
+<a name="ln793">  std::unordered_map&lt;std::string, std::shared_ptr&lt;client::YBTable&gt;&gt; db_to_opened_table_;</a>
+<a name="ln794">  std::shared_ptr&lt;client::YBMetaDataCache&gt; tables_cache_;</a>
+<a name="ln795"> </a>
+<a name="ln796">  rw_semaphore pubsub_mutex_;</a>
+<a name="ln797">  std::unordered_map&lt;std::string, std::unordered_set&lt;Connection*&gt;&gt; channels_to_clients_;</a>
+<a name="ln798">  std::unordered_map&lt;std::string, std::unordered_set&lt;Connection*&gt;&gt; patterns_to_clients_;</a>
+<a name="ln799">  struct ClientSubscription {</a>
+<a name="ln800">    std::unordered_set&lt;std::string&gt; channels;</a>
+<a name="ln801">    std::unordered_set&lt;std::string&gt; patterns;</a>
+<a name="ln802">  };</a>
+<a name="ln803">  std::unordered_map&lt;Connection*, ClientSubscription&gt; clients_to_subscriptions_;</a>
+<a name="ln804"> </a>
+<a name="ln805">  std::unordered_set&lt;Connection*&gt; monitoring_clients_;</a>
+<a name="ln806">  scoped_refptr&lt;AtomicGauge&lt;uint64_t&gt;&gt; num_clients_monitoring_;</a>
+<a name="ln807"> </a>
+<a name="ln808">  std::mutex redis_password_mutex_;</a>
+<a name="ln809">  MonoTime redis_cached_password_validity_expiry_;</a>
+<a name="ln810">  vector&lt;string&gt; redis_cached_passwords_;</a>
+<a name="ln811"> </a>
+<a name="ln812">  RedisServer* server_;</a>
+<a name="ln813"> </a>
+<a name="ln814">};</a>
+<a name="ln815"> </a>
+<a name="ln816">class BatchContextImpl : public BatchContext {</a>
+<a name="ln817"> public:</a>
+<a name="ln818">  BatchContextImpl(</a>
+<a name="ln819">      const string&amp; dbname, const std::shared_ptr&lt;RedisInboundCall&gt;&amp; call,</a>
+<a name="ln820">      RedisServiceImplData* impl_data)</a>
+<a name="ln821">      : impl_data_(impl_data),</a>
+<a name="ln822">        db_name_(dbname),</a>
+<a name="ln823">        call_(call),</a>
+<a name="ln824">        consumption_(impl_data-&gt;server_-&gt;mem_tracker(), 0),</a>
+<a name="ln825">        operations_(&amp;arena_),</a>
+<a name="ln826">        tablets_(&amp;arena_) {</a>
+<a name="ln827">  }</a>
+<a name="ln828"> </a>
+<a name="ln829">  virtual ~BatchContextImpl() {}</a>
+<a name="ln830"> </a>
+<a name="ln831">  const RedisClientCommand&amp; command(size_t idx) const override {</a>
+<a name="ln832">    return call_-&gt;client_batch()[idx];</a>
+<a name="ln833">  }</a>
+<a name="ln834"> </a>
+<a name="ln835">  const std::shared_ptr&lt;RedisInboundCall&gt;&amp; call() const override {</a>
+<a name="ln836">    return call_;</a>
+<a name="ln837">  }</a>
+<a name="ln838"> </a>
+<a name="ln839">  client::YBClient* client() const override {</a>
+<a name="ln840">    return impl_data_-&gt;client_;</a>
+<a name="ln841">  }</a>
+<a name="ln842"> </a>
+<a name="ln843">  RedisServiceImplData* service_data() override {</a>
+<a name="ln844">    return impl_data_;</a>
+<a name="ln845">  }</a>
+<a name="ln846"> </a>
+<a name="ln847">  const RedisServer* server() override {</a>
+<a name="ln848">    return impl_data_-&gt;server_;</a>
+<a name="ln849">  }</a>
+<a name="ln850"> </a>
+<a name="ln851">  void CleanYBTableFromCache() override {</a>
+<a name="ln852">    impl_data_-&gt;CleanYBTableFromCacheForDB(db_name_);</a>
+<a name="ln853">  }</a>
+<a name="ln854"> </a>
+<a name="ln855">  std::shared_ptr&lt;client::YBTable&gt; table() override {</a>
+<a name="ln856">    auto table = impl_data_-&gt;GetYBTableForDB(db_name_);</a>
+<a name="ln857">    if (!table.ok()) {</a>
+<a name="ln858">      return nullptr;</a>
+<a name="ln859">    }</a>
+<a name="ln860">    return *table;</a>
+<a name="ln861">  }</a>
+<a name="ln862"> </a>
+<a name="ln863">  void Commit() {</a>
+<a name="ln864">    Commit(1);</a>
+<a name="ln865">  }</a>
+<a name="ln866"> </a>
+<a name="ln867">  void Commit(int retries) {</a>
+<a name="ln868">    if (operations_.empty()) {</a>
+<a name="ln869">      return;</a>
+<a name="ln870">    }</a>
+<a name="ln871"> </a>
+<a name="ln872">    auto table = impl_data_-&gt;GetYBTableForDB(db_name_);</a>
+<a name="ln873">    if (!table.ok()) {</a>
+<a name="ln874">      for (auto&amp; operation : operations_) {</a>
+<a name="ln875">        operation.Respond(table.status());</a>
+<a name="ln876">      }</a>
+<a name="ln877">    }</a>
+<a name="ln878">    auto deadline = CoarseMonoClock::Now() + FLAGS_redis_service_yb_client_timeout_millis * 1ms;</a>
+<a name="ln879">    lookups_left_.store(operations_.size(), std::memory_order_release);</a>
+<a name="ln880">    retry_lookups_.store(false, std::memory_order_release);</a>
+<a name="ln881">    for (auto&amp; operation : operations_) {</a>
+<a name="ln882">      impl_data_-&gt;client_-&gt;LookupTabletByKey(</a>
+<a name="ln883">          table-&gt;get(), operation.partition_key(), deadline,</a>
+<a name="ln884">          std::bind(</a>
+<a name="ln885">              &amp;BatchContextImpl::LookupDone, scoped_refptr&lt;BatchContextImpl&gt;(this), &amp;operation,</a>
+<a name="ln886">              retries, _1));</a>
+<a name="ln887">    }</a>
+<a name="ln888">  }</a>
+<a name="ln889"> </a>
+<a name="ln890">  void Apply(</a>
+<a name="ln891">      size_t index,</a>
+<a name="ln892">      std::shared_ptr&lt;client::YBRedisReadOp&gt; operation,</a>
+<a name="ln893">      const rpc::RpcMethodMetrics&amp; metrics) override {</a>
+<a name="ln894">    DoApply(index, std::move(operation), metrics);</a>
+<a name="ln895">  }</a>
+<a name="ln896"> </a>
+<a name="ln897">  void Apply(</a>
+<a name="ln898">      size_t index,</a>
+<a name="ln899">      std::shared_ptr&lt;client::YBRedisWriteOp&gt; operation,</a>
+<a name="ln900">      const rpc::RpcMethodMetrics&amp; metrics) override {</a>
+<a name="ln901">    DoApply(index, std::move(operation), metrics);</a>
+<a name="ln902">  }</a>
+<a name="ln903"> </a>
+<a name="ln904">  void Apply(</a>
+<a name="ln905">      size_t index,</a>
+<a name="ln906">      std::function&lt;bool(client::YBSession*, const StatusFunctor&amp;)&gt; functor,</a>
+<a name="ln907">      std::string partition_key,</a>
+<a name="ln908">      const rpc::RpcMethodMetrics&amp; metrics,</a>
+<a name="ln909">      ManualResponse manual_response) override {</a>
+<a name="ln910">    DoApply(index, std::move(functor), std::move(partition_key), metrics, manual_response);</a>
+<a name="ln911">  }</a>
+<a name="ln912"> </a>
+<a name="ln913">  std::string ToString() const {</a>
+<a name="ln914">    return Format(&quot;{ tablets: $0 }&quot;, tablets_);</a>
+<a name="ln915">  }</a>
+<a name="ln916"> </a>
+<a name="ln917"> private:</a>
+<a name="ln918">  template &lt;class... Args&gt;</a>
+<a name="ln919">  void DoApply(Args&amp;&amp;... args) {</a>
+<a name="ln920">    operations_.emplace_back(call_, std::forward&lt;Args&gt;(args)...);</a>
+<a name="ln921">    if (PREDICT_FALSE(operations_.back().responded())) {</a>
+<a name="ln922">      operations_.pop_back();</a>
+<a name="ln923">    } else {</a>
+<a name="ln924">      consumption_.Add(operations_.back().space_used_by_request());</a>
+<a name="ln925">    }</a>
+<a name="ln926">  }</a>
+<a name="ln927"> </a>
+<a name="ln928">  void LookupDone(</a>
+<a name="ln929">      Operation* operation, int retries, const Result&lt;client::internal::RemoteTabletPtr&gt;&amp; result) {</a>
+<a name="ln930">    const int kMaxRetries = 2;</a>
+<a name="ln931">    if (!result.ok()) {</a>
+<a name="ln932">      auto status = result.status();</a>
+<a name="ln933">      if (status.IsNotFound() &amp;&amp; retries &lt; kMaxRetries) {</a>
+<a name="ln934">        retry_lookups_.store(false, std::memory_order_release);</a>
+<a name="ln935">      } else {</a>
+<a name="ln936">        operation-&gt;Respond(status);</a>
+<a name="ln937">      }</a>
+<a name="ln938">    } else {</a>
+<a name="ln939">      operation-&gt;SetTablet(*result);</a>
+<a name="ln940">    }</a>
+<a name="ln941">    if (lookups_left_.fetch_sub(1, std::memory_order_acq_rel) != 1) {</a>
+<a name="ln942">      return;</a>
+<a name="ln943">    }</a>
+<a name="ln944"> </a>
+<a name="ln945">    if (retries &lt; kMaxRetries &amp;&amp; retry_lookups_.load(std::memory_order_acquire)) {</a>
+<a name="ln946">      CleanYBTableFromCache();</a>
+<a name="ln947">      Commit(retries + 1);</a>
+<a name="ln948">      return;</a>
+<a name="ln949">    }</a>
+<a name="ln950"> </a>
+<a name="ln951">    BatchContextPtr self(this);</a>
+<a name="ln952">    for (auto&amp; operation : operations_) {</a>
+<a name="ln953">      if (!operation.responded()) {</a>
+<a name="ln954">        auto it = tablets_.find(operation.tablet()-&gt;tablet_id());</a>
+<a name="ln955">        if (it == tablets_.end()) {</a>
+<a name="ln956">          it = tablets_.emplace(operation.tablet()-&gt;tablet_id(), TabletOperations(&amp;arena_)).first;</a>
+<a name="ln957">        }</a>
+<a name="ln958">        it-&gt;second.Process(self, &amp;arena_, &amp;operation, impl_data_-&gt;metrics_internal_);</a>
+<a name="ln959">      }</a>
+<a name="ln960">    }</a>
+<a name="ln961"> </a>
+<a name="ln962">    int idx = 0;</a>
+<a name="ln963">    for (auto&amp; tablet : tablets_) {</a>
+<a name="ln964">      tablet.second.Done(&amp;impl_data_-&gt;session_pool_, ++idx == tablets_.size());</a>
+<a name="ln965">    }</a>
+<a name="ln966">    tablets_.clear();</a>
+<a name="ln967">  }</a>
+<a name="ln968"> </a>
+<a name="ln969">  RedisServiceImplData* impl_data_ = nullptr;</a>
+<a name="ln970"> </a>
+<a name="ln971">  const string db_name_;</a>
+<a name="ln972">  std::shared_ptr&lt;RedisInboundCall&gt; call_;</a>
+<a name="ln973">  ScopedTrackedConsumption consumption_;</a>
+<a name="ln974"> </a>
+<a name="ln975">  Arena arena_;</a>
+<a name="ln976">  MCDeque&lt;Operation&gt; operations_;</a>
+<a name="ln977">  std::atomic&lt;bool&gt; retry_lookups_;</a>
+<a name="ln978">  std::atomic&lt;size_t&gt; lookups_left_;</a>
+<a name="ln979">  MCUnorderedMap&lt;Slice, TabletOperations, Slice::Hash&gt; tablets_;</a>
+<a name="ln980">};</a>
+<a name="ln981"> </a>
+<a name="ln982">} // namespace</a>
+<a name="ln983"> </a>
+<a name="ln984">class RedisServiceImpl::Impl {</a>
+<a name="ln985"> public:</a>
+<a name="ln986">  Impl(RedisServer* server, string yb_tier_master_address);</a>
+<a name="ln987"> </a>
+<a name="ln988">  ~Impl() {</a>
+<a name="ln989">    // Wait for DebugSleep to finish.</a>
+<a name="ln990">    // We use DebugSleep only during tests.</a>
+<a name="ln991">    // So just for long enough, giving extra 400ms for it.</a>
+<a name="ln992">    std::this_thread::sleep_for(500ms);</a>
+<a name="ln993">  }</a>
+<a name="ln994"> </a>
+<a name="ln995">  void Handle(yb::rpc::InboundCallPtr call_ptr);</a>
+<a name="ln996"> </a>
+<a name="ln997"> private:</a>
+<a name="ln998">  void SetupMethod(const RedisCommandInfo&amp; info) {</a>
+<a name="ln999">    auto info_ptr = std::make_shared&lt;RedisCommandInfo&gt;(info);</a>
+<a name="ln1000">    std::string lower_name = boost::to_lower_copy(info.name);</a>
+<a name="ln1001">    std::string upper_name = boost::to_upper_copy(info.name);</a>
+<a name="ln1002">    size_t len = info.name.size();</a>
+<a name="ln1003">    std::string temp(len, 0);</a>
+<a name="ln1004">    for (size_t i = 0; i != (1ULL &lt;&lt; len); ++i) {</a>
+<a name="ln1005">      for (size_t j = 0; j != len; ++j) {</a>
+<a name="ln1006">        temp[j] = i &amp; (1 &lt;&lt; j) ? upper_name[j] : lower_name[j];</a>
+<a name="ln1007">      }</a>
+<a name="ln1008">      names_.push_back(temp);</a>
+<a name="ln1009">      CHECK(command_name_to_info_map_.emplace(names_.back(), info_ptr).second);</a>
+<a name="ln1010">    }</a>
+<a name="ln1011">  }</a>
+<a name="ln1012"> </a>
+<a name="ln1013">  bool CheckArgumentSizeOK(const RedisClientCommand&amp; cmd_args) {</a>
+<a name="ln1014">    for (Slice arg : cmd_args) {</a>
+<a name="ln1015">      if (arg.size() &gt; FLAGS_redis_max_value_size) {</a>
+<a name="ln1016">        return false;</a>
+<a name="ln1017">      }</a>
+<a name="ln1018">    }</a>
+<a name="ln1019">    return true;</a>
+<a name="ln1020">  }</a>
+<a name="ln1021"> </a>
+<a name="ln1022">  bool CheckAuthentication(RedisConnectionContext* conn_context) {</a>
+<a name="ln1023">    if (!conn_context-&gt;is_authenticated()) {</a>
+<a name="ln1024">      vector&lt;string&gt; passwords;</a>
+<a name="ln1025">      Status s = data_.GetRedisPasswords(&amp;passwords);</a>
+<a name="ln1026">      conn_context-&gt;set_authenticated(!FLAGS_enable_redis_auth || (s.ok() &amp;&amp; passwords.empty()));</a>
+<a name="ln1027">    }</a>
+<a name="ln1028">    return conn_context-&gt;is_authenticated();</a>
+<a name="ln1029">  }</a>
+<a name="ln1030"> </a>
+<a name="ln1031">  void PopulateHandlers();</a>
+<a name="ln1032">  // Fetches the appropriate handler for the command, nullptr if none exists.</a>
+<a name="ln1033">  const RedisCommandInfo* FetchHandler(const RedisClientCommand&amp; cmd_args);</a>
+<a name="ln1034"> </a>
+<a name="ln1035">  std::deque&lt;std::string&gt; names_;</a>
+<a name="ln1036">  std::unordered_map&lt;Slice, RedisCommandInfoPtr, Slice::Hash&gt; command_name_to_info_map_;</a>
+<a name="ln1037"> </a>
+<a name="ln1038">  RedisServiceImplData data_;</a>
+<a name="ln1039">};</a>
+<a name="ln1040"> </a>
+<a name="ln1041">RedisServiceImplData::RedisServiceImplData(RedisServer* server, string&amp;&amp; yb_tier_master_addresses)</a>
+<a name="ln1042">    : yb_tier_master_addresses_(std::move(yb_tier_master_addresses)),</a>
+<a name="ln1043">      initialized_(false),</a>
+<a name="ln1044">      server_(server) {}</a>
+<a name="ln1045"> </a>
+<a name="ln1046">yb::Result&lt;std::shared_ptr&lt;client::YBTable&gt;&gt; RedisServiceImplData::GetYBTableForDB(</a>
+<a name="ln1047">    const string&amp; db_name) {</a>
+<a name="ln1048">  std::shared_ptr&lt;client::YBTable&gt; table;</a>
+<a name="ln1049">  YBTableName table_name = GetYBTableNameForRedisDatabase(db_name);</a>
+<a name="ln1050">  bool was_cached = false;</a>
+<a name="ln1051">  auto res = tables_cache_-&gt;GetTable(table_name, &amp;table, &amp;was_cached);</a>
+<a name="ln1052">  if (!res.ok()) return res;</a>
+<a name="ln1053">  return table;</a>
+<a name="ln1054">}</a>
+<a name="ln1055"> </a>
+<a name="ln1056">void RedisServiceImplData::AppendToMonitors(Connection* conn) {</a>
+<a name="ln1057">  VLOG(3) &lt;&lt; &quot;AppendToMonitors (&quot; &lt;&lt; conn-&gt;ToString();</a>
+<a name="ln1058">  {</a>
+<a name="ln1059">    boost::lock_guard&lt;decltype(pubsub_mutex_)&gt; lock(pubsub_mutex_);</a>
+<a name="ln1060">    monitoring_clients_.insert(conn);</a>
+<a name="ln1061">    num_clients_monitoring_-&gt;set_value(monitoring_clients_.size());</a>
+<a name="ln1062">  }</a>
+<a name="ln1063">  auto&amp; context = static_cast&lt;RedisConnectionContext&amp;&gt;(conn-&gt;context());</a>
+<a name="ln1064">  if (context.ClientMode() != RedisClientMode::kMonitoring) {</a>
+<a name="ln1065">    context.SetClientMode(RedisClientMode::kMonitoring);</a>
+<a name="ln1066">    context.SetCleanupHook(std::bind(&amp;RedisServiceImplData::RemoveFromMonitors, this, conn));</a>
+<a name="ln1067">  }</a>
+<a name="ln1068">}</a>
+<a name="ln1069"> </a>
+<a name="ln1070">void RedisServiceImplData::RemoveFromMonitors(Connection* conn) {</a>
+<a name="ln1071">  VLOG(3) &lt;&lt; &quot;RemoveFromMonitors (&quot; &lt;&lt; conn-&gt;ToString();</a>
+<a name="ln1072">  {</a>
+<a name="ln1073">    boost::lock_guard&lt;decltype(pubsub_mutex_)&gt; lock(pubsub_mutex_);</a>
+<a name="ln1074">    monitoring_clients_.erase(conn);</a>
+<a name="ln1075">    num_clients_monitoring_-&gt;set_value(monitoring_clients_.size());</a>
+<a name="ln1076">  }</a>
+<a name="ln1077">}</a>
+<a name="ln1078"> </a>
+<a name="ln1079">int RedisServiceImplData::NumSubscriptionsUnlocked(Connection* conn) {</a>
+<a name="ln1080">  return clients_to_subscriptions_[conn].channels.size() +</a>
+<a name="ln1081">         clients_to_subscriptions_[conn].patterns.size();</a>
+<a name="ln1082">}</a>
+<a name="ln1083"> </a>
+<a name="ln1084">void RedisServiceImplData::AppendToSubscribers(</a>
+<a name="ln1085">    AsPattern type, const std::vector&lt;std::string&gt;&amp; channels, rpc::Connection* conn,</a>
+<a name="ln1086">    std::vector&lt;int&gt;* subs) {</a>
+<a name="ln1087">  boost::lock_guard&lt;decltype(pubsub_mutex_)&gt; lock(pubsub_mutex_);</a>
+<a name="ln1088">  subs-&gt;clear();</a>
+<a name="ln1089">  for (const auto&amp; channel : channels) {</a>
+<a name="ln1090">    VLOG(3) &lt;&lt; &quot;AppendToSubscribers (&quot; &lt;&lt; type &lt;&lt; &quot;, &quot; &lt;&lt; channel &lt;&lt; &quot;, &quot; &lt;&lt; conn-&gt;ToString();</a>
+<a name="ln1091">    if (type == AsPattern::kTrue) {</a>
+<a name="ln1092">      patterns_to_clients_[channel].insert(conn);</a>
+<a name="ln1093">      clients_to_subscriptions_[conn].patterns.insert(channel);</a>
+<a name="ln1094">    } else {</a>
+<a name="ln1095">      channels_to_clients_[channel].insert(conn);</a>
+<a name="ln1096">      clients_to_subscriptions_[conn].channels.insert(channel);</a>
+<a name="ln1097">    }</a>
+<a name="ln1098">    subs-&gt;push_back(NumSubscriptionsUnlocked(conn));</a>
+<a name="ln1099">  }</a>
+<a name="ln1100">  auto&amp; context = static_cast&lt;RedisConnectionContext&amp;&gt;(conn-&gt;context());</a>
+<a name="ln1101">  if (context.ClientMode() != RedisClientMode::kSubscribed) {</a>
+<a name="ln1102">    context.SetClientMode(RedisClientMode::kSubscribed);</a>
+<a name="ln1103">    context.SetCleanupHook(std::bind(&amp;RedisServiceImplData::CleanUpSubscriptions, this, conn));</a>
+<a name="ln1104">  }</a>
+<a name="ln1105">}</a>
+<a name="ln1106"> </a>
+<a name="ln1107">void RedisServiceImplData::RemoveFromSubscribers(</a>
+<a name="ln1108">    AsPattern type, const std::vector&lt;std::string&gt;&amp; channels, rpc::Connection* conn,</a>
+<a name="ln1109">    std::vector&lt;int&gt;* subs) {</a>
+<a name="ln1110">  boost::lock_guard&lt;decltype(pubsub_mutex_)&gt; lock(pubsub_mutex_);</a>
+<a name="ln1111">  auto&amp; map_to_clients = (type == AsPattern::kTrue ? patterns_to_clients_ : channels_to_clients_);</a>
+<a name="ln1112">  auto&amp; map_from_clients =</a>
+<a name="ln1113">      (type == AsPattern::kTrue ? clients_to_subscriptions_[conn].patterns</a>
+<a name="ln1114">                                : clients_to_subscriptions_[conn].channels);</a>
+<a name="ln1115"> </a>
+<a name="ln1116">  subs-&gt;clear();</a>
+<a name="ln1117">  for (const auto&amp; channel : channels) {</a>
+<a name="ln1118">    map_to_clients[channel].erase(conn);</a>
+<a name="ln1119">    if (map_to_clients[channel].empty()) {</a>
+<a name="ln1120">      map_to_clients.erase(channel);</a>
+<a name="ln1121">    }</a>
+<a name="ln1122">    map_from_clients.erase(channel);</a>
+<a name="ln1123">    subs-&gt;push_back(NumSubscriptionsUnlocked(conn));</a>
+<a name="ln1124">  }</a>
+<a name="ln1125">}</a>
+<a name="ln1126"> </a>
+<a name="ln1127">std::unordered_set&lt;string&gt; RedisServiceImplData::GetSubscriptions(</a>
+<a name="ln1128">    AsPattern type, Connection* conn) {</a>
+<a name="ln1129">  SharedLock&lt;decltype(pubsub_mutex_)&gt; lock(pubsub_mutex_);</a>
+<a name="ln1130">  return (</a>
+<a name="ln1131">      type == AsPattern::kTrue ? clients_to_subscriptions_[conn].patterns</a>
+<a name="ln1132">                               : clients_to_subscriptions_[conn].channels);</a>
+<a name="ln1133">}</a>
+<a name="ln1134"> </a>
+<a name="ln1135">// ENG-4199: Consider getting all the cluster-wide subscriptions?</a>
+<a name="ln1136">std::unordered_set&lt;string&gt; RedisServiceImplData::GetAllSubscriptions(AsPattern type) {</a>
+<a name="ln1137">  unordered_set&lt;string&gt; ret;</a>
+<a name="ln1138">  SharedLock&lt;decltype(pubsub_mutex_)&gt; lock(pubsub_mutex_);</a>
+<a name="ln1139">  for (const auto&amp; element :</a>
+<a name="ln1140">       (type == AsPattern::kTrue ? patterns_to_clients_ : channels_to_clients_)) {</a>
+<a name="ln1141">    ret.insert(element.first);</a>
+<a name="ln1142">  }</a>
+<a name="ln1143">  return ret;</a>
+<a name="ln1144">}</a>
+<a name="ln1145"> </a>
+<a name="ln1146">// ENG-4199: Consider getting all the cluster-wide subscribers?</a>
+<a name="ln1147">int RedisServiceImplData::NumSubscribers(AsPattern type, const std::string&amp; channel) {</a>
+<a name="ln1148">  SharedLock&lt;decltype(pubsub_mutex_)&gt; lock(pubsub_mutex_);</a>
+<a name="ln1149">  const auto&amp; look_in = (type ? patterns_to_clients_ : channels_to_clients_);</a>
+<a name="ln1150">  const auto&amp; iter = look_in.find(channel);</a>
+<a name="ln1151">  return (iter == look_in.end() ? 0 : iter-&gt;second.size());</a>
+<a name="ln1152">}</a>
+<a name="ln1153"> </a>
+<a name="ln1154">void RedisServiceImplData::LogToMonitors(</a>
+<a name="ln1155">    const string&amp; end, const string&amp; db, const RedisClientCommand&amp; cmd) {</a>
+<a name="ln1156">  {</a>
+<a name="ln1157">    SharedLock&lt;decltype(pubsub_mutex_)&gt; rlock(pubsub_mutex_);</a>
+<a name="ln1158">    if (monitoring_clients_.empty()) return;</a>
+<a name="ln1159">  }</a>
+<a name="ln1160"> </a>
+<a name="ln1161">  // Prepare the string to be sent to all the monitoring clients.</a>
+<a name="ln1162">  // TODO: Use timestamp that works with converter.</a>
+<a name="ln1163">  int64_t now_ms = ToMicroseconds(CoarseMonoClock::Now().time_since_epoch());</a>
+<a name="ln1164">  std::stringstream ss;</a>
+<a name="ln1165">  ss &lt;&lt; &quot;+&quot;;</a>
+<a name="ln1166">  ss.setf(std::ios::fixed, std::ios::floatfield);</a>
+<a name="ln1167">  ss.precision(6);</a>
+<a name="ln1168">  ss &lt;&lt; (now_ms / 1000000.0) &lt;&lt; &quot; [&quot; &lt;&lt; db &lt;&lt; &quot; &quot; &lt;&lt; end &lt;&lt; &quot;]&quot;;</a>
+<a name="ln1169">  for (auto&amp; part : cmd) {</a>
+<a name="ln1170">    ss &lt;&lt; &quot; \&quot;&quot; &lt;&lt; part.ToBuffer() &lt;&lt; &quot;\&quot;&quot;;</a>
+<a name="ln1171">  }</a>
+<a name="ln1172">  ss &lt;&lt; &quot;\r\n&quot;;</a>
+<a name="ln1173"> </a>
+<a name="ln1174">  PublishToLocalClients(IsMonitorMessage::kTrue, &quot;&quot;, ss.str());</a>
+<a name="ln1175">}</a>
+<a name="ln1176"> </a>
+<a name="ln1177">int RedisServiceImplData::Publish(const string&amp; channel, const string&amp; message) {</a>
+<a name="ln1178">  VLOG(3) &lt;&lt; &quot;Forwarding to clients on channel &quot; &lt;&lt; channel;</a>
+<a name="ln1179">  return PublishToLocalClients(IsMonitorMessage::kFalse, channel, message);</a>
+<a name="ln1180">}</a>
+<a name="ln1181"> </a>
+<a name="ln1182">Result&lt;vector&lt;HostPortPB&gt;&gt; RedisServiceImplData::GetServerAddrsForChannel(</a>
+<a name="ln1183">    const string&amp; channel_unused) {</a>
+<a name="ln1184">  // TODO(Amit): Instead of forwarding  blindly to all servers, figure out the</a>
+<a name="ln1185">  // ones that have a subscription and send it to them only.</a>
+<a name="ln1186">  std::vector&lt;master::TSInformationPB&gt; live_tservers;</a>
+<a name="ln1187">  Status s = CHECK_NOTNULL(server_-&gt;tserver())-&gt;GetLiveTServers(&amp;live_tservers);</a>
+<a name="ln1188">  if (!s.ok()) {</a>
+<a name="ln1189">    LOG(WARNING) &lt;&lt; s;</a>
+<a name="ln1190">    return s;</a>
+<a name="ln1191">  }</a>
+<a name="ln1192"> </a>
+<a name="ln1193">  vector&lt;HostPortPB&gt; servers;</a>
+<a name="ln1194">  const auto cloud_info_pb = server_-&gt;MakeCloudInfoPB();</a>
+<a name="ln1195">  // Queue NEW_NODE event for all the live tservers.</a>
+<a name="ln1196">  for (const master::TSInformationPB&amp; ts_info : live_tservers) {</a>
+<a name="ln1197">    const auto&amp; hostport_pb = DesiredHostPort(ts_info.registration().common(), cloud_info_pb);</a>
+<a name="ln1198">    if (hostport_pb.host().empty()) {</a>
+<a name="ln1199">      LOG(WARNING) &lt;&lt; &quot;Skipping TS since it doesn't have any rpc address: &quot;</a>
+<a name="ln1200">                   &lt;&lt; ts_info.DebugString();</a>
+<a name="ln1201">      continue;</a>
+<a name="ln1202">    }</a>
+<a name="ln1203">    servers.push_back(hostport_pb);</a>
+<a name="ln1204">  }</a>
+<a name="ln1205">  return servers;</a>
+<a name="ln1206">}</a>
+<a name="ln1207"> </a>
+<a name="ln1208">class PublishResponseHandler {</a>
+<a name="ln1209"> public:</a>
+<a name="ln1210">  PublishResponseHandler(int32_t n, IntFunctor f)</a>
+<a name="ln1211">      : num_replies_pending(n), done_functor(std::move(f)) {}</a>
+<a name="ln1212"> </a>
+<a name="ln1213">  void HandleResponse(const tserver::PublishResponsePB* resp) {</a>
+<a name="ln1214">    num_clients_forwarded_to.IncrementBy(resp-&gt;num_clients_forwarded_to());</a>
+<a name="ln1215"> </a>
+<a name="ln1216">    if (0 == num_replies_pending.IncrementBy(-1)) {</a>
+<a name="ln1217">      done_functor(num_clients_forwarded_to.Load());</a>
+<a name="ln1218">    }</a>
+<a name="ln1219">  }</a>
+<a name="ln1220"> </a>
+<a name="ln1221"> private:</a>
+<a name="ln1222">  AtomicInt&lt;int32_t&gt; num_replies_pending;</a>
+<a name="ln1223">  AtomicInt&lt;int32_t&gt; num_clients_forwarded_to{0};</a>
+<a name="ln1224">  IntFunctor done_functor;</a>
+<a name="ln1225">};</a>
+<a name="ln1226"> </a>
+<a name="ln1227">void RedisServiceImplData::ForwardToInterestedProxies(</a>
+<a name="ln1228">    const string&amp; channel, const string&amp; message, const IntFunctor&amp; f) {</a>
+<a name="ln1229">  auto interested_servers = GetServerAddrsForChannel(channel);</a>
+<a name="ln1230">  if (!interested_servers.ok()) {</a>
+<a name="ln1231">    LOG(ERROR) &lt;&lt; &quot;Could not get servers to forward to &quot; &lt;&lt; interested_servers.status();</a>
+<a name="ln1232">    return;</a>
+<a name="ln1233">  }</a>
+<a name="ln1234">  std::shared_ptr&lt;PublishResponseHandler&gt; resp_handler =</a>
+<a name="ln1235">      std::make_shared&lt;PublishResponseHandler&gt;(interested_servers-&gt;size(), f);</a>
+<a name="ln1236">  for (auto&amp; hostport_pb : *interested_servers) {</a>
+<a name="ln1237">    tserver::PublishRequestPB requestPB;</a>
+<a name="ln1238">    requestPB.set_channel(channel);</a>
+<a name="ln1239">    requestPB.set_message(message);</a>
+<a name="ln1240">    std::shared_ptr&lt;tserver::TabletServerServiceProxy&gt; proxy =</a>
+<a name="ln1241">        std::make_shared&lt;tserver::TabletServerServiceProxy&gt;(</a>
+<a name="ln1242">            &amp;client_-&gt;proxy_cache(), HostPortFromPB(hostport_pb));</a>
+<a name="ln1243">    std::shared_ptr&lt;tserver::PublishResponsePB&gt; responsePB =</a>
+<a name="ln1244">        std::make_shared&lt;tserver::PublishResponsePB&gt;();</a>
+<a name="ln1245">    std::shared_ptr&lt;yb::rpc::RpcController&gt; rpcController = std::make_shared&lt;rpc::RpcController&gt;();</a>
+<a name="ln1246">    // Hold a copy of the shared ptr in the callback to ensure that the proxy, responsePB and</a>
+<a name="ln1247">    // rpcController are valid.</a>
+<a name="ln1248">    // these self-destruct on the latter of the two events</a>
+<a name="ln1249">    //  (i)  exit this loop, and</a>
+<a name="ln1250">    //  (ii) done with the callback.</a>
+<a name="ln1251">    proxy-&gt;PublishAsync(</a>
+<a name="ln1252">        requestPB, responsePB.get(), rpcController.get(),</a>
+<a name="ln1253">        [resp_handler, responsePB, rpcController, proxy]() mutable {</a>
+<a name="ln1254">          resp_handler-&gt;HandleResponse(responsePB.get());</a>
+<a name="ln1255">          responsePB.reset();</a>
+<a name="ln1256">          rpcController.reset();</a>
+<a name="ln1257">          proxy.reset();</a>
+<a name="ln1258">          resp_handler.reset();</a>
+<a name="ln1259">        });</a>
+<a name="ln1260">  }</a>
+<a name="ln1261">}</a>
+<a name="ln1262"> </a>
+<a name="ln1263">string MessageFor(const string&amp; channel, const string&amp; message) {</a>
+<a name="ln1264">  vector&lt;string&gt; parts;</a>
+<a name="ln1265">  parts.push_back(redisserver::EncodeAsBulkString(&quot;message&quot;).ToBuffer());</a>
+<a name="ln1266">  parts.push_back(redisserver::EncodeAsBulkString(channel).ToBuffer());</a>
+<a name="ln1267">  parts.push_back(redisserver::EncodeAsBulkString(message).ToBuffer());</a>
+<a name="ln1268">  return redisserver::EncodeAsArrayOfEncodedElements(parts);</a>
+<a name="ln1269">}</a>
+<a name="ln1270"> </a>
+<a name="ln1271">string PMessageFor(const string&amp; pattern, const string&amp; channel, const string&amp; message) {</a>
+<a name="ln1272">  vector&lt;string&gt; parts;</a>
+<a name="ln1273">  parts.push_back(redisserver::EncodeAsBulkString(&quot;pmessage&quot;).ToBuffer());</a>
+<a name="ln1274">  parts.push_back(redisserver::EncodeAsBulkString(pattern).ToBuffer());</a>
+<a name="ln1275">  parts.push_back(redisserver::EncodeAsBulkString(channel).ToBuffer());</a>
+<a name="ln1276">  parts.push_back(redisserver::EncodeAsBulkString(message).ToBuffer());</a>
+<a name="ln1277">  return redisserver::EncodeAsArrayOfEncodedElements(parts);</a>
+<a name="ln1278">}</a>
+<a name="ln1279"> </a>
+<a name="ln1280">int RedisServiceImplData::PublishToLocalClients(</a>
+<a name="ln1281">    IsMonitorMessage mode, const string&amp; channel, const string&amp; message) {</a>
+<a name="ln1282">  SharedLock&lt;decltype(pubsub_mutex_)&gt; rlock(pubsub_mutex_);</a>
+<a name="ln1283"> </a>
+<a name="ln1284">  int num_pushed_to = 0;</a>
+<a name="ln1285">  // Send the message to all the monitoring clients.</a>
+<a name="ln1286">  OutboundDataPtr out;</a>
+<a name="ln1287">  const std::unordered_set&lt;Connection*&gt;* clients = nullptr;</a>
+<a name="ln1288">  if (mode == IsMonitorMessage::kTrue) {</a>
+<a name="ln1289">    out = std::make_shared&lt;yb::rpc::StringOutboundData&gt;(message, &quot;Monitor redis commands&quot;);</a>
+<a name="ln1290">    clients = &amp;monitoring_clients_;</a>
+<a name="ln1291">  } else {</a>
+<a name="ln1292">    out = std::make_shared&lt;yb::rpc::StringOutboundData&gt;(</a>
+<a name="ln1293">        MessageFor(channel, message), &quot;Publishing to Channel&quot;);</a>
+<a name="ln1294">    clients =</a>
+<a name="ln1295">        (channels_to_clients_.find(channel) == channels_to_clients_.end()</a>
+<a name="ln1296">             ? nullptr</a>
+<a name="ln1297">             : &amp;channels_to_clients_[channel]);</a>
+<a name="ln1298">  }</a>
+<a name="ln1299">  if (clients) {</a>
+<a name="ln1300">    // Handle Monitor and Subscribe clients.</a>
+<a name="ln1301">    for (auto connection : *clients) {</a>
+<a name="ln1302">      DVLOG(3) &lt;&lt; &quot;Publishing to subscribed client &quot; &lt;&lt; connection-&gt;ToString();</a>
+<a name="ln1303">      connection-&gt;QueueOutboundData(out);</a>
+<a name="ln1304">      num_pushed_to++;</a>
+<a name="ln1305">    }</a>
+<a name="ln1306">  }</a>
+<a name="ln1307">  if (mode == IsMonitorMessage::kFalse) {</a>
+<a name="ln1308">    // Handle PSubscribe clients.</a>
+<a name="ln1309">    for (auto&amp; entry : patterns_to_clients_) {</a>
+<a name="ln1310">      auto&amp; pattern = entry.first;</a>
+<a name="ln1311">      auto&amp; clients_subscribed_to_pattern = entry.second;</a>
+<a name="ln1312">      if (!RedisUtil::RedisPatternMatch(pattern, channel, /* ignore case */ false)) {</a>
+<a name="ln1313">        continue;</a>
+<a name="ln1314">      }</a>
+<a name="ln1315"> </a>
+<a name="ln1316">      OutboundDataPtr out = std::make_shared&lt;yb::rpc::StringOutboundData&gt;(</a>
+<a name="ln1317">          PMessageFor(pattern, channel, message), &quot;Publishing to Channel&quot;);</a>
+<a name="ln1318">      for (auto remote : clients_subscribed_to_pattern) {</a>
+<a name="ln1319">        remote-&gt;QueueOutboundData(out);</a>
+<a name="ln1320">        num_pushed_to++;</a>
+<a name="ln1321">      }</a>
+<a name="ln1322">    }</a>
+<a name="ln1323">  }</a>
+<a name="ln1324"> </a>
+<a name="ln1325">  return num_pushed_to;</a>
+<a name="ln1326">}</a>
+<a name="ln1327"> </a>
+<a name="ln1328">void RedisServiceImplData::CleanUpSubscriptions(Connection* conn) {</a>
+<a name="ln1329">  VLOG(3) &lt;&lt; &quot;CleanUpSubscriptions (&quot; &lt;&lt; conn-&gt;ToString();</a>
+<a name="ln1330">  boost::lock_guard&lt;decltype(pubsub_mutex_)&gt; wlock(pubsub_mutex_);</a>
+<a name="ln1331">  if (monitoring_clients_.find(conn) != monitoring_clients_.end()) {</a>
+<a name="ln1332">    monitoring_clients_.erase(conn);</a>
+<a name="ln1333">    num_clients_monitoring_-&gt;set_value(monitoring_clients_.size());</a>
+<a name="ln1334">  }</a>
+<a name="ln1335">  if (clients_to_subscriptions_.find(conn) != clients_to_subscriptions_.end()) {</a>
+<a name="ln1336">    for (auto&amp; channel : clients_to_subscriptions_[conn].channels) {</a>
+<a name="ln1337">      channels_to_clients_[channel].erase(conn);</a>
+<a name="ln1338">      if (channels_to_clients_[channel].empty()) {</a>
+<a name="ln1339">        channels_to_clients_.erase(channel);</a>
+<a name="ln1340">      }</a>
+<a name="ln1341">    }</a>
+<a name="ln1342">    for (auto&amp; pattern : clients_to_subscriptions_[conn].patterns) {</a>
+<a name="ln1343">      patterns_to_clients_[pattern].erase(conn);</a>
+<a name="ln1344">      if (patterns_to_clients_[pattern].empty()) {</a>
+<a name="ln1345">        patterns_to_clients_.erase(pattern);</a>
+<a name="ln1346">      }</a>
+<a name="ln1347">    }</a>
+<a name="ln1348">    clients_to_subscriptions_.erase(conn);</a>
+<a name="ln1349">  }</a>
+<a name="ln1350">}</a>
+<a name="ln1351"> </a>
+<a name="ln1352">Status RedisServiceImplData::Initialize() {</a>
+<a name="ln1353">  boost::lock_guard&lt;std::mutex&gt; guard(yb_mutex_);</a>
+<a name="ln1354">  if (!initialized()) {</a>
+<a name="ln1355">    client_ = server_-&gt;tserver()-&gt;client();</a>
+<a name="ln1356"> </a>
+<a name="ln1357">    server_-&gt;tserver()-&gt;SetPublisher(std::bind(&amp;RedisServiceImplData::Publish, this, _1, _2));</a>
+<a name="ln1358"> </a>
+<a name="ln1359">    tables_cache_ = std::make_shared&lt;YBMetaDataCache&gt;(</a>
+<a name="ln1360">        client_, false /* Update roles permissions cache */);</a>
+<a name="ln1361">    session_pool_.Init(client_, server_-&gt;metric_entity());</a>
+<a name="ln1362"> </a>
+<a name="ln1363">    initialized_.store(true, std::memory_order_release);</a>
+<a name="ln1364">  }</a>
+<a name="ln1365">  return Status::OK();</a>
+<a name="ln1366">}</a>
+<a name="ln1367"> </a>
+<a name="ln1368">void RedisServiceImplData::CleanYBTableFromCacheForDB(const string&amp; db) {</a>
+<a name="ln1369">  tables_cache_-&gt;RemoveCachedTable(GetYBTableNameForRedisDatabase(db));</a>
+<a name="ln1370">}</a>
+<a name="ln1371"> </a>
+<a name="ln1372">Status RedisServiceImplData::GetRedisPasswords(vector&lt;string&gt;* passwords) {</a>
+<a name="ln1373">  MonoTime now = MonoTime::Now();</a>
+<a name="ln1374"> </a>
+<a name="ln1375">  std::lock_guard&lt;std::mutex&gt; lock(redis_password_mutex_);</a>
+<a name="ln1376">  if (redis_cached_password_validity_expiry_.Initialized() &amp;&amp;</a>
+<a name="ln1377">      now &lt; redis_cached_password_validity_expiry_) {</a>
+<a name="ln1378">    *passwords = redis_cached_passwords_;</a>
+<a name="ln1379">    return Status::OK();</a>
+<a name="ln1380">  }</a>
+<a name="ln1381"> </a>
+<a name="ln1382">  RETURN_NOT_OK(client_-&gt;GetRedisPasswords(&amp;redis_cached_passwords_));</a>
+<a name="ln1383">  *passwords = redis_cached_passwords_;</a>
+<a name="ln1384">  redis_cached_password_validity_expiry_ =</a>
+<a name="ln1385">      now + MonoDelta::FromMilliseconds(FLAGS_redis_password_caching_duration_ms);</a>
+<a name="ln1386">  return Status::OK();</a>
+<a name="ln1387">}</a>
+<a name="ln1388"> </a>
+<a name="ln1389">void RedisServiceImpl::Impl::PopulateHandlers() {</a>
+<a name="ln1390">  auto metric_entity = data_.server_-&gt;metric_entity();</a>
+<a name="ln1391">  FillRedisCommands(metric_entity, std::bind(&amp;Impl::SetupMethod, this, _1));</a>
+<a name="ln1392"> </a>
+<a name="ln1393">  // Set up metrics for erroneous calls.</a>
+<a name="ln1394">  data_.metrics_error_.handler_latency = YB_REDIS_METRIC(error).Instantiate(metric_entity);</a>
+<a name="ln1395">  data_.metrics_internal_[static_cast&lt;size_t&gt;(OperationType::kWrite)].handler_latency =</a>
+<a name="ln1396">      YB_REDIS_METRIC(set_internal).Instantiate(metric_entity);</a>
+<a name="ln1397">  data_.metrics_internal_[static_cast&lt;size_t&gt;(OperationType::kRead)].handler_latency =</a>
+<a name="ln1398">      YB_REDIS_METRIC(get_internal).Instantiate(metric_entity);</a>
+<a name="ln1399">  data_.metrics_internal_[static_cast&lt;size_t&gt;(OperationType::kLocal)].handler_latency =</a>
+<a name="ln1400">      data_.metrics_internal_[static_cast&lt;size_t&gt;(OperationType::kRead)].handler_latency;</a>
+<a name="ln1401"> </a>
+<a name="ln1402">  auto* proto = &amp;METRIC_redis_monitoring_clients;</a>
+<a name="ln1403">  data_.num_clients_monitoring_ = proto-&gt;Instantiate(metric_entity, 0);</a>
+<a name="ln1404">}</a>
+<a name="ln1405"> </a>
+<a name="ln1406">const RedisCommandInfo* RedisServiceImpl::Impl::FetchHandler(const RedisClientCommand&amp; cmd_args) {</a>
+<a name="ln1407">  if (cmd_args.size() &lt; 1) {</a>
+<a name="ln1408">    return nullptr;</a>
+<a name="ln1409">  }</a>
+<a name="ln1410">  Slice cmd_name = cmd_args[0];</a>
+<a name="ln1411">  auto iter = command_name_to_info_map_.find(cmd_args[0]);</a>
+<a name="ln1412">  if (iter == command_name_to_info_map_.end()) {</a>
+<a name="ln1413">    YB_LOG_EVERY_N_SECS(ERROR, 60)</a>
+<a name="ln1414">        &lt;&lt; &quot;Command &quot; &lt;&lt; cmd_name &lt;&lt; &quot; not yet supported. &quot;</a>
+<a name="ln1415">        &lt;&lt; &quot;Arguments: &quot; &lt;&lt; ToString(cmd_args) &lt;&lt; &quot;. &quot;</a>
+<a name="ln1416">        &lt;&lt; &quot;Raw: &quot; &lt;&lt; Slice(cmd_args[0].data(), cmd_args.back().end()).ToDebugString();</a>
+<a name="ln1417">    return nullptr;</a>
+<a name="ln1418">  }</a>
+<a name="ln1419">  return iter-&gt;second.get();</a>
+<a name="ln1420">}</a>
+<a name="ln1421"> </a>
+<a name="ln1422">RedisServiceImpl::Impl::Impl(RedisServer* server, string yb_tier_master_addresses)</a>
+<a name="ln1423">    : data_(server, std::move(yb_tier_master_addresses)) {</a>
+<a name="ln1424">  PopulateHandlers();</a>
+<a name="ln1425">}</a>
+<a name="ln1426"> </a>
+<a name="ln1427">bool AllowedInClientMode(const RedisCommandInfo* info, RedisClientMode mode) {</a>
+<a name="ln1428">  if (mode == RedisClientMode::kMonitoring) {</a>
+<a name="ln1429">    static std::unordered_set&lt;string&gt; allowed = {&quot;quit&quot;};</a>
+<a name="ln1430">    return allowed.find(info-&gt;name) != allowed.end();</a>
+<a name="ln1431">  } else if (mode == RedisClientMode::kSubscribed) {</a>
+<a name="ln1432">    static std::unordered_set&lt;string&gt; allowed = {&quot;subscribe&quot;,    &quot;unsubscribe&quot;, &quot;psubscribe&quot;,</a>
+<a name="ln1433">                                                 &quot;punsubscribe&quot;, &quot;ping&quot;,        &quot;quit&quot;};</a>
+<a name="ln1434">    return allowed.find(info-&gt;name) != allowed.end();</a>
+<a name="ln1435">  } else {</a>
+<a name="ln1436">    // kNormal.</a>
+<a name="ln1437">    return true;</a>
+<a name="ln1438">  }</a>
+<a name="ln1439">}</a>
+<a name="ln1440"> </a>
+<a name="ln1441">void RedisServiceImpl::Impl::Handle(rpc::InboundCallPtr call_ptr) {</a>
+<a name="ln1442">  auto call = std::static_pointer_cast&lt;RedisInboundCall&gt;(call_ptr);</a>
+<a name="ln1443"> </a>
+<a name="ln1444">  DVLOG(2) &lt;&lt; &quot;Asked to handle a call &quot; &lt;&lt; call-&gt;ToString();</a>
+<a name="ln1445">  if (call-&gt;serialized_request().size() &gt; FLAGS_redis_max_command_size) {</a>
+<a name="ln1446">    auto message = StrCat(&quot;Size of redis command &quot;, call-&gt;serialized_request().size(),</a>
+<a name="ln1447">                          &quot;, but we only support up to length of &quot;, FLAGS_redis_max_command_size);</a>
+<a name="ln1448">    for (size_t idx = 0; idx != call-&gt;client_batch().size(); ++idx) {</a>
+<a name="ln1449">      RespondWithFailure(call, idx, message);</a>
+<a name="ln1450">    }</a>
+<a name="ln1451">    return;</a>
+<a name="ln1452">  }</a>
+<a name="ln1453"> </a>
+<a name="ln1454">  // Ensure that we have the required YBClient(s) initialized.</a>
+<a name="ln1455">  if (!data_.initialized()) {</a>
+<a name="ln1456">    auto status = data_.Initialize();</a>
+<a name="ln1457">    if (!status.ok()) {</a>
+<a name="ln1458">      auto message = StrCat(&quot;Could not open .redis table. &quot;, status.ToString());</a>
+<a name="ln1459">      for (size_t idx = 0; idx != call-&gt;client_batch().size(); ++idx) {</a>
+<a name="ln1460">        RespondWithFailure(call, idx, message);</a>
+<a name="ln1461">      }</a>
+<a name="ln1462">      return;</a>
+<a name="ln1463">    }</a>
+<a name="ln1464">  }</a>
+<a name="ln1465"> </a>
+<a name="ln1466">  // Call could contain several commands, i.e. batch.</a>
+<a name="ln1467">  // We process them as follows:</a>
+<a name="ln1468">  // Each read commands are processed individually.</a>
+<a name="ln1469">  // Sequential write commands use single session and the same batcher.</a>
+<a name="ln1470">  const auto&amp; batch = call-&gt;client_batch();</a>
+<a name="ln1471">  auto conn = call-&gt;connection();</a>
+<a name="ln1472">  const string remote = yb::ToString(conn-&gt;remote());</a>
+<a name="ln1473">  RedisConnectionContext* conn_context = &amp;(call-&gt;connection_context());</a>
+<a name="ln1474">  string db_name = conn_context-&gt;redis_db_to_use();</a>
+<a name="ln1475">  auto context = make_scoped_refptr&lt;BatchContextImpl&gt;(db_name, call, &amp;data_);</a>
+<a name="ln1476">  for (size_t idx = 0; idx != batch.size(); ++idx) {</a>
+<a name="ln1477">    const RedisClientCommand&amp; c = batch[idx];</a>
+<a name="ln1478"> </a>
+<a name="ln1479">    auto cmd_info = FetchHandler(c);</a>
+<a name="ln1480"> </a>
+<a name="ln1481">    // Handle the current redis command.</a>
+<a name="ln1482">    if (cmd_info == nullptr) {</a>
+<a name="ln1483">      RespondWithFailure(call, idx, &quot;Unsupported call.&quot;);</a>
+<a name="ln1484">      continue;</a>
+<a name="ln1485">    } else if (!AllowedInClientMode(cmd_info, conn_context-&gt;ClientMode())) {</a>
+<a name="ln1486">      RespondWithFailure(</a>
+<a name="ln1487">          call, idx, Substitute(</a>
+<a name="ln1488">                         &quot;Command $0 not allowed in client mode $1.&quot;, cmd_info-&gt;name,</a>
+<a name="ln1489">                         yb::ToString(conn_context-&gt;ClientMode())));</a>
+<a name="ln1490">      continue;</a>
+<a name="ln1491">    }</a>
+<a name="ln1492"> </a>
+<a name="ln1493">    size_t arity = static_cast&lt;size_t&gt;(std::abs(cmd_info-&gt;arity) - 1);</a>
+<a name="ln1494">    bool exact_count = cmd_info-&gt;arity &gt; 0;</a>
+<a name="ln1495">    size_t passed_arguments = c.size() - 1;</a>
+<a name="ln1496">    if (!exact_count &amp;&amp; passed_arguments &lt; arity) {</a>
+<a name="ln1497">      // -X means that the command needs &gt;= X arguments.</a>
+<a name="ln1498">      YB_LOG_EVERY_N_SECS(ERROR, 60)</a>
+<a name="ln1499">          &lt;&lt; &quot;Requested command &quot; &lt;&lt; c[0] &lt;&lt; &quot; does not have enough arguments.&quot;</a>
+<a name="ln1500">          &lt;&lt; &quot; At least &quot; &lt;&lt; arity &lt;&lt; &quot; expected, but &quot; &lt;&lt; passed_arguments &lt;&lt; &quot; found.&quot;;</a>
+<a name="ln1501">      RespondWithFailure(call, idx, &quot;Too few arguments.&quot;);</a>
+<a name="ln1502">    } else if (exact_count &amp;&amp; passed_arguments != arity) {</a>
+<a name="ln1503">      // X (&gt; 0) means that the command needs exactly X arguments.</a>
+<a name="ln1504">      YB_LOG_EVERY_N_SECS(ERROR, 60)</a>
+<a name="ln1505">          &lt;&lt; &quot;Requested command &quot; &lt;&lt; c[0] &lt;&lt; &quot; has wrong number of arguments. &quot;</a>
+<a name="ln1506">          &lt;&lt; arity &lt;&lt; &quot; expected, but &quot; &lt;&lt; passed_arguments &lt;&lt; &quot; found.&quot;;</a>
+<a name="ln1507">      RespondWithFailure(call, idx, &quot;Wrong number of arguments.&quot;);</a>
+<a name="ln1508">    } else if (!CheckArgumentSizeOK(c)) {</a>
+<a name="ln1509">      RespondWithFailure(call, idx, &quot;Redis argument too long.&quot;);</a>
+<a name="ln1510">    } else if (!CheckAuthentication(conn_context) &amp;&amp; cmd_info-&gt;name != &quot;auth&quot;) {</a>
+<a name="ln1511">      RespondWithFailure(call, idx, &quot;Authentication required.&quot;, &quot;NOAUTH&quot;);</a>
+<a name="ln1512">    } else {</a>
+<a name="ln1513">      if (cmd_info-&gt;name != &quot;config&quot; &amp;&amp; cmd_info-&gt;name != &quot;monitor&quot;) {</a>
+<a name="ln1514">        data_.LogToMonitors(remote, db_name, c);</a>
+<a name="ln1515">      }</a>
+<a name="ln1516"> </a>
+<a name="ln1517">      // Handle the call.</a>
+<a name="ln1518">      cmd_info-&gt;functor(*cmd_info, idx, context.get());</a>
+<a name="ln1519"> </a>
+<a name="ln1520">      if (cmd_info-&gt;name == &quot;select&quot; &amp;&amp; db_name != conn_context-&gt;redis_db_to_use()) {</a>
+<a name="ln1521">        // update context.</a>
+<a name="ln1522">        context-&gt;Commit();</a>
+<a name="ln1523">        db_name = conn_context-&gt;redis_db_to_use();</a>
+<a name="ln1524">        context = make_scoped_refptr&lt;BatchContextImpl&gt;(db_name, call, &amp;data_);</a>
+<a name="ln1525">      }</a>
+<a name="ln1526">    }</a>
+<a name="ln1527">  }</a>
+<a name="ln1528">  context-&gt;Commit();</a>
+<a name="ln1529">}</a>
+<a name="ln1530"> </a>
+<a name="ln1531">RedisServiceImpl::RedisServiceImpl(RedisServer* server, string yb_tier_master_address)</a>
+<a name="ln1532">    : RedisServerServiceIf(server-&gt;metric_entity()),</a>
+<a name="ln1533">      impl_(new Impl(server, std::move(yb_tier_master_address))) {}</a>
+<a name="ln1534"> </a>
+<a name="ln1535">RedisServiceImpl::~RedisServiceImpl() {</a>
+<a name="ln1536">}</a>
+<a name="ln1537"> </a>
+<a name="ln1538">void RedisServiceImpl::Handle(yb::rpc::InboundCallPtr call) {</a>
+<a name="ln1539">  impl_-&gt;Handle(std::move(call));</a>
+<a name="ln1540">}</a>
+<a name="ln1541"> </a>
+<a name="ln1542">}  // namespace redisserver</a>
+<a name="ln1543">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="444"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="457"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="511"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="526"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="536"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1009"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1057"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1071"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1090"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1178"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1302"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1329"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1444"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="338"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the compiler generated constructor. Consider inspecting: client_.</p></div>
+<div class="balloon" rel="384"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: session_pool_.</p></div>
+<div class="balloon" rel="1041"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: client_, session_pool_.</p></div>
+<div class="balloon" rel="818"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: lookups_left_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

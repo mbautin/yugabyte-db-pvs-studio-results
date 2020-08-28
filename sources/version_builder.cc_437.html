@@ -1,0 +1,430 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>version_builder.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Copyright (c) 2011 The LevelDB Authors. All rights reserved.</a>
+<a name="ln21">// Use of this source code is governed by a BSD-style license that can be</a>
+<a name="ln22">// found in the LICENSE file. See the AUTHORS file for names of contributors.</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;yb/rocksdb/db/version_builder.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#ifndef __STDC_FORMAT_MACROS</a>
+<a name="ln27">#define __STDC_FORMAT_MACROS</a>
+<a name="ln28">#endif</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &lt;inttypes.h&gt;</a>
+<a name="ln31">#include &lt;algorithm&gt;</a>
+<a name="ln32">#include &lt;atomic&gt;</a>
+<a name="ln33">#include &lt;set&gt;</a>
+<a name="ln34">#include &lt;thread&gt;</a>
+<a name="ln35">#include &lt;unordered_map&gt;</a>
+<a name="ln36">#include &lt;unordered_set&gt;</a>
+<a name="ln37">#include &lt;utility&gt;</a>
+<a name="ln38">#include &lt;vector&gt;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &quot;yb/rocksdb/db/dbformat.h&quot;</a>
+<a name="ln41">#include &quot;yb/rocksdb/db/internal_stats.h&quot;</a>
+<a name="ln42">#include &quot;yb/rocksdb/db/table_cache.h&quot;</a>
+<a name="ln43">#include &quot;yb/rocksdb/db/version_set.h&quot;</a>
+<a name="ln44">#include &quot;yb/rocksdb/table/table_reader.h&quot;</a>
+<a name="ln45"> </a>
+<a name="ln46">namespace rocksdb {</a>
+<a name="ln47"> </a>
+<a name="ln48">bool NewestFirstBySeqNo(FileMetaData* a, FileMetaData* b) {</a>
+<a name="ln49">  if (a-&gt;smallest.seqno != b-&gt;smallest.seqno) {</a>
+<a name="ln50">    return a-&gt;smallest.seqno &gt; b-&gt;smallest.seqno;</a>
+<a name="ln51">  }</a>
+<a name="ln52">  if (a-&gt;largest.seqno != b-&gt;largest.seqno) {</a>
+<a name="ln53">    return a-&gt;largest.seqno &gt; b-&gt;largest.seqno;</a>
+<a name="ln54">  }</a>
+<a name="ln55">  // Break ties by file number</a>
+<a name="ln56">  return a-&gt;fd.GetNumber() &gt; b-&gt;fd.GetNumber();</a>
+<a name="ln57">}</a>
+<a name="ln58"> </a>
+<a name="ln59">namespace {</a>
+<a name="ln60">bool BySmallestKey(FileMetaData* a, FileMetaData* b,</a>
+<a name="ln61">                   const InternalKeyComparator* cmp) {</a>
+<a name="ln62">  int r = cmp-&gt;Compare(a-&gt;smallest.key, b-&gt;smallest.key);</a>
+<a name="ln63">  if (r != 0) {</a>
+<a name="ln64">    return (r &lt; 0);</a>
+<a name="ln65">  }</a>
+<a name="ln66">  // Break ties by file number</a>
+<a name="ln67">  return (a-&gt;fd.GetNumber() &lt; b-&gt;fd.GetNumber());</a>
+<a name="ln68">}</a>
+<a name="ln69">}  // namespace</a>
+<a name="ln70"> </a>
+<a name="ln71">class VersionBuilder::Rep {</a>
+<a name="ln72"> private:</a>
+<a name="ln73">  // Helper to sort files_ in v</a>
+<a name="ln74">  // kLevel0 -- NewestFirstBySeqNo</a>
+<a name="ln75">  // kLevelNon0 -- BySmallestKey</a>
+<a name="ln76">  struct FileComparator {</a>
+<a name="ln77">    enum SortMethod { kLevel0 = 0, kLevelNon0 = 1, } sort_method;</a>
+<a name="ln78">    InternalKeyComparatorPtr internal_comparator;</a>
+<a name="ln79"> </a>
+<a name="ln80">    bool operator()(FileMetaData* f1, FileMetaData* f2) const {</a>
+<a name="ln81">      switch (sort_method) {</a>
+<a name="ln82">        case kLevel0:</a>
+<a name="ln83">          return NewestFirstBySeqNo(f1, f2);</a>
+<a name="ln84">        case kLevelNon0:</a>
+<a name="ln85">          return BySmallestKey(f1, f2, internal_comparator.get());</a>
+<a name="ln86">      }</a>
+<a name="ln87">      assert(false);</a>
+<a name="ln88">      return false;</a>
+<a name="ln89">    }</a>
+<a name="ln90">  };</a>
+<a name="ln91"> </a>
+<a name="ln92">  struct LevelState {</a>
+<a name="ln93">    std::unordered_set&lt;uint64_t&gt; deleted_files;</a>
+<a name="ln94">    // Map from file number to file meta data.</a>
+<a name="ln95">    std::unordered_map&lt;uint64_t, FileMetaData*&gt; added_files;</a>
+<a name="ln96">  };</a>
+<a name="ln97"> </a>
+<a name="ln98">  const EnvOptions&amp; env_options_;</a>
+<a name="ln99">  Logger* info_log_;</a>
+<a name="ln100">  TableCache* table_cache_;</a>
+<a name="ln101">  VersionStorageInfo* base_vstorage_;</a>
+<a name="ln102">  LevelState* levels_;</a>
+<a name="ln103">  FileComparator level_zero_cmp_;</a>
+<a name="ln104">  FileComparator level_nonzero_cmp_;</a>
+<a name="ln105"> </a>
+<a name="ln106"> public:</a>
+<a name="ln107">  Rep(const EnvOptions&amp; env_options, Logger* info_log, TableCache* table_cache,</a>
+<a name="ln108">      VersionStorageInfo* base_vstorage)</a>
+<a name="ln109">      : env_options_(env_options),</a>
+<a name="ln110">        info_log_(info_log),</a>
+<a name="ln111">        table_cache_(table_cache),</a>
+<a name="ln112">        base_vstorage_(base_vstorage) {</a>
+<a name="ln113">    levels_ = new LevelState[base_vstorage_-&gt;num_levels()];</a>
+<a name="ln114">    level_zero_cmp_.sort_method = FileComparator::kLevel0;</a>
+<a name="ln115">    level_nonzero_cmp_.sort_method = FileComparator::kLevelNon0;</a>
+<a name="ln116">    level_nonzero_cmp_.internal_comparator =</a>
+<a name="ln117">        base_vstorage_-&gt;InternalComparator();</a>
+<a name="ln118">  }</a>
+<a name="ln119"> </a>
+<a name="ln120">  ~Rep() {</a>
+<a name="ln121">    for (int level = 0; level &lt; base_vstorage_-&gt;num_levels(); level++) {</a>
+<a name="ln122">      const auto&amp; added = levels_[level].added_files;</a>
+<a name="ln123">      for (auto&amp; pair : added) {</a>
+<a name="ln124">        UnrefFile(pair.second);</a>
+<a name="ln125">      }</a>
+<a name="ln126">    }</a>
+<a name="ln127"> </a>
+<a name="ln128">    delete[] levels_;</a>
+<a name="ln129">  }</a>
+<a name="ln130"> </a>
+<a name="ln131">  void UnrefFile(FileMetaData* f) {</a>
+<a name="ln132">    if (f-&gt;Unref(table_cache_)) {</a>
+<a name="ln133">      delete f;</a>
+<a name="ln134">    }</a>
+<a name="ln135">  }</a>
+<a name="ln136"> </a>
+<a name="ln137">  void CheckConsistency(VersionStorageInfo* vstorage) {</a>
+<a name="ln138">#ifndef NDEBUG</a>
+<a name="ln139">    // make sure the files are sorted correctly</a>
+<a name="ln140">    for (int level = 0; level &lt; vstorage-&gt;num_levels(); level++) {</a>
+<a name="ln141">      auto&amp; level_files = vstorage-&gt;LevelFiles(level);</a>
+<a name="ln142">      for (size_t i = 1; i &lt; level_files.size(); i++) {</a>
+<a name="ln143">        auto f1 = level_files[i - 1];</a>
+<a name="ln144">        auto f2 = level_files[i];</a>
+<a name="ln145">        if (level == 0) {</a>
+<a name="ln146">          assert(level_zero_cmp_(f1, f2));</a>
+<a name="ln147">          assert(f1-&gt;largest.seqno &gt; f2-&gt;largest.seqno ||</a>
+<a name="ln148">                 // We can have multiple files with seqno = 0 as a result of</a>
+<a name="ln149">                 // using DB::AddFile()</a>
+<a name="ln150">                 (f1-&gt;largest.seqno == 0 &amp;&amp; f2-&gt;largest.seqno == 0));</a>
+<a name="ln151">        } else {</a>
+<a name="ln152">          assert(level_nonzero_cmp_(f1, f2));</a>
+<a name="ln153"> </a>
+<a name="ln154">          // Make sure there is no overlap in levels &gt; 0</a>
+<a name="ln155">          if (vstorage-&gt;InternalComparator()-&gt;Compare(f1-&gt;largest.key,</a>
+<a name="ln156">                                                      f2-&gt;smallest.key) &gt;= 0) {</a>
+<a name="ln157">            fprintf(stderr, &quot;overlapping ranges in same level %s vs. %s\n&quot;,</a>
+<a name="ln158">                    f1-&gt;largest.key.DebugString().c_str(),</a>
+<a name="ln159">                    f2-&gt;smallest.key.DebugString().c_str());</a>
+<a name="ln160">            abort();</a>
+<a name="ln161">          }</a>
+<a name="ln162">        }</a>
+<a name="ln163">      }</a>
+<a name="ln164">    }</a>
+<a name="ln165">#endif</a>
+<a name="ln166">  }</a>
+<a name="ln167"> </a>
+<a name="ln168">  void CheckConsistencyForDeletes(VersionEdit* edit, uint64_t number,</a>
+<a name="ln169">                                  int level) {</a>
+<a name="ln170">#ifndef NDEBUG</a>
+<a name="ln171">    // a file to be deleted better exist in the previous version</a>
+<a name="ln172">    bool found = false;</a>
+<a name="ln173">    for (int l = 0; !found &amp;&amp; l &lt; base_vstorage_-&gt;num_levels(); l++) {</a>
+<a name="ln174">      const std::vector&lt;FileMetaData*&gt;&amp; base_files =</a>
+<a name="ln175">          base_vstorage_-&gt;LevelFiles(l);</a>
+<a name="ln176">      for (size_t i = 0; i &lt; base_files.size(); i++) {</a>
+<a name="ln177">        FileMetaData* f = base_files[i];</a>
+<a name="ln178">        if (f-&gt;fd.GetNumber() == number) {</a>
+<a name="ln179">          found = true;</a>
+<a name="ln180">          break;</a>
+<a name="ln181">        }</a>
+<a name="ln182">      }</a>
+<a name="ln183">    }</a>
+<a name="ln184">    // if the file did not exist in the previous version, then it</a>
+<a name="ln185">    // is possibly moved from lower level to higher level in current</a>
+<a name="ln186">    // version</a>
+<a name="ln187">    for (int l = level + 1; !found &amp;&amp; l &lt; base_vstorage_-&gt;num_levels(); l++) {</a>
+<a name="ln188">      auto&amp; level_added = levels_[l].added_files;</a>
+<a name="ln189">      auto got = level_added.find(number);</a>
+<a name="ln190">      if (got != level_added.end()) {</a>
+<a name="ln191">        found = true;</a>
+<a name="ln192">        break;</a>
+<a name="ln193">      }</a>
+<a name="ln194">    }</a>
+<a name="ln195"> </a>
+<a name="ln196">    // maybe this file was added in a previous edit that was Applied</a>
+<a name="ln197">    if (!found) {</a>
+<a name="ln198">      auto&amp; level_added = levels_[level].added_files;</a>
+<a name="ln199">      auto got = level_added.find(number);</a>
+<a name="ln200">      if (got != level_added.end()) {</a>
+<a name="ln201">        found = true;</a>
+<a name="ln202">      }</a>
+<a name="ln203">    }</a>
+<a name="ln204">    if (!found) {</a>
+<a name="ln205">      fprintf(stderr, &quot;not found %&quot; PRIu64 &quot;\n&quot;, number);</a>
+<a name="ln206">    }</a>
+<a name="ln207">    assert(found);</a>
+<a name="ln208">#endif</a>
+<a name="ln209">  }</a>
+<a name="ln210"> </a>
+<a name="ln211">  // Apply all of the edits in *edit to the current state.</a>
+<a name="ln212">  void Apply(VersionEdit* edit) {</a>
+<a name="ln213">    CheckConsistency(base_vstorage_);</a>
+<a name="ln214"> </a>
+<a name="ln215">    // Delete files</a>
+<a name="ln216">    const VersionEdit::DeletedFileSet&amp; del = edit-&gt;GetDeletedFiles();</a>
+<a name="ln217">    for (const auto&amp; del_file : del) {</a>
+<a name="ln218">      const auto level = del_file.first;</a>
+<a name="ln219">      const auto number = del_file.second;</a>
+<a name="ln220">      levels_[level].deleted_files.insert(number);</a>
+<a name="ln221">      CheckConsistencyForDeletes(edit, number, level);</a>
+<a name="ln222"> </a>
+<a name="ln223">      auto exising = levels_[level].added_files.find(number);</a>
+<a name="ln224">      if (exising != levels_[level].added_files.end()) {</a>
+<a name="ln225">        UnrefFile(exising-&gt;second);</a>
+<a name="ln226">        levels_[level].added_files.erase(number);</a>
+<a name="ln227">      }</a>
+<a name="ln228">    }</a>
+<a name="ln229"> </a>
+<a name="ln230">    // Add new files</a>
+<a name="ln231">    for (const auto&amp; new_file : edit-&gt;GetNewFiles()) {</a>
+<a name="ln232">      const int level = new_file.first;</a>
+<a name="ln233">      FileMetaData* f = new FileMetaData(new_file.second);</a>
+<a name="ln234">      f-&gt;refs = 1;</a>
+<a name="ln235"> </a>
+<a name="ln236">      assert(levels_[level].added_files.find(f-&gt;fd.GetNumber()) ==</a>
+<a name="ln237">             levels_[level].added_files.end());</a>
+<a name="ln238">      levels_[level].deleted_files.erase(f-&gt;fd.GetNumber());</a>
+<a name="ln239">      levels_[level].added_files[f-&gt;fd.GetNumber()] = f;</a>
+<a name="ln240">    }</a>
+<a name="ln241">  }</a>
+<a name="ln242"> </a>
+<a name="ln243">  // Save the current state in *v.</a>
+<a name="ln244">  void SaveTo(VersionStorageInfo* vstorage) {</a>
+<a name="ln245">    CheckConsistency(base_vstorage_);</a>
+<a name="ln246">    CheckConsistency(vstorage);</a>
+<a name="ln247"> </a>
+<a name="ln248">    for (int level = 0; level &lt; base_vstorage_-&gt;num_levels(); level++) {</a>
+<a name="ln249">      const auto&amp; cmp = (level == 0) ? level_zero_cmp_ : level_nonzero_cmp_;</a>
+<a name="ln250">      // Merge the set of added files with the set of pre-existing files.</a>
+<a name="ln251">      // Drop any deleted files.  Store the result in *v.</a>
+<a name="ln252">      const auto&amp; base_files = base_vstorage_-&gt;LevelFiles(level);</a>
+<a name="ln253">      auto base_iter = base_files.begin();</a>
+<a name="ln254">      auto base_end = base_files.end();</a>
+<a name="ln255">      const auto&amp; unordered_added_files = levels_[level].added_files;</a>
+<a name="ln256">      vstorage-&gt;Reserve(level,</a>
+<a name="ln257">                        base_files.size() + unordered_added_files.size());</a>
+<a name="ln258"> </a>
+<a name="ln259">      // Sort added files for the level.</a>
+<a name="ln260">      std::vector&lt;FileMetaData*&gt; added_files;</a>
+<a name="ln261">      added_files.reserve(unordered_added_files.size());</a>
+<a name="ln262">      for (const auto&amp; pair : unordered_added_files) {</a>
+<a name="ln263">        added_files.push_back(pair.second);</a>
+<a name="ln264">      }</a>
+<a name="ln265">      std::sort(added_files.begin(), added_files.end(), cmp);</a>
+<a name="ln266"> </a>
+<a name="ln267">#ifndef NDEBUG</a>
+<a name="ln268">      FileMetaData* prev_file = nullptr;</a>
+<a name="ln269">#endif</a>
+<a name="ln270"> </a>
+<a name="ln271">      for (const auto&amp; added : added_files) {</a>
+<a name="ln272">#ifndef NDEBUG</a>
+<a name="ln273">        if (level &gt; 0 &amp;&amp; prev_file != nullptr) {</a>
+<a name="ln274">          assert(base_vstorage_-&gt;InternalComparator()-&gt;Compare(</a>
+<a name="ln275">                     prev_file-&gt;smallest.key, added-&gt;smallest.key) &lt;= 0);</a>
+<a name="ln276">        }</a>
+<a name="ln277">        prev_file = added;</a>
+<a name="ln278">#endif</a>
+<a name="ln279"> </a>
+<a name="ln280">        // Add all smaller files listed in base_</a>
+<a name="ln281">        for (auto bpos = std::upper_bound(base_iter, base_end, added, cmp);</a>
+<a name="ln282">             base_iter != bpos; ++base_iter) {</a>
+<a name="ln283">          MaybeAddFile(vstorage, level, *base_iter);</a>
+<a name="ln284">        }</a>
+<a name="ln285"> </a>
+<a name="ln286">        MaybeAddFile(vstorage, level, added);</a>
+<a name="ln287">      }</a>
+<a name="ln288"> </a>
+<a name="ln289">      // Add remaining base files</a>
+<a name="ln290">      for (; base_iter != base_end; ++base_iter) {</a>
+<a name="ln291">        MaybeAddFile(vstorage, level, *base_iter);</a>
+<a name="ln292">      }</a>
+<a name="ln293">    }</a>
+<a name="ln294"> </a>
+<a name="ln295">    CheckConsistency(vstorage);</a>
+<a name="ln296">  }</a>
+<a name="ln297"> </a>
+<a name="ln298">  void LoadTableHandlers(InternalStats* internal_stats, int max_threads) {</a>
+<a name="ln299">    assert(table_cache_ != nullptr);</a>
+<a name="ln300">    // &lt;file metadata, level&gt;</a>
+<a name="ln301">    std::vector&lt;std::pair&lt;FileMetaData*, int&gt;&gt; files_meta;</a>
+<a name="ln302">    for (int level = 0; level &lt; base_vstorage_-&gt;num_levels(); level++) {</a>
+<a name="ln303">      for (auto&amp; file_meta_pair : levels_[level].added_files) {</a>
+<a name="ln304">        auto* file_meta = file_meta_pair.second;</a>
+<a name="ln305">        assert(!file_meta-&gt;table_reader_handle);</a>
+<a name="ln306">        files_meta.emplace_back(file_meta, level);</a>
+<a name="ln307">      }</a>
+<a name="ln308">    }</a>
+<a name="ln309"> </a>
+<a name="ln310">    std::atomic&lt;size_t&gt; next_file_meta_idx(0);</a>
+<a name="ln311">    std::function&lt;void()&gt; load_handlers_func = [&amp;]() {</a>
+<a name="ln312">      while (true) {</a>
+<a name="ln313">        size_t file_idx = next_file_meta_idx.fetch_add(1);</a>
+<a name="ln314">        if (file_idx &gt;= files_meta.size()) {</a>
+<a name="ln315">          break;</a>
+<a name="ln316">        }</a>
+<a name="ln317"> </a>
+<a name="ln318">        auto* file_meta = files_meta[file_idx].first;</a>
+<a name="ln319">        int level = files_meta[file_idx].second;</a>
+<a name="ln320">        CHECK_OK(table_cache_-&gt;FindTable(env_options_,</a>
+<a name="ln321">                                         base_vstorage_-&gt;InternalComparator(),</a>
+<a name="ln322">                                         file_meta-&gt;fd, &amp;file_meta-&gt;table_reader_handle,</a>
+<a name="ln323">                                         kDefaultQueryId,</a>
+<a name="ln324">                                         false /*no_io */, true /* record_read_stats */,</a>
+<a name="ln325">                                         internal_stats-&gt;GetFileReadHist(level)));</a>
+<a name="ln326">        if (file_meta-&gt;table_reader_handle != nullptr) {</a>
+<a name="ln327">          // Load table_reader</a>
+<a name="ln328">          file_meta-&gt;fd.table_reader = table_cache_-&gt;GetTableReaderFromHandle(</a>
+<a name="ln329">              file_meta-&gt;table_reader_handle);</a>
+<a name="ln330">        }</a>
+<a name="ln331">      }</a>
+<a name="ln332">    };</a>
+<a name="ln333"> </a>
+<a name="ln334">    if (max_threads &lt;= 1) {</a>
+<a name="ln335">      load_handlers_func();</a>
+<a name="ln336">    } else {</a>
+<a name="ln337">      std::vector&lt;std::thread&gt; threads;</a>
+<a name="ln338">      for (int i = 0; i &lt; max_threads; i++) {</a>
+<a name="ln339">        threads.emplace_back(load_handlers_func);</a>
+<a name="ln340">      }</a>
+<a name="ln341"> </a>
+<a name="ln342">      for (auto&amp; t : threads) {</a>
+<a name="ln343">        t.join();</a>
+<a name="ln344">      }</a>
+<a name="ln345">    }</a>
+<a name="ln346">  }</a>
+<a name="ln347"> </a>
+<a name="ln348">  void MaybeAddFile(VersionStorageInfo* vstorage, int level, FileMetaData* f) {</a>
+<a name="ln349">    if (levels_[level].deleted_files.count(f-&gt;fd.GetNumber()) &gt; 0) {</a>
+<a name="ln350">      // f is to-be-delected table file</a>
+<a name="ln351">      vstorage-&gt;RemoveCurrentStats(f);</a>
+<a name="ln352">    } else {</a>
+<a name="ln353">      vstorage-&gt;AddFile(level, f, info_log_);</a>
+<a name="ln354">    }</a>
+<a name="ln355">  }</a>
+<a name="ln356">};</a>
+<a name="ln357"> </a>
+<a name="ln358">VersionBuilder::VersionBuilder(const EnvOptions&amp; env_options,</a>
+<a name="ln359">                               TableCache* table_cache,</a>
+<a name="ln360">                               VersionStorageInfo* base_vstorage,</a>
+<a name="ln361">                               Logger* info_log)</a>
+<a name="ln362">    : rep_(new Rep(env_options, info_log, table_cache, base_vstorage)) {}</a>
+<a name="ln363">VersionBuilder::~VersionBuilder() { delete rep_; }</a>
+<a name="ln364">void VersionBuilder::CheckConsistency(VersionStorageInfo* vstorage) {</a>
+<a name="ln365">  rep_-&gt;CheckConsistency(vstorage);</a>
+<a name="ln366">}</a>
+<a name="ln367">void VersionBuilder::CheckConsistencyForDeletes(VersionEdit* edit,</a>
+<a name="ln368">                                                uint64_t number, int level) {</a>
+<a name="ln369">  rep_-&gt;CheckConsistencyForDeletes(edit, number, level);</a>
+<a name="ln370">}</a>
+<a name="ln371">void VersionBuilder::Apply(VersionEdit* edit) { rep_-&gt;Apply(edit); }</a>
+<a name="ln372">void VersionBuilder::SaveTo(VersionStorageInfo* vstorage) {</a>
+<a name="ln373">  rep_-&gt;SaveTo(vstorage);</a>
+<a name="ln374">}</a>
+<a name="ln375">void VersionBuilder::LoadTableHandlers(InternalStats* internal_stats,</a>
+<a name="ln376">                                       int max_threads) {</a>
+<a name="ln377">  rep_-&gt;LoadTableHandlers(internal_stats, max_threads);</a>
+<a name="ln378">}</a>
+<a name="ln379">void VersionBuilder::MaybeAddFile(VersionStorageInfo* vstorage, int level,</a>
+<a name="ln380">                                  FileMetaData* f) {</a>
+<a name="ln381">  rep_-&gt;MaybeAddFile(vstorage, level, f);</a>
+<a name="ln382">}</a>
+<a name="ln383"> </a>
+<a name="ln384">}  // namespace rocksdb</a>
+
+</code></pre>
+<div class="balloon" rel="320"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

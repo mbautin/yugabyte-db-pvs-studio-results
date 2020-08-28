@@ -1,0 +1,547 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>service_pool.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/rpc/service_pool.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;memory&gt;</a>
+<a name="ln36">#include &lt;queue&gt;</a>
+<a name="ln37">#include &lt;string&gt;</a>
+<a name="ln38">#include &lt;vector&gt;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &lt;boost/asio/strand.hpp&gt;</a>
+<a name="ln41"> </a>
+<a name="ln42">#include &lt;cds/container/basket_queue.h&gt;</a>
+<a name="ln43">#include &lt;cds/gc/dhp.h&gt;</a>
+<a name="ln44"> </a>
+<a name="ln45">#include &lt;glog/logging.h&gt;</a>
+<a name="ln46"> </a>
+<a name="ln47">#include &quot;yb/gutil/gscoped_ptr.h&quot;</a>
+<a name="ln48">#include &quot;yb/gutil/ref_counted.h&quot;</a>
+<a name="ln49"> </a>
+<a name="ln50">#include &quot;yb/rpc/inbound_call.h&quot;</a>
+<a name="ln51">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln52">#include &quot;yb/rpc/scheduler.h&quot;</a>
+<a name="ln53">#include &quot;yb/rpc/service_if.h&quot;</a>
+<a name="ln54"> </a>
+<a name="ln55">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln56">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln57">#include &quot;yb/util/lockfree.h&quot;</a>
+<a name="ln58">#include &quot;yb/util/metrics.h&quot;</a>
+<a name="ln59">#include &quot;yb/util/scope_exit.h&quot;</a>
+<a name="ln60">#include &quot;yb/util/status.h&quot;</a>
+<a name="ln61">#include &quot;yb/util/thread.h&quot;</a>
+<a name="ln62">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln63"> </a>
+<a name="ln64">using namespace std::literals;</a>
+<a name="ln65">using namespace std::placeholders;</a>
+<a name="ln66">using std::shared_ptr;</a>
+<a name="ln67">using strings::Substitute;</a>
+<a name="ln68"> </a>
+<a name="ln69">DEFINE_int64(max_time_in_queue_ms, 6000,</a>
+<a name="ln70">             &quot;Fail calls that get stuck in the queue longer than the specified amount of time &quot;</a>
+<a name="ln71">                 &quot;(in ms)&quot;);</a>
+<a name="ln72">TAG_FLAG(max_time_in_queue_ms, advanced);</a>
+<a name="ln73">TAG_FLAG(max_time_in_queue_ms, runtime);</a>
+<a name="ln74">DEFINE_int64(backpressure_recovery_period_ms, 600000,</a>
+<a name="ln75">             &quot;Once we hit a backpressure/service-overflow we will consider dropping stale requests &quot;</a>
+<a name="ln76">             &quot;for this duration (in ms)&quot;);</a>
+<a name="ln77">TAG_FLAG(backpressure_recovery_period_ms, advanced);</a>
+<a name="ln78">TAG_FLAG(backpressure_recovery_period_ms, runtime);</a>
+<a name="ln79">DEFINE_test_flag(bool, enable_backpressure_mode_for_testing, false,</a>
+<a name="ln80">            &quot;For testing purposes. Enables the rpc's to be considered timed out in the queue even &quot;</a>
+<a name="ln81">            &quot;when we have not had any backpressure in the recent past.&quot;);</a>
+<a name="ln82"> </a>
+<a name="ln83">METRIC_DEFINE_histogram(server, rpc_incoming_queue_time,</a>
+<a name="ln84">                        &quot;RPC Queue Time&quot;,</a>
+<a name="ln85">                        yb::MetricUnit::kMicroseconds,</a>
+<a name="ln86">                        &quot;Number of microseconds incoming RPC requests spend in the worker queue&quot;,</a>
+<a name="ln87">                        60000000LU, 3);</a>
+<a name="ln88"> </a>
+<a name="ln89">METRIC_DEFINE_counter(server, rpcs_timed_out_in_queue,</a>
+<a name="ln90">                      &quot;RPC Queue Timeouts&quot;,</a>
+<a name="ln91">                      yb::MetricUnit::kRequests,</a>
+<a name="ln92">                      &quot;Number of RPCs whose timeout elapsed while waiting &quot;</a>
+<a name="ln93">                      &quot;in the service queue, and thus were not processed. &quot;</a>
+<a name="ln94">                      &quot;Does not include calls that were expired before we tried to execute them.&quot;);</a>
+<a name="ln95"> </a>
+<a name="ln96">METRIC_DEFINE_counter(server, rpcs_timed_out_early_in_queue,</a>
+<a name="ln97">                      &quot;RPC Queue Timeouts&quot;,</a>
+<a name="ln98">                      yb::MetricUnit::kRequests,</a>
+<a name="ln99">                      &quot;Number of RPCs whose timeout elapsed while waiting &quot;</a>
+<a name="ln100">                      &quot;in the service queue, and thus were not processed. &quot;</a>
+<a name="ln101">                      &quot;Timeout for those calls were detected before the calls tried to execute.&quot;);</a>
+<a name="ln102"> </a>
+<a name="ln103">METRIC_DEFINE_counter(server, rpcs_queue_overflow,</a>
+<a name="ln104">                      &quot;RPC Queue Overflows&quot;,</a>
+<a name="ln105">                      yb::MetricUnit::kRequests,</a>
+<a name="ln106">                      &quot;Number of RPCs dropped because the service queue &quot;</a>
+<a name="ln107">                      &quot;was full.&quot;);</a>
+<a name="ln108"> </a>
+<a name="ln109">namespace yb {</a>
+<a name="ln110">namespace rpc {</a>
+<a name="ln111"> </a>
+<a name="ln112">namespace {</a>
+<a name="ln113"> </a>
+<a name="ln114">const CoarseDuration kTimeoutCheckGranularity = 100ms;</a>
+<a name="ln115">const char* const kTimedOutInQueue = &quot;Call waited in the queue past deadline&quot;;</a>
+<a name="ln116"> </a>
+<a name="ln117">} // namespace</a>
+<a name="ln118"> </a>
+<a name="ln119">class ServicePoolImpl final : public InboundCallHandler {</a>
+<a name="ln120"> public:</a>
+<a name="ln121">  ServicePoolImpl(size_t max_tasks,</a>
+<a name="ln122">                  ThreadPool* thread_pool,</a>
+<a name="ln123">                  Scheduler* scheduler,</a>
+<a name="ln124">                  ServiceIfPtr service,</a>
+<a name="ln125">                  const scoped_refptr&lt;MetricEntity&gt;&amp; entity)</a>
+<a name="ln126">      : max_queued_calls_(max_tasks),</a>
+<a name="ln127">        thread_pool_(*thread_pool),</a>
+<a name="ln128">        scheduler_(*scheduler),</a>
+<a name="ln129">        service_(std::move(service)),</a>
+<a name="ln130">        incoming_queue_time_(METRIC_rpc_incoming_queue_time.Instantiate(entity)),</a>
+<a name="ln131">        rpcs_timed_out_in_queue_(METRIC_rpcs_timed_out_in_queue.Instantiate(entity)),</a>
+<a name="ln132">        rpcs_timed_out_early_in_queue_(</a>
+<a name="ln133">            METRIC_rpcs_timed_out_early_in_queue.Instantiate(entity)),</a>
+<a name="ln134">        rpcs_queue_overflow_(METRIC_rpcs_queue_overflow.Instantiate(entity)),</a>
+<a name="ln135">        check_timeout_strand_(scheduler-&gt;io_service()),</a>
+<a name="ln136">        log_prefix_(Format(&quot;$0: &quot;, service_-&gt;service_name())) {</a>
+<a name="ln137"> </a>
+<a name="ln138">          // Create per service counter for rpcs_in_queue_.</a>
+<a name="ln139">          auto id = Format(&quot;rpcs_in_queue_$0&quot;, service_-&gt;service_name());</a>
+<a name="ln140">          EscapeMetricNameForPrometheus(&amp;id);</a>
+<a name="ln141">          string description = id + &quot; metric for ServicePoolImpl&quot;;</a>
+<a name="ln142">          rpcs_in_queue_ = entity-&gt;FindOrCreateGauge(</a>
+<a name="ln143">              std::unique_ptr&lt;GaugePrototype&lt;int64_t&gt;&gt;(new OwningGaugePrototype&lt;int64_t&gt;(</a>
+<a name="ln144">                  entity-&gt;prototype().name(), std::move(id),</a>
+<a name="ln145">                  description, MetricUnit::kRequests, description, MetricLevel::kInfo)),</a>
+<a name="ln146">              static_cast&lt;int64&gt;(0) /* initial_value */);</a>
+<a name="ln147"> </a>
+<a name="ln148">          LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;yb::rpc::ServicePoolImpl created at &quot; &lt;&lt; this;</a>
+<a name="ln149">  }</a>
+<a name="ln150"> </a>
+<a name="ln151">  ~ServicePoolImpl() {</a>
+<a name="ln152">    StartShutdown();</a>
+<a name="ln153">    CompleteShutdown();</a>
+<a name="ln154">  }</a>
+<a name="ln155"> </a>
+<a name="ln156">  void CompleteShutdown() {</a>
+<a name="ln157">    shutdown_complete_latch_.Wait();</a>
+<a name="ln158">    while (scheduled_tasks_.load(std::memory_order_acquire) != 0) {</a>
+<a name="ln159">      std::this_thread::sleep_for(10ms);</a>
+<a name="ln160">    }</a>
+<a name="ln161">  }</a>
+<a name="ln162"> </a>
+<a name="ln163">  void StartShutdown() {</a>
+<a name="ln164">    bool closing_state = false;</a>
+<a name="ln165">    if (closing_.compare_exchange_strong(closing_state, true)) {</a>
+<a name="ln166">      service_-&gt;Shutdown();</a>
+<a name="ln167"> </a>
+<a name="ln168">      auto check_timeout_task = check_timeout_task_.load(std::memory_order_acquire);</a>
+<a name="ln169">      if (check_timeout_task != kUninitializedScheduledTaskId) {</a>
+<a name="ln170">        scheduler_.Abort(check_timeout_task);</a>
+<a name="ln171">      }</a>
+<a name="ln172"> </a>
+<a name="ln173">      check_timeout_strand_.dispatch([this] {</a>
+<a name="ln174">        std::weak_ptr&lt;InboundCall&gt; inbound_call_wrapper;</a>
+<a name="ln175">        while (pre_check_timeout_queue_.pop(inbound_call_wrapper)) {}</a>
+<a name="ln176">        shutdown_complete_latch_.CountDown();</a>
+<a name="ln177">      });</a>
+<a name="ln178">    }</a>
+<a name="ln179">  }</a>
+<a name="ln180"> </a>
+<a name="ln181">  void Enqueue(const InboundCallPtr&amp; call) {</a>
+<a name="ln182">    TRACE_TO(call-&gt;trace(), &quot;Inserting onto call queue&quot;);</a>
+<a name="ln183"> </a>
+<a name="ln184">    auto task = call-&gt;BindTask(this);</a>
+<a name="ln185">    if (!task) {</a>
+<a name="ln186">      Overflow(call, &quot;service&quot;, queued_calls_.load(std::memory_order_relaxed));</a>
+<a name="ln187">      return;</a>
+<a name="ln188">    }</a>
+<a name="ln189"> </a>
+<a name="ln190">    auto call_deadline = call-&gt;GetClientDeadline();</a>
+<a name="ln191">    if (call_deadline != CoarseTimePoint::max()) {</a>
+<a name="ln192">      pre_check_timeout_queue_.push(call);</a>
+<a name="ln193">      ScheduleCheckTimeout(call_deadline);</a>
+<a name="ln194">    }</a>
+<a name="ln195"> </a>
+<a name="ln196">    thread_pool_.Enqueue(task);</a>
+<a name="ln197">  }</a>
+<a name="ln198"> </a>
+<a name="ln199">  const Counter* RpcsTimedOutInQueueMetricForTests() const {</a>
+<a name="ln200">    return rpcs_timed_out_early_in_queue_.get();</a>
+<a name="ln201">  }</a>
+<a name="ln202"> </a>
+<a name="ln203">  const Counter* RpcsQueueOverflowMetric() const {</a>
+<a name="ln204">    return rpcs_queue_overflow_.get();</a>
+<a name="ln205">  }</a>
+<a name="ln206"> </a>
+<a name="ln207">  std::string service_name() const {</a>
+<a name="ln208">    return service_-&gt;service_name();</a>
+<a name="ln209">  }</a>
+<a name="ln210"> </a>
+<a name="ln211">  ServiceIfPtr TEST_get_service() const {</a>
+<a name="ln212">    return service_;</a>
+<a name="ln213">  }</a>
+<a name="ln214"> </a>
+<a name="ln215">  void Overflow(const InboundCallPtr&amp; call, const char* type, size_t limit) {</a>
+<a name="ln216">    const auto err_msg =</a>
+<a name="ln217">        Substitute(&quot;$0 request on $1 from $2 dropped due to backpressure. &quot;</a>
+<a name="ln218">                   &quot;The $3 queue is full, it has $4 items.&quot;,</a>
+<a name="ln219">            call-&gt;method_name(),</a>
+<a name="ln220">            service_-&gt;service_name(),</a>
+<a name="ln221">            yb::ToString(call-&gt;remote_address()),</a>
+<a name="ln222">            type,</a>
+<a name="ln223">            limit);</a>
+<a name="ln224">    YB_LOG_EVERY_N_SECS(WARNING, 3) &lt;&lt; LogPrefix() &lt;&lt; err_msg;</a>
+<a name="ln225">    const auto response_status = STATUS(ServiceUnavailable, err_msg);</a>
+<a name="ln226">    rpcs_queue_overflow_-&gt;Increment();</a>
+<a name="ln227">    call-&gt;RespondFailure(ErrorStatusPB::ERROR_SERVER_TOO_BUSY, response_status);</a>
+<a name="ln228">    last_backpressure_at_.store(</a>
+<a name="ln229">        CoarseMonoClock::Now().time_since_epoch(), std::memory_order_release);</a>
+<a name="ln230">  }</a>
+<a name="ln231"> </a>
+<a name="ln232">  void Failure(const InboundCallPtr&amp; call, const Status&amp; status) override {</a>
+<a name="ln233">    if (!call-&gt;TryStartProcessing()) {</a>
+<a name="ln234">      return;</a>
+<a name="ln235">    }</a>
+<a name="ln236"> </a>
+<a name="ln237">    if (status.IsServiceUnavailable()) {</a>
+<a name="ln238">      Overflow(call, &quot;global&quot;, thread_pool_.options().queue_limit);</a>
+<a name="ln239">      return;</a>
+<a name="ln240">    }</a>
+<a name="ln241">    YB_LOG_EVERY_N_SECS(WARNING, 1)</a>
+<a name="ln242">        &lt;&lt; LogPrefix()</a>
+<a name="ln243">        &lt;&lt; call-&gt;method_name() &lt;&lt; &quot; request on &quot; &lt;&lt; service_-&gt;service_name() &lt;&lt; &quot; from &quot;</a>
+<a name="ln244">        &lt;&lt; call-&gt;remote_address() &lt;&lt; &quot; dropped because of: &quot; &lt;&lt; status.ToString();</a>
+<a name="ln245">    const auto response_status = STATUS(ServiceUnavailable, &quot;Service is shutting down&quot;);</a>
+<a name="ln246">    call-&gt;RespondFailure(ErrorStatusPB::FATAL_SERVER_SHUTTING_DOWN, response_status);</a>
+<a name="ln247">  }</a>
+<a name="ln248"> </a>
+<a name="ln249">  void Handle(InboundCallPtr incoming) override {</a>
+<a name="ln250">    incoming-&gt;RecordHandlingStarted(incoming_queue_time_);</a>
+<a name="ln251">    ADOPT_TRACE(incoming-&gt;trace());</a>
+<a name="ln252"> </a>
+<a name="ln253">    const char* error_message;</a>
+<a name="ln254">    if (PREDICT_FALSE(incoming-&gt;ClientTimedOut())) {</a>
+<a name="ln255">      error_message = kTimedOutInQueue;</a>
+<a name="ln256">    } else if (PREDICT_FALSE(ShouldDropRequestDuringHighLoad(incoming))) {</a>
+<a name="ln257">      error_message = &quot;The server is overloaded. Call waited in the queue past max_time_in_queue.&quot;;</a>
+<a name="ln258">    } else {</a>
+<a name="ln259">      TRACE_TO(incoming-&gt;trace(), &quot;Handling call&quot;);</a>
+<a name="ln260"> </a>
+<a name="ln261">      if (incoming-&gt;TryStartProcessing()) {</a>
+<a name="ln262">        service_-&gt;Handle(std::move(incoming));</a>
+<a name="ln263">      }</a>
+<a name="ln264">      return;</a>
+<a name="ln265">    }</a>
+<a name="ln266"> </a>
+<a name="ln267">    TRACE_TO(incoming-&gt;trace(), error_message);</a>
+<a name="ln268">    VLOG_WITH_PREFIX(4)</a>
+<a name="ln269">        &lt;&lt; &quot;Timing out call &quot; &lt;&lt; incoming-&gt;ToString() &lt;&lt; &quot; due to: &quot; &lt;&lt; error_message;</a>
+<a name="ln270"> </a>
+<a name="ln271">    // Respond as a failure, even though the client will probably ignore</a>
+<a name="ln272">    // the response anyway.</a>
+<a name="ln273">    TimedOut(incoming.get(), error_message, rpcs_timed_out_in_queue_.get());</a>
+<a name="ln274">  }</a>
+<a name="ln275"> </a>
+<a name="ln276"> private:</a>
+<a name="ln277">  void TimedOut(InboundCall* call, const char* error_message, Counter* metric) {</a>
+<a name="ln278">    if (call-&gt;RespondTimedOutIfPending(error_message)) {</a>
+<a name="ln279">      metric-&gt;Increment();</a>
+<a name="ln280">    }</a>
+<a name="ln281">  }</a>
+<a name="ln282"> </a>
+<a name="ln283">  bool ShouldDropRequestDuringHighLoad(const InboundCallPtr&amp; incoming) {</a>
+<a name="ln284">    CoarseTimePoint last_backpressure_at(last_backpressure_at_.load(std::memory_order_acquire));</a>
+<a name="ln285"> </a>
+<a name="ln286">    // For testing purposes.</a>
+<a name="ln287">    if (GetAtomicFlag(&amp;FLAGS_TEST_enable_backpressure_mode_for_testing)) {</a>
+<a name="ln288">      last_backpressure_at = CoarseMonoClock::Now();</a>
+<a name="ln289">    }</a>
+<a name="ln290"> </a>
+<a name="ln291">    // Test for a sentinel value, to avoid reading the clock.</a>
+<a name="ln292">    if (last_backpressure_at == CoarseTimePoint()) {</a>
+<a name="ln293">      return false;</a>
+<a name="ln294">    }</a>
+<a name="ln295"> </a>
+<a name="ln296">    auto now = CoarseMonoClock::Now();</a>
+<a name="ln297">    if (now &gt; last_backpressure_at + FLAGS_backpressure_recovery_period_ms * 1ms) {</a>
+<a name="ln298">      last_backpressure_at_.store(CoarseTimePoint().time_since_epoch(), std::memory_order_release);</a>
+<a name="ln299">      return false;</a>
+<a name="ln300">    }</a>
+<a name="ln301"> </a>
+<a name="ln302">    return incoming-&gt;GetTimeInQueue().ToMilliseconds() &gt; FLAGS_max_time_in_queue_ms;</a>
+<a name="ln303">  }</a>
+<a name="ln304"> </a>
+<a name="ln305">  void CheckTimeout(ScheduledTaskId task_id, CoarseTimePoint time, const Status&amp; status) {</a>
+<a name="ln306">    auto se = ScopeExit([this, task_id, time] {</a>
+<a name="ln307">      auto expected_duration = time.time_since_epoch();</a>
+<a name="ln308">      next_check_timeout_.compare_exchange_strong(</a>
+<a name="ln309">          expected_duration, CoarseTimePoint::max().time_since_epoch(),</a>
+<a name="ln310">          std::memory_order_acq_rel);</a>
+<a name="ln311">      auto expected_task_id = task_id;</a>
+<a name="ln312">      check_timeout_task_.compare_exchange_strong(</a>
+<a name="ln313">          expected_task_id, kUninitializedScheduledTaskId, std::memory_order_acq_rel);</a>
+<a name="ln314">      scheduled_tasks_.fetch_sub(1, std::memory_order_acq_rel);</a>
+<a name="ln315">    });</a>
+<a name="ln316">    if (!status.ok()) {</a>
+<a name="ln317">      return;</a>
+<a name="ln318">    }</a>
+<a name="ln319"> </a>
+<a name="ln320">    auto now = CoarseMonoClock::now();</a>
+<a name="ln321">    {</a>
+<a name="ln322">      std::weak_ptr&lt;InboundCall&gt; weak_inbound_call;</a>
+<a name="ln323">      while (pre_check_timeout_queue_.pop(weak_inbound_call)) {</a>
+<a name="ln324">        auto inbound_call = weak_inbound_call.lock();</a>
+<a name="ln325">        if (!inbound_call) {</a>
+<a name="ln326">          continue;</a>
+<a name="ln327">        }</a>
+<a name="ln328">        if (now &gt; inbound_call-&gt;GetClientDeadline()) {</a>
+<a name="ln329">          TimedOut(inbound_call.get(), kTimedOutInQueue, rpcs_timed_out_early_in_queue_.get());</a>
+<a name="ln330">        } else {</a>
+<a name="ln331">          check_timeout_queue_.emplace(inbound_call);</a>
+<a name="ln332">        }</a>
+<a name="ln333">      }</a>
+<a name="ln334">    }</a>
+<a name="ln335"> </a>
+<a name="ln336">    while (!check_timeout_queue_.empty() &amp;&amp; now &gt; check_timeout_queue_.top().time) {</a>
+<a name="ln337">      auto call = check_timeout_queue_.top().call.lock();</a>
+<a name="ln338">      if (call) {</a>
+<a name="ln339">        TimedOut(call.get(), kTimedOutInQueue, rpcs_timed_out_early_in_queue_.get());</a>
+<a name="ln340">      }</a>
+<a name="ln341">      check_timeout_queue_.pop();</a>
+<a name="ln342">    }</a>
+<a name="ln343"> </a>
+<a name="ln344">    if (!check_timeout_queue_.empty()) {</a>
+<a name="ln345">      ScheduleCheckTimeout(check_timeout_queue_.top().time);</a>
+<a name="ln346">    }</a>
+<a name="ln347">  }</a>
+<a name="ln348"> </a>
+<a name="ln349">  void ScheduleCheckTimeout(CoarseTimePoint time) {</a>
+<a name="ln350">    if (closing_.load(std::memory_order_acquire)) {</a>
+<a name="ln351">      return;</a>
+<a name="ln352">    }</a>
+<a name="ln353">    CoarseDuration next_check_timeout = next_check_timeout_.load(std::memory_order_acquire);</a>
+<a name="ln354">    time += kTimeoutCheckGranularity;</a>
+<a name="ln355">    while (CoarseTimePoint(next_check_timeout) &gt; time) {</a>
+<a name="ln356">      if (next_check_timeout_.compare_exchange_weak(</a>
+<a name="ln357">              next_check_timeout, time.time_since_epoch(), std::memory_order_acq_rel)) {</a>
+<a name="ln358">        check_timeout_strand_.dispatch([this, time] {</a>
+<a name="ln359">          auto check_timeout_task = check_timeout_task_.load(std::memory_order_acquire);</a>
+<a name="ln360">          if (check_timeout_task != kUninitializedScheduledTaskId) {</a>
+<a name="ln361">            scheduler_.Abort(check_timeout_task);</a>
+<a name="ln362">          }</a>
+<a name="ln363">          scheduled_tasks_.fetch_add(1, std::memory_order_acq_rel);</a>
+<a name="ln364">          auto task_id = scheduler_.Schedule(</a>
+<a name="ln365">              [this, time](ScheduledTaskId task_id, const Status&amp; status) {</a>
+<a name="ln366">                check_timeout_strand_.dispatch([this, time, task_id, status] {</a>
+<a name="ln367">                  CheckTimeout(task_id, time, status);</a>
+<a name="ln368">                });</a>
+<a name="ln369">              },</a>
+<a name="ln370">              ToSteady(time));</a>
+<a name="ln371">          check_timeout_task_.store(task_id, std::memory_order_release);</a>
+<a name="ln372">        });</a>
+<a name="ln373">        break;</a>
+<a name="ln374">      }</a>
+<a name="ln375">    }</a>
+<a name="ln376">  }</a>
+<a name="ln377"> </a>
+<a name="ln378">  const std::string&amp; LogPrefix() const {</a>
+<a name="ln379">    return log_prefix_;</a>
+<a name="ln380">  }</a>
+<a name="ln381"> </a>
+<a name="ln382">  bool CallQueued() override {</a>
+<a name="ln383">    auto queued_calls = queued_calls_.fetch_add(1, std::memory_order_acq_rel);</a>
+<a name="ln384">    if (queued_calls &lt; 0) {</a>
+<a name="ln385">      YB_LOG_EVERY_N_SECS(DFATAL, 5) &lt;&lt; &quot;Negative number of queued calls: &quot; &lt;&lt; queued_calls;</a>
+<a name="ln386">    }</a>
+<a name="ln387"> </a>
+<a name="ln388">    if (queued_calls &gt;= max_queued_calls_) {</a>
+<a name="ln389">      queued_calls_.fetch_sub(1, std::memory_order_relaxed);</a>
+<a name="ln390">      return false;</a>
+<a name="ln391">    }</a>
+<a name="ln392"> </a>
+<a name="ln393">    rpcs_in_queue_-&gt;Increment();</a>
+<a name="ln394">    return true;</a>
+<a name="ln395">  }</a>
+<a name="ln396"> </a>
+<a name="ln397">  void CallDequeued() override {</a>
+<a name="ln398">    queued_calls_.fetch_sub(1, std::memory_order_relaxed);</a>
+<a name="ln399">    rpcs_in_queue_-&gt;Decrement();</a>
+<a name="ln400">  }</a>
+<a name="ln401"> </a>
+<a name="ln402">  const size_t max_queued_calls_;</a>
+<a name="ln403">  ThreadPool&amp; thread_pool_;</a>
+<a name="ln404">  Scheduler&amp; scheduler_;</a>
+<a name="ln405">  ServiceIfPtr service_;</a>
+<a name="ln406">  scoped_refptr&lt;Histogram&gt; incoming_queue_time_;</a>
+<a name="ln407">  scoped_refptr&lt;Counter&gt; rpcs_timed_out_in_queue_;</a>
+<a name="ln408">  scoped_refptr&lt;Counter&gt; rpcs_timed_out_early_in_queue_;</a>
+<a name="ln409">  scoped_refptr&lt;Counter&gt; rpcs_queue_overflow_;</a>
+<a name="ln410">  scoped_refptr&lt;AtomicGauge&lt;int64_t&gt;&gt; rpcs_in_queue_;</a>
+<a name="ln411">  // Have to use CoarseDuration here, since CoarseTimePoint does not work with clang + libstdc++</a>
+<a name="ln412">  std::atomic&lt;CoarseDuration&gt; last_backpressure_at_{CoarseTimePoint().time_since_epoch()};</a>
+<a name="ln413">  std::atomic&lt;int64_t&gt; queued_calls_{0};</a>
+<a name="ln414"> </a>
+<a name="ln415">  // It is too expensive to update timeout priority queue when each call is received.</a>
+<a name="ln416">  // So we are doing the following trick.</a>
+<a name="ln417">  // All calls are added to pre_check_timeout_queue_, w/o priority.</a>
+<a name="ln418">  // Then before timeout check we move calls from this queue to priority queue.</a>
+<a name="ln419">  typedef cds::container::BasketQueue&lt;cds::gc::DHP, std::weak_ptr&lt;InboundCall&gt;&gt;</a>
+<a name="ln420">      PreCheckTimeoutQueue;</a>
+<a name="ln421">  PreCheckTimeoutQueue pre_check_timeout_queue_;</a>
+<a name="ln422"> </a>
+<a name="ln423">  // Used to track scheduled time, to avoid unnecessary rescheduling.</a>
+<a name="ln424">  std::atomic&lt;CoarseDuration&gt; next_check_timeout_{CoarseTimePoint::max().time_since_epoch()};</a>
+<a name="ln425"> </a>
+<a name="ln426">  // Last scheduled task, required to abort scheduled task during reschedule.</a>
+<a name="ln427">  std::atomic&lt;ScheduledTaskId&gt; check_timeout_task_{kUninitializedScheduledTaskId};</a>
+<a name="ln428"> </a>
+<a name="ln429">  std::atomic&lt;int&gt; scheduled_tasks_{0};</a>
+<a name="ln430"> </a>
+<a name="ln431">  // Timeout checking synchronization.</a>
+<a name="ln432">  IoService::strand check_timeout_strand_;</a>
+<a name="ln433"> </a>
+<a name="ln434">  struct QueuedCheckDeadline {</a>
+<a name="ln435">    CoarseTimePoint time;</a>
+<a name="ln436">    // We use weak pointer to avoid retaining call that was already processed.</a>
+<a name="ln437">    std::weak_ptr&lt;InboundCall&gt; call;</a>
+<a name="ln438"> </a>
+<a name="ln439">    explicit QueuedCheckDeadline(const InboundCallPtr&amp; inp)</a>
+<a name="ln440">        : time(inp-&gt;GetClientDeadline()), call(inp) {</a>
+<a name="ln441">    }</a>
+<a name="ln442">  };</a>
+<a name="ln443"> </a>
+<a name="ln444">  // Priority queue puts the geatest value on top, so we invert comparison.</a>
+<a name="ln445">  friend bool operator&lt;(const QueuedCheckDeadline&amp; lhs, const QueuedCheckDeadline&amp; rhs) {</a>
+<a name="ln446">    return lhs.time &gt; rhs.time;</a>
+<a name="ln447">  }</a>
+<a name="ln448"> </a>
+<a name="ln449">  std::priority_queue&lt;QueuedCheckDeadline&gt; check_timeout_queue_;</a>
+<a name="ln450"> </a>
+<a name="ln451">  std::atomic&lt;bool&gt; closing_ = {false};</a>
+<a name="ln452">  CountDownLatch shutdown_complete_latch_{1};</a>
+<a name="ln453">  std::string log_prefix_;</a>
+<a name="ln454">};</a>
+<a name="ln455"> </a>
+<a name="ln456">ServicePool::ServicePool(size_t max_tasks,</a>
+<a name="ln457">                         ThreadPool* thread_pool,</a>
+<a name="ln458">                         Scheduler* scheduler,</a>
+<a name="ln459">                         ServiceIfPtr service,</a>
+<a name="ln460">                         const scoped_refptr&lt;MetricEntity&gt;&amp; metric_entity)</a>
+<a name="ln461">    : impl_(new ServicePoolImpl(</a>
+<a name="ln462">        max_tasks, thread_pool, scheduler, std::move(service), metric_entity)) {</a>
+<a name="ln463">}</a>
+<a name="ln464"> </a>
+<a name="ln465">ServicePool::~ServicePool() {</a>
+<a name="ln466">}</a>
+<a name="ln467"> </a>
+<a name="ln468">void ServicePool::StartShutdown() {</a>
+<a name="ln469">  impl_-&gt;StartShutdown();</a>
+<a name="ln470">}</a>
+<a name="ln471"> </a>
+<a name="ln472">void ServicePool::CompleteShutdown() {</a>
+<a name="ln473">  impl_-&gt;CompleteShutdown();</a>
+<a name="ln474">}</a>
+<a name="ln475"> </a>
+<a name="ln476">void ServicePool::QueueInboundCall(InboundCallPtr call) {</a>
+<a name="ln477">  impl_-&gt;Enqueue(std::move(call));</a>
+<a name="ln478">}</a>
+<a name="ln479"> </a>
+<a name="ln480">void ServicePool::Handle(InboundCallPtr call) {</a>
+<a name="ln481">  impl_-&gt;Handle(std::move(call));</a>
+<a name="ln482">}</a>
+<a name="ln483"> </a>
+<a name="ln484">const Counter* ServicePool::RpcsTimedOutInQueueMetricForTests() const {</a>
+<a name="ln485">  return impl_-&gt;RpcsTimedOutInQueueMetricForTests();</a>
+<a name="ln486">}</a>
+<a name="ln487"> </a>
+<a name="ln488">const Counter* ServicePool::RpcsQueueOverflowMetric() const {</a>
+<a name="ln489">  return impl_-&gt;RpcsQueueOverflowMetric();</a>
+<a name="ln490">}</a>
+<a name="ln491"> </a>
+<a name="ln492">std::string ServicePool::service_name() const {</a>
+<a name="ln493">  return impl_-&gt;service_name();</a>
+<a name="ln494">}</a>
+<a name="ln495"> </a>
+<a name="ln496">ServiceIfPtr ServicePool::TEST_get_service() const {</a>
+<a name="ln497">  return impl_-&gt;TEST_get_service();</a>
+<a name="ln498">}</a>
+<a name="ln499"> </a>
+<a name="ln500">} // namespace rpc</a>
+<a name="ln501">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="268"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

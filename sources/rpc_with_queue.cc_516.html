@@ -1,0 +1,209 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>rpc_with_queue.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/rpc/rpc_with_queue.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/rpc/connection.h&quot;</a>
+<a name="ln19">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln20">#include &quot;yb/rpc/reactor.h&quot;</a>
+<a name="ln21">#include &quot;yb/rpc/rpc_introspection.pb.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/util/string_util.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">namespace yb {</a>
+<a name="ln26">namespace rpc {</a>
+<a name="ln27"> </a>
+<a name="ln28">ConnectionContextWithQueue::ConnectionContextWithQueue(</a>
+<a name="ln29">    size_t max_concurrent_calls,</a>
+<a name="ln30">    size_t max_queued_bytes)</a>
+<a name="ln31">    : max_concurrent_calls_(max_concurrent_calls), max_queued_bytes_(max_queued_bytes) {</a>
+<a name="ln32">}</a>
+<a name="ln33"> </a>
+<a name="ln34">ConnectionContextWithQueue::~ConnectionContextWithQueue() {</a>
+<a name="ln35">}</a>
+<a name="ln36"> </a>
+<a name="ln37">void ConnectionContextWithQueue::DumpPB(const DumpRunningRpcsRequestPB&amp; req,</a>
+<a name="ln38">                                        RpcConnectionPB* resp) {</a>
+<a name="ln39">  for (auto&amp; call : calls_queue_) {</a>
+<a name="ln40">    call-&gt;DumpPB(req, resp-&gt;add_calls_in_flight());</a>
+<a name="ln41">  }</a>
+<a name="ln42">}</a>
+<a name="ln43"> </a>
+<a name="ln44">bool ConnectionContextWithQueue::Idle(std::string* reason_not_idle) {</a>
+<a name="ln45">  if (calls_queue_.empty()) {</a>
+<a name="ln46">    return true;</a>
+<a name="ln47">  }</a>
+<a name="ln48"> </a>
+<a name="ln49">  if (reason_not_idle) {</a>
+<a name="ln50">    AppendWithSeparator(Format(&quot;$0 calls&quot;, calls_queue_.size()), reason_not_idle);</a>
+<a name="ln51">  }</a>
+<a name="ln52"> </a>
+<a name="ln53">  return false;</a>
+<a name="ln54">}</a>
+<a name="ln55"> </a>
+<a name="ln56">void ConnectionContextWithQueue::Enqueue(std::shared_ptr&lt;QueueableInboundCall&gt; call) {</a>
+<a name="ln57">  auto reactor = call-&gt;connection()-&gt;reactor();</a>
+<a name="ln58">  DCHECK(reactor-&gt;IsCurrentThread());</a>
+<a name="ln59"> </a>
+<a name="ln60">  calls_queue_.push_back(call);</a>
+<a name="ln61">  queued_bytes_ += call-&gt;weight_in_bytes();</a>
+<a name="ln62"> </a>
+<a name="ln63">  size_t size = calls_queue_.size();</a>
+<a name="ln64">  if (size == replies_being_sent_ + 1) {</a>
+<a name="ln65">    first_without_reply_.store(call.get(), std::memory_order_release);</a>
+<a name="ln66">  }</a>
+<a name="ln67">  if (size &lt;= max_concurrent_calls_) {</a>
+<a name="ln68">    reactor-&gt;messenger()-&gt;QueueInboundCall(call);</a>
+<a name="ln69">  }</a>
+<a name="ln70">}</a>
+<a name="ln71"> </a>
+<a name="ln72">void ConnectionContextWithQueue::Shutdown(const Status&amp; status) {</a>
+<a name="ln73">  // Could erase calls, that we did not start to process yet.</a>
+<a name="ln74">  if (calls_queue_.size() &gt; max_concurrent_calls_) {</a>
+<a name="ln75">    calls_queue_.erase(calls_queue_.begin() + max_concurrent_calls_, calls_queue_.end());</a>
+<a name="ln76">  }</a>
+<a name="ln77"> </a>
+<a name="ln78">  for (auto&amp; call : calls_queue_) {</a>
+<a name="ln79">    call-&gt;Abort(status);</a>
+<a name="ln80">  }</a>
+<a name="ln81">}</a>
+<a name="ln82"> </a>
+<a name="ln83">void ConnectionContextWithQueue::CallProcessed(InboundCall* call) {</a>
+<a name="ln84">  ++processed_call_count_;</a>
+<a name="ln85">  auto reactor = call-&gt;connection()-&gt;reactor();</a>
+<a name="ln86">  DCHECK(reactor-&gt;IsCurrentThread());</a>
+<a name="ln87"> </a>
+<a name="ln88">  DCHECK(!calls_queue_.empty());</a>
+<a name="ln89">  DCHECK_EQ(calls_queue_.front().get(), call);</a>
+<a name="ln90">  DCHECK_GT(replies_being_sent_, 0);</a>
+<a name="ln91"> </a>
+<a name="ln92">  bool could_enqueue = can_enqueue();</a>
+<a name="ln93">  auto call_weight_in_bytes = down_cast&lt;QueueableInboundCall*&gt;(call)-&gt;weight_in_bytes();</a>
+<a name="ln94">  queued_bytes_ -= call_weight_in_bytes;</a>
+<a name="ln95"> </a>
+<a name="ln96">  calls_queue_.pop_front();</a>
+<a name="ln97">  --replies_being_sent_;</a>
+<a name="ln98">  if (calls_queue_.size() &gt;= max_concurrent_calls_) {</a>
+<a name="ln99">    auto call_ptr = calls_queue_[max_concurrent_calls_ - 1];</a>
+<a name="ln100">    reactor-&gt;messenger()-&gt;QueueInboundCall(call_ptr);</a>
+<a name="ln101">  }</a>
+<a name="ln102">  if (Idle() &amp;&amp; idle_listener_) {</a>
+<a name="ln103">    idle_listener_();</a>
+<a name="ln104">  }</a>
+<a name="ln105"> </a>
+<a name="ln106">  if (!could_enqueue &amp;&amp; can_enqueue()) {</a>
+<a name="ln107">    call-&gt;connection()-&gt;ParseReceived();</a>
+<a name="ln108">  }</a>
+<a name="ln109">}</a>
+<a name="ln110"> </a>
+<a name="ln111">void ConnectionContextWithQueue::QueueResponse(const ConnectionPtr&amp; conn,</a>
+<a name="ln112">                                               InboundCallPtr call) {</a>
+<a name="ln113">  QueueableInboundCall* queueable_call = down_cast&lt;QueueableInboundCall*&gt;(call.get());</a>
+<a name="ln114">  queueable_call-&gt;SetHasReply();</a>
+<a name="ln115">  if (queueable_call == first_without_reply_.load(std::memory_order_acquire)) {</a>
+<a name="ln116">    auto scheduled = conn-&gt;reactor()-&gt;ScheduleReactorTask(flush_outbound_queue_task_);</a>
+<a name="ln117">    LOG_IF(WARNING, !scheduled) &lt;&lt; &quot;Failed to schedule flush outbound queue&quot;;</a>
+<a name="ln118">  }</a>
+<a name="ln119">}</a>
+<a name="ln120"> </a>
+<a name="ln121">void ConnectionContextWithQueue::FlushOutboundQueue(Connection* conn) {</a>
+<a name="ln122">  DCHECK(conn-&gt;reactor()-&gt;IsCurrentThread());</a>
+<a name="ln123"> </a>
+<a name="ln124">  const size_t begin = replies_being_sent_;</a>
+<a name="ln125">  size_t end = begin;</a>
+<a name="ln126">  for (;;) {</a>
+<a name="ln127">    size_t queue_size = calls_queue_.size();</a>
+<a name="ln128">    while (end &lt; queue_size) {</a>
+<a name="ln129">      if (!calls_queue_[end]-&gt;has_reply()) {</a>
+<a name="ln130">        break;</a>
+<a name="ln131">      }</a>
+<a name="ln132">      ++end;</a>
+<a name="ln133">    }</a>
+<a name="ln134">    auto new_first_without_reply = end &lt; queue_size ? calls_queue_[end].get() : nullptr;</a>
+<a name="ln135">    first_without_reply_.store(new_first_without_reply, std::memory_order_release);</a>
+<a name="ln136">    // It is usual case that we break here, but sometimes there could happen that before updating</a>
+<a name="ln137">    // first_without_reply_ we did QueueResponse for this call.</a>
+<a name="ln138">    if (!new_first_without_reply || !new_first_without_reply-&gt;has_reply()) {</a>
+<a name="ln139">      break;</a>
+<a name="ln140">    }</a>
+<a name="ln141">  }</a>
+<a name="ln142"> </a>
+<a name="ln143">  if (begin != end) {</a>
+<a name="ln144">    replies_being_sent_ = end;</a>
+<a name="ln145">    boost::container::small_vector&lt;OutboundDataPtr, 64&gt; batch(</a>
+<a name="ln146">        calls_queue_.begin() + begin,</a>
+<a name="ln147">        calls_queue_.begin() + end);</a>
+<a name="ln148">    conn-&gt;QueueOutboundDataBatch(batch);</a>
+<a name="ln149">  }</a>
+<a name="ln150">}</a>
+<a name="ln151"> </a>
+<a name="ln152">void ConnectionContextWithQueue::AssignConnection(const ConnectionPtr&amp; conn) {</a>
+<a name="ln153">  flush_outbound_queue_task_ = MakeFunctorReactorTask(</a>
+<a name="ln154">      std::bind(&amp;ConnectionContextWithQueue::FlushOutboundQueue, this, conn.get()), conn,</a>
+<a name="ln155">      SOURCE_LOCATION());</a>
+<a name="ln156">}</a>
+<a name="ln157"> </a>
+<a name="ln158">} // namespace rpc</a>
+<a name="ln159">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="58"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="86"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="88"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="117"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="122"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

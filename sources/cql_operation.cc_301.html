@@ -1,0 +1,1565 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>cql_operation.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/docdb/cql_operation.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/common/index.h&quot;</a>
+<a name="ln17">#include &quot;yb/common/jsonb.h&quot;</a>
+<a name="ln18">#include &quot;yb/common/partition.h&quot;</a>
+<a name="ln19">#include &quot;yb/common/ql_protocol_util.h&quot;</a>
+<a name="ln20">#include &quot;yb/common/ql_resultset.h&quot;</a>
+<a name="ln21">#include &quot;yb/common/ql_storage_interface.h&quot;</a>
+<a name="ln22">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;yb/docdb/doc_ql_scanspec.h&quot;</a>
+<a name="ln25">#include &quot;yb/docdb/docdb_debug.h&quot;</a>
+<a name="ln26">#include &quot;yb/docdb/docdb_rocksdb_util.h&quot;</a>
+<a name="ln27">#include &quot;yb/docdb/docdb_util.h&quot;</a>
+<a name="ln28">#include &quot;yb/docdb/primitive_value_util.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;yb/util/bfpg/tserver_opcodes.h&quot;</a>
+<a name="ln31">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln32">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln33"> </a>
+<a name="ln34">#include &quot;yb/yql/cql/ql/util/errcodes.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">DEFINE_test_flag(bool, pause_write_apply_after_if, false,</a>
+<a name="ln37">                 &quot;Pause application of QLWriteOperation after evaluating if condition.&quot;);</a>
+<a name="ln38"> </a>
+<a name="ln39">DEFINE_bool(ycql_consistent_transactional_paging, false,</a>
+<a name="ln40">            &quot;Whether to enforce consistency of data returned for second page and beyond for YCQL &quot;</a>
+<a name="ln41">            &quot;queries on transactional tables. If true, read restart errors could be returned to &quot;</a>
+<a name="ln42">            &quot;prevent inconsistency. If false, no read restart errors are returned but the data may &quot;</a>
+<a name="ln43">            &quot;be stale. The latter is preferable for long scans. The data returned for the first &quot;</a>
+<a name="ln44">            &quot;page of results is never stale regardless of this flag.&quot;);</a>
+<a name="ln45"> </a>
+<a name="ln46">DECLARE_bool(trace_docdb_calls);</a>
+<a name="ln47"> </a>
+<a name="ln48">namespace yb {</a>
+<a name="ln49">namespace docdb {</a>
+<a name="ln50"> </a>
+<a name="ln51">namespace {</a>
+<a name="ln52"> </a>
+<a name="ln53">// Append dummy entries in schema to table_row</a>
+<a name="ln54">// TODO(omer): this should most probably be added somewhere else</a>
+<a name="ln55">void AddProjection(const Schema&amp; schema, QLTableRow* table_row) {</a>
+<a name="ln56">  for (size_t i = 0; i &lt; schema.num_columns(); i++) {</a>
+<a name="ln57">    const auto&amp; column_id = schema.column_id(i);</a>
+<a name="ln58">    table_row-&gt;AllocColumn(column_id);</a>
+<a name="ln59">  }</a>
+<a name="ln60">}</a>
+<a name="ln61"> </a>
+<a name="ln62">// Create projection schemas of static and non-static columns from a rowblock projection schema</a>
+<a name="ln63">// (for read) and a WHERE / IF condition (for read / write). &quot;schema&quot; is the full table schema</a>
+<a name="ln64">// and &quot;rowblock_schema&quot; is the selected columns from which we are splitting into static and</a>
+<a name="ln65">// non-static column portions.</a>
+<a name="ln66">CHECKED_STATUS CreateProjections(const Schema&amp; schema, const QLReferencedColumnsPB&amp; column_refs,</a>
+<a name="ln67">                                 Schema* static_projection, Schema* non_static_projection) {</a>
+<a name="ln68">  // The projection schemas are used to scan docdb.</a>
+<a name="ln69">  unordered_set&lt;ColumnId&gt; static_columns, non_static_columns;</a>
+<a name="ln70"> </a>
+<a name="ln71">  // Add regular columns.</a>
+<a name="ln72">  for (int32_t id : column_refs.ids()) {</a>
+<a name="ln73">    const ColumnId column_id(id);</a>
+<a name="ln74">    if (!schema.is_key_column(column_id)) {</a>
+<a name="ln75">      non_static_columns.insert(column_id);</a>
+<a name="ln76">    }</a>
+<a name="ln77">  }</a>
+<a name="ln78"> </a>
+<a name="ln79">  // Add static columns.</a>
+<a name="ln80">  for (int32_t id : column_refs.static_ids()) {</a>
+<a name="ln81">    const ColumnId column_id(id);</a>
+<a name="ln82">    static_columns.insert(column_id);</a>
+<a name="ln83">  }</a>
+<a name="ln84"> </a>
+<a name="ln85">  RETURN_NOT_OK(</a>
+<a name="ln86">      schema.CreateProjectionByIdsIgnoreMissing(</a>
+<a name="ln87">          vector&lt;ColumnId&gt;(static_columns.begin(), static_columns.end()),</a>
+<a name="ln88">          static_projection));</a>
+<a name="ln89">  RETURN_NOT_OK(</a>
+<a name="ln90">      schema.CreateProjectionByIdsIgnoreMissing(</a>
+<a name="ln91">          vector&lt;ColumnId&gt;(non_static_columns.begin(), non_static_columns.end()),</a>
+<a name="ln92">          non_static_projection));</a>
+<a name="ln93"> </a>
+<a name="ln94">  return Status::OK();</a>
+<a name="ln95">}</a>
+<a name="ln96"> </a>
+<a name="ln97">CHECKED_STATUS PopulateRow(const QLTableRow&amp; table_row, const Schema&amp; schema,</a>
+<a name="ln98">                           const size_t begin_idx, const size_t col_count,</a>
+<a name="ln99">                           QLRow* row, size_t *col_idx) {</a>
+<a name="ln100">  for (size_t i = begin_idx; i &lt; begin_idx + col_count; i++) {</a>
+<a name="ln101">    RETURN_NOT_OK(table_row.GetValue(schema.column_id(i), row-&gt;mutable_column((*col_idx)++)));</a>
+<a name="ln102">  }</a>
+<a name="ln103">  return Status::OK();</a>
+<a name="ln104">}</a>
+<a name="ln105"> </a>
+<a name="ln106">CHECKED_STATUS PopulateRow(const QLTableRow&amp; table_row, const Schema&amp; projection,</a>
+<a name="ln107">                           QLRow* row, size_t* col_idx) {</a>
+<a name="ln108">  return PopulateRow(table_row, projection, 0, projection.num_columns(), row, col_idx);</a>
+<a name="ln109">}</a>
+<a name="ln110"> </a>
+<a name="ln111">// Outer join a static row with a non-static row.</a>
+<a name="ln112">// A join is successful if and only if for every hash key, the values in the static and the</a>
+<a name="ln113">// non-static row are either non-NULL and the same, or one of them is NULL. Therefore we say that</a>
+<a name="ln114">// a join is successful if the static row is empty, and in turn return true.</a>
+<a name="ln115">// Copies the entries from the static row into the non-static one.</a>
+<a name="ln116">bool JoinStaticRow(</a>
+<a name="ln117">    const Schema&amp; schema, const Schema&amp; static_projection, const QLTableRow&amp; static_row,</a>
+<a name="ln118">    QLTableRow* non_static_row) {</a>
+<a name="ln119">  // The join is successful if the static row is empty</a>
+<a name="ln120">  if (static_row.IsEmpty()) {</a>
+<a name="ln121">    return true;</a>
+<a name="ln122">  }</a>
+<a name="ln123"> </a>
+<a name="ln124">  // Now we know that the static row is not empty. The non-static row cannot be empty, therefore</a>
+<a name="ln125">  // we know that both the static row and the non-static one have non-NULL entries for all</a>
+<a name="ln126">  // hash keys. Therefore if MatchColumn returns false, we know the join is unsuccessful.</a>
+<a name="ln127">  // TODO(neil)</a>
+<a name="ln128">  // - Need to assign TTL and WriteTime to their default values.</a>
+<a name="ln129">  // - Check if they should be compared and copied over. Most likely not needed as we don't allow</a>
+<a name="ln130">  //   selecting TTL and WriteTime for static columns.</a>
+<a name="ln131">  // - This copying function should be moved to QLTableRow class.</a>
+<a name="ln132">  for (size_t i = 0; i &lt; schema.num_hash_key_columns(); i++) {</a>
+<a name="ln133">    if (!non_static_row-&gt;MatchColumn(schema.column_id(i), static_row)) {</a>
+<a name="ln134">      return false;</a>
+<a name="ln135">    }</a>
+<a name="ln136">  }</a>
+<a name="ln137"> </a>
+<a name="ln138">  // Join the static columns in the static row into the non-static row.</a>
+<a name="ln139">  for (size_t i = 0; i &lt; static_projection.num_columns(); i++) {</a>
+<a name="ln140">    non_static_row-&gt;CopyColumn(static_projection.column_id(i), static_row);</a>
+<a name="ln141">  }</a>
+<a name="ln142"> </a>
+<a name="ln143">  return true;</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146">// Join a non-static row with a static row.</a>
+<a name="ln147">// Returns true if the two rows match</a>
+<a name="ln148">bool JoinNonStaticRow(</a>
+<a name="ln149">    const Schema&amp; schema, const Schema&amp; static_projection, const QLTableRow&amp; non_static_row,</a>
+<a name="ln150">    QLTableRow* static_row) {</a>
+<a name="ln151">  bool join_successful = true;</a>
+<a name="ln152"> </a>
+<a name="ln153">  for (size_t i = 0; i &lt; schema.num_hash_key_columns(); i++) {</a>
+<a name="ln154">    if (!static_row-&gt;MatchColumn(schema.column_id(i), non_static_row)) {</a>
+<a name="ln155">      join_successful = false;</a>
+<a name="ln156">      break;</a>
+<a name="ln157">    }</a>
+<a name="ln158">  }</a>
+<a name="ln159"> </a>
+<a name="ln160">  if (!join_successful) {</a>
+<a name="ln161">    static_row-&gt;Clear();</a>
+<a name="ln162">    for (size_t i = 0; i &lt; static_projection.num_columns(); i++) {</a>
+<a name="ln163">      static_row-&gt;AllocColumn(static_projection.column_id(i));</a>
+<a name="ln164">    }</a>
+<a name="ln165"> </a>
+<a name="ln166">    for (size_t i = 0; i &lt; schema.num_hash_key_columns(); i++) {</a>
+<a name="ln167">      static_row-&gt;CopyColumn(schema.column_id(i), non_static_row);</a>
+<a name="ln168">    }</a>
+<a name="ln169">  }</a>
+<a name="ln170">  return join_successful;</a>
+<a name="ln171">}</a>
+<a name="ln172"> </a>
+<a name="ln173">CHECKED_STATUS FindMemberForIndex(const QLColumnValuePB&amp; column_value,</a>
+<a name="ln174">                                  size_t index,</a>
+<a name="ln175">                                  rapidjson::Value* document,</a>
+<a name="ln176">                                  rapidjson::Value::MemberIterator* memberit,</a>
+<a name="ln177">                                  rapidjson::Value::ValueIterator* valueit,</a>
+<a name="ln178">                                  bool* last_elem_object,</a>
+<a name="ln179">                                  bool is_insert) {</a>
+<a name="ln180">  *last_elem_object = false;</a>
+<a name="ln181"> </a>
+<a name="ln182">  int64_t array_index;</a>
+<a name="ln183">  if (document-&gt;IsArray()) {</a>
+<a name="ln184">    util::VarInt varint;</a>
+<a name="ln185">    RETURN_NOT_OK(varint.DecodeFromComparable(</a>
+<a name="ln186">        column_value.json_args(index).operand().value().varint_value()));</a>
+<a name="ln187">    array_index = VERIFY_RESULT(varint.ToInt64());</a>
+<a name="ln188"> </a>
+<a name="ln189">    if (array_index &gt;= document-&gt;GetArray().Size() || array_index &lt; 0) {</a>
+<a name="ln190">      return STATUS_SUBSTITUTE(QLError, &quot;Array index out of bounds: &quot;, array_index);</a>
+<a name="ln191">    }</a>
+<a name="ln192">    *valueit = document-&gt;Begin();</a>
+<a name="ln193">    std::advance(*valueit, array_index);</a>
+<a name="ln194">  } else if (document-&gt;IsObject()) {</a>
+<a name="ln195">    if (!is_insert) {</a>
+<a name="ln196">      util::VarInt varint;</a>
+<a name="ln197">      auto status =</a>
+<a name="ln198">        varint.DecodeFromComparable(column_value.json_args(index).operand().value().varint_value());</a>
+<a name="ln199">      if (status.ok()) {</a>
+<a name="ln200">        array_index = VERIFY_RESULT(varint.ToInt64());</a>
+<a name="ln201">        return STATUS_SUBSTITUTE(QLError, &quot;Cannot use array index $0 to access object&quot;,</a>
+<a name="ln202">            array_index);</a>
+<a name="ln203">      }</a>
+<a name="ln204">    }</a>
+<a name="ln205"> </a>
+<a name="ln206">    *last_elem_object = true;</a>
+<a name="ln207"> </a>
+<a name="ln208">    const auto&amp; member = column_value.json_args(index).operand().value().string_value().c_str();</a>
+<a name="ln209">    *memberit = document-&gt;FindMember(member);</a>
+<a name="ln210">    if (*memberit == document-&gt;MemberEnd()) {</a>
+<a name="ln211">      return STATUS_SUBSTITUTE(QLError, &quot;Could not find member: &quot;, member);</a>
+<a name="ln212">    }</a>
+<a name="ln213">  } else {</a>
+<a name="ln214">    return STATUS_SUBSTITUTE(QLError, &quot;JSON field is invalid&quot;, column_value.ShortDebugString());</a>
+<a name="ln215">  }</a>
+<a name="ln216">  return Status::OK();</a>
+<a name="ln217">}</a>
+<a name="ln218"> </a>
+<a name="ln219">CHECKED_STATUS CheckUserTimestampForCollections(const UserTimeMicros user_timestamp) {</a>
+<a name="ln220">  if (user_timestamp != Value::kInvalidUserTimestamp) {</a>
+<a name="ln221">    return STATUS(InvalidArgument, &quot;User supplied timestamp is only allowed for &quot;</a>
+<a name="ln222">        &quot;replacing the whole collection&quot;);</a>
+<a name="ln223">  }</a>
+<a name="ln224">  return Status::OK();</a>
+<a name="ln225">}</a>
+<a name="ln226"> </a>
+<a name="ln227">} // namespace</a>
+<a name="ln228"> </a>
+<a name="ln229">QLWriteOperation::QLWriteOperation(std::shared_ptr&lt;const Schema&gt; schema,</a>
+<a name="ln230">                                   const IndexMap&amp; index_map,</a>
+<a name="ln231">                                   const Schema* unique_index_key_schema,</a>
+<a name="ln232">                                   const TransactionOperationContextOpt&amp; txn_op_context)</a>
+<a name="ln233">    : schema_(std::move(schema)),</a>
+<a name="ln234">      index_map_(index_map),</a>
+<a name="ln235">      unique_index_key_schema_(unique_index_key_schema),</a>
+<a name="ln236">      txn_op_context_(txn_op_context)</a>
+<a name="ln237">{}</a>
+<a name="ln238"> </a>
+<a name="ln239">Status QLWriteOperation::Init(QLWriteRequestPB* request, QLResponsePB* response) {</a>
+<a name="ln240">  request_.Swap(request);</a>
+<a name="ln241">  response_ = response;</a>
+<a name="ln242">  insert_into_unique_index_ = request_.type() == QLWriteRequestPB::QL_STMT_INSERT &amp;&amp;</a>
+<a name="ln243">                              unique_index_key_schema_ != nullptr;</a>
+<a name="ln244">  require_read_ = RequireRead(request_, *schema_) || insert_into_unique_index_;</a>
+<a name="ln245">  update_indexes_ = !request_.update_index_ids().empty();</a>
+<a name="ln246"> </a>
+<a name="ln247">  // Determine if static / non-static columns are being written.</a>
+<a name="ln248">  bool write_static_columns = false;</a>
+<a name="ln249">  bool write_non_static_columns = false;</a>
+<a name="ln250">  // TODO(Amit): Remove the DVLOGS after backfill features stabilize.</a>
+<a name="ln251">  DVLOG(4) &lt;&lt; &quot;Processing request &quot; &lt;&lt; yb::ToString(*request);</a>
+<a name="ln252">  for (const auto&amp; column : request_.column_values()) {</a>
+<a name="ln253">    DVLOG(4) &lt;&lt; &quot;Looking at column : &quot; &lt;&lt; yb::ToString(column);</a>
+<a name="ln254">    auto schema_column = schema_-&gt;column_by_id(ColumnId(column.column_id()));</a>
+<a name="ln255">    DVLOG(4) &lt;&lt; &quot;schema column : &quot; &lt;&lt; yb::ToString(schema_column);</a>
+<a name="ln256">    RETURN_NOT_OK(schema_column);</a>
+<a name="ln257">    if (schema_column-&gt;is_static()) {</a>
+<a name="ln258">      write_static_columns = true;</a>
+<a name="ln259">    } else {</a>
+<a name="ln260">      write_non_static_columns = true;</a>
+<a name="ln261">    }</a>
+<a name="ln262">    if (write_static_columns &amp;&amp; write_non_static_columns) {</a>
+<a name="ln263">      break;</a>
+<a name="ln264">    }</a>
+<a name="ln265">  }</a>
+<a name="ln266"> </a>
+<a name="ln267">  bool is_range_operation = IsRangeOperation(request_, *schema_);</a>
+<a name="ln268"> </a>
+<a name="ln269">  // We need the hashed key if writing to the static columns, and need primary key if writing to</a>
+<a name="ln270">  // non-static columns or writing the full primary key (i.e. range columns are present or table</a>
+<a name="ln271">  // does not have range columns).</a>
+<a name="ln272">  return InitializeKeys(</a>
+<a name="ln273">      write_static_columns || is_range_operation,</a>
+<a name="ln274">      write_non_static_columns || !request_.range_column_values().empty() ||</a>
+<a name="ln275">      schema_-&gt;num_range_key_columns() == 0);</a>
+<a name="ln276">}</a>
+<a name="ln277"> </a>
+<a name="ln278">Status QLWriteOperation::InitializeKeys(const bool hashed_key, const bool primary_key) {</a>
+<a name="ln279">  // Populate the hashed and range components in the same order as they are in the table schema.</a>
+<a name="ln280">  const auto&amp; hashed_column_values = request_.hashed_column_values();</a>
+<a name="ln281">  const auto&amp; range_column_values = request_.range_column_values();</a>
+<a name="ln282">  std::vector&lt;PrimitiveValue&gt; hashed_components;</a>
+<a name="ln283">  std::vector&lt;PrimitiveValue&gt; range_components;</a>
+<a name="ln284">  RETURN_NOT_OK(QLKeyColumnValuesToPrimitiveValues(</a>
+<a name="ln285">      hashed_column_values, *schema_, 0,</a>
+<a name="ln286">      schema_-&gt;num_hash_key_columns(), &amp;hashed_components));</a>
+<a name="ln287">  RETURN_NOT_OK(QLKeyColumnValuesToPrimitiveValues(</a>
+<a name="ln288">      range_column_values, *schema_, schema_-&gt;num_hash_key_columns(),</a>
+<a name="ln289">      schema_-&gt;num_range_key_columns(), &amp;range_components));</a>
+<a name="ln290"> </a>
+<a name="ln291">  // need_pk - true is we should construct pk_key_key_</a>
+<a name="ln292">  const bool need_pk = primary_key &amp;&amp; !pk_doc_key_;</a>
+<a name="ln293"> </a>
+<a name="ln294">  // We need the hash key if writing to the static columns.</a>
+<a name="ln295">  if (hashed_key &amp;&amp; !hashed_doc_key_) {</a>
+<a name="ln296">    if (need_pk) {</a>
+<a name="ln297">      hashed_doc_key_.emplace(request_.hash_code(), hashed_components);</a>
+<a name="ln298">    } else {</a>
+<a name="ln299">      hashed_doc_key_.emplace(request_.hash_code(), std::move(hashed_components));</a>
+<a name="ln300">    }</a>
+<a name="ln301">    encoded_hashed_doc_key_ = hashed_doc_key_-&gt;EncodeAsRefCntPrefix();</a>
+<a name="ln302">  }</a>
+<a name="ln303"> </a>
+<a name="ln304">  // We need the primary key if writing to non-static columns or writing the full primary key</a>
+<a name="ln305">  // (i.e. range columns are present).</a>
+<a name="ln306">  if (need_pk) {</a>
+<a name="ln307">    if (request_.has_hash_code() &amp;&amp; !hashed_column_values.empty()) {</a>
+<a name="ln308">      pk_doc_key_.emplace(</a>
+<a name="ln309">         request_.hash_code(), std::move(hashed_components), std::move(range_components));</a>
+<a name="ln310">    } else {</a>
+<a name="ln311">      // In case of syscatalog tables, we don't have any hash components.</a>
+<a name="ln312">      pk_doc_key_.emplace(std::move(range_components));</a>
+<a name="ln313">    }</a>
+<a name="ln314">    encoded_pk_doc_key_ =  pk_doc_key_-&gt;EncodeAsRefCntPrefix();</a>
+<a name="ln315">  }</a>
+<a name="ln316"> </a>
+<a name="ln317">  return Status::OK();</a>
+<a name="ln318">}</a>
+<a name="ln319"> </a>
+<a name="ln320">Status QLWriteOperation::GetDocPaths(</a>
+<a name="ln321">    GetDocPathsMode mode, DocPathsToLock *paths, IsolationLevel *level) const {</a>
+<a name="ln322">  if (mode == GetDocPathsMode::kLock || request_.column_values().empty()) {</a>
+<a name="ln323">    if (encoded_hashed_doc_key_) {</a>
+<a name="ln324">      paths-&gt;push_back(encoded_hashed_doc_key_);</a>
+<a name="ln325">    }</a>
+<a name="ln326">    if (encoded_pk_doc_key_) {</a>
+<a name="ln327">      paths-&gt;push_back(encoded_pk_doc_key_);</a>
+<a name="ln328">    }</a>
+<a name="ln329">  } else {</a>
+<a name="ln330">    KeyBytes buffer;</a>
+<a name="ln331">    for (const auto&amp; column_value : request_.column_values()) {</a>
+<a name="ln332">      ColumnId column_id(column_value.column_id());</a>
+<a name="ln333">      const ColumnSchema&amp; column = VERIFY_RESULT(schema_-&gt;column_by_id(column_id));</a>
+<a name="ln334"> </a>
+<a name="ln335">      Slice doc_key = column.is_static() ? encoded_hashed_doc_key_.as_slice()</a>
+<a name="ln336">                                         : encoded_pk_doc_key_.as_slice();</a>
+<a name="ln337">      buffer.Clear();</a>
+<a name="ln338">      buffer.AppendValueType(ValueType::kColumnId);</a>
+<a name="ln339">      buffer.AppendColumnId(column_id);</a>
+<a name="ln340">      RefCntBuffer path(doc_key.size() + buffer.size());</a>
+<a name="ln341">      memcpy(path.data(), doc_key.data(), doc_key.size());</a>
+<a name="ln342">      buffer.AsSlice().CopyTo(path.data() + doc_key.size());</a>
+<a name="ln343">      paths-&gt;push_back(RefCntPrefix(path));</a>
+<a name="ln344">    }</a>
+<a name="ln345">  }</a>
+<a name="ln346"> </a>
+<a name="ln347">  // When this write operation requires a read, it requires a read snapshot so paths will be locked</a>
+<a name="ln348">  // in snapshot isolation for consistency. Otherwise, pure writes will happen in serializable</a>
+<a name="ln349">  // isolation so that they will serialize but do not conflict with one another.</a>
+<a name="ln350">  //</a>
+<a name="ln351">  // Currently, only keys that are being written are locked, no lock is taken on read at the</a>
+<a name="ln352">  // snapshot isolation level.</a>
+<a name="ln353">  *level = require_read_ ? IsolationLevel::SNAPSHOT_ISOLATION</a>
+<a name="ln354">                         : IsolationLevel::SERIALIZABLE_ISOLATION;</a>
+<a name="ln355"> </a>
+<a name="ln356">  return Status::OK();</a>
+<a name="ln357">}</a>
+<a name="ln358"> </a>
+<a name="ln359">Status QLWriteOperation::ReadColumns(const DocOperationApplyData&amp; data,</a>
+<a name="ln360">                                     Schema *param_static_projection,</a>
+<a name="ln361">                                     Schema *param_non_static_projection,</a>
+<a name="ln362">                                     QLTableRow* table_row) {</a>
+<a name="ln363">  Schema *static_projection = param_static_projection;</a>
+<a name="ln364">  Schema *non_static_projection = param_non_static_projection;</a>
+<a name="ln365"> </a>
+<a name="ln366">  Schema local_static_projection;</a>
+<a name="ln367">  Schema local_non_static_projection;</a>
+<a name="ln368">  if (static_projection == nullptr) {</a>
+<a name="ln369">    static_projection = &amp;local_static_projection;</a>
+<a name="ln370">  }</a>
+<a name="ln371">  if (non_static_projection == nullptr) {</a>
+<a name="ln372">    non_static_projection = &amp;local_non_static_projection;</a>
+<a name="ln373">  }</a>
+<a name="ln374"> </a>
+<a name="ln375">  // Create projections to scan docdb.</a>
+<a name="ln376">  RETURN_NOT_OK(CreateProjections(*schema_, request_.column_refs(),</a>
+<a name="ln377">                                  static_projection, non_static_projection));</a>
+<a name="ln378"> </a>
+<a name="ln379">  // Generate hashed / primary key depending on if static / non-static columns are referenced in</a>
+<a name="ln380">  // the if-condition.</a>
+<a name="ln381">  RETURN_NOT_OK(InitializeKeys(</a>
+<a name="ln382">      !static_projection-&gt;columns().empty(), !non_static_projection-&gt;columns().empty()));</a>
+<a name="ln383"> </a>
+<a name="ln384">  // Scan docdb for the static and non-static columns of the row using the hashed / primary key.</a>
+<a name="ln385">  if (hashed_doc_key_) {</a>
+<a name="ln386">    DocQLScanSpec spec(*static_projection, *hashed_doc_key_, request_.query_id());</a>
+<a name="ln387">    DocRowwiseIterator iterator(*static_projection, *schema_, txn_op_context_,</a>
+<a name="ln388">                                data.doc_write_batch-&gt;doc_db(),</a>
+<a name="ln389">                                data.deadline, data.read_time);</a>
+<a name="ln390">    RETURN_NOT_OK(iterator.Init(spec));</a>
+<a name="ln391">    if (VERIFY_RESULT(iterator.HasNext())) {</a>
+<a name="ln392">      RETURN_NOT_OK(iterator.NextRow(table_row));</a>
+<a name="ln393">    }</a>
+<a name="ln394">    data.restart_read_ht-&gt;MakeAtLeast(iterator.RestartReadHt());</a>
+<a name="ln395">  }</a>
+<a name="ln396">  if (pk_doc_key_) {</a>
+<a name="ln397">    DocQLScanSpec spec(*non_static_projection, *pk_doc_key_, request_.query_id());</a>
+<a name="ln398">    DocRowwiseIterator iterator(*non_static_projection, *schema_, txn_op_context_,</a>
+<a name="ln399">                                data.doc_write_batch-&gt;doc_db(),</a>
+<a name="ln400">                                data.deadline, data.read_time);</a>
+<a name="ln401">    RETURN_NOT_OK(iterator.Init(spec));</a>
+<a name="ln402">    if (VERIFY_RESULT(iterator.HasNext())) {</a>
+<a name="ln403">      RETURN_NOT_OK(iterator.NextRow(table_row));</a>
+<a name="ln404">      // If there are indexes to update, check if liveness column exists for update/delete because</a>
+<a name="ln405">      // that will affect whether the row will still exist after the DML and whether we need to</a>
+<a name="ln406">      // remove the key from the indexes.</a>
+<a name="ln407">      if (update_indexes_ &amp;&amp; (request_.type() == QLWriteRequestPB::QL_STMT_UPDATE ||</a>
+<a name="ln408">                              request_.type() == QLWriteRequestPB::QL_STMT_DELETE)) {</a>
+<a name="ln409">        liveness_column_exists_ = iterator.LivenessColumnExists();</a>
+<a name="ln410">      }</a>
+<a name="ln411">    } else {</a>
+<a name="ln412">      // If no non-static column is found, the row does not exist and we should clear the static</a>
+<a name="ln413">      // columns in the map to indicate the row does not exist.</a>
+<a name="ln414">      table_row-&gt;Clear();</a>
+<a name="ln415">    }</a>
+<a name="ln416">    data.restart_read_ht-&gt;MakeAtLeast(iterator.RestartReadHt());</a>
+<a name="ln417">  }</a>
+<a name="ln418"> </a>
+<a name="ln419">  return Status::OK();</a>
+<a name="ln420">}</a>
+<a name="ln421"> </a>
+<a name="ln422">Status QLWriteOperation::PopulateConditionalDmlRow(const DocOperationApplyData&amp; data,</a>
+<a name="ln423">                                                   const bool should_apply,</a>
+<a name="ln424">                                                   const QLTableRow&amp; table_row,</a>
+<a name="ln425">                                                   Schema static_projection,</a>
+<a name="ln426">                                                   Schema non_static_projection,</a>
+<a name="ln427">                                                   std::unique_ptr&lt;QLRowBlock&gt;* rowblock) {</a>
+<a name="ln428">  // Populate the result set to return the &quot;applied&quot; status, and optionally the hash / primary key</a>
+<a name="ln429">  // and the present column values if the condition is not satisfied and the row does exist</a>
+<a name="ln430">  // (value_map is not empty).</a>
+<a name="ln431">  const bool return_present_values = !should_apply &amp;&amp; !table_row.IsEmpty();</a>
+<a name="ln432">  const size_t num_key_columns =</a>
+<a name="ln433">      pk_doc_key_ ? schema_-&gt;num_key_columns() : schema_-&gt;num_hash_key_columns();</a>
+<a name="ln434">  std::vector&lt;ColumnSchema&gt; columns;</a>
+<a name="ln435">  columns.emplace_back(ColumnSchema(&quot;[applied]&quot;, BOOL));</a>
+<a name="ln436">  if (return_present_values) {</a>
+<a name="ln437">    columns.insert(columns.end(), schema_-&gt;columns().begin(),</a>
+<a name="ln438">                   schema_-&gt;columns().begin() + num_key_columns);</a>
+<a name="ln439">    columns.insert(columns.end(), static_projection.columns().begin(),</a>
+<a name="ln440">                   static_projection.columns().end());</a>
+<a name="ln441">    columns.insert(columns.end(), non_static_projection.columns().begin(),</a>
+<a name="ln442">                   non_static_projection.columns().end());</a>
+<a name="ln443">  }</a>
+<a name="ln444">  rowblock-&gt;reset(new QLRowBlock(Schema(columns, 0)));</a>
+<a name="ln445">  QLRow&amp; row = rowblock-&gt;get()-&gt;Extend();</a>
+<a name="ln446">  row.mutable_column(0)-&gt;set_bool_value(should_apply);</a>
+<a name="ln447">  size_t col_idx = 1;</a>
+<a name="ln448">  if (return_present_values) {</a>
+<a name="ln449">    RETURN_NOT_OK(PopulateRow(table_row, *schema_, 0, num_key_columns, &amp;row, &amp;col_idx));</a>
+<a name="ln450">    RETURN_NOT_OK(PopulateRow(table_row, static_projection, &amp;row, &amp;col_idx));</a>
+<a name="ln451">    RETURN_NOT_OK(PopulateRow(table_row, non_static_projection, &amp;row, &amp;col_idx));</a>
+<a name="ln452">  }</a>
+<a name="ln453"> </a>
+<a name="ln454">  return Status::OK();</a>
+<a name="ln455">}</a>
+<a name="ln456"> </a>
+<a name="ln457">Status QLWriteOperation::PopulateStatusRow(const DocOperationApplyData&amp; data,</a>
+<a name="ln458">                                           const bool should_apply,</a>
+<a name="ln459">                                           const QLTableRow&amp; table_row,</a>
+<a name="ln460">                                           std::unique_ptr&lt;QLRowBlock&gt;* rowblock) {</a>
+<a name="ln461"> </a>
+<a name="ln462">  std::vector&lt;ColumnSchema&gt; columns;</a>
+<a name="ln463">  columns.emplace_back(ColumnSchema(&quot;[applied]&quot;, BOOL));</a>
+<a name="ln464">  columns.emplace_back(ColumnSchema(&quot;[message]&quot;, STRING));</a>
+<a name="ln465">  columns.insert(columns.end(), schema_-&gt;columns().begin(), schema_-&gt;columns().end());</a>
+<a name="ln466"> </a>
+<a name="ln467">  rowblock-&gt;reset(new QLRowBlock(Schema(columns, 0)));</a>
+<a name="ln468">  QLRow&amp; row = rowblock-&gt;get()-&gt;Extend();</a>
+<a name="ln469">  row.mutable_column(0)-&gt;set_bool_value(should_apply);</a>
+<a name="ln470">  // No message unless there is an error (then message will be set in executor).</a>
+<a name="ln471"> </a>
+<a name="ln472">  // If not applied report the existing row values as for regular if clause.</a>
+<a name="ln473">  if (!should_apply) {</a>
+<a name="ln474">    for (size_t i = 0; i &lt; schema_-&gt;num_columns(); i++) {</a>
+<a name="ln475">      boost::optional&lt;const QLValuePB&amp;&gt; col_val = table_row.GetValue(schema_-&gt;column_id(i));</a>
+<a name="ln476">      if (col_val.is_initialized()) {</a>
+<a name="ln477">        *(row.mutable_column(i + 2)) = *col_val;</a>
+<a name="ln478">      }</a>
+<a name="ln479">    }</a>
+<a name="ln480">  }</a>
+<a name="ln481"> </a>
+<a name="ln482">  return Status::OK();</a>
+<a name="ln483">}</a>
+<a name="ln484"> </a>
+<a name="ln485">// Check if a duplicate value is inserted into a unique index.</a>
+<a name="ln486">Result&lt;bool&gt; QLWriteOperation::HasDuplicateUniqueIndexValue(const DocOperationApplyData&amp; data) {</a>
+<a name="ln487">  VLOG(3) &lt;&lt; &quot;Looking for collisions in \n&quot;</a>
+<a name="ln488">          &lt;&lt; docdb::DocDBDebugDumpToStr(data.doc_write_batch-&gt;doc_db());</a>
+<a name="ln489">  // We only need to check backwards for backfilled entries.</a>
+<a name="ln490">  bool ret =</a>
+<a name="ln491">      VERIFY_RESULT(HasDuplicateUniqueIndexValue(data, Direction::kForward)) ||</a>
+<a name="ln492">      (request_.is_backfilling() &amp;&amp;</a>
+<a name="ln493">       VERIFY_RESULT(HasDuplicateUniqueIndexValue(data, Direction::kBackward)));</a>
+<a name="ln494">  if (!ret) {</a>
+<a name="ln495">    VLOG(3) &lt;&lt; &quot;No collisions found&quot;;</a>
+<a name="ln496">  }</a>
+<a name="ln497">  return ret;</a>
+<a name="ln498">}</a>
+<a name="ln499"> </a>
+<a name="ln500">Result&lt;bool&gt; QLWriteOperation::HasDuplicateUniqueIndexValue(</a>
+<a name="ln501">    const DocOperationApplyData&amp; data, Direction direction) {</a>
+<a name="ln502">  VLOG(2) &lt;&lt; &quot;Looking for collision while going &quot; &lt;&lt; yb::ToString(direction)</a>
+<a name="ln503">          &lt;&lt; &quot;. Trying to insert &quot; &lt;&lt; *pk_doc_key_;</a>
+<a name="ln504">  auto requested_read_time = data.read_time;</a>
+<a name="ln505">  if (direction == Direction::kForward) {</a>
+<a name="ln506">    return HasDuplicateUniqueIndexValue(data, requested_read_time);</a>
+<a name="ln507">  }</a>
+<a name="ln508"> </a>
+<a name="ln509">  auto iter = CreateIntentAwareIterator(</a>
+<a name="ln510">      data.doc_write_batch-&gt;doc_db(), BloomFilterMode::USE_BLOOM_FILTER,</a>
+<a name="ln511">      pk_doc_key_-&gt;Encode().AsSlice(), request_.query_id(), txn_op_context_,</a>
+<a name="ln512">      data.deadline, ReadHybridTime::Max());</a>
+<a name="ln513"> </a>
+<a name="ln514">  HybridTime oldest_past_min_ht = VERIFY_RESULT(FindOldestOverwrittenTimestamp(</a>
+<a name="ln515">      iter.get(), SubDocKey(*pk_doc_key_), requested_read_time.read));</a>
+<a name="ln516">  const HybridTime oldest_past_min_ht_liveness =</a>
+<a name="ln517">      VERIFY_RESULT(FindOldestOverwrittenTimestamp(</a>
+<a name="ln518">          iter.get(),</a>
+<a name="ln519">          SubDocKey(*pk_doc_key_, PrimitiveValue::SystemColumnId(</a>
+<a name="ln520">                                      SystemColumnIds::kLivenessColumn)),</a>
+<a name="ln521">          requested_read_time.read));</a>
+<a name="ln522">  oldest_past_min_ht.MakeAtMost(oldest_past_min_ht_liveness);</a>
+<a name="ln523">  if (!oldest_past_min_ht.is_valid()) {</a>
+<a name="ln524">    return false;</a>
+<a name="ln525">  }</a>
+<a name="ln526">  return HasDuplicateUniqueIndexValue(</a>
+<a name="ln527">      data, ReadHybridTime::SingleTime(oldest_past_min_ht));</a>
+<a name="ln528">}</a>
+<a name="ln529"> </a>
+<a name="ln530">Result&lt;bool&gt; QLWriteOperation::HasDuplicateUniqueIndexValue(</a>
+<a name="ln531">    const DocOperationApplyData&amp; data, ReadHybridTime read_time) {</a>
+<a name="ln532">  // Set up the iterator to read the current primary key associated with the index key.</a>
+<a name="ln533">  DocQLScanSpec spec(*unique_index_key_schema_, *pk_doc_key_, request_.query_id(), true);</a>
+<a name="ln534">  DocRowwiseIterator iterator(</a>
+<a name="ln535">      *unique_index_key_schema_, *schema_, txn_op_context_, data.doc_write_batch-&gt;doc_db(),</a>
+<a name="ln536">      data.deadline, read_time);</a>
+<a name="ln537">  RETURN_NOT_OK(iterator.Init(spec));</a>
+<a name="ln538"> </a>
+<a name="ln539">  // It is a duplicate value if the index key exist already and the associated indexed primary key</a>
+<a name="ln540">  // is not the same.</a>
+<a name="ln541">  if (!VERIFY_RESULT(iterator.HasNext())) {</a>
+<a name="ln542">    VLOG(2) &lt;&lt; &quot;No collision found while checking at &quot; &lt;&lt; yb::ToString(read_time);</a>
+<a name="ln543">    return false;</a>
+<a name="ln544">  }</a>
+<a name="ln545">  QLTableRow table_row;</a>
+<a name="ln546">  RETURN_NOT_OK(iterator.NextRow(&amp;table_row));</a>
+<a name="ln547">  std::unordered_set&lt;ColumnId&gt; key_column_ids(unique_index_key_schema_-&gt;column_ids().begin(),</a>
+<a name="ln548">                                              unique_index_key_schema_-&gt;column_ids().end());</a>
+<a name="ln549">  for (const auto&amp; column_value : request_.column_values()) {</a>
+<a name="ln550">    ColumnId column_id(column_value.column_id());</a>
+<a name="ln551">    if (key_column_ids.count(column_id) &gt; 0) {</a>
+<a name="ln552">      auto value = table_row.GetValue(column_id);</a>
+<a name="ln553">      if (value &amp;&amp; *value != column_value.expr().value()) {</a>
+<a name="ln554">        VLOG(2) &lt;&lt; &quot;Found collision while checking at &quot; &lt;&lt; yb::ToString(read_time)</a>
+<a name="ln555">                &lt;&lt; &quot; Existing :&quot; &lt;&lt; yb::ToString(*value)</a>
+<a name="ln556">                &lt;&lt; &quot; vs New :&quot; &lt;&lt; yb::ToString(column_value.expr().value()) &lt;&lt; &quot; used read time as &quot;</a>
+<a name="ln557">                &lt;&lt; yb::ToString(data.read_time);</a>
+<a name="ln558">        DVLOG(3) &lt;&lt; &quot;DocDB is now :\n&quot;</a>
+<a name="ln559">                 &lt;&lt; docdb::DocDBDebugDumpToStr(data.doc_write_batch-&gt;doc_db());</a>
+<a name="ln560">        return true;</a>
+<a name="ln561">      }</a>
+<a name="ln562">    }</a>
+<a name="ln563">  }</a>
+<a name="ln564"> </a>
+<a name="ln565">  VLOG(2) &lt;&lt; &quot;No collision while checking at &quot; &lt;&lt; yb::ToString(read_time);</a>
+<a name="ln566">  return false;</a>
+<a name="ln567">}</a>
+<a name="ln568"> </a>
+<a name="ln569">Result&lt;HybridTime&gt; QLWriteOperation::FindOldestOverwrittenTimestamp(IntentAwareIterator* iter,</a>
+<a name="ln570">                                                  const SubDocKey&amp; sub_doc_key,</a>
+<a name="ln571">                                                  HybridTime min_read_time) {</a>
+<a name="ln572">  HybridTime result;</a>
+<a name="ln573">  VLOG(3) &lt;&lt; &quot;Doing iter-&gt;Seek &quot; &lt;&lt; *pk_doc_key_ &lt;&lt; &quot;.&quot;;</a>
+<a name="ln574">  iter-&gt;Seek(*pk_doc_key_);</a>
+<a name="ln575">  if (iter-&gt;valid()) {</a>
+<a name="ln576">    const KeyBytes bytes = sub_doc_key.EncodeWithoutHt();</a>
+<a name="ln577">    const Slice&amp; sub_key_slice = bytes.AsSlice();</a>
+<a name="ln578">    result = VERIFY_RESULT(</a>
+<a name="ln579">        iter-&gt;FindOldestRecord(sub_key_slice, min_read_time));</a>
+<a name="ln580">    VLOG(2) &lt;&lt; &quot;iter-&gt;FindOldestRecord returned &quot; &lt;&lt; result &lt;&lt; &quot; for &quot;</a>
+<a name="ln581">            &lt;&lt; SubDocKey::DebugSliceToString(sub_key_slice);</a>
+<a name="ln582">  } else {</a>
+<a name="ln583">    VLOG(3) &lt;&lt; &quot;iter-&gt;Seek &quot; &lt;&lt; *pk_doc_key_ &lt;&lt; &quot; turned out to be invalid&quot;;</a>
+<a name="ln584">  }</a>
+<a name="ln585">  return result;</a>
+<a name="ln586">}</a>
+<a name="ln587"> </a>
+<a name="ln588">Status QLWriteOperation::ApplyForJsonOperators(const QLColumnValuePB&amp; column_value,</a>
+<a name="ln589">                                               const DocOperationApplyData&amp; data,</a>
+<a name="ln590">                                               const DocPath&amp; sub_path, const MonoDelta&amp; ttl,</a>
+<a name="ln591">                                               const UserTimeMicros&amp; user_timestamp,</a>
+<a name="ln592">                                               const ColumnSchema&amp; column,</a>
+<a name="ln593">                                               QLTableRow* existing_row,</a>
+<a name="ln594">                                               bool is_insert) {</a>
+<a name="ln595">  using common::Jsonb;</a>
+<a name="ln596">  // Read the json column value inorder to perform a read modify write.</a>
+<a name="ln597">  QLExprResult temp;</a>
+<a name="ln598">  RETURN_NOT_OK(existing_row-&gt;ReadColumn(column_value.column_id(), temp.Writer()));</a>
+<a name="ln599">  const auto&amp; ql_value = temp.Value();</a>
+<a name="ln600">  if (IsNull(ql_value)) {</a>
+<a name="ln601">    return STATUS_SUBSTITUTE(QLError, &quot;Invalid Json value: &quot;, column_value.ShortDebugString());</a>
+<a name="ln602">  }</a>
+<a name="ln603">  Jsonb jsonb(std::move(ql_value.jsonb_value()));</a>
+<a name="ln604">  rapidjson::Document document;</a>
+<a name="ln605">  RETURN_NOT_OK(jsonb.ToRapidJson(&amp;document));</a>
+<a name="ln606"> </a>
+<a name="ln607">  // Deserialize the rhs.</a>
+<a name="ln608">  Jsonb rhs(std::move(column_value.expr().value().jsonb_value()));</a>
+<a name="ln609">  rapidjson::Document rhs_doc;</a>
+<a name="ln610">  RETURN_NOT_OK(rhs.ToRapidJson(&amp;rhs_doc));</a>
+<a name="ln611"> </a>
+<a name="ln612">  // Update the json value.</a>
+<a name="ln613">  rapidjson::Value::MemberIterator memberit;</a>
+<a name="ln614">  rapidjson::Value::ValueIterator valueit;</a>
+<a name="ln615">  bool last_elem_object;</a>
+<a name="ln616">  rapidjson::Value* node = &amp;document;</a>
+<a name="ln617"> </a>
+<a name="ln618">  int i = 0;</a>
+<a name="ln619">  auto status = FindMemberForIndex(column_value, i, node, &amp;memberit, &amp;valueit,</a>
+<a name="ln620">      &amp;last_elem_object, is_insert);</a>
+<a name="ln621">  for (i = 1; i &lt; column_value.json_args_size() &amp;&amp; status.ok(); i++) {</a>
+<a name="ln622">    node = (last_elem_object) ? &amp;(memberit-&gt;value) : &amp;(*valueit);</a>
+<a name="ln623">    status = FindMemberForIndex(column_value, i, node, &amp;memberit, &amp;valueit,</a>
+<a name="ln624">        &amp;last_elem_object, is_insert);</a>
+<a name="ln625">  }</a>
+<a name="ln626"> </a>
+<a name="ln627">  bool update_missing = false;</a>
+<a name="ln628">  if (is_insert) {</a>
+<a name="ln629">    RETURN_NOT_OK(status);</a>
+<a name="ln630">  } else {</a>
+<a name="ln631">    update_missing = !status.ok();</a>
+<a name="ln632">  }</a>
+<a name="ln633"> </a>
+<a name="ln634">  if (update_missing) {</a>
+<a name="ln635">    // NOTE: lhs path cannot exceed by more than one hop</a>
+<a name="ln636">    if (last_elem_object &amp;&amp; i == column_value.json_args_size()) {</a>
+<a name="ln637">      auto val = column_value.json_args(i - 1).operand().value().string_value();</a>
+<a name="ln638">      rapidjson::Value v(val.c_str(), val.size(), document.GetAllocator());</a>
+<a name="ln639">      node-&gt;AddMember(v, rhs_doc, document.GetAllocator());</a>
+<a name="ln640">    } else {</a>
+<a name="ln641">      RETURN_NOT_OK(status);</a>
+<a name="ln642">    }</a>
+<a name="ln643">  } else if (last_elem_object) {</a>
+<a name="ln644">    memberit-&gt;value = rhs_doc.Move();</a>
+<a name="ln645">  } else {</a>
+<a name="ln646">    *valueit = rhs_doc.Move();</a>
+<a name="ln647">  }</a>
+<a name="ln648"> </a>
+<a name="ln649">  // Now write the new json value back.</a>
+<a name="ln650">  QLValue result;</a>
+<a name="ln651">  Jsonb jsonb_result;</a>
+<a name="ln652">  RETURN_NOT_OK(jsonb_result.FromRapidJson(document));</a>
+<a name="ln653">  *result.mutable_jsonb_value() = std::move(jsonb_result.MoveSerializedJsonb());</a>
+<a name="ln654">  const SubDocument&amp; sub_doc =</a>
+<a name="ln655">      SubDocument::FromQLValuePB(result.value(), column.sorting_type(),</a>
+<a name="ln656">                                 yb::bfql::TSOpcode::kScalarInsert);</a>
+<a name="ln657">  RETURN_NOT_OK(data.doc_write_batch-&gt;InsertSubDocument(</a>
+<a name="ln658">    sub_path, sub_doc, data.read_time, data.deadline,</a>
+<a name="ln659">    request_.query_id(), ttl, user_timestamp));</a>
+<a name="ln660"> </a>
+<a name="ln661">  // Update the current row as well so that we can accumulate the result of multiple json</a>
+<a name="ln662">  // operations and write the final value.</a>
+<a name="ln663">  existing_row-&gt;AllocColumn(column_value.column_id()).value = result.value();</a>
+<a name="ln664">  return Status::OK();</a>
+<a name="ln665">}</a>
+<a name="ln666"> </a>
+<a name="ln667">Status QLWriteOperation::ApplyForSubscriptArgs(const QLColumnValuePB&amp; column_value,</a>
+<a name="ln668">                                               const QLTableRow&amp; existing_row,</a>
+<a name="ln669">                                               const DocOperationApplyData&amp; data,</a>
+<a name="ln670">                                               const MonoDelta&amp; ttl,</a>
+<a name="ln671">                                               const UserTimeMicros&amp; user_timestamp,</a>
+<a name="ln672">                                               const ColumnSchema&amp; column,</a>
+<a name="ln673">                                               DocPath* sub_path) {</a>
+<a name="ln674">  QLExprResult expr_result;</a>
+<a name="ln675">  RETURN_NOT_OK(EvalExpr(column_value.expr(), existing_row, expr_result.Writer()));</a>
+<a name="ln676">  const yb::bfql::TSOpcode write_instr = GetTSWriteInstruction(column_value.expr());</a>
+<a name="ln677">  const SubDocument&amp; sub_doc =</a>
+<a name="ln678">      SubDocument::FromQLValuePB(expr_result.Value(), column.sorting_type(), write_instr);</a>
+<a name="ln679">  RETURN_NOT_OK(CheckUserTimestampForCollections(user_timestamp));</a>
+<a name="ln680"> </a>
+<a name="ln681">  // Setting the value for a sub-column</a>
+<a name="ln682">  // Currently we only support two cases here: `map['key'] = v` and `list[index] = v`)</a>
+<a name="ln683">  // Any other case should be rejected by the semantic analyser before getting here</a>
+<a name="ln684">  // Later when we support frozen or nested collections this code may need refactoring</a>
+<a name="ln685">  DCHECK_EQ(column_value.subscript_args().size(), 1);</a>
+<a name="ln686">  DCHECK(column_value.subscript_args(0).has_value()) &lt;&lt; &quot;An index must be a constant&quot;;</a>
+<a name="ln687">  switch (column.type()-&gt;main()) {</a>
+<a name="ln688">    case MAP: {</a>
+<a name="ln689">      const PrimitiveValue &amp;pv = PrimitiveValue::FromQLValuePB(</a>
+<a name="ln690">          column_value.subscript_args(0).value(),</a>
+<a name="ln691">          ColumnSchema::SortingType::kNotSpecified);</a>
+<a name="ln692">      sub_path-&gt;AddSubKey(pv);</a>
+<a name="ln693">      RETURN_NOT_OK(data.doc_write_batch-&gt;InsertSubDocument(</a>
+<a name="ln694">          *sub_path, sub_doc, data.read_time, data.deadline,</a>
+<a name="ln695">          request_.query_id(), ttl, user_timestamp));</a>
+<a name="ln696">      break;</a>
+<a name="ln697">    }</a>
+<a name="ln698">    case LIST: {</a>
+<a name="ln699">      MonoDelta default_ttl = schema_-&gt;table_properties().HasDefaultTimeToLive() ?</a>
+<a name="ln700">          MonoDelta::FromMilliseconds(schema_-&gt;table_properties().DefaultTimeToLive()) :</a>
+<a name="ln701">          MonoDelta::kMax;</a>
+<a name="ln702"> </a>
+<a name="ln703">      // At YQL layer list indexes start at 0, but internally we start at 1.</a>
+<a name="ln704">      int index = column_value.subscript_args(0).value().int32_value() + 1;</a>
+<a name="ln705">      RETURN_NOT_OK(data.doc_write_batch-&gt;ReplaceCqlInList(</a>
+<a name="ln706">          *sub_path, {index}, {sub_doc}, data.read_time, data.deadline, request_.query_id(),</a>
+<a name="ln707">          default_ttl, ttl));</a>
+<a name="ln708">      break;</a>
+<a name="ln709">    }</a>
+<a name="ln710">    default: {</a>
+<a name="ln711">      LOG(ERROR) &lt;&lt; &quot;Unexpected type for setting subcolumn: &quot;</a>
+<a name="ln712">                 &lt;&lt; column.type()-&gt;ToString();</a>
+<a name="ln713">    }</a>
+<a name="ln714">  }</a>
+<a name="ln715">  return Status::OK();</a>
+<a name="ln716">}</a>
+<a name="ln717"> </a>
+<a name="ln718">Status QLWriteOperation::ApplyForRegularColumns(const QLColumnValuePB&amp; column_value,</a>
+<a name="ln719">                                                const QLTableRow&amp; existing_row,</a>
+<a name="ln720">                                                const DocOperationApplyData&amp; data,</a>
+<a name="ln721">                                                const DocPath&amp; sub_path, const MonoDelta&amp; ttl,</a>
+<a name="ln722">                                                const UserTimeMicros&amp; user_timestamp,</a>
+<a name="ln723">                                                const ColumnSchema&amp; column,</a>
+<a name="ln724">                                                const ColumnId&amp; column_id,</a>
+<a name="ln725">                                                QLTableRow* new_row) {</a>
+<a name="ln726">  using yb::bfql::TSOpcode;</a>
+<a name="ln727"> </a>
+<a name="ln728">  // Typical case, setting a columns value</a>
+<a name="ln729">  QLExprResult expr_result;</a>
+<a name="ln730">  RETURN_NOT_OK(EvalExpr(column_value.expr(), existing_row, expr_result.Writer()));</a>
+<a name="ln731">  const TSOpcode write_instr = GetTSWriteInstruction(column_value.expr());</a>
+<a name="ln732">  const SubDocument&amp; sub_doc =</a>
+<a name="ln733">      SubDocument::FromQLValuePB(expr_result.Value(), column.sorting_type(), write_instr);</a>
+<a name="ln734">  switch (write_instr) {</a>
+<a name="ln735">    case TSOpcode::kToJson: FALLTHROUGH_INTENDED;</a>
+<a name="ln736">    case TSOpcode::kScalarInsert:</a>
+<a name="ln737">          RETURN_NOT_OK(data.doc_write_batch-&gt;InsertSubDocument(</a>
+<a name="ln738">              sub_path, sub_doc, data.read_time, data.deadline,</a>
+<a name="ln739">              request_.query_id(), ttl, user_timestamp));</a>
+<a name="ln740">      break;</a>
+<a name="ln741">    case TSOpcode::kMapExtend:</a>
+<a name="ln742">    case TSOpcode::kSetExtend:</a>
+<a name="ln743">    case TSOpcode::kMapRemove:</a>
+<a name="ln744">    case TSOpcode::kSetRemove:</a>
+<a name="ln745">          RETURN_NOT_OK(CheckUserTimestampForCollections(user_timestamp));</a>
+<a name="ln746">          RETURN_NOT_OK(data.doc_write_batch-&gt;ExtendSubDocument(</a>
+<a name="ln747">            sub_path, sub_doc, data.read_time, data.deadline, request_.query_id(), ttl));</a>
+<a name="ln748">      break;</a>
+<a name="ln749">    case TSOpcode::kListPrepend:</a>
+<a name="ln750">          sub_doc.SetExtendOrder(ListExtendOrder::PREPEND_BLOCK);</a>
+<a name="ln751">          FALLTHROUGH_INTENDED;</a>
+<a name="ln752">    case TSOpcode::kListAppend:</a>
+<a name="ln753">          RETURN_NOT_OK(CheckUserTimestampForCollections(user_timestamp));</a>
+<a name="ln754">          RETURN_NOT_OK(data.doc_write_batch-&gt;ExtendList(</a>
+<a name="ln755">              sub_path, sub_doc, data.read_time, data.deadline, request_.query_id(), ttl));</a>
+<a name="ln756">      break;</a>
+<a name="ln757">    case TSOpcode::kListRemove:</a>
+<a name="ln758">      // TODO(akashnil or mihnea) this should call RemoveFromList once thats implemented</a>
+<a name="ln759">      // Currently list subtraction is computed in memory using builtin call so this</a>
+<a name="ln760">      // case should never be reached. Once it is implemented the corresponding case</a>
+<a name="ln761">      // from EvalQLExpressionPB should be uncommented to enable this optimization.</a>
+<a name="ln762">          RETURN_NOT_OK(CheckUserTimestampForCollections(user_timestamp));</a>
+<a name="ln763">          RETURN_NOT_OK(data.doc_write_batch-&gt;InsertSubDocument(</a>
+<a name="ln764">              sub_path, sub_doc, data.read_time, data.deadline,</a>
+<a name="ln765">              request_.query_id(), ttl, user_timestamp));</a>
+<a name="ln766">      break;</a>
+<a name="ln767">    default:</a>
+<a name="ln768">      LOG(FATAL) &lt;&lt; &quot;Unsupported operation: &quot; &lt;&lt; static_cast&lt;int&gt;(write_instr);</a>
+<a name="ln769">      break;</a>
+<a name="ln770">  }</a>
+<a name="ln771"> </a>
+<a name="ln772">  if (update_indexes_) {</a>
+<a name="ln773">    new_row-&gt;AllocColumn(column_id, expr_result.Value());</a>
+<a name="ln774">  }</a>
+<a name="ln775">  return Status::OK();</a>
+<a name="ln776">}</a>
+<a name="ln777"> </a>
+<a name="ln778">Status QLWriteOperation::Apply(const DocOperationApplyData&amp; data) {</a>
+<a name="ln779">  QLTableRow existing_row;</a>
+<a name="ln780">  if (request_.has_if_expr()) {</a>
+<a name="ln781">    // Check if the if-condition is satisfied.</a>
+<a name="ln782">    bool should_apply = true;</a>
+<a name="ln783">    Schema static_projection, non_static_projection;</a>
+<a name="ln784">    RETURN_NOT_OK(ReadColumns(data, &amp;static_projection, &amp;non_static_projection, &amp;existing_row));</a>
+<a name="ln785">    RETURN_NOT_OK(EvalCondition(request_.if_expr().condition(), existing_row, &amp;should_apply));</a>
+<a name="ln786">    // Set the response accordingly.</a>
+<a name="ln787">    response_-&gt;set_applied(should_apply);</a>
+<a name="ln788">    if (!should_apply &amp;&amp; request_.else_error()) {</a>
+<a name="ln789">      return ql::ErrorStatus(ql::ErrorCode::CONDITION_NOT_SATISFIED); // QLError</a>
+<a name="ln790">    } else if (request_.returns_status()) {</a>
+<a name="ln791">      RETURN_NOT_OK(PopulateStatusRow(data, should_apply, existing_row, &amp;rowblock_));</a>
+<a name="ln792">    } else {</a>
+<a name="ln793">      RETURN_NOT_OK(PopulateConditionalDmlRow(data,</a>
+<a name="ln794">          should_apply,</a>
+<a name="ln795">          existing_row,</a>
+<a name="ln796">          static_projection,</a>
+<a name="ln797">          non_static_projection,</a>
+<a name="ln798">          &amp;rowblock_));</a>
+<a name="ln799">    }</a>
+<a name="ln800"> </a>
+<a name="ln801">    // If we do not need to apply we are already done.</a>
+<a name="ln802">    if (!should_apply) {</a>
+<a name="ln803">      response_-&gt;set_status(QLResponsePB::YQL_STATUS_OK);</a>
+<a name="ln804">      return Status::OK();</a>
+<a name="ln805">    }</a>
+<a name="ln806"> </a>
+<a name="ln807">    TEST_PAUSE_IF_FLAG(TEST_pause_write_apply_after_if);</a>
+<a name="ln808">  } else if (RequireReadForExpressions(request_) || request_.returns_status()) {</a>
+<a name="ln809">    RETURN_NOT_OK(ReadColumns(data, nullptr, nullptr, &amp;existing_row));</a>
+<a name="ln810">    if (request_.returns_status()) {</a>
+<a name="ln811">      RETURN_NOT_OK(PopulateStatusRow(data, /* should_apply = */ true, existing_row, &amp;rowblock_));</a>
+<a name="ln812">    }</a>
+<a name="ln813">  }</a>
+<a name="ln814"> </a>
+<a name="ln815">  VLOG(3) &lt;&lt; &quot;insert_into_unique_index_ is &quot; &lt;&lt; insert_into_unique_index_;</a>
+<a name="ln816">  if (insert_into_unique_index_ &amp;&amp; VERIFY_RESULT(HasDuplicateUniqueIndexValue(data))) {</a>
+<a name="ln817">    VLOG(3) &lt;&lt; &quot;set_applied is set to &quot; &lt;&lt; false &lt;&lt; &quot; for over &quot; &lt;&lt; yb::ToString(existing_row);</a>
+<a name="ln818">    response_-&gt;set_applied(false);</a>
+<a name="ln819">    response_-&gt;set_status(QLResponsePB::YQL_STATUS_OK);</a>
+<a name="ln820">    return Status::OK();</a>
+<a name="ln821">  }</a>
+<a name="ln822"> </a>
+<a name="ln823">  const MonoDelta ttl =</a>
+<a name="ln824">      request_.has_ttl() ? MonoDelta::FromMilliseconds(request_.ttl()) : Value::kMaxTtl;</a>
+<a name="ln825"> </a>
+<a name="ln826">  const UserTimeMicros user_timestamp = request_.has_user_timestamp_usec() ?</a>
+<a name="ln827">      request_.user_timestamp_usec() : Value::kInvalidUserTimestamp;</a>
+<a name="ln828"> </a>
+<a name="ln829">  // Initialize the new row being written to either the existing row if read, or just populate</a>
+<a name="ln830">  // the primary key.</a>
+<a name="ln831">  QLTableRow new_row;</a>
+<a name="ln832">  if (!existing_row.IsEmpty()) {</a>
+<a name="ln833">    new_row = existing_row;</a>
+<a name="ln834">  } else {</a>
+<a name="ln835">    size_t idx = 0;</a>
+<a name="ln836">    for (const QLExpressionPB&amp; expr : request_.hashed_column_values()) {</a>
+<a name="ln837">      new_row.AllocColumn(schema_-&gt;column_id(idx), expr.value());</a>
+<a name="ln838">      idx++;</a>
+<a name="ln839">    }</a>
+<a name="ln840">    for (const QLExpressionPB&amp; expr : request_.range_column_values()) {</a>
+<a name="ln841">      new_row.AllocColumn(schema_-&gt;column_id(idx), expr.value());</a>
+<a name="ln842">      idx++;</a>
+<a name="ln843">    }</a>
+<a name="ln844">  }</a>
+<a name="ln845"> </a>
+<a name="ln846">  switch (request_.type()) {</a>
+<a name="ln847">    // QL insert == update (upsert) to be consistent with Cassandra's semantics. In either</a>
+<a name="ln848">    // INSERT or UPDATE, if non-key columns are specified, they will be inserted which will cause</a>
+<a name="ln849">    // the primary key to be inserted also when necessary. Otherwise, we should insert the</a>
+<a name="ln850">    // primary key at least.</a>
+<a name="ln851">    case QLWriteRequestPB::QL_STMT_INSERT:</a>
+<a name="ln852">    case QLWriteRequestPB::QL_STMT_UPDATE: {</a>
+<a name="ln853">      // Add the appropriate liveness column only for inserts.</a>
+<a name="ln854">      // We never use init markers for QL to ensure we perform writes without any reads to</a>
+<a name="ln855">      // ensure our write path is fast while complicating the read path a bit.</a>
+<a name="ln856">      auto is_insert = request_.type() == QLWriteRequestPB::QL_STMT_INSERT;</a>
+<a name="ln857">      if (is_insert &amp;&amp; encoded_pk_doc_key_) {</a>
+<a name="ln858">        const DocPath sub_path(encoded_pk_doc_key_.as_slice(),</a>
+<a name="ln859">                               PrimitiveValue::SystemColumnId(SystemColumnIds::kLivenessColumn));</a>
+<a name="ln860">        const auto value = Value(PrimitiveValue(), ttl, user_timestamp);</a>
+<a name="ln861">        RETURN_NOT_OK(data.doc_write_batch-&gt;SetPrimitive(</a>
+<a name="ln862">            sub_path, value, data.read_time, data.deadline, request_.query_id()));</a>
+<a name="ln863">      }</a>
+<a name="ln864"> </a>
+<a name="ln865">      for (const auto&amp; column_value : request_.column_values()) {</a>
+<a name="ln866">        if (!column_value.has_column_id()) {</a>
+<a name="ln867">          return STATUS_FORMAT(InvalidArgument, &quot;column id missing: $0&quot;,</a>
+<a name="ln868">                               column_value.DebugString());</a>
+<a name="ln869">        }</a>
+<a name="ln870">        const ColumnId column_id(column_value.column_id());</a>
+<a name="ln871">        const auto maybe_column = schema_-&gt;column_by_id(column_id);</a>
+<a name="ln872">        RETURN_NOT_OK(maybe_column);</a>
+<a name="ln873">        const ColumnSchema&amp; column = *maybe_column;</a>
+<a name="ln874"> </a>
+<a name="ln875">        DocPath sub_path(</a>
+<a name="ln876">            column.is_static() ?</a>
+<a name="ln877">                encoded_hashed_doc_key_.as_slice() : encoded_pk_doc_key_.as_slice(),</a>
+<a name="ln878">            PrimitiveValue(column_id));</a>
+<a name="ln879"> </a>
+<a name="ln880">        QLValue expr_result;</a>
+<a name="ln881">        if (!column_value.json_args().empty()) {</a>
+<a name="ln882">          RETURN_NOT_OK(ApplyForJsonOperators(column_value, data, sub_path, ttl,</a>
+<a name="ln883">                                              user_timestamp, column, &amp;new_row, is_insert));</a>
+<a name="ln884">        } else if (!column_value.subscript_args().empty()) {</a>
+<a name="ln885">          RETURN_NOT_OK(ApplyForSubscriptArgs(column_value, existing_row, data, ttl,</a>
+<a name="ln886">                                              user_timestamp, column, &amp;sub_path));</a>
+<a name="ln887">        } else {</a>
+<a name="ln888">          RETURN_NOT_OK(ApplyForRegularColumns(column_value, existing_row, data, sub_path, ttl,</a>
+<a name="ln889">                                               user_timestamp, column, column_id, &amp;new_row));</a>
+<a name="ln890">        }</a>
+<a name="ln891">      }</a>
+<a name="ln892"> </a>
+<a name="ln893">      if (update_indexes_) {</a>
+<a name="ln894">        RETURN_NOT_OK(UpdateIndexes(existing_row, new_row));</a>
+<a name="ln895">      }</a>
+<a name="ln896">      break;</a>
+<a name="ln897">    }</a>
+<a name="ln898">    case QLWriteRequestPB::QL_STMT_DELETE: {</a>
+<a name="ln899">      // We have three cases:</a>
+<a name="ln900">      // 1. If non-key columns are specified, we delete only those columns.</a>
+<a name="ln901">      // 2. Otherwise, if range cols are missing, this must be a range delete.</a>
+<a name="ln902">      // 3. Otherwise, this is a normal delete.</a>
+<a name="ln903">      // Analyzer ensures these are the only cases before getting here (e.g. range deletes cannot</a>
+<a name="ln904">      // specify non-key columns).</a>
+<a name="ln905">      if (request_.column_values_size() &gt; 0) {</a>
+<a name="ln906">        // Delete the referenced columns only.</a>
+<a name="ln907">        for (const auto&amp; column_value : request_.column_values()) {</a>
+<a name="ln908">          CHECK(column_value.has_column_id())</a>
+<a name="ln909">              &lt;&lt; &quot;column id missing: &quot; &lt;&lt; column_value.DebugString();</a>
+<a name="ln910">          const ColumnId column_id(column_value.column_id());</a>
+<a name="ln911">          const auto&amp; column = VERIFY_RESULT_REF(schema_-&gt;column_by_id(column_id));</a>
+<a name="ln912">          const DocPath sub_path(</a>
+<a name="ln913">              column.is_static() ?</a>
+<a name="ln914">                encoded_hashed_doc_key_.as_slice() : encoded_pk_doc_key_.as_slice(),</a>
+<a name="ln915">              PrimitiveValue(column_id));</a>
+<a name="ln916">          RETURN_NOT_OK(data.doc_write_batch-&gt;DeleteSubDoc(sub_path,</a>
+<a name="ln917">              data.read_time, data.deadline, request_.query_id(), user_timestamp));</a>
+<a name="ln918">          if (update_indexes_) {</a>
+<a name="ln919">            new_row.MarkTombstoned(column_id);</a>
+<a name="ln920">          }</a>
+<a name="ln921">        }</a>
+<a name="ln922">        if (update_indexes_) {</a>
+<a name="ln923">          RETURN_NOT_OK(UpdateIndexes(existing_row, new_row));</a>
+<a name="ln924">        }</a>
+<a name="ln925">      } else if (IsRangeOperation(request_, *schema_)) {</a>
+<a name="ln926">        // If the range columns are not specified, we read everything and delete all rows for</a>
+<a name="ln927">        // which the where condition matches.</a>
+<a name="ln928"> </a>
+<a name="ln929">        // Create the schema projection -- range deletes cannot reference non-primary key columns,</a>
+<a name="ln930">        // so the non-static projection is all we need, it should contain all referenced columns.</a>
+<a name="ln931">        Schema static_projection;</a>
+<a name="ln932">        Schema projection;</a>
+<a name="ln933">        RETURN_NOT_OK(CreateProjections(*schema_, request_.column_refs(),</a>
+<a name="ln934">            &amp;static_projection, &amp;projection));</a>
+<a name="ln935"> </a>
+<a name="ln936">        // Construct the scan spec basing on the WHERE condition.</a>
+<a name="ln937">        vector&lt;PrimitiveValue&gt; hashed_components;</a>
+<a name="ln938">        RETURN_NOT_OK(QLKeyColumnValuesToPrimitiveValues(</a>
+<a name="ln939">            request_.hashed_column_values(), *schema_, 0,</a>
+<a name="ln940">            schema_-&gt;num_hash_key_columns(), &amp;hashed_components));</a>
+<a name="ln941"> </a>
+<a name="ln942">        boost::optional&lt;int32_t&gt; hash_code = request_.has_hash_code()</a>
+<a name="ln943">                                             ? boost::make_optional&lt;int32_t&gt;(request_.hash_code())</a>
+<a name="ln944">                                             : boost::none;</a>
+<a name="ln945">        DocQLScanSpec spec(projection,</a>
+<a name="ln946">                           hash_code,</a>
+<a name="ln947">                           hash_code, // max hash code.</a>
+<a name="ln948">                           hashed_components,</a>
+<a name="ln949">                           request_.has_where_expr() ? &amp;request_.where_expr().condition() : nullptr,</a>
+<a name="ln950">                           nullptr,</a>
+<a name="ln951">                           request_.query_id());</a>
+<a name="ln952"> </a>
+<a name="ln953">        // Create iterator.</a>
+<a name="ln954">        DocRowwiseIterator iterator(</a>
+<a name="ln955">            projection, *schema_, txn_op_context_,</a>
+<a name="ln956">            data.doc_write_batch-&gt;doc_db(),</a>
+<a name="ln957">            data.deadline, data.read_time);</a>
+<a name="ln958">        RETURN_NOT_OK(iterator.Init(spec));</a>
+<a name="ln959"> </a>
+<a name="ln960">        // Iterate through rows and delete those that match the condition.</a>
+<a name="ln961">        // TODO We do not lock here, so other write transactions coming in might appear partially</a>
+<a name="ln962">        // applied if they happen in the middle of a ranged delete.</a>
+<a name="ln963">        while (VERIFY_RESULT(iterator.HasNext())) {</a>
+<a name="ln964">          existing_row.Clear();</a>
+<a name="ln965">          RETURN_NOT_OK(iterator.NextRow(&amp;existing_row));</a>
+<a name="ln966"> </a>
+<a name="ln967">          // Match the row with the where condition before deleting it.</a>
+<a name="ln968">          bool match = false;</a>
+<a name="ln969">          RETURN_NOT_OK(spec.Match(existing_row, &amp;match));</a>
+<a name="ln970">          if (match) {</a>
+<a name="ln971">            const DocPath row_path(iterator.row_key());</a>
+<a name="ln972">            RETURN_NOT_OK(DeleteRow(row_path, data.doc_write_batch, data.read_time, data.deadline));</a>
+<a name="ln973">            if (update_indexes_) {</a>
+<a name="ln974">              liveness_column_exists_ = iterator.LivenessColumnExists();</a>
+<a name="ln975">              RETURN_NOT_OK(UpdateIndexes(existing_row, new_row));</a>
+<a name="ln976">            }</a>
+<a name="ln977">          }</a>
+<a name="ln978">        }</a>
+<a name="ln979">        data.restart_read_ht-&gt;MakeAtLeast(iterator.RestartReadHt());</a>
+<a name="ln980">      } else {</a>
+<a name="ln981">        // Otherwise, delete the referenced row (all columns).</a>
+<a name="ln982">        RETURN_NOT_OK(DeleteRow(DocPath(encoded_pk_doc_key_.as_slice()), data.doc_write_batch,</a>
+<a name="ln983">                                data.read_time, data.deadline));</a>
+<a name="ln984">        if (update_indexes_) {</a>
+<a name="ln985">          RETURN_NOT_OK(UpdateIndexes(existing_row, new_row));</a>
+<a name="ln986">        }</a>
+<a name="ln987">      }</a>
+<a name="ln988">      break;</a>
+<a name="ln989">    }</a>
+<a name="ln990">  }</a>
+<a name="ln991"> </a>
+<a name="ln992">  response_-&gt;set_status(QLResponsePB::YQL_STATUS_OK);</a>
+<a name="ln993"> </a>
+<a name="ln994">  return Status::OK();</a>
+<a name="ln995">}</a>
+<a name="ln996"> </a>
+<a name="ln997">Status QLWriteOperation::DeleteRow(const DocPath&amp; row_path, DocWriteBatch* doc_write_batch,</a>
+<a name="ln998">                                   const ReadHybridTime&amp; read_ht, const CoarseTimePoint deadline) {</a>
+<a name="ln999">  if (request_.has_user_timestamp_usec()) {</a>
+<a name="ln1000">    // If user_timestamp is provided, we need to add a tombstone for each individual</a>
+<a name="ln1001">    // column in the schema since we don't want to analyze this on the read path.</a>
+<a name="ln1002">    for (int i = schema_-&gt;num_key_columns(); i &lt; schema_-&gt;num_columns(); i++) {</a>
+<a name="ln1003">      const DocPath sub_path(row_path.encoded_doc_key(),</a>
+<a name="ln1004">                             PrimitiveValue(schema_-&gt;column_id(i)));</a>
+<a name="ln1005">      RETURN_NOT_OK(doc_write_batch-&gt;DeleteSubDoc(sub_path,</a>
+<a name="ln1006">                                                  read_ht,</a>
+<a name="ln1007">                                                  deadline,</a>
+<a name="ln1008">                                                  request_.query_id(),</a>
+<a name="ln1009">                                                  request_.user_timestamp_usec()));</a>
+<a name="ln1010">    }</a>
+<a name="ln1011"> </a>
+<a name="ln1012">    // Delete the liveness column as well.</a>
+<a name="ln1013">    const DocPath liveness_column(</a>
+<a name="ln1014">        row_path.encoded_doc_key(),</a>
+<a name="ln1015">        PrimitiveValue::SystemColumnId(SystemColumnIds::kLivenessColumn));</a>
+<a name="ln1016">    RETURN_NOT_OK(doc_write_batch-&gt;DeleteSubDoc(liveness_column,</a>
+<a name="ln1017">                                                read_ht,</a>
+<a name="ln1018">                                                deadline,</a>
+<a name="ln1019">                                                request_.query_id(),</a>
+<a name="ln1020">                                                request_.user_timestamp_usec()));</a>
+<a name="ln1021">  } else {</a>
+<a name="ln1022">    RETURN_NOT_OK(doc_write_batch-&gt;DeleteSubDoc(row_path, read_ht, deadline));</a>
+<a name="ln1023">  }</a>
+<a name="ln1024"> </a>
+<a name="ln1025">  return Status::OK();</a>
+<a name="ln1026">}</a>
+<a name="ln1027"> </a>
+<a name="ln1028">namespace {</a>
+<a name="ln1029"> </a>
+<a name="ln1030">YB_DEFINE_ENUM(ValueState, (kNull)(kNotNull)(kMissing));</a>
+<a name="ln1031"> </a>
+<a name="ln1032">ValueState GetValueState(const QLTableRow&amp; row, const ColumnId column_id) {</a>
+<a name="ln1033">  const auto value = row.GetValue(column_id);</a>
+<a name="ln1034">  return !value ? ValueState::kMissing : IsNull(*value) ? ValueState::kNull : ValueState::kNotNull;</a>
+<a name="ln1035">}</a>
+<a name="ln1036"> </a>
+<a name="ln1037">} // namespace</a>
+<a name="ln1038"> </a>
+<a name="ln1039">bool QLWriteOperation::IsRowDeleted(const QLTableRow&amp; existing_row,</a>
+<a name="ln1040">                                    const QLTableRow&amp; new_row) const {</a>
+<a name="ln1041">  // Delete the whole row?</a>
+<a name="ln1042">  if (request_.type() == QLWriteRequestPB::QL_STMT_DELETE &amp;&amp; request_.column_values().empty()) {</a>
+<a name="ln1043">    return true;</a>
+<a name="ln1044">  }</a>
+<a name="ln1045"> </a>
+<a name="ln1046">  // For update/delete, if there is no liveness column, the row will be deleted after the DML unless</a>
+<a name="ln1047">  // a non-null column still remains.</a>
+<a name="ln1048">  if ((request_.type() == QLWriteRequestPB::QL_STMT_UPDATE ||</a>
+<a name="ln1049">       request_.type() == QLWriteRequestPB::QL_STMT_DELETE) &amp;&amp;</a>
+<a name="ln1050">      !liveness_column_exists_) {</a>
+<a name="ln1051">    for (size_t idx = schema_-&gt;num_key_columns(); idx &lt; schema_-&gt;num_columns(); idx++) {</a>
+<a name="ln1052">      if (schema_-&gt;column(idx).is_static()) {</a>
+<a name="ln1053">        continue;</a>
+<a name="ln1054">      }</a>
+<a name="ln1055">      const ColumnId column_id = schema_-&gt;column_id(idx);</a>
+<a name="ln1056">      switch (GetValueState(new_row, column_id)) {</a>
+<a name="ln1057">        case ValueState::kNull: continue;</a>
+<a name="ln1058">        case ValueState::kNotNull: return false;</a>
+<a name="ln1059">        case ValueState::kMissing: break;</a>
+<a name="ln1060">      }</a>
+<a name="ln1061">      switch (GetValueState(existing_row, column_id)) {</a>
+<a name="ln1062">        case ValueState::kNull: continue;</a>
+<a name="ln1063">        case ValueState::kNotNull: return false;</a>
+<a name="ln1064">        case ValueState::kMissing: break;</a>
+<a name="ln1065">      }</a>
+<a name="ln1066">    }</a>
+<a name="ln1067">    return true;</a>
+<a name="ln1068">  }</a>
+<a name="ln1069"> </a>
+<a name="ln1070">  return false;</a>
+<a name="ln1071">}</a>
+<a name="ln1072"> </a>
+<a name="ln1073">namespace {</a>
+<a name="ln1074"> </a>
+<a name="ln1075">QLExpressionPB* NewKeyColumn(QLWriteRequestPB* request, const IndexInfo&amp; index, const size_t idx) {</a>
+<a name="ln1076">  return (idx &lt; index.hash_column_count()</a>
+<a name="ln1077">          ? request-&gt;add_hashed_column_values()</a>
+<a name="ln1078">          : request-&gt;add_range_column_values());</a>
+<a name="ln1079">}</a>
+<a name="ln1080"> </a>
+<a name="ln1081">} // namespace</a>
+<a name="ln1082"> </a>
+<a name="ln1083">QLWriteRequestPB* QLWriteOperation::NewIndexRequest(const IndexInfo* index,</a>
+<a name="ln1084">                                                    const QLWriteRequestPB::QLStmtType type,</a>
+<a name="ln1085">                                                    const QLTableRow&amp; new_row) {</a>
+<a name="ln1086">  index_requests_.emplace_back(index, QLWriteRequestPB());</a>
+<a name="ln1087">  QLWriteRequestPB* request = &amp;index_requests_.back().second;</a>
+<a name="ln1088">  request-&gt;set_type(type);</a>
+<a name="ln1089">  return request;</a>
+<a name="ln1090">}</a>
+<a name="ln1091"> </a>
+<a name="ln1092">Status QLWriteOperation::UpdateIndexes(const QLTableRow&amp; existing_row, const QLTableRow&amp; new_row) {</a>
+<a name="ln1093">  // Prepare the write requests to update the indexes. There should be at most 2 requests for each</a>
+<a name="ln1094">  // index (one insert and one delete).</a>
+<a name="ln1095">  VLOG(2) &lt;&lt; &quot;Updating indexes&quot;;</a>
+<a name="ln1096">  const auto&amp; index_ids = request_.update_index_ids();</a>
+<a name="ln1097">  index_requests_.reserve(index_ids.size() * 2);</a>
+<a name="ln1098">  for (const TableId&amp; index_id : index_ids) {</a>
+<a name="ln1099">    const IndexInfo* index = VERIFY_RESULT(index_map_.FindIndex(index_id));</a>
+<a name="ln1100">    bool index_key_changed = false;</a>
+<a name="ln1101">    if (IsRowDeleted(existing_row, new_row)) {</a>
+<a name="ln1102">      index_key_changed = true;</a>
+<a name="ln1103">    } else {</a>
+<a name="ln1104">      QLWriteRequestPB* index_request =</a>
+<a name="ln1105">          (index-&gt;HasWritePermission() ? NewIndexRequest(index,</a>
+<a name="ln1106">                                                         QLWriteRequestPB::QL_STMT_INSERT,</a>
+<a name="ln1107">                                                         new_row)</a>
+<a name="ln1108">                                       : nullptr);</a>
+<a name="ln1109">      RETURN_NOT_OK(PrepareIndexWriteAndCheckIfIndexKeyChanged(</a>
+<a name="ln1110">          this, existing_row, new_row, index, index_request, &amp;index_key_changed));</a>
+<a name="ln1111">    }</a>
+<a name="ln1112"> </a>
+<a name="ln1113">    // If the index key is changed, delete the current key.</a>
+<a name="ln1114">    if (index_key_changed &amp;&amp; index-&gt;HasDeletePermission()) {</a>
+<a name="ln1115">      QLWriteRequestPB* index_request =</a>
+<a name="ln1116">          NewIndexRequest(index, QLWriteRequestPB::QL_STMT_DELETE, new_row);</a>
+<a name="ln1117">      for (size_t idx = 0; idx &lt; index-&gt;key_column_count(); idx++) {</a>
+<a name="ln1118">        const IndexInfo::IndexColumn&amp; index_column = index-&gt;column(idx);</a>
+<a name="ln1119">        QLExpressionPB *key_column = NewKeyColumn(index_request, *index, idx);</a>
+<a name="ln1120"> </a>
+<a name="ln1121">        // For old message expr_case() == NOT SET.</a>
+<a name="ln1122">        // For new message expr_case == kColumnId when indexing expression is a column-ref.</a>
+<a name="ln1123">        if (index_column.colexpr.expr_case() != QLExpressionPB::ExprCase::EXPR_NOT_SET &amp;&amp;</a>
+<a name="ln1124">            index_column.colexpr.expr_case() != QLExpressionPB::ExprCase::kColumnId) {</a>
+<a name="ln1125">          QLExprResult result;</a>
+<a name="ln1126">          RETURN_NOT_OK(EvalExpr(index_column.colexpr, existing_row, result.Writer()));</a>
+<a name="ln1127">          result.MoveTo(key_column-&gt;mutable_value());</a>
+<a name="ln1128">        } else {</a>
+<a name="ln1129">          auto result = existing_row.GetValue(index_column.indexed_column_id);</a>
+<a name="ln1130">          if (result) {</a>
+<a name="ln1131">            key_column-&gt;mutable_value()-&gt;CopyFrom(*result);</a>
+<a name="ln1132">          }</a>
+<a name="ln1133">        }</a>
+<a name="ln1134">      }</a>
+<a name="ln1135">    }</a>
+<a name="ln1136">  }</a>
+<a name="ln1137"> </a>
+<a name="ln1138">  return Status::OK();</a>
+<a name="ln1139">}</a>
+<a name="ln1140"> </a>
+<a name="ln1141">Status PrepareIndexWriteAndCheckIfIndexKeyChanged(</a>
+<a name="ln1142">    QLExprExecutor* expr_executor, const QLTableRow&amp; existing_row, const QLTableRow&amp; new_row,</a>
+<a name="ln1143">    const IndexInfo* index, QLWriteRequestPB* index_request, bool* has_index_key_changed) {</a>
+<a name="ln1144">  bool index_key_changed = false;</a>
+<a name="ln1145">  // Prepare the new index key.</a>
+<a name="ln1146">  for (size_t idx = 0; idx &lt; index-&gt;key_column_count(); idx++) {</a>
+<a name="ln1147">    const IndexInfo::IndexColumn&amp; index_column = index-&gt;column(idx);</a>
+<a name="ln1148">    QLExpressionPB *key_column =</a>
+<a name="ln1149">        (index_request ? NewKeyColumn(index_request, *index, idx) : nullptr);</a>
+<a name="ln1150"> </a>
+<a name="ln1151">    // Column_id should be used without executing &quot;colexpr&quot; for the following cases (we want</a>
+<a name="ln1152">    // to avoid executing colexpr as it is less efficient).</a>
+<a name="ln1153">    // - Old PROTO messages (expr_case() == NOT SET).</a>
+<a name="ln1154">    // - When indexing expression is just a column-ref (expr_case == kColumnId)</a>
+<a name="ln1155">    if (index_column.colexpr.expr_case() == QLExpressionPB::ExprCase::EXPR_NOT_SET ||</a>
+<a name="ln1156">        index_column.colexpr.expr_case() == QLExpressionPB::ExprCase::kColumnId) {</a>
+<a name="ln1157">      auto result = new_row.GetValue(index_column.indexed_column_id);</a>
+<a name="ln1158">      if (!existing_row.IsEmpty()) {</a>
+<a name="ln1159">        // For each column in the index key, if there is a new value, see if the value is</a>
+<a name="ln1160">        // changed from the current value. Else, use the current value.</a>
+<a name="ln1161">        if (result) {</a>
+<a name="ln1162">          if (!new_row.MatchColumn(index_column.indexed_column_id, existing_row)) {</a>
+<a name="ln1163">            index_key_changed = true;</a>
+<a name="ln1164">          }</a>
+<a name="ln1165">        } else {</a>
+<a name="ln1166">          result = existing_row.GetValue(index_column.indexed_column_id);</a>
+<a name="ln1167">        }</a>
+<a name="ln1168">      }</a>
+<a name="ln1169">      if (result &amp;&amp; key_column) {</a>
+<a name="ln1170">        key_column-&gt;mutable_value()-&gt;CopyFrom(*result);</a>
+<a name="ln1171">      }</a>
+<a name="ln1172">    } else {</a>
+<a name="ln1173">      QLExprResult result;</a>
+<a name="ln1174">      if (existing_row.IsEmpty()) {</a>
+<a name="ln1175">        RETURN_NOT_OK(expr_executor-&gt;EvalExpr(index_column.colexpr, new_row, result.Writer()));</a>
+<a name="ln1176">      } else {</a>
+<a name="ln1177">        // The following code needs to be updated to support various expression including JSONB.</a>
+<a name="ln1178">        // For each column in the index key, if there is a new value, see if the value is</a>
+<a name="ln1179">        // specified in the new value. Otherwise, use the current value.</a>
+<a name="ln1180">        if (new_row.IsColumnSpecified(index_column.indexed_column_id)) {</a>
+<a name="ln1181">          RETURN_NOT_OK(expr_executor-&gt;EvalExpr(index_column.colexpr, new_row, result.Writer()));</a>
+<a name="ln1182">          if (!new_row.MatchColumn(index_column.indexed_column_id, existing_row)) {</a>
+<a name="ln1183">            index_key_changed = true;</a>
+<a name="ln1184">          }</a>
+<a name="ln1185">        } else {</a>
+<a name="ln1186">          RETURN_NOT_OK(expr_executor-&gt;EvalExpr(</a>
+<a name="ln1187">              index_column.colexpr, existing_row, result.Writer()));</a>
+<a name="ln1188">        }</a>
+<a name="ln1189">      }</a>
+<a name="ln1190">      if (key_column) {</a>
+<a name="ln1191">        result.MoveTo(key_column-&gt;mutable_value());</a>
+<a name="ln1192">      }</a>
+<a name="ln1193">    }</a>
+<a name="ln1194">  }</a>
+<a name="ln1195"> </a>
+<a name="ln1196">  // Prepare the covering columns.</a>
+<a name="ln1197">  for (size_t idx = index-&gt;key_column_count(); idx &lt; index-&gt;columns().size(); idx++) {</a>
+<a name="ln1198">    const IndexInfo::IndexColumn&amp; index_column = index-&gt;column(idx);</a>
+<a name="ln1199">    auto result = new_row.GetValue(index_column.indexed_column_id);</a>
+<a name="ln1200">    // If the index value is changed and there is no new covering column value set, use the</a>
+<a name="ln1201">    // current value.</a>
+<a name="ln1202">    if (index_key_changed &amp;&amp; !result) {</a>
+<a name="ln1203">      result = existing_row.GetValue(index_column.indexed_column_id);</a>
+<a name="ln1204">    }</a>
+<a name="ln1205">    if (result &amp;&amp; index_request) {</a>
+<a name="ln1206">      QLColumnValuePB* covering_column = index_request-&gt;add_column_values();</a>
+<a name="ln1207">      covering_column-&gt;set_column_id(index_column.column_id);</a>
+<a name="ln1208">      covering_column-&gt;mutable_expr()-&gt;mutable_value()-&gt;CopyFrom(*result);</a>
+<a name="ln1209">    }</a>
+<a name="ln1210">  }</a>
+<a name="ln1211"> </a>
+<a name="ln1212">  if (has_index_key_changed) {</a>
+<a name="ln1213">    *has_index_key_changed = index_key_changed;</a>
+<a name="ln1214">  }</a>
+<a name="ln1215">  return Status::OK();</a>
+<a name="ln1216">}</a>
+<a name="ln1217"> </a>
+<a name="ln1218">Status QLReadOperation::Execute(const common::YQLStorageIf&amp; ql_storage,</a>
+<a name="ln1219">                                CoarseTimePoint deadline,</a>
+<a name="ln1220">                                const ReadHybridTime&amp; read_time,</a>
+<a name="ln1221">                                const Schema&amp; schema,</a>
+<a name="ln1222">                                const Schema&amp; projection,</a>
+<a name="ln1223">                                QLResultSet* resultset,</a>
+<a name="ln1224">                                HybridTime* restart_read_ht) {</a>
+<a name="ln1225">  SimulateTimeoutIfTesting(&amp;deadline);</a>
+<a name="ln1226">  size_t row_count_limit = std::numeric_limits&lt;std::size_t&gt;::max();</a>
+<a name="ln1227">  size_t num_rows_skipped = 0;</a>
+<a name="ln1228">  size_t offset = 0;</a>
+<a name="ln1229">  if (request_.has_offset()) {</a>
+<a name="ln1230">    offset = request_.offset();</a>
+<a name="ln1231">  }</a>
+<a name="ln1232">  if (request_.has_limit()) {</a>
+<a name="ln1233">    if (request_.limit() == 0) {</a>
+<a name="ln1234">      return Status::OK();</a>
+<a name="ln1235">    }</a>
+<a name="ln1236">    row_count_limit = request_.limit();</a>
+<a name="ln1237">  }</a>
+<a name="ln1238"> </a>
+<a name="ln1239">  // Create the projections of the non-key columns selected by the row block plus any referenced in</a>
+<a name="ln1240">  // the WHERE condition. When DocRowwiseIterator::NextRow() populates the value map, it uses this</a>
+<a name="ln1241">  // projection only to scan sub-documents. The query schema is used to select only referenced</a>
+<a name="ln1242">  // columns and key columns.</a>
+<a name="ln1243">  Schema static_projection, non_static_projection;</a>
+<a name="ln1244">  RETURN_NOT_OK(CreateProjections(schema, request_.column_refs(),</a>
+<a name="ln1245">                                  &amp;static_projection, &amp;non_static_projection));</a>
+<a name="ln1246">  const bool read_static_columns = !static_projection.columns().empty();</a>
+<a name="ln1247">  const bool read_distinct_columns = request_.distinct();</a>
+<a name="ln1248"> </a>
+<a name="ln1249">  std::unique_ptr&lt;common::YQLRowwiseIteratorIf&gt; iter;</a>
+<a name="ln1250">  std::unique_ptr&lt;common::QLScanSpec&gt; spec, static_row_spec;</a>
+<a name="ln1251">  RETURN_NOT_OK(ql_storage.BuildYQLScanSpec(</a>
+<a name="ln1252">      request_, read_time, schema, read_static_columns, static_projection, &amp;spec,</a>
+<a name="ln1253">      &amp;static_row_spec));</a>
+<a name="ln1254">  RETURN_NOT_OK(ql_storage.GetIterator(request_, projection, schema, txn_op_context_,</a>
+<a name="ln1255">                                       deadline, read_time, *spec, &amp;iter));</a>
+<a name="ln1256">  if (FLAGS_trace_docdb_calls) {</a>
+<a name="ln1257">    TRACE(&quot;Initialized iterator&quot;);</a>
+<a name="ln1258">  }</a>
+<a name="ln1259"> </a>
+<a name="ln1260">  QLTableRow static_row;</a>
+<a name="ln1261">  QLTableRow non_static_row;</a>
+<a name="ln1262">  QLTableRow&amp; selected_row = read_distinct_columns ? static_row : non_static_row;</a>
+<a name="ln1263"> </a>
+<a name="ln1264">  // In case when we are continuing a select with a paging state, or when using a reverse scan,</a>
+<a name="ln1265">  // the static columns for the next row to fetch are not included in the first iterator and we</a>
+<a name="ln1266">  // need to fetch them with a separate spec and iterator before beginning the normal fetch below.</a>
+<a name="ln1267">  if (static_row_spec != nullptr) {</a>
+<a name="ln1268">    std::unique_ptr&lt;common::YQLRowwiseIteratorIf&gt; static_row_iter;</a>
+<a name="ln1269">    RETURN_NOT_OK(ql_storage.GetIterator(</a>
+<a name="ln1270">        request_, static_projection, schema, txn_op_context_, deadline, read_time,</a>
+<a name="ln1271">        *static_row_spec, &amp;static_row_iter));</a>
+<a name="ln1272">    if (VERIFY_RESULT(static_row_iter-&gt;HasNext())) {</a>
+<a name="ln1273">      RETURN_NOT_OK(static_row_iter-&gt;NextRow(&amp;static_row));</a>
+<a name="ln1274">    }</a>
+<a name="ln1275">  }</a>
+<a name="ln1276"> </a>
+<a name="ln1277">  // Begin the normal fetch.</a>
+<a name="ln1278">  int match_count = 0;</a>
+<a name="ln1279">  bool static_dealt_with = true;</a>
+<a name="ln1280">  while (resultset-&gt;rsrow_count() &lt; row_count_limit &amp;&amp; VERIFY_RESULT(iter-&gt;HasNext())) {</a>
+<a name="ln1281">    const bool last_read_static = iter-&gt;IsNextStaticColumn();</a>
+<a name="ln1282"> </a>
+<a name="ln1283">    // Note that static columns are sorted before non-static columns in DocDB as follows. This is</a>
+<a name="ln1284">    // because &quot;&lt;empty_range_components&gt;&quot; is empty and terminated by kGroupEnd which sorts before</a>
+<a name="ln1285">    // all other ValueType characters in a non-empty range component.</a>
+<a name="ln1286">    //   &lt;hash_code&gt;&lt;hash_components&gt;&lt;empty_range_components&gt;&lt;static_column_id&gt; -&gt; value;</a>
+<a name="ln1287">    //   &lt;hash_code&gt;&lt;hash_components&gt;&lt;range_components&gt;&lt;non_static_column_id&gt; -&gt; value;</a>
+<a name="ln1288">    if (last_read_static) {</a>
+<a name="ln1289">      static_row.Clear();</a>
+<a name="ln1290">      RETURN_NOT_OK(iter-&gt;NextRow(static_projection, &amp;static_row));</a>
+<a name="ln1291">    } else { // Reading a regular row that contains non-static columns.</a>
+<a name="ln1292"> </a>
+<a name="ln1293">      // Read this regular row.</a>
+<a name="ln1294">      // TODO(omer): this is quite inefficient if read_distinct_column. A better way to do this</a>
+<a name="ln1295">      // would be to only read the first non-static column for each hash key, and skip the rest</a>
+<a name="ln1296">      non_static_row.Clear();</a>
+<a name="ln1297">      RETURN_NOT_OK(iter-&gt;NextRow(non_static_projection, &amp;non_static_row));</a>
+<a name="ln1298">    }</a>
+<a name="ln1299"> </a>
+<a name="ln1300">    // We have two possible cases: whether we use distinct or not</a>
+<a name="ln1301">    // If we use distinct, then in general we only need to add the static rows</a>
+<a name="ln1302">    // However, we might have to add non-static rows, if there is no static row corresponding to</a>
+<a name="ln1303">    // it. Of course, we add one entry per hash key in non-static row.</a>
+<a name="ln1304">    // If we do not use distinct, we are generally only adding non-static rows</a>
+<a name="ln1305">    // However, if there is no non-static row for the static row, we have to add it.</a>
+<a name="ln1306">    if (read_distinct_columns) {</a>
+<a name="ln1307">      bool join_successful = false;</a>
+<a name="ln1308">      if (!last_read_static) {</a>
+<a name="ln1309">        join_successful = JoinNonStaticRow(schema, static_projection, non_static_row, &amp;static_row);</a>
+<a name="ln1310">      }</a>
+<a name="ln1311"> </a>
+<a name="ln1312">      // If the join was not successful, it means that the non-static row we read has no</a>
+<a name="ln1313">      // corresponding static row, so we have to add it to the result</a>
+<a name="ln1314">      if (!join_successful) {</a>
+<a name="ln1315">        RETURN_NOT_OK(AddRowToResult(</a>
+<a name="ln1316">            spec, static_row, row_count_limit, offset, resultset, &amp;match_count, &amp;num_rows_skipped));</a>
+<a name="ln1317">      }</a>
+<a name="ln1318">    } else {</a>
+<a name="ln1319">      if (last_read_static) {</a>
+<a name="ln1320"> </a>
+<a name="ln1321">        // If the next row to be read is not static, deal with it later, as we do not know whether</a>
+<a name="ln1322">        // the non-static row corresponds to this static row; if the non-static row doesn't</a>
+<a name="ln1323">        // correspond to this static row, we will have to add it later, so set static_dealt_with to</a>
+<a name="ln1324">        // false</a>
+<a name="ln1325">        if (VERIFY_RESULT(iter-&gt;HasNext()) &amp;&amp; !iter-&gt;IsNextStaticColumn()) {</a>
+<a name="ln1326">          static_dealt_with = false;</a>
+<a name="ln1327">          continue;</a>
+<a name="ln1328">        }</a>
+<a name="ln1329"> </a>
+<a name="ln1330">        AddProjection(non_static_projection, &amp;static_row);</a>
+<a name="ln1331">        RETURN_NOT_OK(AddRowToResult(spec, static_row, row_count_limit, offset, resultset,</a>
+<a name="ln1332">                                     &amp;match_count, &amp;num_rows_skipped));</a>
+<a name="ln1333">      } else {</a>
+<a name="ln1334">        // We also have to do the join if we are not reading any static columns, as Cassandra</a>
+<a name="ln1335">        // reports nulls for static rows with no corresponding non-static row</a>
+<a name="ln1336">        if (read_static_columns || !static_dealt_with) {</a>
+<a name="ln1337">          const bool join_successful = JoinStaticRow(schema,</a>
+<a name="ln1338">                                               static_projection,</a>
+<a name="ln1339">                                               static_row,</a>
+<a name="ln1340">                                               &amp;non_static_row);</a>
+<a name="ln1341">          // Add the static row if the join was not successful and it is the first time we are</a>
+<a name="ln1342">          // dealing with this static row</a>
+<a name="ln1343">          if (!join_successful &amp;&amp; !static_dealt_with) {</a>
+<a name="ln1344">            AddProjection(non_static_projection, &amp;static_row);</a>
+<a name="ln1345">            RETURN_NOT_OK(AddRowToResult(</a>
+<a name="ln1346">                spec, static_row, row_count_limit, offset, resultset, &amp;match_count,</a>
+<a name="ln1347">                &amp;num_rows_skipped));</a>
+<a name="ln1348">          }</a>
+<a name="ln1349">        }</a>
+<a name="ln1350">        static_dealt_with = true;</a>
+<a name="ln1351">        RETURN_NOT_OK(AddRowToResult(</a>
+<a name="ln1352">            spec, non_static_row, row_count_limit, offset, resultset, &amp;match_count,</a>
+<a name="ln1353">            &amp;num_rows_skipped));</a>
+<a name="ln1354">      }</a>
+<a name="ln1355">    }</a>
+<a name="ln1356">  }</a>
+<a name="ln1357"> </a>
+<a name="ln1358">  if (request_.is_aggregate() &amp;&amp; match_count &gt; 0) {</a>
+<a name="ln1359">    RETURN_NOT_OK(PopulateAggregate(selected_row, resultset));</a>
+<a name="ln1360">  }</a>
+<a name="ln1361"> </a>
+<a name="ln1362">  if (FLAGS_trace_docdb_calls) {</a>
+<a name="ln1363">    TRACE(&quot;Fetched $0 rows.&quot;, resultset-&gt;rsrow_count());</a>
+<a name="ln1364">  }</a>
+<a name="ln1365"> </a>
+<a name="ln1366">  RETURN_NOT_OK(SetPagingStateIfNecessary(</a>
+<a name="ln1367">      iter.get(), resultset, row_count_limit, num_rows_skipped, read_time));</a>
+<a name="ln1368"> </a>
+<a name="ln1369">  // SetPagingStateIfNecessary could perform read, so we assign restart_read_ht after it.</a>
+<a name="ln1370">  *restart_read_ht = iter-&gt;RestartReadHt();</a>
+<a name="ln1371"> </a>
+<a name="ln1372">  return Status::OK();</a>
+<a name="ln1373">}</a>
+<a name="ln1374"> </a>
+<a name="ln1375">Status QLReadOperation::SetPagingStateIfNecessary(const common::YQLRowwiseIteratorIf* iter,</a>
+<a name="ln1376">                                                  const QLResultSet* resultset,</a>
+<a name="ln1377">                                                  const size_t row_count_limit,</a>
+<a name="ln1378">                                                  const size_t num_rows_skipped,</a>
+<a name="ln1379">                                                  const ReadHybridTime&amp; read_time) {</a>
+<a name="ln1380">  if ((resultset-&gt;rsrow_count() &gt;= row_count_limit || request_.has_offset()) &amp;&amp;</a>
+<a name="ln1381">      !request_.is_aggregate()) {</a>
+<a name="ln1382">    SubDocKey next_row_key;</a>
+<a name="ln1383">    RETURN_NOT_OK(iter-&gt;GetNextReadSubDocKey(&amp;next_row_key));</a>
+<a name="ln1384">    // When the &quot;limit&quot; number of rows are returned and we are asked to return the paging state,</a>
+<a name="ln1385">    // return the partition key and row key of the next row to read in the paging state if there are</a>
+<a name="ln1386">    // still more rows to read. Otherwise, leave the paging state empty which means we are done</a>
+<a name="ln1387">    // reading from this tablet.</a>
+<a name="ln1388">    if (request_.return_paging_state()) {</a>
+<a name="ln1389">      if (!next_row_key.doc_key().empty()) {</a>
+<a name="ln1390">        QLPagingStatePB* paging_state = response_.mutable_paging_state();</a>
+<a name="ln1391">        paging_state-&gt;set_next_partition_key(</a>
+<a name="ln1392">            PartitionSchema::EncodeMultiColumnHashValue(next_row_key.doc_key().hash()));</a>
+<a name="ln1393">        paging_state-&gt;set_next_row_key(next_row_key.Encode().ToStringBuffer());</a>
+<a name="ln1394">        paging_state-&gt;set_total_rows_skipped(request_.paging_state().total_rows_skipped() +</a>
+<a name="ln1395">            num_rows_skipped);</a>
+<a name="ln1396">      } else if (request_.has_offset()) {</a>
+<a name="ln1397">        QLPagingStatePB* paging_state = response_.mutable_paging_state();</a>
+<a name="ln1398">        paging_state-&gt;set_total_rows_skipped(request_.paging_state().total_rows_skipped() +</a>
+<a name="ln1399">            num_rows_skipped);</a>
+<a name="ln1400">      }</a>
+<a name="ln1401">    }</a>
+<a name="ln1402">    if (response_.has_paging_state()) {</a>
+<a name="ln1403">      if (FLAGS_ycql_consistent_transactional_paging) {</a>
+<a name="ln1404">        read_time.AddToPB(response_.mutable_paging_state());</a>
+<a name="ln1405">      } else {</a>
+<a name="ln1406">        // Using SingleTime will help avoid read restarts on second page and later but will</a>
+<a name="ln1407">        // potentially produce stale results on those pages.</a>
+<a name="ln1408">        auto per_row_consistent_read_time = ReadHybridTime::SingleTime(read_time.read);</a>
+<a name="ln1409">        per_row_consistent_read_time.AddToPB(response_.mutable_paging_state());</a>
+<a name="ln1410">      }</a>
+<a name="ln1411">    }</a>
+<a name="ln1412">  }</a>
+<a name="ln1413"> </a>
+<a name="ln1414">  return Status::OK();</a>
+<a name="ln1415">}</a>
+<a name="ln1416"> </a>
+<a name="ln1417">Status QLReadOperation::GetIntents(const Schema&amp; schema, KeyValueWriteBatchPB* out) {</a>
+<a name="ln1418">  std::vector&lt;PrimitiveValue&gt; hashed_components;</a>
+<a name="ln1419">  RETURN_NOT_OK(QLKeyColumnValuesToPrimitiveValues(</a>
+<a name="ln1420">      request_.hashed_column_values(), schema, 0, schema.num_hash_key_columns(),</a>
+<a name="ln1421">      &amp;hashed_components));</a>
+<a name="ln1422">  auto pair = out-&gt;mutable_read_pairs()-&gt;Add();</a>
+<a name="ln1423">  if (hashed_components.empty()) {</a>
+<a name="ln1424">    // Empty hashed components mean that we don't have primary key at all, but request</a>
+<a name="ln1425">    // could still contain hash_code as part of tablet routing.</a>
+<a name="ln1426">    // So we should ignore it.</a>
+<a name="ln1427">    pair-&gt;set_key(std::string(1, ValueTypeAsChar::kGroupEnd));</a>
+<a name="ln1428">  } else {</a>
+<a name="ln1429">    DocKey doc_key(request_.hash_code(), hashed_components);</a>
+<a name="ln1430">    pair-&gt;set_key(doc_key.Encode().ToStringBuffer());</a>
+<a name="ln1431">  }</a>
+<a name="ln1432">  pair-&gt;set_value(std::string(1, ValueTypeAsChar::kNullLow));</a>
+<a name="ln1433">  return Status::OK();</a>
+<a name="ln1434">}</a>
+<a name="ln1435"> </a>
+<a name="ln1436">Status QLReadOperation::PopulateResultSet(const std::unique_ptr&lt;common::QLScanSpec&gt;&amp; spec,</a>
+<a name="ln1437">                                          const QLTableRow&amp; table_row,</a>
+<a name="ln1438">                                          QLResultSet *resultset) {</a>
+<a name="ln1439">  resultset-&gt;AllocateRow();</a>
+<a name="ln1440">  int rscol_index = 0;</a>
+<a name="ln1441">  for (const QLExpressionPB&amp; expr : request_.selected_exprs()) {</a>
+<a name="ln1442">    QLExprResult value;</a>
+<a name="ln1443">    RETURN_NOT_OK(EvalExpr(expr, table_row, value.Writer(), spec-&gt;schema()));</a>
+<a name="ln1444">    resultset-&gt;AppendColumn(rscol_index, value.Value());</a>
+<a name="ln1445">    rscol_index++;</a>
+<a name="ln1446">  }</a>
+<a name="ln1447"> </a>
+<a name="ln1448">  return Status::OK();</a>
+<a name="ln1449">}</a>
+<a name="ln1450"> </a>
+<a name="ln1451">Status QLReadOperation::EvalAggregate(const QLTableRow&amp; table_row) {</a>
+<a name="ln1452">  if (aggr_result_.empty()) {</a>
+<a name="ln1453">    int column_count = request_.selected_exprs().size();</a>
+<a name="ln1454">    aggr_result_.resize(column_count);</a>
+<a name="ln1455">  }</a>
+<a name="ln1456"> </a>
+<a name="ln1457">  int aggr_index = 0;</a>
+<a name="ln1458">  for (const QLExpressionPB&amp; expr : request_.selected_exprs()) {</a>
+<a name="ln1459">    RETURN_NOT_OK(EvalExpr(expr, table_row, aggr_result_[aggr_index++].Writer()));</a>
+<a name="ln1460">  }</a>
+<a name="ln1461">  return Status::OK();</a>
+<a name="ln1462">}</a>
+<a name="ln1463"> </a>
+<a name="ln1464">Status QLReadOperation::PopulateAggregate(const QLTableRow&amp; table_row, QLResultSet *resultset) {</a>
+<a name="ln1465">  resultset-&gt;AllocateRow();</a>
+<a name="ln1466">  int column_count = request_.selected_exprs().size();</a>
+<a name="ln1467">  for (int rscol_index = 0; rscol_index &lt; column_count; rscol_index++) {</a>
+<a name="ln1468">    resultset-&gt;AppendColumn(rscol_index, aggr_result_[rscol_index].Value());</a>
+<a name="ln1469">  }</a>
+<a name="ln1470">  return Status::OK();</a>
+<a name="ln1471">}</a>
+<a name="ln1472"> </a>
+<a name="ln1473">Status QLReadOperation::AddRowToResult(const std::unique_ptr&lt;common::QLScanSpec&gt;&amp; spec,</a>
+<a name="ln1474">                                       const QLTableRow&amp; row,</a>
+<a name="ln1475">                                       const size_t row_count_limit,</a>
+<a name="ln1476">                                       const size_t offset,</a>
+<a name="ln1477">                                       QLResultSet* resultset,</a>
+<a name="ln1478">                                       int* match_count,</a>
+<a name="ln1479">                                       size_t *num_rows_skipped) {</a>
+<a name="ln1480">  VLOG(3) &lt;&lt; __FUNCTION__ &lt;&lt; &quot; : &quot; &lt;&lt; yb::ToString(row);</a>
+<a name="ln1481">  if (resultset-&gt;rsrow_count() &lt; row_count_limit) {</a>
+<a name="ln1482">    bool match = false;</a>
+<a name="ln1483">    RETURN_NOT_OK(spec-&gt;Match(row, &amp;match));</a>
+<a name="ln1484">    if (match) {</a>
+<a name="ln1485">      if (*num_rows_skipped &gt;= offset) {</a>
+<a name="ln1486">        (*match_count)++;</a>
+<a name="ln1487">        if (request_.is_aggregate()) {</a>
+<a name="ln1488">          RETURN_NOT_OK(EvalAggregate(row));</a>
+<a name="ln1489">        } else {</a>
+<a name="ln1490">          RETURN_NOT_OK(PopulateResultSet(spec, row, resultset));</a>
+<a name="ln1491">        }</a>
+<a name="ln1492">      } else {</a>
+<a name="ln1493">        (*num_rows_skipped)++;</a>
+<a name="ln1494">      }</a>
+<a name="ln1495">    }</a>
+<a name="ln1496">  }</a>
+<a name="ln1497">  return Status::OK();</a>
+<a name="ln1498">}</a>
+<a name="ln1499"> </a>
+<a name="ln1500">}  // namespace docdb</a>
+<a name="ln1501">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="251"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="253"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="255"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="487"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="495"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="502"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="542"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="554"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="558"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="565"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="573"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="580"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="583"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="686"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="815"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="817"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="908"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1095"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1480"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

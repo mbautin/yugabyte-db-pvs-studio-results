@@ -1,0 +1,325 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>index_builder.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/rocksdb/table/index_builder.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/rocksdb/comparator.h&quot;</a>
+<a name="ln17">#include &quot;yb/rocksdb/slice_transform.h&quot;</a>
+<a name="ln18">#include &quot;yb/rocksdb/table/block.h&quot;</a>
+<a name="ln19">#include &quot;yb/rocksdb/table/block_based_table_factory.h&quot;</a>
+<a name="ln20">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln21">#include &quot;yb/util/memory/memory.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">namespace rocksdb {</a>
+<a name="ln24"> </a>
+<a name="ln25">IndexBuilder* IndexBuilder::CreateIndexBuilder(</a>
+<a name="ln26">    IndexType type,</a>
+<a name="ln27">    const Comparator* comparator,</a>
+<a name="ln28">    const SliceTransform* prefix_extractor,</a>
+<a name="ln29">    const BlockBasedTableOptions&amp; table_opt) {</a>
+<a name="ln30">  switch (type) {</a>
+<a name="ln31">    case IndexType::kBinarySearch: {</a>
+<a name="ln32">      return new ShortenedIndexBuilder(comparator,</a>
+<a name="ln33">                                       table_opt.index_block_restart_interval);</a>
+<a name="ln34">    }</a>
+<a name="ln35">    case IndexType::kHashSearch: {</a>
+<a name="ln36">      return new HashIndexBuilder(comparator, prefix_extractor,</a>
+<a name="ln37">                                  table_opt.index_block_restart_interval);</a>
+<a name="ln38">    }</a>
+<a name="ln39">    case IndexType::kMultiLevelBinarySearch: {</a>
+<a name="ln40">      return new MultiLevelIndexBuilder(comparator, table_opt);</a>
+<a name="ln41">    }</a>
+<a name="ln42">    default: {</a>
+<a name="ln43">      assert(!&quot;Do not recognize the index type &quot;);</a>
+<a name="ln44">      return nullptr;</a>
+<a name="ln45">    }</a>
+<a name="ln46">  }</a>
+<a name="ln47">  // impossible.</a>
+<a name="ln48">  assert(false);</a>
+<a name="ln49">  return nullptr;</a>
+<a name="ln50">}</a>
+<a name="ln51"> </a>
+<a name="ln52">void ShortenedIndexBuilder::AddIndexEntry(</a>
+<a name="ln53">    std::string* last_key_in_current_block,</a>
+<a name="ln54">    const Slice* first_key_in_next_block,</a>
+<a name="ln55">    const BlockHandle&amp; block_handle) {</a>
+<a name="ln56">  std::string handle_encoding;</a>
+<a name="ln57">  block_handle.AppendEncodedTo(&amp;handle_encoding);</a>
+<a name="ln58">  AddIndexEntry(</a>
+<a name="ln59">      last_key_in_current_block, first_key_in_next_block, handle_encoding, ShortenKeys::kTrue);</a>
+<a name="ln60">}</a>
+<a name="ln61"> </a>
+<a name="ln62">void ShortenedIndexBuilder::AddIndexEntry(</a>
+<a name="ln63">    std::string* last_key_in_current_block,</a>
+<a name="ln64">    const Slice* first_key_in_next_block,</a>
+<a name="ln65">    const std::string&amp; block_handle_encoded,</a>
+<a name="ln66">    const ShortenKeys shorten_keys) {</a>
+<a name="ln67">  if (shorten_keys) {</a>
+<a name="ln68">    if (UNLIKELY(first_key_in_next_block == nullptr)) {</a>
+<a name="ln69">      comparator_-&gt;FindShortSuccessor(last_key_in_current_block);</a>
+<a name="ln70">    } else {</a>
+<a name="ln71">      comparator_-&gt;FindShortestSeparator(last_key_in_current_block, *first_key_in_next_block);</a>
+<a name="ln72">    }</a>
+<a name="ln73">  }</a>
+<a name="ln74"> </a>
+<a name="ln75">  index_block_builder_.Add(*last_key_in_current_block, block_handle_encoded);</a>
+<a name="ln76">}</a>
+<a name="ln77"> </a>
+<a name="ln78">Status ShortenedIndexBuilder::Finish(IndexBlocks* index_blocks) {</a>
+<a name="ln79">  index_blocks-&gt;index_block_contents = index_block_builder_.Finish();</a>
+<a name="ln80">  return Status::OK();</a>
+<a name="ln81">}</a>
+<a name="ln82"> </a>
+<a name="ln83">void HashIndexBuilder::AddIndexEntry(</a>
+<a name="ln84">    std::string* last_key_in_current_block,</a>
+<a name="ln85">    const Slice* first_key_in_next_block,</a>
+<a name="ln86">    const BlockHandle&amp; block_handle) {</a>
+<a name="ln87">  ++current_restart_index_;</a>
+<a name="ln88">  primary_index_builder_.AddIndexEntry(</a>
+<a name="ln89">      last_key_in_current_block, first_key_in_next_block, block_handle);</a>
+<a name="ln90">}</a>
+<a name="ln91"> </a>
+<a name="ln92">void HashIndexBuilder::OnKeyAdded(const Slice&amp; key) {</a>
+<a name="ln93">  auto key_prefix = hash_key_extractor_-&gt;Transform(key);</a>
+<a name="ln94">  bool is_first_entry = pending_block_num_ == 0;</a>
+<a name="ln95"> </a>
+<a name="ln96">  // Keys may share the prefix</a>
+<a name="ln97">  if (is_first_entry || pending_entry_prefix_ != key_prefix) {</a>
+<a name="ln98">    if (!is_first_entry) {</a>
+<a name="ln99">      FlushPendingPrefix();</a>
+<a name="ln100">    }</a>
+<a name="ln101"> </a>
+<a name="ln102">    // need a hard copy otherwise the underlying data changes all the time.</a>
+<a name="ln103">    // TODO(kailiu) ToString() is expensive. We may speed up can avoid data</a>
+<a name="ln104">    // copy.</a>
+<a name="ln105">    pending_entry_prefix_ = key_prefix.ToString();</a>
+<a name="ln106">    pending_block_num_ = 1;</a>
+<a name="ln107">    pending_entry_index_ = static_cast&lt;uint32_t&gt;(current_restart_index_);</a>
+<a name="ln108">  } else {</a>
+<a name="ln109">    // entry number increments when keys share the prefix reside in</a>
+<a name="ln110">    // different data blocks.</a>
+<a name="ln111">    auto last_restart_index = pending_entry_index_ + pending_block_num_ - 1;</a>
+<a name="ln112">    assert(last_restart_index &lt;= current_restart_index_);</a>
+<a name="ln113">    if (last_restart_index != current_restart_index_) {</a>
+<a name="ln114">      ++pending_block_num_;</a>
+<a name="ln115">    }</a>
+<a name="ln116">  }</a>
+<a name="ln117">}</a>
+<a name="ln118"> </a>
+<a name="ln119">Status HashIndexBuilder::Finish(IndexBlocks* index_blocks) {</a>
+<a name="ln120">  FlushPendingPrefix();</a>
+<a name="ln121">  RETURN_NOT_OK(primary_index_builder_.Finish(index_blocks));</a>
+<a name="ln122">  index_blocks-&gt;meta_blocks.emplace(kHashIndexPrefixesBlock, prefix_block_);</a>
+<a name="ln123">  index_blocks-&gt;meta_blocks.emplace(kHashIndexPrefixesMetadataBlock, prefix_meta_block_);</a>
+<a name="ln124">  return Status::OK();</a>
+<a name="ln125">}</a>
+<a name="ln126"> </a>
+<a name="ln127">void HashIndexBuilder::FlushPendingPrefix() {</a>
+<a name="ln128">  prefix_block_.append(pending_entry_prefix_.data(), pending_entry_prefix_.size());</a>
+<a name="ln129">  PutVarint32(&amp;prefix_meta_block_, static_cast&lt;uint32_t&gt;(pending_entry_prefix_.size()));</a>
+<a name="ln130">  PutVarint32(&amp;prefix_meta_block_, pending_entry_index_);</a>
+<a name="ln131">  PutVarint32(&amp;prefix_meta_block_, pending_block_num_);</a>
+<a name="ln132">}</a>
+<a name="ln133"> </a>
+<a name="ln134">MultiLevelIndexBuilder::MultiLevelIndexBuilder(</a>
+<a name="ln135">    const Comparator* comparator, const BlockBasedTableOptions&amp; table_opt)</a>
+<a name="ln136">    : IndexBuilder(comparator),</a>
+<a name="ln137">      table_opt_(table_opt) {}</a>
+<a name="ln138"> </a>
+<a name="ln139">void MultiLevelIndexBuilder::EnsureCurrentLevelIndexBuilderCreated() {</a>
+<a name="ln140">  if (!current_level_index_block_builder_) {</a>
+<a name="ln141">    DCHECK(!flush_policy_);</a>
+<a name="ln142">    current_level_index_block_builder_.reset(</a>
+<a name="ln143">        new ShortenedIndexBuilder(comparator_, table_opt_.index_block_restart_interval));</a>
+<a name="ln144">    flush_policy_ = FlushBlockBySizePolicyFactory::NewFlushBlockPolicy(</a>
+<a name="ln145">        table_opt_.index_block_size, table_opt_.block_size_deviation,</a>
+<a name="ln146">        table_opt_.min_keys_per_index_block,</a>
+<a name="ln147">        current_level_index_block_builder_-&gt;GetIndexBlockBuilder());</a>
+<a name="ln148">  }</a>
+<a name="ln149">}</a>
+<a name="ln150"> </a>
+<a name="ln151">void MultiLevelIndexBuilder::AddIndexEntry(</a>
+<a name="ln152">    std::string* last_key_in_current_block, const Slice* first_key_in_next_block,</a>
+<a name="ln153">    const BlockHandle&amp; block_handle, const ShortenKeys shorten_keys) {</a>
+<a name="ln154">  DCHECK(!current_level_block_.is_ready)</a>
+<a name="ln155">      &lt;&lt; &quot;Expected to first flush already complete index block&quot;;</a>
+<a name="ln156">  EnsureCurrentLevelIndexBuilderCreated();</a>
+<a name="ln157"> </a>
+<a name="ln158">  block_handle_encoding_.clear();</a>
+<a name="ln159">  block_handle.AppendEncodedTo(&amp;block_handle_encoding_);</a>
+<a name="ln160"> </a>
+<a name="ln161">  current_level_index_block_builder_-&gt;AddIndexEntry(</a>
+<a name="ln162">      last_key_in_current_block, first_key_in_next_block, block_handle_encoding_, shorten_keys);</a>
+<a name="ln163"> </a>
+<a name="ln164">  if (flush_policy_-&gt;Update(*last_key_in_current_block, block_handle_encoding_)</a>
+<a name="ln165">      || first_key_in_next_block == nullptr) {</a>
+<a name="ln166">    current_level_block_.is_ready = true;</a>
+<a name="ln167">    yb::CopyToBuffer(*last_key_in_current_block, &amp;current_level_block_.last_key);</a>
+<a name="ln168">    current_level_block_.has_next_block = first_key_in_next_block != nullptr;</a>
+<a name="ln169">    if (current_level_block_.has_next_block) {</a>
+<a name="ln170">      first_key_in_next_block-&gt;CopyToBuffer(&amp;current_level_block_.next_block_first_key);</a>
+<a name="ln171">    }</a>
+<a name="ln172">  }</a>
+<a name="ln173">}</a>
+<a name="ln174"> </a>
+<a name="ln175">bool MultiLevelIndexBuilder::ShouldFlush() const {</a>
+<a name="ln176">  return current_level_block_.is_ready ||</a>
+<a name="ln177">         next_level_.block_to_add.IsReadyAndLast() ||</a>
+<a name="ln178">         (next_level_index_builder_ &amp;&amp; next_level_index_builder_-&gt;ShouldFlush());</a>
+<a name="ln179">}</a>
+<a name="ln180"> </a>
+<a name="ln181">Status MultiLevelIndexBuilder::FlushCurrentLevel(IndexBlocks* index_blocks) {</a>
+<a name="ln182">  RETURN_NOT_OK(current_level_index_block_builder_-&gt;Finish(index_blocks));</a>
+<a name="ln183">  finished_index_block_builder_ = std::move(current_level_index_block_builder_);</a>
+<a name="ln184">  flush_policy_.reset();</a>
+<a name="ln185">  current_level_size_ += index_blocks-&gt;index_block_contents.size() + kBlockTrailerSize;</a>
+<a name="ln186">  return Status::OK();</a>
+<a name="ln187">}</a>
+<a name="ln188"> </a>
+<a name="ln189">void MultiLevelIndexBuilder::AddToNextLevelIfReady(</a>
+<a name="ln190">    IndexBlockInfo* block_info, const BlockHandle&amp; block_handle) {</a>
+<a name="ln191">  DCHECK_ONLY_NOTNULL(block_info);</a>
+<a name="ln192">  if (block_info-&gt;is_ready) {</a>
+<a name="ln193">    DCHECK_ONLY_NOTNULL(next_level_index_builder_.get());</a>
+<a name="ln194">    // We don't need to shorten keys in next level index builder, since we already did that when</a>
+<a name="ln195">    // added this entry at previous levels.</a>
+<a name="ln196">    if (block_info-&gt;has_next_block) {</a>
+<a name="ln197">      Slice key_slice(block_info-&gt;next_block_first_key);</a>
+<a name="ln198">      next_level_index_builder_-&gt;AddIndexEntry(</a>
+<a name="ln199">          &amp;block_info-&gt;last_key, &amp;key_slice, block_handle, ShortenKeys::kFalse);</a>
+<a name="ln200">    } else {</a>
+<a name="ln201">      next_level_index_builder_-&gt;AddIndexEntry(</a>
+<a name="ln202">          &amp;block_info-&gt;last_key, nullptr, block_handle, ShortenKeys::kFalse);</a>
+<a name="ln203">      DCHECK(next_level_index_builder_-&gt;ShouldFlush())</a>
+<a name="ln204">          &lt;&lt; &quot;Expected to request flushing of last block at next index level&quot;;</a>
+<a name="ln205">    }</a>
+<a name="ln206">    block_info-&gt;is_ready = false;</a>
+<a name="ln207">  }</a>
+<a name="ln208">}</a>
+<a name="ln209"> </a>
+<a name="ln210">Result&lt;bool&gt; MultiLevelIndexBuilder::FlushNextBlock(</a>
+<a name="ln211">    IndexBlocks* index_blocks, const BlockHandle&amp; last_index_block_handle) {</a>
+<a name="ln212">  if (next_level_.just_flushed) {</a>
+<a name="ln213">    // We should only have current level index block to add for next level if we have just</a>
+<a name="ln214">    // flushed it, but not next level index block.</a>
+<a name="ln215">    if (next_level_.block_to_add.is_ready) {</a>
+<a name="ln216">      return STATUS(IllegalState, &quot;MultiLevelIndexBuilder just flushed next level index block, but&quot;</a>
+<a name="ln217">          &quot; current level index block is ready to add for next level.&quot;);</a>
+<a name="ln218">    }</a>
+<a name="ln219">    next_level_.last_flushed_block_ = last_index_block_handle;</a>
+<a name="ln220">    next_level_.just_flushed = false;</a>
+<a name="ln221">  }</a>
+<a name="ln222">  if (flushing_indexes_) {</a>
+<a name="ln223">    // If ready - add last flushed current level index block to next level index.</a>
+<a name="ln224">    AddToNextLevelIfReady(&amp;next_level_.block_to_add, last_index_block_handle);</a>
+<a name="ln225">    if (next_level_index_builder_ &amp;&amp; next_level_index_builder_-&gt;ShouldFlush()) {</a>
+<a name="ln226">      // First flush next level index block for all previously flushed index blocks at this</a>
+<a name="ln227">      // level and only after that we will flush pending current level index block on subsequent</a>
+<a name="ln228">      // FlushNextBlock() call at this level.</a>
+<a name="ln229">      auto result = next_level_index_builder_-&gt;FlushNextBlock(</a>
+<a name="ln230">          index_blocks, next_level_.last_flushed_block_);</a>
+<a name="ln231">      RETURN_NOT_OK(result);</a>
+<a name="ln232">      next_level_.just_flushed = true;</a>
+<a name="ln233">      return result;</a>
+<a name="ln234">    }</a>
+<a name="ln235">  }</a>
+<a name="ln236">  flushing_indexes_ = true;</a>
+<a name="ln237">  if (current_level_block_.is_ready) {</a>
+<a name="ln238">    RETURN_NOT_OK(FlushCurrentLevel(index_blocks));</a>
+<a name="ln239">    if (!next_level_index_builder_ &amp;&amp; current_level_block_.has_next_block) {</a>
+<a name="ln240">      // We only need next level index builder if we plan to have more than one index entry at next</a>
+<a name="ln241">      // level, i.e. if we have next block at current level. Otherwise current level will be the top</a>
+<a name="ln242">      // level with single index block.</a>
+<a name="ln243">      next_level_index_builder_ = std::make_unique&lt;MultiLevelIndexBuilder&gt;(</a>
+<a name="ln244">          comparator_, table_opt_);</a>
+<a name="ln245">    }</a>
+<a name="ln246">    if (next_level_index_builder_) {</a>
+<a name="ln247">      // Postpone adding index entry for just flushed block for next FlushNextBlock() call, since</a>
+<a name="ln248">      // we need to have block handle to add it to next level index.</a>
+<a name="ln249">      next_level_.block_to_add = std::move(current_level_block_);</a>
+<a name="ln250">    }</a>
+<a name="ln251">    current_level_block_.is_ready = false;</a>
+<a name="ln252">    return true;</a>
+<a name="ln253">  } else if (!last_index_block_handle.IsSet()) {</a>
+<a name="ln254">    // It means this is the first call of FlushNextBlock() and no keys have been added to index,</a>
+<a name="ln255">    // which can only happen when we call FlushNextBlock() unconditionally during finishing of empty</a>
+<a name="ln256">    // SST file, so we need to produce an empty index.</a>
+<a name="ln257">    EnsureCurrentLevelIndexBuilderCreated();</a>
+<a name="ln258">    RETURN_NOT_OK(FlushCurrentLevel(index_blocks));</a>
+<a name="ln259">    return true;</a>
+<a name="ln260">  } else {</a>
+<a name="ln261">    return false;</a>
+<a name="ln262">  }</a>
+<a name="ln263">}</a>
+<a name="ln264"> </a>
+<a name="ln265">size_t MultiLevelIndexBuilder::EstimatedSize() const {</a>
+<a name="ln266">  // We subtract kBlockTrailerSize at the top level, because it will be added by</a>
+<a name="ln267">  // BlockBasedTableBuilder.</a>
+<a name="ln268">  return current_level_size_ +</a>
+<a name="ln269">      (next_level_index_builder_ ? next_level_index_builder_-&gt;EstimatedSize() : -kBlockTrailerSize);</a>
+<a name="ln270">}</a>
+<a name="ln271"> </a>
+<a name="ln272">int MultiLevelIndexBuilder::NumLevels() const {</a>
+<a name="ln273">  return 1 + (next_level_index_builder_ ? next_level_index_builder_-&gt;NumLevels() : 0);</a>
+<a name="ln274">}</a>
+<a name="ln275"> </a>
+<a name="ln276">} // namespace rocksdb</a>
+
+</code></pre>
+<div class="balloon" rel="48"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v779/" target="_blank">V779</a> Unreachable code detected. It is possible that an error is present.</p></div>
+<div class="balloon" rel="141"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="154"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="203"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

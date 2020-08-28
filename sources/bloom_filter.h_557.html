@@ -1,0 +1,309 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>bloom_filter.h</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32">#ifndef YB_UTIL_BLOOM_FILTER_H</a>
+<a name="ln33">#define YB_UTIL_BLOOM_FILTER_H</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &quot;yb/gutil/gscoped_ptr.h&quot;</a>
+<a name="ln36">#include &quot;yb/gutil/hash/city.h&quot;</a>
+<a name="ln37">#include &quot;yb/gutil/macros.h&quot;</a>
+<a name="ln38">#include &quot;yb/util/bitmap.h&quot;</a>
+<a name="ln39">#include &quot;yb/util/slice.h&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41">namespace yb {</a>
+<a name="ln42"> </a>
+<a name="ln43">// Probe calculated from a given key. This caches the calculated</a>
+<a name="ln44">// hash values which are necessary for probing into a Bloom Filter,</a>
+<a name="ln45">// so that when many bloom filters have to be consulted for a given</a>
+<a name="ln46">// key, we only need to calculate the hashes once.</a>
+<a name="ln47">//</a>
+<a name="ln48">// This is implemented based on the idea of double-hashing from the following paper:</a>
+<a name="ln49">//   &quot;Less Hashing, Same Performance: Building a Better Bloom Filter&quot;</a>
+<a name="ln50">//   Kirsch and Mitzenmacher, ESA 2006</a>
+<a name="ln51">//   http://www.eecs.harvard.edu/~kirsch/pubs/bbbf/esa06.pdf</a>
+<a name="ln52">//</a>
+<a name="ln53">// Currently, the implementation uses the 64-bit City Hash.</a>
+<a name="ln54">// TODO: an SSE CRC32 hash is probably ~20% faster. Come back to this</a>
+<a name="ln55">// at some point.</a>
+<a name="ln56">class BloomKeyProbe {</a>
+<a name="ln57"> public:</a>
+<a name="ln58">  // Default constructor - this is only used to instantiate an object</a>
+<a name="ln59">  // and later reassign by assignment from another instance</a>
+<a name="ln60">  BloomKeyProbe() {}</a>
+<a name="ln61"> </a>
+<a name="ln62">  // Construct a probe from the given key.</a>
+<a name="ln63">  //</a>
+<a name="ln64">  // NOTE: proper operation requires that the referenced memory remain</a>
+<a name="ln65">  // valid for the lifetime of this object.</a>
+<a name="ln66">  explicit BloomKeyProbe(const Slice &amp;key) : key_(key) {</a>
+<a name="ln67">    uint64_t h = util_hash::CityHash64(</a>
+<a name="ln68">      reinterpret_cast&lt;const char *&gt;(key.data()),</a>
+<a name="ln69">      key.size());</a>
+<a name="ln70"> </a>
+<a name="ln71">    // Use the top and bottom halves of the 64-bit hash</a>
+<a name="ln72">    // as the two independent hash functions for mixing.</a>
+<a name="ln73">    h_1_ = static_cast&lt;uint32&gt;(h);</a>
+<a name="ln74">    h_2_ = static_cast&lt;uint32&gt;(h &gt;&gt; 32);</a>
+<a name="ln75">  }</a>
+<a name="ln76"> </a>
+<a name="ln77">  const Slice &amp;key() const { return key_; }</a>
+<a name="ln78"> </a>
+<a name="ln79">  // The initial hash value. See MixHash() for usage example.</a>
+<a name="ln80">  uint32_t initial_hash() const {</a>
+<a name="ln81">    return h_1_;</a>
+<a name="ln82">  }</a>
+<a name="ln83"> </a>
+<a name="ln84">  // Mix the given hash function with the second calculated hash</a>
+<a name="ln85">  // value. A sequence of independent hashes can be calculated</a>
+<a name="ln86">  // by repeatedly calling MixHash() on its previous result.</a>
+<a name="ln87">  uint32_t MixHash(uint32_t h) const {</a>
+<a name="ln88">    return h + h_2_;</a>
+<a name="ln89">  }</a>
+<a name="ln90"> </a>
+<a name="ln91"> private:</a>
+<a name="ln92">  Slice key_;</a>
+<a name="ln93"> </a>
+<a name="ln94">  // The two hashes.</a>
+<a name="ln95">  uint32_t h_1_;</a>
+<a name="ln96">  uint32_t h_2_;</a>
+<a name="ln97">};</a>
+<a name="ln98"> </a>
+<a name="ln99">// Sizing parameters for the constructor to BloomFilterBuilder.</a>
+<a name="ln100">// This is simply to provide a nicer API than a bunch of overloaded</a>
+<a name="ln101">// constructors.</a>
+<a name="ln102">class BloomFilterSizing {</a>
+<a name="ln103"> public:</a>
+<a name="ln104">  // Size the bloom filter by a fixed size and false positive rate.</a>
+<a name="ln105">  //</a>
+<a name="ln106">  // Picks the number of entries to achieve the above.</a>
+<a name="ln107">  static BloomFilterSizing BySizeAndFPRate(size_t n_bytes, double fp_rate);</a>
+<a name="ln108"> </a>
+<a name="ln109">  // Size the bloom filer by an expected count and false positive rate.</a>
+<a name="ln110">  //</a>
+<a name="ln111">  // Picks the number of bytes to achieve the above.</a>
+<a name="ln112">  static BloomFilterSizing ByCountAndFPRate(size_t expected_count, double fp_rate);</a>
+<a name="ln113"> </a>
+<a name="ln114">  size_t n_bytes() const { return n_bytes_; }</a>
+<a name="ln115">  size_t expected_count() const { return expected_count_; }</a>
+<a name="ln116"> </a>
+<a name="ln117"> private:</a>
+<a name="ln118">  BloomFilterSizing(size_t n_bytes, size_t expected_count) :</a>
+<a name="ln119">    n_bytes_(n_bytes),</a>
+<a name="ln120">    expected_count_(expected_count)</a>
+<a name="ln121">  {}</a>
+<a name="ln122"> </a>
+<a name="ln123">  size_t n_bytes_;</a>
+<a name="ln124">  size_t expected_count_;</a>
+<a name="ln125">};</a>
+<a name="ln126"> </a>
+<a name="ln127"> </a>
+<a name="ln128">// Builder for a BloomFilter structure.</a>
+<a name="ln129">class BloomFilterBuilder {</a>
+<a name="ln130"> public:</a>
+<a name="ln131">  // Create a bloom filter.</a>
+<a name="ln132">  // See BloomFilterSizing static methods to specify this argument.</a>
+<a name="ln133">  explicit BloomFilterBuilder(const BloomFilterSizing &amp;sizing);</a>
+<a name="ln134"> </a>
+<a name="ln135">  // Clear all entries, reset insertion count.</a>
+<a name="ln136">  void Clear();</a>
+<a name="ln137"> </a>
+<a name="ln138">  // Add the given key to the bloom filter.</a>
+<a name="ln139">  void AddKey(const BloomKeyProbe &amp;probe);</a>
+<a name="ln140"> </a>
+<a name="ln141">  // Return an estimate of the false positive rate.</a>
+<a name="ln142">  double false_positive_rate() const;</a>
+<a name="ln143"> </a>
+<a name="ln144">  int n_bytes() const {</a>
+<a name="ln145">    return n_bits_ / 8;</a>
+<a name="ln146">  }</a>
+<a name="ln147"> </a>
+<a name="ln148">  int n_bits() const {</a>
+<a name="ln149">    return n_bits_;</a>
+<a name="ln150">  }</a>
+<a name="ln151"> </a>
+<a name="ln152">  // Return a slice view into this Bloom Filter, suitable for</a>
+<a name="ln153">  // writing out to a file.</a>
+<a name="ln154">  const Slice slice() const {</a>
+<a name="ln155">    return Slice(&amp;bitmap_[0], n_bytes());</a>
+<a name="ln156">  }</a>
+<a name="ln157"> </a>
+<a name="ln158">  // Return the number of hashes that are calculated for each entry</a>
+<a name="ln159">  // in the bloom filter.</a>
+<a name="ln160">  size_t n_hashes() const { return n_hashes_; }</a>
+<a name="ln161"> </a>
+<a name="ln162">  size_t expected_count() const { return expected_count_; }</a>
+<a name="ln163"> </a>
+<a name="ln164">  // Return the number of keys inserted.</a>
+<a name="ln165">  size_t count() const { return n_inserted_; }</a>
+<a name="ln166"> </a>
+<a name="ln167"> private:</a>
+<a name="ln168">  DISALLOW_COPY_AND_ASSIGN(BloomFilterBuilder);</a>
+<a name="ln169"> </a>
+<a name="ln170">  size_t n_bits_;</a>
+<a name="ln171">  gscoped_array&lt;uint8_t&gt; bitmap_;</a>
+<a name="ln172"> </a>
+<a name="ln173">  // The number of hash functions to compute.</a>
+<a name="ln174">  size_t n_hashes_;</a>
+<a name="ln175"> </a>
+<a name="ln176">  // The expected number of elements, for which the bloom is optimized.</a>
+<a name="ln177">  size_t expected_count_;</a>
+<a name="ln178"> </a>
+<a name="ln179">  // The number of elements inserted so far since the last Reset.</a>
+<a name="ln180">  size_t n_inserted_;</a>
+<a name="ln181">};</a>
+<a name="ln182"> </a>
+<a name="ln183"> </a>
+<a name="ln184">// Wrapper around a byte array for reading it as a bloom filter.</a>
+<a name="ln185">class BloomFilter {</a>
+<a name="ln186"> public:</a>
+<a name="ln187">  BloomFilter(const Slice &amp;data, size_t n_hashes);</a>
+<a name="ln188"> </a>
+<a name="ln189">  // Return true if the filter may contain the given key.</a>
+<a name="ln190">  bool MayContainKey(const BloomKeyProbe &amp;probe) const;</a>
+<a name="ln191"> </a>
+<a name="ln192"> private:</a>
+<a name="ln193">  friend class BloomFilterBuilder;</a>
+<a name="ln194">  static uint32_t PickBit(uint32_t hash, size_t n_bits);</a>
+<a name="ln195"> </a>
+<a name="ln196">  size_t n_bits_;</a>
+<a name="ln197">  const uint8_t *bitmap_;</a>
+<a name="ln198"> </a>
+<a name="ln199">  size_t n_hashes_;</a>
+<a name="ln200">};</a>
+<a name="ln201"> </a>
+<a name="ln202"> </a>
+<a name="ln203">////////////////////////////////////////////////////////////</a>
+<a name="ln204">// Inline implementations</a>
+<a name="ln205">////////////////////////////////////////////////////////////</a>
+<a name="ln206"> </a>
+<a name="ln207">inline uint32_t BloomFilter::PickBit(uint32_t hash, size_t n_bits) {</a>
+<a name="ln208">  switch (n_bits) {</a>
+<a name="ln209">    // Fast path for the default bloom filter block size. Bitwise math</a>
+<a name="ln210">    // is much faster than division.</a>
+<a name="ln211">    case 4096 * 8:</a>
+<a name="ln212">      return hash &amp; (n_bits - 1);</a>
+<a name="ln213"> </a>
+<a name="ln214">    default:</a>
+<a name="ln215">      return hash % n_bits;</a>
+<a name="ln216">  }</a>
+<a name="ln217">}</a>
+<a name="ln218"> </a>
+<a name="ln219">inline void BloomFilterBuilder::AddKey(const BloomKeyProbe &amp;probe) {</a>
+<a name="ln220">  uint32_t h = probe.initial_hash();</a>
+<a name="ln221">  for (size_t i = 0; i &lt; n_hashes_; i++) {</a>
+<a name="ln222">    uint32_t bitpos = BloomFilter::PickBit(h, n_bits_);</a>
+<a name="ln223">    BitmapSet(&amp;bitmap_[0], bitpos);</a>
+<a name="ln224">    h = probe.MixHash(h);</a>
+<a name="ln225">  }</a>
+<a name="ln226">  n_inserted_++;</a>
+<a name="ln227">}</a>
+<a name="ln228"> </a>
+<a name="ln229">inline bool BloomFilter::MayContainKey(const BloomKeyProbe &amp;probe) const {</a>
+<a name="ln230">  uint32_t h = probe.initial_hash();</a>
+<a name="ln231"> </a>
+<a name="ln232">  // Basic unrolling by 2s gives a small benefit here since the two bit positions</a>
+<a name="ln233">  // can be calculated in parallel -- it's a 50% chance that the first will be</a>
+<a name="ln234">  // set even if it's a bloom miss, in which case we can parallelize the load.</a>
+<a name="ln235">  int rem_hashes = n_hashes_;</a>
+<a name="ln236">  while (rem_hashes &gt;= 2) {</a>
+<a name="ln237">    uint32_t bitpos1 = PickBit(h, n_bits_);</a>
+<a name="ln238">    h = probe.MixHash(h);</a>
+<a name="ln239">    uint32_t bitpos2 = PickBit(h, n_bits_);</a>
+<a name="ln240">    h = probe.MixHash(h);</a>
+<a name="ln241"> </a>
+<a name="ln242">    if (!BitmapTest(&amp;bitmap_[0], bitpos1) ||</a>
+<a name="ln243">        !BitmapTest(&amp;bitmap_[0], bitpos2)) {</a>
+<a name="ln244">      return false;</a>
+<a name="ln245">    }</a>
+<a name="ln246"> </a>
+<a name="ln247">    rem_hashes -= 2;</a>
+<a name="ln248">  }</a>
+<a name="ln249"> </a>
+<a name="ln250">  while (rem_hashes) {</a>
+<a name="ln251">    uint32_t bitpos = PickBit(h, n_bits_);</a>
+<a name="ln252">    if (!BitmapTest(&amp;bitmap_[0], bitpos)) {</a>
+<a name="ln253">      return false;</a>
+<a name="ln254">    }</a>
+<a name="ln255">    h = probe.MixHash(h);</a>
+<a name="ln256">    rem_hashes--;</a>
+<a name="ln257">  }</a>
+<a name="ln258">  return true;</a>
+<a name="ln259">}</a>
+<a name="ln260"> </a>
+<a name="ln261">} // namespace yb</a>
+<a name="ln262"> </a>
+<a name="ln263">#endif</a>
+
+</code></pre>
+<div class="balloon" rel="60"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: h_1_, h_2_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

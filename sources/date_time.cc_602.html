@@ -1,0 +1,498 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>date_time.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15">// DateTime parser and serializer</a>
+<a name="ln16">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;unicode/gregocal.h&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &lt;regex&gt;</a>
+<a name="ln21">#include &lt;ctime&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln24">#include &quot;yb/util/date_time.h&quot;</a>
+<a name="ln25">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln26">#include &quot;boost/date_time/gregorian/gregorian.hpp&quot;</a>
+<a name="ln27">#include &quot;boost/date_time/c_local_time_adjustor.hpp&quot;</a>
+<a name="ln28">#include &quot;boost/date_time/local_time/local_time.hpp&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">using std::locale;</a>
+<a name="ln31">using std::vector;</a>
+<a name="ln32">using std::string;</a>
+<a name="ln33">using std::regex;</a>
+<a name="ln34">using icu::GregorianCalendar;</a>
+<a name="ln35">using icu::TimeZone;</a>
+<a name="ln36">using icu::UnicodeString;</a>
+<a name="ln37">using boost::gregorian::date;</a>
+<a name="ln38">using boost::local_time::local_date_time;</a>
+<a name="ln39">using boost::local_time::local_time_facet;</a>
+<a name="ln40">using boost::local_time::local_microsec_clock;</a>
+<a name="ln41">using boost::local_time::posix_time_zone;</a>
+<a name="ln42">using boost::local_time::time_zone_ptr;</a>
+<a name="ln43">using boost::posix_time::ptime;</a>
+<a name="ln44">using boost::posix_time::microseconds;</a>
+<a name="ln45">using boost::posix_time::time_duration;</a>
+<a name="ln46">using boost::posix_time::microsec_clock;</a>
+<a name="ln47">using boost::posix_time::milliseconds;</a>
+<a name="ln48"> </a>
+<a name="ln49">DEFINE_bool(use_icu_timezones, true, &quot;Use the new ICU library for timezones instead of boost&quot;);</a>
+<a name="ln50"> </a>
+<a name="ln51">namespace yb {</a>
+<a name="ln52"> </a>
+<a name="ln53">namespace {</a>
+<a name="ln54"> </a>
+<a name="ln55">// UTC timezone.</a>
+<a name="ln56">static const time_zone_ptr kUtcTimezone(new posix_time_zone(&quot;UTC&quot;));</a>
+<a name="ln57"> </a>
+<a name="ln58">// Unix epoch (time_t 0) at UTC.</a>
+<a name="ln59">static const local_date_time kEpoch(boost::posix_time::from_time_t(0), kUtcTimezone);</a>
+<a name="ln60"> </a>
+<a name="ln61">// Date offset of Unix epoch (2^31).</a>
+<a name="ln62">static constexpr uint32_t kEpochDateOffset = 1&lt;&lt;31;</a>
+<a name="ln63"> </a>
+<a name="ln64">// Day in milli- and micro-seconds.</a>
+<a name="ln65">static constexpr int64_t kDayInMilliSeconds = 24 * 60 * 60 * 1000L;</a>
+<a name="ln66">static constexpr int64_t kDayInMicroSeconds = kDayInMilliSeconds * 1000L;</a>
+<a name="ln67"> </a>
+<a name="ln68">Timestamp ToTimestamp(const local_date_time&amp; t) {</a>
+<a name="ln69">  return Timestamp((t - kEpoch).total_microseconds());</a>
+<a name="ln70">}</a>
+<a name="ln71"> </a>
+<a name="ln72">Result&lt;uint32_t&gt; ToDate(const int64_t days_since_epoch) {</a>
+<a name="ln73">  const int64_t date = days_since_epoch + kEpochDateOffset;</a>
+<a name="ln74">  if (date &lt; std::numeric_limits&lt;uint32_t&gt;::min() || date &gt; std::numeric_limits&lt;uint32_t&gt;::max()) {</a>
+<a name="ln75">    return STATUS(InvalidArgument, &quot;Invalid date&quot;);</a>
+<a name="ln76">  }</a>
+<a name="ln77">  return date;</a>
+<a name="ln78">}</a>
+<a name="ln79"> </a>
+<a name="ln80">Result&lt;GregorianCalendar&gt; CreateCalendar() {</a>
+<a name="ln81">  UErrorCode status = U_ZERO_ERROR;</a>
+<a name="ln82">  GregorianCalendar cal(*TimeZone::getGMT(), status);</a>
+<a name="ln83">  if (U_FAILURE(status)) {</a>
+<a name="ln84">    return STATUS(InvalidArgument, &quot;Failed to create Gregorian calendar&quot;, u_errorName(status));</a>
+<a name="ln85">  }</a>
+<a name="ln86">  cal.setGregorianChange(U_DATE_MIN, status);</a>
+<a name="ln87">  if (U_FAILURE(status)) {</a>
+<a name="ln88">    return STATUS(InvalidArgument, &quot;Failed to set Gregorian change&quot;, u_errorName(status));</a>
+<a name="ln89">  }</a>
+<a name="ln90">  cal.setLenient(FALSE);</a>
+<a name="ln91">  cal.clear();</a>
+<a name="ln92">  return cal;</a>
+<a name="ln93">}</a>
+<a name="ln94"> </a>
+<a name="ln95">// Get system (local) time zone.</a>
+<a name="ln96">string GetSystemTimezone() {</a>
+<a name="ln97">  // Get system timezone by getting current UTC time, converting to local time and computing the</a>
+<a name="ln98">  // offset.</a>
+<a name="ln99">  const ptime utc_time = microsec_clock::universal_time();</a>
+<a name="ln100">  const ptime local_time = boost::date_time::c_local_adjustor&lt;ptime&gt;::utc_to_local(utc_time);</a>
+<a name="ln101">  const time_duration offset = local_time - utc_time;</a>
+<a name="ln102">  const int hours = offset.hours();</a>
+<a name="ln103">  const int minutes = offset.minutes();</a>
+<a name="ln104">  char buffer[7]; // &quot;+HH:MM&quot; or &quot;-HH:MM&quot;</a>
+<a name="ln105">  const int result = snprintf(buffer, sizeof(buffer), &quot;%+2.2d:%2.2d&quot;, hours, minutes);</a>
+<a name="ln106">  CHECK(result &gt; 0 &amp;&amp; result &lt; sizeof(buffer)) &lt;&lt; &quot;Unexpected snprintf result: &quot; &lt;&lt; result;</a>
+<a name="ln107">  return buffer;</a>
+<a name="ln108">}</a>
+<a name="ln109"> </a>
+<a name="ln110">/* Subset of supported Timezone formats https://docs.oracle.com/cd/E51711_01/DR/ICU_Time_Zones.html</a>
+<a name="ln111"> * Full database can be found at https://www.iana.org/time-zones</a>
+<a name="ln112"> * We support everything that Cassandra supports, like z/Z, +/-0800, +/-08:30 GMT+/-[0]7:00,</a>
+<a name="ln113"> * and we also support UTC+/-[0]9:30 which Cassandra does not support</a>
+<a name="ln114"> */</a>
+<a name="ln115">Result&lt;string&gt; GetTimezone(string timezoneID) {</a>
+<a name="ln116">  /* Parse timezone offset from string in most formats of timezones</a>
+<a name="ln117">   * Some formats are supported by ICU and some different ones by Boost::PosixTime</a>
+<a name="ln118">   * To capture both, return posix supported directly, and for ICU, create ICU Timezone and then</a>
+<a name="ln119">   * convert to a supported Posix format.</a>
+<a name="ln120">   */</a>
+<a name="ln121">  // [+/-]0830 is not supported by ICU TimeZone or Posixtime so need to do some extra work</a>
+<a name="ln122">  std::smatch m;</a>
+<a name="ln123">  std::regex rgx = regex(&quot;(?:\\+|-)(\\d{2})(\\d{2})&quot;);</a>
+<a name="ln124">  if (timezoneID.empty()) {</a>
+<a name="ln125">    return GetSystemTimezone();</a>
+<a name="ln126">  } else if (timezoneID == &quot;z&quot; || timezoneID == &quot;Z&quot;) {</a>
+<a name="ln127">    timezoneID = &quot;GMT&quot;;</a>
+<a name="ln128">  } else if (std::regex_match(timezoneID, m , rgx)) {</a>
+<a name="ln129">    return m.str(1) + &quot;:&quot; + m.str(2);</a>
+<a name="ln130">  } else if (timezoneID.at(0) == '+' || timezoneID.at(0) == '-' ||</a>
+<a name="ln131">             timezoneID.substr(0, 3) == &quot;UTC&quot;) {</a>
+<a name="ln132">    return timezoneID;</a>
+<a name="ln133">  }</a>
+<a name="ln134">  std::unique_ptr&lt;TimeZone&gt; tzone(TimeZone::createTimeZone(timezoneID.c_str()));</a>
+<a name="ln135">  UnicodeString id;</a>
+<a name="ln136">  tzone-&gt;getID(id);</a>
+<a name="ln137">  string timezone;</a>
+<a name="ln138">  id.toUTF8String(timezone);</a>
+<a name="ln139">  if (*tzone == TimeZone::getUnknown()) {</a>
+<a name="ln140">    return STATUS(InvalidArgument, &quot;Invalid Timezone: &quot; + timezoneID +</a>
+<a name="ln141">        &quot;\nUse standardized timezone such as \&quot;America/New_York\&quot; or offset such as UTC-07:00.&quot;);</a>
+<a name="ln142">  }</a>
+<a name="ln143">  time_duration td = milliseconds(tzone-&gt;getRawOffset());</a>
+<a name="ln144">  const int hours = td.hours();</a>
+<a name="ln145">  const int minutes = td.minutes();</a>
+<a name="ln146">  char buffer[7]; // &quot;+HH:MM&quot; or &quot;-HH:MM&quot;</a>
+<a name="ln147">  const int result = snprintf(buffer, sizeof(buffer), &quot;%+2.2d:%2.2d&quot;, hours, abs(minutes));</a>
+<a name="ln148">  if (result &lt;= 0 || result &gt;= sizeof(buffer)) {</a>
+<a name="ln149">    return STATUS(Corruption, &quot;Parsing timezone into timezone offset string failed&quot;);</a>
+<a name="ln150">  }</a>
+<a name="ln151">  return buffer;</a>
+<a name="ln152">}</a>
+<a name="ln153"> </a>
+<a name="ln154">} // namespace</a>
+<a name="ln155"> </a>
+<a name="ln156">//------------------------------------------------------------------------------------------------</a>
+<a name="ln157">Result&lt;Timestamp&gt; DateTime::TimestampFromString(const string&amp; str,</a>
+<a name="ln158">                                                const InputFormat&amp; input_format) {</a>
+<a name="ln159">  std::smatch m;</a>
+<a name="ln160">  // trying first regex to match from the format</a>
+<a name="ln161">  for (const auto&amp; reg : input_format.regexes) {</a>
+<a name="ln162">    if (std::regex_match(str, m, reg)) {</a>
+<a name="ln163">      // setting default values where missing</a>
+<a name="ln164">      const int year = stoi(m.str(1));</a>
+<a name="ln165">      const int month = stoi(m.str(2));</a>
+<a name="ln166">      const int day = stoi(m.str(3));</a>
+<a name="ln167">      const int hours = m.str(4).empty() ? 0 : stoi(m.str(4));</a>
+<a name="ln168">      const int minutes = m.str(5).empty() ? 0 : stoi(m.str(5));</a>
+<a name="ln169">      const int seconds = m.str(6).empty() ? 0 : stoi(m.str(6));</a>
+<a name="ln170">      int64_t frac = m.str(7).empty() ? 0 : stoi(m.str(7));</a>
+<a name="ln171">      frac = AdjustPrecision(frac, m.str(7).size(), time_duration::num_fractional_digits());</a>
+<a name="ln172">      // constructing date_time and getting difference from epoch to set as Timestamp value</a>
+<a name="ln173">      try {</a>
+<a name="ln174">        const date d(year, month, day);</a>
+<a name="ln175">        const time_duration t(hours, minutes, seconds, frac);</a>
+<a name="ln176">        posix_time_zone *ptz;</a>
+<a name="ln177">        if (FLAGS_use_icu_timezones) {</a>
+<a name="ln178">          ptz = new posix_time_zone(VERIFY_RESULT(GetTimezone(m.str(8))));</a>
+<a name="ln179">        } else {</a>
+<a name="ln180">          ptz = new posix_time_zone(m.str(8).empty() ? GetSystemTimezone()</a>
+<a name="ln181">            : m.str(8));</a>
+<a name="ln182">        }</a>
+<a name="ln183">        const time_zone_ptr tz(ptz);</a>
+<a name="ln184">        return ToTimestamp(local_date_time(d, t, tz, local_date_time::NOT_DATE_TIME_ON_ERROR));</a>
+<a name="ln185">      } catch (std::exception&amp; e) {</a>
+<a name="ln186">        return STATUS(InvalidArgument, &quot;Invalid timestamp&quot;, e.what());</a>
+<a name="ln187">      }</a>
+<a name="ln188">    }</a>
+<a name="ln189">  }</a>
+<a name="ln190">  return STATUS(InvalidArgument, &quot;Invalid timestamp&quot;, &quot;Wrong format of input string&quot;);</a>
+<a name="ln191">}</a>
+<a name="ln192"> </a>
+<a name="ln193">Timestamp DateTime::TimestampFromInt(const int64_t val, const InputFormat&amp; input_format) {</a>
+<a name="ln194">  return Timestamp(AdjustPrecision(val, input_format.input_precision, kInternalPrecision));</a>
+<a name="ln195">}</a>
+<a name="ln196"> </a>
+<a name="ln197">string DateTime::TimestampToString(const Timestamp timestamp, const OutputFormat&amp; output_format) {</a>
+<a name="ln198">  std::ostringstream ss;</a>
+<a name="ln199">  ss.imbue(output_format.output_locale);</a>
+<a name="ln200">  try {</a>
+<a name="ln201">    ss &lt;&lt; (kEpoch + microseconds(timestamp.value()));</a>
+<a name="ln202">  } catch (...) {</a>
+<a name="ln203">    // If we cannot produce a valid date, default to showing the exact timestamp value.</a>
+<a name="ln204">    // This can happen if timestamp value is outside the standard year range (1400..10000).</a>
+<a name="ln205">    ss &lt;&lt; timestamp.value();</a>
+<a name="ln206">  }</a>
+<a name="ln207">  return ss.str();</a>
+<a name="ln208">}</a>
+<a name="ln209"> </a>
+<a name="ln210">Timestamp DateTime::TimestampNow() {</a>
+<a name="ln211">  return ToTimestamp(local_microsec_clock::local_time(kUtcTimezone));</a>
+<a name="ln212">}</a>
+<a name="ln213"> </a>
+<a name="ln214">//------------------------------------------------------------------------------------------------</a>
+<a name="ln215">Result&lt;uint32_t&gt; DateTime::DateFromString(const std::string&amp; str) {</a>
+<a name="ln216">  // Regex for date format &quot;yyyy-mm-dd&quot;</a>
+<a name="ln217">  static const regex date_format(&quot;(-?\\d{1,7})-(\\d{1,2})-(\\d{1,2})&quot;);</a>
+<a name="ln218">  std::smatch m;</a>
+<a name="ln219">  if (!std::regex_match(str, m, date_format)) {</a>
+<a name="ln220">    return STATUS(InvalidArgument, &quot;Invalid date format&quot;);</a>
+<a name="ln221">  }</a>
+<a name="ln222">  const int year = stoi(m.str(1));</a>
+<a name="ln223">  const int month = stoi(m.str(2));</a>
+<a name="ln224">  const int day = stoi(m.str(3));</a>
+<a name="ln225">  if (month &lt; 1 || month &gt; 12) {</a>
+<a name="ln226">    return STATUS(InvalidArgument, &quot;Invalid month&quot;);</a>
+<a name="ln227">  }</a>
+<a name="ln228">  if (day &lt; 1 || day &gt; 31) {</a>
+<a name="ln229">    return STATUS(InvalidArgument, &quot;Invalid day of month&quot;);</a>
+<a name="ln230">  }</a>
+<a name="ln231">  const auto cal_era = (year &lt;= 0) ? GregorianCalendar::EEras::BC : GregorianCalendar::EEras::AD;</a>
+<a name="ln232">  const int cal_year = (year &lt;= 0) ? -year + 1 : year;</a>
+<a name="ln233">  GregorianCalendar cal = VERIFY_RESULT(CreateCalendar());</a>
+<a name="ln234">  cal.set(UCAL_ERA, cal_era);</a>
+<a name="ln235">  cal.set(cal_year, month - 1, day);</a>
+<a name="ln236">  UErrorCode status = U_ZERO_ERROR;</a>
+<a name="ln237">  const int64_t ms_since_epoch = cal.getTime(status);</a>
+<a name="ln238">  if (U_FAILURE(status)) {</a>
+<a name="ln239">    return STATUS(InvalidArgument, &quot;Failed to get time&quot;, u_errorName(status));</a>
+<a name="ln240">  }</a>
+<a name="ln241">  return ToDate(ms_since_epoch / kDayInMilliSeconds);</a>
+<a name="ln242">}</a>
+<a name="ln243"> </a>
+<a name="ln244">Result&lt;uint32_t&gt; DateTime::DateFromTimestamp(const Timestamp timestamp) {</a>
+<a name="ln245">  return ToDate(timestamp.ToInt64() / kDayInMicroSeconds);</a>
+<a name="ln246">}</a>
+<a name="ln247"> </a>
+<a name="ln248">Result&lt;uint32_t&gt; DateTime::DateFromUnixTimestamp(const int64_t unix_timestamp) {</a>
+<a name="ln249">  return ToDate(unix_timestamp / kDayInMilliSeconds);</a>
+<a name="ln250">}</a>
+<a name="ln251"> </a>
+<a name="ln252">Result&lt;string&gt; DateTime::DateToString(const uint32_t date) {</a>
+<a name="ln253">  GregorianCalendar cal = VERIFY_RESULT(CreateCalendar());</a>
+<a name="ln254">  UErrorCode status = U_ZERO_ERROR;</a>
+<a name="ln255">  cal.setTime(DateToUnixTimestamp(date), status);</a>
+<a name="ln256">  if (U_FAILURE(status)) {</a>
+<a name="ln257">    return STATUS(InvalidArgument, &quot;Failed to set time&quot;, u_errorName(status));</a>
+<a name="ln258">  }</a>
+<a name="ln259">  const int year  = cal.get(UCAL_ERA, status) == GregorianCalendar::EEras::BC ?</a>
+<a name="ln260">                    -(cal.get(UCAL_YEAR, status) - 1) : cal.get(UCAL_YEAR, status);</a>
+<a name="ln261">  const int month = cal.get(UCAL_MONTH, status) + 1;</a>
+<a name="ln262">  const int day   = cal.get(UCAL_DATE, status);</a>
+<a name="ln263">  if (U_FAILURE(status)) {</a>
+<a name="ln264">    return STATUS(InvalidArgument, &quot;Failed to get date&quot;, u_errorName(status));</a>
+<a name="ln265">  }</a>
+<a name="ln266">  char buffer[15]; // Between &quot;-5877641-06-23&quot; and &quot;5881580-07-11&quot;.</a>
+<a name="ln267">  const int result = snprintf(buffer, sizeof(buffer), &quot;%d-%2.2d-%2.2d&quot;, year, month, day);</a>
+<a name="ln268">  CHECK(result &gt; 0 &amp;&amp; result &lt; sizeof(buffer)) &lt;&lt; &quot;Unexpected snprintf result: &quot; &lt;&lt; result;</a>
+<a name="ln269">  return buffer;</a>
+<a name="ln270">}</a>
+<a name="ln271"> </a>
+<a name="ln272">Timestamp DateTime::DateToTimestamp(uint32_t date) {</a>
+<a name="ln273">  return Timestamp((static_cast&lt;int64_t&gt;(date) - kEpochDateOffset) * kDayInMicroSeconds);</a>
+<a name="ln274">}</a>
+<a name="ln275"> </a>
+<a name="ln276">int64_t DateTime::DateToUnixTimestamp(uint32_t date) {</a>
+<a name="ln277">  return (static_cast&lt;int64_t&gt;(date) - kEpochDateOffset) * kDayInMilliSeconds;</a>
+<a name="ln278">}</a>
+<a name="ln279"> </a>
+<a name="ln280">uint32_t DateTime::DateNow() {</a>
+<a name="ln281">  return TimestampNow().ToInt64() / kDayInMicroSeconds + kEpochDateOffset;</a>
+<a name="ln282">}</a>
+<a name="ln283"> </a>
+<a name="ln284">//------------------------------------------------------------------------------------------------</a>
+<a name="ln285">Result&lt;int64_t&gt; DateTime::TimeFromString(const std::string&amp; str) {</a>
+<a name="ln286">  // Regex for time format &quot;hh:mm:ss[.fffffffff]&quot;</a>
+<a name="ln287">  static const regex time_format(&quot;(\\d{1,2}):(\\d{1,2}):(\\d{1,2})(\\.(\\d{0,9}))?&quot;);</a>
+<a name="ln288">  std::smatch m;</a>
+<a name="ln289">  if (!std::regex_match(str, m, time_format)) {</a>
+<a name="ln290">    return STATUS(InvalidArgument, &quot;Invalid time format&quot;);</a>
+<a name="ln291">  }</a>
+<a name="ln292">  const int64_t hour = stoi(m.str(1));</a>
+<a name="ln293">  const int64_t minute = stoi(m.str(2));</a>
+<a name="ln294">  const int64_t second = stoi(m.str(3));</a>
+<a name="ln295">  const int64_t nano_sec = m.str(5).empty() ? 0 : (stoi(m.str(5)) * pow(10, 9 - m.str(5).size()));</a>
+<a name="ln296">  if (hour &lt; 0 || hour &gt; 23) {</a>
+<a name="ln297">    return STATUS(InvalidArgument, &quot;Invalid hour&quot;);</a>
+<a name="ln298">  }</a>
+<a name="ln299">  if (minute &lt; 0 || minute &gt; 59) {</a>
+<a name="ln300">    return STATUS(InvalidArgument, &quot;Invalid minute&quot;);</a>
+<a name="ln301">  }</a>
+<a name="ln302">  if (second &lt; 0 || second &gt; 59) {</a>
+<a name="ln303">    return STATUS(InvalidArgument, &quot;Invalid second&quot;);</a>
+<a name="ln304">  }</a>
+<a name="ln305">  return ((hour * 60 + minute) * 60 + second) * 1000000000 + nano_sec;</a>
+<a name="ln306">}</a>
+<a name="ln307"> </a>
+<a name="ln308">Result&lt;string&gt; DateTime::TimeToString(int64_t time) {</a>
+<a name="ln309">  if (time &lt; 0) {</a>
+<a name="ln310">    return STATUS(InvalidArgument, &quot;Invalid time&quot;);</a>
+<a name="ln311">  }</a>
+<a name="ln312">  const int nano_sec = time % 1000000000; time /= 1000000000;</a>
+<a name="ln313">  const int second = time % 60; time /= 60;</a>
+<a name="ln314">  const int minute = time % 60; time /= 60;</a>
+<a name="ln315">  const int hour = time;</a>
+<a name="ln316">  if (hour &gt; 23) {</a>
+<a name="ln317">    return STATUS(InvalidArgument, &quot;Invalid hour&quot;);</a>
+<a name="ln318">  }</a>
+<a name="ln319">  char buffer[19]; // &quot;hh:mm:ss[.fffffffff]&quot;</a>
+<a name="ln320">  const int result = snprintf(buffer, sizeof(buffer), &quot;%2.2d:%2.2d:%2.2d.%9.9d&quot;,</a>
+<a name="ln321">                              hour, minute, second, nano_sec);</a>
+<a name="ln322">  CHECK(result &gt; 0 &amp;&amp; result &lt; sizeof(buffer)) &lt;&lt; &quot;Unexpected snprintf result: &quot; &lt;&lt; result;</a>
+<a name="ln323">  return buffer;</a>
+<a name="ln324">}</a>
+<a name="ln325"> </a>
+<a name="ln326">int64_t DateTime::TimeNow() {</a>
+<a name="ln327">  return (TimestampNow().ToInt64() % kDayInMicroSeconds) * 1000;</a>
+<a name="ln328">}</a>
+<a name="ln329"> </a>
+<a name="ln330">//------------------------------------------------------------------------------------------------</a>
+<a name="ln331">int64_t DateTime::AdjustPrecision(int64_t val,</a>
+<a name="ln332">                                  int input_precision,</a>
+<a name="ln333">                                  const int output_precision) {</a>
+<a name="ln334">  while (input_precision &lt; output_precision) {</a>
+<a name="ln335">    // In case of overflow we just return max/min values -- this is needed for correctness of</a>
+<a name="ln336">    // comparison operations and is similar to Cassandra behaviour.</a>
+<a name="ln337">    if (val &gt; (INT64_MAX / 10)) return INT64_MAX;</a>
+<a name="ln338">    if (val &lt; (INT64_MIN / 10)) return INT64_MIN;</a>
+<a name="ln339"> </a>
+<a name="ln340">    val *= 10;</a>
+<a name="ln341">    input_precision += 1;</a>
+<a name="ln342">  }</a>
+<a name="ln343">  while (input_precision &gt; output_precision) {</a>
+<a name="ln344">    val /= 10;</a>
+<a name="ln345">    input_precision -= 1;</a>
+<a name="ln346">  }</a>
+<a name="ln347">  return val;</a>
+<a name="ln348">}</a>
+<a name="ln349"> </a>
+<a name="ln350">const DateTime::InputFormat DateTime::CqlInputFormat = []() -&gt; InputFormat {</a>
+<a name="ln351">  // declaring format components used to construct regexes below</a>
+<a name="ln352">  string fmt_empty = &quot;()&quot;;</a>
+<a name="ln353">  string date_fmt = &quot;(\\d{4})-(\\d{1,2})-(\\d{1,2})&quot;;</a>
+<a name="ln354">  string time_fmt = &quot;(\\d{1,2}):(\\d{1,2}):(\\d{1,2})&quot;;</a>
+<a name="ln355">  string time_fmt_no_sec = &quot;(\\d{1,2}):(\\d{1,2})&quot; + fmt_empty;</a>
+<a name="ln356">  string time_empty = fmt_empty + fmt_empty + fmt_empty;</a>
+<a name="ln357">  string frac_fmt = &quot;\\.(\\d{1,3})&quot;;</a>
+<a name="ln358">  // Offset, i.e. +/-xx:xx, +/-0000, timezone parser will do additional checking.</a>
+<a name="ln359">  string tzX_fmt = &quot;((?:\\+|-)\\d{2}:?\\d{2})&quot;;</a>
+<a name="ln360">  // Zulu Timezone e.g allows user to just add z or Z at the end with no space in front to indicate</a>
+<a name="ln361">  // Zulu Time which is equivlent to GMT/UTC.</a>
+<a name="ln362">  string tzY_fmt = &quot;([zZ])&quot;;</a>
+<a name="ln363">  // Timezone name, abbreviation, or offset (preceded by space), e.g. PDT, UDT+/-xx:xx, etc..</a>
+<a name="ln364">  // At this point this allows anything that starts with a letter or '+' (after space), and leaves</a>
+<a name="ln365">  // further processing to the timezone parser.</a>
+<a name="ln366">  string tzZ_fmt = &quot; ([a-zA-Z\\+].+)&quot;;</a>
+<a name="ln367"> </a>
+<a name="ln368">  // These cases match the valid Cassandra input formats</a>
+<a name="ln369">  vector&lt;std::regex&gt; regexes {</a>
+<a name="ln370">      // e.g. &quot;1992-06-04 12:30&quot; or &quot;1992-6-4 12:30&quot;</a>
+<a name="ln371">      regex(date_fmt + &quot; &quot; + time_fmt_no_sec + fmt_empty + fmt_empty),</a>
+<a name="ln372">      // e.g. &quot;1992-06-04 12:30+04:00&quot; or &quot;1992-6-4 12:30-04:30&quot;</a>
+<a name="ln373">      regex(date_fmt + &quot; &quot; + time_fmt_no_sec + fmt_empty + tzX_fmt),</a>
+<a name="ln374">      // e.g. &quot;1992-06-04 12:30 UTCz&quot; or &quot;1992-6-4 12:30Z&quot;</a>
+<a name="ln375">      regex(date_fmt + &quot; &quot; + time_fmt_no_sec + fmt_empty + tzY_fmt),</a>
+<a name="ln376">      // e.g. &quot;1992-06-04 12:30 UTC+04:00&quot; or &quot;1992-6-4 12:30 UTC-04:30&quot;</a>
+<a name="ln377">      regex(date_fmt + &quot; &quot; + time_fmt_no_sec + fmt_empty + tzZ_fmt),</a>
+<a name="ln378">      // e.g. &quot;1992-06-04 12:30.321&quot; or &quot;1992-6-4 12:30.12&quot;</a>
+<a name="ln379">      regex(date_fmt + &quot; &quot; + time_fmt_no_sec + frac_fmt + fmt_empty),</a>
+<a name="ln380">      // e.g. &quot;1992-06-04 12:30.321+04:00&quot; or &quot;1992-6-4 12:30.12-04:30&quot;</a>
+<a name="ln381">      regex(date_fmt + &quot; &quot; + time_fmt_no_sec + frac_fmt + tzX_fmt),</a>
+<a name="ln382">      // e.g. &quot;1992-06-04 12:30.321z&quot; or &quot;1992-6-4 12:30.12Z&quot;</a>
+<a name="ln383">      regex(date_fmt + &quot; &quot; + time_fmt_no_sec + frac_fmt + tzY_fmt),</a>
+<a name="ln384">      // e.g. &quot;1992-06-04 12:30.321 UTC+04:00&quot; or &quot;1992-6-4 12:30.12 UTC-04:30&quot;</a>
+<a name="ln385">      regex(date_fmt + &quot; &quot; + time_fmt_no_sec + frac_fmt + tzZ_fmt),</a>
+<a name="ln386">      // e.g. &quot;1992-06-04 12:30:45&quot; or &quot;1992-6-4 12:30:45&quot;</a>
+<a name="ln387">      regex(date_fmt + &quot; &quot; + time_fmt + fmt_empty + fmt_empty),</a>
+<a name="ln388">      // e.g. &quot;1992-06-04 12:30:45+04:00&quot; or &quot;1992-6-4 12:30:45-04:30&quot;</a>
+<a name="ln389">      regex(date_fmt + &quot; &quot; + time_fmt + fmt_empty + tzX_fmt),</a>
+<a name="ln390">      // e.g. &quot;1992-06-04 12:30:45z&quot; or &quot;1992-6-4 12:30:45Z&quot;</a>
+<a name="ln391">      regex(date_fmt + &quot; &quot; + time_fmt + fmt_empty + tzY_fmt),</a>
+<a name="ln392">      // e.g. &quot;1992-06-04 12:30:45 UTC+04:00&quot; or &quot;1992-6-4 12:30:45 UTC-04:30&quot;</a>
+<a name="ln393">      regex(date_fmt + &quot; &quot; + time_fmt + fmt_empty + tzZ_fmt),</a>
+<a name="ln394">      // e.g. &quot;1992-06-04 12:30:45.321&quot; or &quot;1992-6-4 12:30:45.12&quot;</a>
+<a name="ln395">      regex(date_fmt + &quot; &quot; + time_fmt + frac_fmt + fmt_empty),</a>
+<a name="ln396">      // e.g. &quot;1992-06-04 12:30:45.321+04:00&quot; or &quot;1992-6-4 12:30:45.12-04:30&quot;</a>
+<a name="ln397">      regex(date_fmt + &quot; &quot; + time_fmt + frac_fmt + tzX_fmt),</a>
+<a name="ln398">      // e.g. &quot;1992-06-04 12:30:45.321z&quot; or &quot;1992-6-4 12:30:45.12Z&quot;</a>
+<a name="ln399">      regex(date_fmt + &quot; &quot; + time_fmt + frac_fmt + tzY_fmt),</a>
+<a name="ln400">      // e.g. &quot;1992-06-04 12:30:45.321 UTC+04:00&quot; or &quot;1992-6-4 12:30:45.12 UTC-04:30&quot;</a>
+<a name="ln401">      regex(date_fmt + &quot; &quot; + time_fmt + frac_fmt + tzZ_fmt),</a>
+<a name="ln402">      // e.g. &quot;1992-06-04T12:30&quot; or &quot;1992-6-4T12:30&quot;</a>
+<a name="ln403">      regex(date_fmt + &quot;T&quot; + time_fmt_no_sec + fmt_empty + fmt_empty),</a>
+<a name="ln404">      // e.g. &quot;1992-06-04T12:30+04:00&quot; or &quot;1992-6-4T12:30-04:30&quot;</a>
+<a name="ln405">      regex(date_fmt + &quot;T&quot; + time_fmt_no_sec + fmt_empty + tzX_fmt),</a>
+<a name="ln406">      // e.g. &quot;1992-06-04T12:30z&quot; or &quot;1992-6-4T12:30TZ&quot;</a>
+<a name="ln407">      regex(date_fmt + &quot;T&quot; + time_fmt_no_sec + fmt_empty + tzY_fmt),</a>
+<a name="ln408">      // e.g. &quot;1992-06-04T12:30 UTC+04:00&quot; or &quot;1992-6-4T12:30T UTC-04:30&quot;</a>
+<a name="ln409">      regex(date_fmt + &quot;T&quot; + time_fmt_no_sec + fmt_empty + tzZ_fmt),</a>
+<a name="ln410">      // e.g. &quot;1992-06-04T12:30.321&quot; or &quot;1992-6-4T12:30.12&quot;</a>
+<a name="ln411">      regex(date_fmt + &quot;T&quot; + time_fmt_no_sec + frac_fmt + fmt_empty),</a>
+<a name="ln412">      // e.g. &quot;1992-06-04T12:30.321+04:00&quot; or &quot;1992-6-4T12:30.12-04:30&quot;</a>
+<a name="ln413">      regex(date_fmt + &quot;T&quot; + time_fmt_no_sec + frac_fmt + tzX_fmt),</a>
+<a name="ln414">      // e.g. &quot;1992-06-04T12:30.321z&quot; or &quot;1992-6-4T12:30.12Z&quot;</a>
+<a name="ln415">      regex(date_fmt + &quot;T&quot; + time_fmt_no_sec + frac_fmt + tzY_fmt),</a>
+<a name="ln416">      // e.g. &quot;1992-06-04T12:30.321 UTC+04:00&quot; or &quot;1992-6-4T12:30.12 UTC-04:30&quot;</a>
+<a name="ln417">      regex(date_fmt + &quot;T&quot; + time_fmt_no_sec + frac_fmt + tzZ_fmt),</a>
+<a name="ln418">      // e.g. &quot;1992-06-04T12:30:45&quot; or &quot;1992-6-4T12:30:45&quot;</a>
+<a name="ln419">      regex(date_fmt + &quot;T&quot; + time_fmt + fmt_empty + fmt_empty),</a>
+<a name="ln420">      // e.g. &quot;1992-06-04T12:30:45+04:00&quot; or &quot;1992-6-4T12:30:45-04:30&quot;</a>
+<a name="ln421">      regex(date_fmt + &quot;T&quot; + time_fmt + fmt_empty + tzX_fmt),</a>
+<a name="ln422">      // e.g. &quot;1992-06-04T12:30:45z&quot; or &quot;1992-6-4T12:30:45Z&quot;</a>
+<a name="ln423">      regex(date_fmt + &quot;T&quot; + time_fmt + fmt_empty + tzY_fmt),</a>
+<a name="ln424">      // e.g. &quot;1992-06-04T12:30:45 UTC+04:00&quot; or &quot;1992-6-4T12:30:45 UTC-04:30&quot;</a>
+<a name="ln425">      regex(date_fmt + &quot;T&quot; + time_fmt + fmt_empty + tzZ_fmt),</a>
+<a name="ln426">      // e.g. &quot;1992-06-04T12:30:45.321&quot; or &quot;1992-6-4T12:30:45.12&quot;</a>
+<a name="ln427">      regex(date_fmt + &quot;T&quot; + time_fmt + frac_fmt + fmt_empty),</a>
+<a name="ln428">      // e.g. &quot;1992-06-04T12:30:45.321+04:00&quot; or &quot;1992-6-4T12:30:45.12-04:30&quot;</a>
+<a name="ln429">      regex(date_fmt + &quot;T&quot; + time_fmt + frac_fmt + tzX_fmt),</a>
+<a name="ln430">      // e.g. &quot;1992-06-04T12:30:45.321z&quot; or &quot;1992-6-4T12:30:45.12Z&quot;</a>
+<a name="ln431">      regex(date_fmt + &quot;T&quot; + time_fmt + frac_fmt + tzY_fmt),</a>
+<a name="ln432">      // e.g. &quot;1992-06-04T12:30:45.321 UTC+04:00&quot; or &quot;1992-6-4T12:30:45.12 UTC-04:30&quot;</a>
+<a name="ln433">      regex(date_fmt + &quot;T&quot; + time_fmt + frac_fmt + tzZ_fmt),</a>
+<a name="ln434">      // e.g. &quot;1992-06-04&quot; or &quot;1992-6-4&quot;</a>
+<a name="ln435">      regex(date_fmt + time_empty + fmt_empty + fmt_empty),</a>
+<a name="ln436">      // e.g. &quot;1992-06-04+04:00&quot; or &quot;1992-6-4-04:30&quot;</a>
+<a name="ln437">      regex(date_fmt + time_empty + fmt_empty + tzX_fmt),</a>
+<a name="ln438">      // e.g. &quot;1992-06-04z&quot; or &quot;1992-6-4Z&quot;</a>
+<a name="ln439">      regex(date_fmt + time_empty + fmt_empty + tzY_fmt),</a>
+<a name="ln440">      // e.g. &quot;1992-06-04 UTC+04:00&quot; or &quot;1992-6-4 UTC-04:30&quot;</a>
+<a name="ln441">      regex(date_fmt + time_empty + fmt_empty + tzZ_fmt)};</a>
+<a name="ln442">  int input_precision = 3; // Cassandra current default</a>
+<a name="ln443">  return InputFormat(regexes, input_precision);</a>
+<a name="ln444">} ();</a>
+<a name="ln445"> </a>
+<a name="ln446">const DateTime::OutputFormat DateTime::CqlOutputFormat = OutputFormat(</a>
+<a name="ln447">    locale(locale::classic(), new local_time_facet(&quot;%Y-%m-%dT%H:%M:%S.%f%q&quot;))</a>
+<a name="ln448">);</a>
+<a name="ln449"> </a>
+<a name="ln450">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="106"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="268"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="322"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

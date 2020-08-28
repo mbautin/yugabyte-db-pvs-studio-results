@@ -1,0 +1,1257 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>document_db.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20"> </a>
+<a name="ln21">#ifndef ROCKSDB_LITE</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/rocksdb/utilities/document_db.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;yb/rocksdb/cache.h&quot;</a>
+<a name="ln26">#include &quot;yb/rocksdb/table.h&quot;</a>
+<a name="ln27">#include &quot;yb/rocksdb/filter_policy.h&quot;</a>
+<a name="ln28">#include &quot;yb/rocksdb/comparator.h&quot;</a>
+<a name="ln29">#include &quot;yb/rocksdb/db.h&quot;</a>
+<a name="ln30">#include &quot;yb/util/slice.h&quot;</a>
+<a name="ln31">#include &quot;yb/rocksdb/utilities/json_document.h&quot;</a>
+<a name="ln32">#include &quot;yb/rocksdb/util/coding.h&quot;</a>
+<a name="ln33">#include &quot;yb/rocksdb/util/mutexlock.h&quot;</a>
+<a name="ln34">#include &quot;yb/rocksdb/port/port.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">namespace rocksdb {</a>
+<a name="ln37"> </a>
+<a name="ln38">// IMPORTANT NOTE: Secondary index column families should be very small and</a>
+<a name="ln39">// generally fit in memory. Assume that accessing secondary index column</a>
+<a name="ln40">// families is much faster than accessing primary index (data heap) column</a>
+<a name="ln41">// family. Accessing a key (i.e. checking for existance) from a column family in</a>
+<a name="ln42">// RocksDB is not much faster than accessing both key and value since they are</a>
+<a name="ln43">// kept together and loaded from storage together.</a>
+<a name="ln44"> </a>
+<a name="ln45">namespace {</a>
+<a name="ln46">// &lt; 0   &lt;=&gt;  lhs &lt; rhs</a>
+<a name="ln47">// == 0  &lt;=&gt;  lhs == rhs</a>
+<a name="ln48">// &gt; 0   &lt;=&gt;  lhs == rhs</a>
+<a name="ln49">// TODO(icanadi) move this to JSONDocument?</a>
+<a name="ln50">int DocumentCompare(const JSONDocument&amp; lhs, const JSONDocument&amp; rhs) {</a>
+<a name="ln51">  assert(lhs.IsObject() == false &amp;&amp; rhs.IsObject() == false &amp;&amp;</a>
+<a name="ln52">         lhs.type() == rhs.type());</a>
+<a name="ln53"> </a>
+<a name="ln54">  switch (lhs.type()) {</a>
+<a name="ln55">    case JSONDocument::kNull:</a>
+<a name="ln56">      return 0;</a>
+<a name="ln57">    case JSONDocument::kBool:</a>
+<a name="ln58">      return static_cast&lt;int&gt;(lhs.GetBool()) - static_cast&lt;int&gt;(rhs.GetBool());</a>
+<a name="ln59">    case JSONDocument::kDouble: {</a>
+<a name="ln60">      double res = lhs.GetDouble() - rhs.GetDouble();</a>
+<a name="ln61">      return res == 0.0 ? 0 : (res &lt; 0.0 ? -1 : 1);</a>
+<a name="ln62">    }</a>
+<a name="ln63">    case JSONDocument::kInt64: {</a>
+<a name="ln64">      int64_t res = lhs.GetInt64() - rhs.GetInt64();</a>
+<a name="ln65">      return res == 0 ? 0 : (res &lt; 0 ? -1 : 1);</a>
+<a name="ln66">    }</a>
+<a name="ln67">    case JSONDocument::kString:</a>
+<a name="ln68">      return Slice(lhs.GetString()).compare(Slice(rhs.GetString()));</a>
+<a name="ln69">    default:</a>
+<a name="ln70">      assert(false);</a>
+<a name="ln71">  }</a>
+<a name="ln72">  return 0;</a>
+<a name="ln73">}</a>
+<a name="ln74">}  // namespace</a>
+<a name="ln75"> </a>
+<a name="ln76">class Filter {</a>
+<a name="ln77"> public:</a>
+<a name="ln78">  // returns nullptr on parse failure</a>
+<a name="ln79">  static Filter* ParseFilter(const JSONDocument&amp; filter);</a>
+<a name="ln80"> </a>
+<a name="ln81">  struct Interval {</a>
+<a name="ln82">    JSONDocument upper_bound;</a>
+<a name="ln83">    JSONDocument lower_bound;</a>
+<a name="ln84">    bool upper_inclusive;</a>
+<a name="ln85">    bool lower_inclusive;</a>
+<a name="ln86">    Interval()</a>
+<a name="ln87">        : upper_bound(),</a>
+<a name="ln88">          lower_bound(),</a>
+<a name="ln89">          upper_inclusive(false),</a>
+<a name="ln90">          lower_inclusive(false) {}</a>
+<a name="ln91">    Interval(const JSONDocument&amp; ub, const JSONDocument&amp; lb, bool ui, bool li)</a>
+<a name="ln92">        : upper_bound(ub),</a>
+<a name="ln93">          lower_bound(lb),</a>
+<a name="ln94">          upper_inclusive(ui),</a>
+<a name="ln95">          lower_inclusive(li) {</a>
+<a name="ln96">    }</a>
+<a name="ln97"> </a>
+<a name="ln98">    void UpdateUpperBound(const JSONDocument&amp; ub, bool inclusive);</a>
+<a name="ln99">    void UpdateLowerBound(const JSONDocument&amp; lb, bool inclusive);</a>
+<a name="ln100">  };</a>
+<a name="ln101"> </a>
+<a name="ln102">  bool SatisfiesFilter(const JSONDocument&amp; document) const;</a>
+<a name="ln103">  const Interval* GetInterval(const std::string&amp; field) const;</a>
+<a name="ln104"> </a>
+<a name="ln105"> private:</a>
+<a name="ln106">  explicit Filter(const JSONDocument&amp; filter) : filter_(filter.Copy()) {</a>
+<a name="ln107">    assert(filter_.IsOwner());</a>
+<a name="ln108">  }</a>
+<a name="ln109"> </a>
+<a name="ln110">  // copied from the parameter</a>
+<a name="ln111">  const JSONDocument filter_;</a>
+<a name="ln112">  // constant after construction</a>
+<a name="ln113">  std::unordered_map&lt;std::string, Interval&gt; intervals_;</a>
+<a name="ln114">};</a>
+<a name="ln115"> </a>
+<a name="ln116">void Filter::Interval::UpdateUpperBound(const JSONDocument&amp; ub,</a>
+<a name="ln117">                                        bool inclusive) {</a>
+<a name="ln118">  bool update = upper_bound.IsNull();</a>
+<a name="ln119">  if (!update) {</a>
+<a name="ln120">    int cmp = DocumentCompare(upper_bound, ub);</a>
+<a name="ln121">    update = (cmp &gt; 0) || (cmp == 0 &amp;&amp; !inclusive);</a>
+<a name="ln122">  }</a>
+<a name="ln123">  if (update) {</a>
+<a name="ln124">    upper_bound = ub;</a>
+<a name="ln125">    upper_inclusive = inclusive;</a>
+<a name="ln126">  }</a>
+<a name="ln127">}</a>
+<a name="ln128"> </a>
+<a name="ln129">void Filter::Interval::UpdateLowerBound(const JSONDocument&amp; lb,</a>
+<a name="ln130">                                        bool inclusive) {</a>
+<a name="ln131">  bool update = lower_bound.IsNull();</a>
+<a name="ln132">  if (!update) {</a>
+<a name="ln133">    int cmp = DocumentCompare(lower_bound, lb);</a>
+<a name="ln134">    update = (cmp &lt; 0) || (cmp == 0 &amp;&amp; !inclusive);</a>
+<a name="ln135">  }</a>
+<a name="ln136">  if (update) {</a>
+<a name="ln137">    lower_bound = lb;</a>
+<a name="ln138">    lower_inclusive = inclusive;</a>
+<a name="ln139">  }</a>
+<a name="ln140">}</a>
+<a name="ln141"> </a>
+<a name="ln142">Filter* Filter::ParseFilter(const JSONDocument&amp; filter) {</a>
+<a name="ln143">  if (filter.IsObject() == false) {</a>
+<a name="ln144">    return nullptr;</a>
+<a name="ln145">  }</a>
+<a name="ln146"> </a>
+<a name="ln147">  std::unique_ptr&lt;Filter&gt; f(new Filter(filter));</a>
+<a name="ln148"> </a>
+<a name="ln149">  for (const auto&amp; items : f-&gt;filter_.Items()) {</a>
+<a name="ln150">    if (items.first.size() &amp;&amp; items.first[0] == '$') {</a>
+<a name="ln151">      // fields starting with '$' are commands</a>
+<a name="ln152">      continue;</a>
+<a name="ln153">    }</a>
+<a name="ln154">    assert(f-&gt;intervals_.find(items.first) == f-&gt;intervals_.end());</a>
+<a name="ln155">    if (items.second.IsObject()) {</a>
+<a name="ln156">      if (items.second.Count() == 0) {</a>
+<a name="ln157">        // uhm...?</a>
+<a name="ln158">        return nullptr;</a>
+<a name="ln159">      }</a>
+<a name="ln160">      Interval interval;</a>
+<a name="ln161">      for (const auto&amp; condition : items.second.Items()) {</a>
+<a name="ln162">        if (condition.second.IsObject() || condition.second.IsArray()) {</a>
+<a name="ln163">          // comparison operators not defined on objects. invalid array</a>
+<a name="ln164">          return nullptr;</a>
+<a name="ln165">        }</a>
+<a name="ln166">        // comparison operators:</a>
+<a name="ln167">        if (condition.first == &quot;$gt&quot;) {</a>
+<a name="ln168">          interval.UpdateLowerBound(condition.second, false);</a>
+<a name="ln169">        } else if (condition.first == &quot;$gte&quot;) {</a>
+<a name="ln170">          interval.UpdateLowerBound(condition.second, true);</a>
+<a name="ln171">        } else if (condition.first == &quot;$lt&quot;) {</a>
+<a name="ln172">          interval.UpdateUpperBound(condition.second, false);</a>
+<a name="ln173">        } else if (condition.first == &quot;$lte&quot;) {</a>
+<a name="ln174">          interval.UpdateUpperBound(condition.second, true);</a>
+<a name="ln175">        } else {</a>
+<a name="ln176">          // TODO(icanadi) more logical operators</a>
+<a name="ln177">          return nullptr;</a>
+<a name="ln178">        }</a>
+<a name="ln179">      }</a>
+<a name="ln180">      f-&gt;intervals_.insert({items.first, interval});</a>
+<a name="ln181">    } else {</a>
+<a name="ln182">      // equality</a>
+<a name="ln183">      f-&gt;intervals_.insert(</a>
+<a name="ln184">          {items.first, Interval(items.second,</a>
+<a name="ln185">                                 items.second, true, true)});</a>
+<a name="ln186">    }</a>
+<a name="ln187">  }</a>
+<a name="ln188"> </a>
+<a name="ln189">  return f.release();</a>
+<a name="ln190">}</a>
+<a name="ln191"> </a>
+<a name="ln192">const Filter::Interval* Filter::GetInterval(const std::string&amp; field) const {</a>
+<a name="ln193">  auto itr = intervals_.find(field);</a>
+<a name="ln194">  if (itr == intervals_.end()) {</a>
+<a name="ln195">    return nullptr;</a>
+<a name="ln196">  }</a>
+<a name="ln197">  // we can do that since intervals_ is constant after construction</a>
+<a name="ln198">  return &amp;itr-&gt;second;</a>
+<a name="ln199">}</a>
+<a name="ln200"> </a>
+<a name="ln201">bool Filter::SatisfiesFilter(const JSONDocument&amp; document) const {</a>
+<a name="ln202">  for (const auto&amp; interval : intervals_) {</a>
+<a name="ln203">    if (!document.Contains(interval.first)) {</a>
+<a name="ln204">      // doesn't have the value, doesn't satisfy the filter</a>
+<a name="ln205">      // (we don't support null queries yet)</a>
+<a name="ln206">      return false;</a>
+<a name="ln207">    }</a>
+<a name="ln208">    auto value = document[interval.first];</a>
+<a name="ln209">    if (!interval.second.upper_bound.IsNull()) {</a>
+<a name="ln210">      if (value.type() != interval.second.upper_bound.type()) {</a>
+<a name="ln211">        // no cross-type queries yet</a>
+<a name="ln212">        // TODO(icanadi) do this at least for numbers!</a>
+<a name="ln213">        return false;</a>
+<a name="ln214">      }</a>
+<a name="ln215">      int cmp = DocumentCompare(interval.second.upper_bound, value);</a>
+<a name="ln216">      if (cmp &lt; 0 || (cmp == 0 &amp;&amp; interval.second.upper_inclusive == false)) {</a>
+<a name="ln217">        // bigger (or equal) than upper bound</a>
+<a name="ln218">        return false;</a>
+<a name="ln219">      }</a>
+<a name="ln220">    }</a>
+<a name="ln221">    if (!interval.second.lower_bound.IsNull()) {</a>
+<a name="ln222">      if (value.type() != interval.second.lower_bound.type()) {</a>
+<a name="ln223">        // no cross-type queries yet</a>
+<a name="ln224">        return false;</a>
+<a name="ln225">      }</a>
+<a name="ln226">      int cmp = DocumentCompare(interval.second.lower_bound, value);</a>
+<a name="ln227">      if (cmp &gt; 0 || (cmp == 0 &amp;&amp; interval.second.lower_inclusive == false)) {</a>
+<a name="ln228">        // smaller (or equal) than the lower bound</a>
+<a name="ln229">        return false;</a>
+<a name="ln230">      }</a>
+<a name="ln231">    }</a>
+<a name="ln232">  }</a>
+<a name="ln233">  return true;</a>
+<a name="ln234">}</a>
+<a name="ln235"> </a>
+<a name="ln236">class Index {</a>
+<a name="ln237"> public:</a>
+<a name="ln238">  Index() = default;</a>
+<a name="ln239">  virtual ~Index() {}</a>
+<a name="ln240"> </a>
+<a name="ln241">  virtual const char* Name() const = 0;</a>
+<a name="ln242"> </a>
+<a name="ln243">  // Functions that are executed during write time</a>
+<a name="ln244">  // ---------------------------------------------</a>
+<a name="ln245">  // GetIndexKey() generates a key that will be used to index document and</a>
+<a name="ln246">  // returns the key though the second std::string* parameter</a>
+<a name="ln247">  virtual void GetIndexKey(const JSONDocument&amp; document,</a>
+<a name="ln248">                           std::string* key) const = 0;</a>
+<a name="ln249">  // Keys generated with GetIndexKey() will be compared using this comparator.</a>
+<a name="ln250">  // It should be assumed that there will be a suffix added to the index key</a>
+<a name="ln251">  // according to IndexKey implementation</a>
+<a name="ln252">  virtual const Comparator* GetComparator() const = 0;</a>
+<a name="ln253"> </a>
+<a name="ln254">  // Functions that are executed during query time</a>
+<a name="ln255">  // ---------------------------------------------</a>
+<a name="ln256">  enum Direction {</a>
+<a name="ln257">    kForwards,</a>
+<a name="ln258">    kBackwards,</a>
+<a name="ln259">  };</a>
+<a name="ln260">  // Returns true if this index can provide some optimization for satisfying</a>
+<a name="ln261">  // filter. False otherwise</a>
+<a name="ln262">  virtual bool UsefulIndex(const Filter&amp; filter) const = 0;</a>
+<a name="ln263">  // For every filter (assuming UsefulIndex()) there is a continuous interval of</a>
+<a name="ln264">  // keys in the index that satisfy the index conditions. That interval can be</a>
+<a name="ln265">  // three things:</a>
+<a name="ln266">  // * [A, B]</a>
+<a name="ln267">  // * [A, infinity&gt;</a>
+<a name="ln268">  // * &lt;-infinity, B]</a>
+<a name="ln269">  //</a>
+<a name="ln270">  // Query engine that uses this Index for optimization will access the interval</a>
+<a name="ln271">  // by first calling Position() and then iterating in the Direction (returned</a>
+<a name="ln272">  // by Position()) while ShouldContinueLooking() is true.</a>
+<a name="ln273">  // * For [A, B] interval Position() will Seek() to A and return kForwards.</a>
+<a name="ln274">  // ShouldContinueLooking() will be true until the iterator value gets beyond B</a>
+<a name="ln275">  // -- then it will return false</a>
+<a name="ln276">  // * For [A, infinity&gt; Position() will Seek() to A and return kForwards.</a>
+<a name="ln277">  // ShouldContinueLooking() will always return true</a>
+<a name="ln278">  // * For &lt;-infinity, B] Position() will Seek() to B and return kBackwards.</a>
+<a name="ln279">  // ShouldContinueLooking() will always return true (given that iterator is</a>
+<a name="ln280">  // advanced by calling Prev())</a>
+<a name="ln281">  virtual Direction Position(const Filter&amp; filter,</a>
+<a name="ln282">                             Iterator* iterator) const = 0;</a>
+<a name="ln283">  virtual bool ShouldContinueLooking(const Filter&amp; filter,</a>
+<a name="ln284">                                     const Slice&amp; secondary_key,</a>
+<a name="ln285">                                     Direction direction) const = 0;</a>
+<a name="ln286"> </a>
+<a name="ln287">  // Static function that is executed when Index is created</a>
+<a name="ln288">  // ---------------------------------------------</a>
+<a name="ln289">  // Create Index from user-supplied description. Return nullptr on parse</a>
+<a name="ln290">  // failure.</a>
+<a name="ln291">  static Index* CreateIndexFromDescription(const JSONDocument&amp; description,</a>
+<a name="ln292">                                           const std::string&amp; name);</a>
+<a name="ln293"> </a>
+<a name="ln294"> private:</a>
+<a name="ln295">  // No copying allowed</a>
+<a name="ln296">  Index(const Index&amp;);</a>
+<a name="ln297">  void operator=(const Index&amp;);</a>
+<a name="ln298">};</a>
+<a name="ln299"> </a>
+<a name="ln300">// Encoding helper function</a>
+<a name="ln301">namespace {</a>
+<a name="ln302">std::string InternalSecondaryIndexName(const std::string&amp; user_name) {</a>
+<a name="ln303">  return &quot;index_&quot; + user_name;</a>
+<a name="ln304">}</a>
+<a name="ln305"> </a>
+<a name="ln306">// Don't change these, they are persisted in secondary indexes</a>
+<a name="ln307">enum JSONPrimitivesEncoding : char {</a>
+<a name="ln308">  kNull = 0x1,</a>
+<a name="ln309">  kBool = 0x2,</a>
+<a name="ln310">  kDouble = 0x3,</a>
+<a name="ln311">  kInt64 = 0x4,</a>
+<a name="ln312">  kString = 0x5,</a>
+<a name="ln313">};</a>
+<a name="ln314"> </a>
+<a name="ln315">// encodes simple JSON members (meaning string, integer, etc)</a>
+<a name="ln316">// the end result of this will be lexicographically compared to each other</a>
+<a name="ln317">bool EncodeJSONPrimitive(const JSONDocument&amp; json, std::string* dst) {</a>
+<a name="ln318">  // TODO(icanadi) revise this at some point, have a custom comparator</a>
+<a name="ln319">  switch (json.type()) {</a>
+<a name="ln320">    case JSONDocument::kNull:</a>
+<a name="ln321">      dst-&gt;push_back(kNull);</a>
+<a name="ln322">      break;</a>
+<a name="ln323">    case JSONDocument::kBool:</a>
+<a name="ln324">      dst-&gt;push_back(kBool);</a>
+<a name="ln325">      dst-&gt;push_back(static_cast&lt;char&gt;(json.GetBool()));</a>
+<a name="ln326">      break;</a>
+<a name="ln327">    case JSONDocument::kDouble:</a>
+<a name="ln328">      dst-&gt;push_back(kDouble);</a>
+<a name="ln329">      PutFixed64(dst, static_cast&lt;uint64_t&gt;(json.GetDouble()));</a>
+<a name="ln330">      break;</a>
+<a name="ln331">    case JSONDocument::kInt64:</a>
+<a name="ln332">      dst-&gt;push_back(kInt64);</a>
+<a name="ln333">      {</a>
+<a name="ln334">        auto val = json.GetInt64();</a>
+<a name="ln335">        dst-&gt;push_back((val &lt; 0) ? '0' : '1');</a>
+<a name="ln336">        PutFixed64(dst, static_cast&lt;uint64_t&gt;(val));</a>
+<a name="ln337">      }</a>
+<a name="ln338">      break;</a>
+<a name="ln339">    case JSONDocument::kString:</a>
+<a name="ln340">      dst-&gt;push_back(kString);</a>
+<a name="ln341">      dst-&gt;append(json.GetString());</a>
+<a name="ln342">      break;</a>
+<a name="ln343">    default:</a>
+<a name="ln344">      return false;</a>
+<a name="ln345">  }</a>
+<a name="ln346">  return true;</a>
+<a name="ln347">}</a>
+<a name="ln348"> </a>
+<a name="ln349">}  // namespace</a>
+<a name="ln350"> </a>
+<a name="ln351">// format of the secondary key is:</a>
+<a name="ln352">// &lt;secondary_key&gt;&lt;primary_key&gt;&lt;offset_of_primary_key uint32_t&gt;</a>
+<a name="ln353">class IndexKey {</a>
+<a name="ln354"> public:</a>
+<a name="ln355">  IndexKey() : ok_(false) {}</a>
+<a name="ln356">  explicit IndexKey(const Slice&amp; slice) {</a>
+<a name="ln357">    if (slice.size() &lt; sizeof(uint32_t)) {</a>
+<a name="ln358">      ok_ = false;</a>
+<a name="ln359">      return;</a>
+<a name="ln360">    }</a>
+<a name="ln361">    uint32_t primary_key_offset =</a>
+<a name="ln362">        DecodeFixed32(slice.data() + slice.size() - sizeof(uint32_t));</a>
+<a name="ln363">    if (primary_key_offset &gt;= slice.size() - sizeof(uint32_t)) {</a>
+<a name="ln364">      ok_ = false;</a>
+<a name="ln365">      return;</a>
+<a name="ln366">    }</a>
+<a name="ln367">    parts_[0] = Slice(slice.data(), primary_key_offset);</a>
+<a name="ln368">    parts_[1] = Slice(slice.data() + primary_key_offset,</a>
+<a name="ln369">                      slice.size() - primary_key_offset - sizeof(uint32_t));</a>
+<a name="ln370">    ok_ = true;</a>
+<a name="ln371">  }</a>
+<a name="ln372">  IndexKey(const Slice&amp; secondary_key, const Slice&amp; primary_key) : ok_(true) {</a>
+<a name="ln373">    parts_[0] = secondary_key;</a>
+<a name="ln374">    parts_[1] = primary_key;</a>
+<a name="ln375">  }</a>
+<a name="ln376"> </a>
+<a name="ln377">  SliceParts GetSliceParts() {</a>
+<a name="ln378">    uint32_t primary_key_offset = static_cast&lt;uint32_t&gt;(parts_[0].size());</a>
+<a name="ln379">    EncodeFixed32(primary_key_offset_buf_, primary_key_offset);</a>
+<a name="ln380">    parts_[2] = Slice(primary_key_offset_buf_, sizeof(uint32_t));</a>
+<a name="ln381">    return SliceParts(parts_, 3);</a>
+<a name="ln382">  }</a>
+<a name="ln383"> </a>
+<a name="ln384">  const Slice&amp; GetPrimaryKey() const { return parts_[1]; }</a>
+<a name="ln385">  const Slice&amp; GetSecondaryKey() const { return parts_[0]; }</a>
+<a name="ln386"> </a>
+<a name="ln387">  bool ok() const { return ok_; }</a>
+<a name="ln388"> </a>
+<a name="ln389"> private:</a>
+<a name="ln390">  bool ok_;</a>
+<a name="ln391">  // 0 -- secondary key</a>
+<a name="ln392">  // 1 -- primary key</a>
+<a name="ln393">  // 2 -- primary key offset</a>
+<a name="ln394">  Slice parts_[3];</a>
+<a name="ln395">  char primary_key_offset_buf_[sizeof(uint32_t)];</a>
+<a name="ln396">};</a>
+<a name="ln397"> </a>
+<a name="ln398">class SimpleSortedIndex : public Index {</a>
+<a name="ln399"> public:</a>
+<a name="ln400">  SimpleSortedIndex(const std::string&amp; field, const std::string&amp; name)</a>
+<a name="ln401">      : field_(field), name_(name) {}</a>
+<a name="ln402"> </a>
+<a name="ln403">  const char* Name() const override { return name_.c_str(); }</a>
+<a name="ln404"> </a>
+<a name="ln405">  virtual void GetIndexKey(const JSONDocument&amp; document, std::string* key) const</a>
+<a name="ln406">      override {</a>
+<a name="ln407">    if (!document.Contains(field_)) {</a>
+<a name="ln408">      if (!EncodeJSONPrimitive(JSONDocument(JSONDocument::kNull), key)) {</a>
+<a name="ln409">        assert(false);</a>
+<a name="ln410">      }</a>
+<a name="ln411">    } else {</a>
+<a name="ln412">      if (!EncodeJSONPrimitive(document[field_], key)) {</a>
+<a name="ln413">        assert(false);</a>
+<a name="ln414">      }</a>
+<a name="ln415">    }</a>
+<a name="ln416">  }</a>
+<a name="ln417">  const Comparator* GetComparator() const override {</a>
+<a name="ln418">    return BytewiseComparator();</a>
+<a name="ln419">  }</a>
+<a name="ln420"> </a>
+<a name="ln421">  bool UsefulIndex(const Filter&amp; filter) const override {</a>
+<a name="ln422">    return filter.GetInterval(field_) != nullptr;</a>
+<a name="ln423">  }</a>
+<a name="ln424">  // REQUIRES: UsefulIndex(filter) == true</a>
+<a name="ln425">  virtual Direction Position(const Filter&amp; filter,</a>
+<a name="ln426">                             Iterator* iterator) const override {</a>
+<a name="ln427">    auto interval = filter.GetInterval(field_);</a>
+<a name="ln428">    assert(interval != nullptr);  // because index is useful</a>
+<a name="ln429">    Direction direction;</a>
+<a name="ln430"> </a>
+<a name="ln431">    const JSONDocument* limit;</a>
+<a name="ln432">    if (!interval-&gt;lower_bound.IsNull()) {</a>
+<a name="ln433">      limit = &amp;(interval-&gt;lower_bound);</a>
+<a name="ln434">      direction = kForwards;</a>
+<a name="ln435">    } else {</a>
+<a name="ln436">      limit = &amp;(interval-&gt;upper_bound);</a>
+<a name="ln437">      direction = kBackwards;</a>
+<a name="ln438">    }</a>
+<a name="ln439"> </a>
+<a name="ln440">    std::string encoded_limit;</a>
+<a name="ln441">    if (!EncodeJSONPrimitive(*limit, &amp;encoded_limit)) {</a>
+<a name="ln442">      assert(false);</a>
+<a name="ln443">    }</a>
+<a name="ln444">    iterator-&gt;Seek(Slice(encoded_limit));</a>
+<a name="ln445"> </a>
+<a name="ln446">    return direction;</a>
+<a name="ln447">  }</a>
+<a name="ln448">  // REQUIRES: UsefulIndex(filter) == true</a>
+<a name="ln449">  virtual bool ShouldContinueLooking(</a>
+<a name="ln450">      const Filter&amp; filter, const Slice&amp; secondary_key,</a>
+<a name="ln451">      Index::Direction direction) const override {</a>
+<a name="ln452">    auto interval = filter.GetInterval(field_);</a>
+<a name="ln453">    assert(interval != nullptr);  // because index is useful</a>
+<a name="ln454">    if (direction == kForwards) {</a>
+<a name="ln455">      if (interval-&gt;upper_bound.IsNull()) {</a>
+<a name="ln456">        // continue looking, no upper bound</a>
+<a name="ln457">        return true;</a>
+<a name="ln458">      }</a>
+<a name="ln459">      std::string encoded_upper_bound;</a>
+<a name="ln460">      if (!EncodeJSONPrimitive(interval-&gt;upper_bound, &amp;encoded_upper_bound)) {</a>
+<a name="ln461">        // uhm...?</a>
+<a name="ln462">        // TODO(icanadi) store encoded upper and lower bounds in Filter*?</a>
+<a name="ln463">        assert(false);</a>
+<a name="ln464">      }</a>
+<a name="ln465">      // TODO(icanadi) we need to somehow decode this and use DocumentCompare()</a>
+<a name="ln466">      int compare = secondary_key.compare(Slice(encoded_upper_bound));</a>
+<a name="ln467">      // if (current key is bigger than upper bound) OR (current key is equal to</a>
+<a name="ln468">      // upper bound, but inclusive is false) THEN stop looking. otherwise,</a>
+<a name="ln469">      // continue</a>
+<a name="ln470">      return (compare &gt; 0 ||</a>
+<a name="ln471">              (compare == 0 &amp;&amp; interval-&gt;upper_inclusive == false))</a>
+<a name="ln472">                 ? false</a>
+<a name="ln473">                 : true;</a>
+<a name="ln474">    } else {</a>
+<a name="ln475">      assert(direction == kBackwards);</a>
+<a name="ln476">      if (interval-&gt;lower_bound.IsNull()) {</a>
+<a name="ln477">        // continue looking, no lower bound</a>
+<a name="ln478">        return true;</a>
+<a name="ln479">      }</a>
+<a name="ln480">      std::string encoded_lower_bound;</a>
+<a name="ln481">      if (!EncodeJSONPrimitive(interval-&gt;lower_bound, &amp;encoded_lower_bound)) {</a>
+<a name="ln482">        // uhm...?</a>
+<a name="ln483">        // TODO(icanadi) store encoded upper and lower bounds in Filter*?</a>
+<a name="ln484">        assert(false);</a>
+<a name="ln485">      }</a>
+<a name="ln486">      // TODO(icanadi) we need to somehow decode this and use DocumentCompare()</a>
+<a name="ln487">      int compare = secondary_key.compare(Slice(encoded_lower_bound));</a>
+<a name="ln488">      // if (current key is smaller than lower bound) OR (current key is equal</a>
+<a name="ln489">      // to lower bound, but inclusive is false) THEN stop looking. otherwise,</a>
+<a name="ln490">      // continue</a>
+<a name="ln491">      return (compare &lt; 0 ||</a>
+<a name="ln492">              (compare == 0 &amp;&amp; interval-&gt;lower_inclusive == false))</a>
+<a name="ln493">                 ? false</a>
+<a name="ln494">                 : true;</a>
+<a name="ln495">    }</a>
+<a name="ln496"> </a>
+<a name="ln497">    assert(false);</a>
+<a name="ln498">    // this is here just so compiler doesn't complain</a>
+<a name="ln499">    return false;</a>
+<a name="ln500">  }</a>
+<a name="ln501"> </a>
+<a name="ln502"> private:</a>
+<a name="ln503">  std::string field_;</a>
+<a name="ln504">  std::string name_;</a>
+<a name="ln505">};</a>
+<a name="ln506"> </a>
+<a name="ln507">Index* Index::CreateIndexFromDescription(const JSONDocument&amp; description,</a>
+<a name="ln508">                                         const std::string&amp; name) {</a>
+<a name="ln509">  if (!description.IsObject() || description.Count() != 1) {</a>
+<a name="ln510">    // not supported yet</a>
+<a name="ln511">    return nullptr;</a>
+<a name="ln512">  }</a>
+<a name="ln513">  const auto&amp; field = *description.Items().begin();</a>
+<a name="ln514">  if (field.second.IsInt64() == false || field.second.GetInt64() != 1) {</a>
+<a name="ln515">    // not supported yet</a>
+<a name="ln516">    return nullptr;</a>
+<a name="ln517">  }</a>
+<a name="ln518">  return new SimpleSortedIndex(field.first, name);</a>
+<a name="ln519">}</a>
+<a name="ln520"> </a>
+<a name="ln521">class CursorWithFilterIndexed : public Cursor {</a>
+<a name="ln522"> public:</a>
+<a name="ln523">  CursorWithFilterIndexed(Iterator* primary_index_iter,</a>
+<a name="ln524">                          Iterator* secondary_index_iter, const Index* index,</a>
+<a name="ln525">                          const Filter* filter)</a>
+<a name="ln526">      : primary_index_iter_(primary_index_iter),</a>
+<a name="ln527">        secondary_index_iter_(secondary_index_iter),</a>
+<a name="ln528">        index_(index),</a>
+<a name="ln529">        filter_(filter),</a>
+<a name="ln530">        valid_(true),</a>
+<a name="ln531">        current_json_document_(nullptr) {</a>
+<a name="ln532">    assert(filter_.get() != nullptr);</a>
+<a name="ln533">    direction_ = index-&gt;Position(*filter_.get(), secondary_index_iter_.get());</a>
+<a name="ln534">    UpdateIndexKey();</a>
+<a name="ln535">    AdvanceUntilSatisfies();</a>
+<a name="ln536">  }</a>
+<a name="ln537"> </a>
+<a name="ln538">  bool Valid() const override {</a>
+<a name="ln539">    return valid_ &amp;&amp; secondary_index_iter_-&gt;Valid();</a>
+<a name="ln540">  }</a>
+<a name="ln541">  void Next() override {</a>
+<a name="ln542">    assert(Valid());</a>
+<a name="ln543">    Advance();</a>
+<a name="ln544">    AdvanceUntilSatisfies();</a>
+<a name="ln545">  }</a>
+<a name="ln546">  // temporary object. copy it if you want to use it</a>
+<a name="ln547">  const JSONDocument&amp; document() const override {</a>
+<a name="ln548">    assert(Valid());</a>
+<a name="ln549">    return *current_json_document_;</a>
+<a name="ln550">  }</a>
+<a name="ln551">  Status status() const override {</a>
+<a name="ln552">    if (!status_.ok()) {</a>
+<a name="ln553">      return status_;</a>
+<a name="ln554">    }</a>
+<a name="ln555">    if (!primary_index_iter_-&gt;status().ok()) {</a>
+<a name="ln556">      return primary_index_iter_-&gt;status();</a>
+<a name="ln557">    }</a>
+<a name="ln558">    return secondary_index_iter_-&gt;status();</a>
+<a name="ln559">  }</a>
+<a name="ln560"> </a>
+<a name="ln561"> private:</a>
+<a name="ln562">  void Advance() {</a>
+<a name="ln563">    if (direction_ == Index::kForwards) {</a>
+<a name="ln564">      secondary_index_iter_-&gt;Next();</a>
+<a name="ln565">    } else {</a>
+<a name="ln566">      secondary_index_iter_-&gt;Prev();</a>
+<a name="ln567">    }</a>
+<a name="ln568">    UpdateIndexKey();</a>
+<a name="ln569">  }</a>
+<a name="ln570">  void AdvanceUntilSatisfies() {</a>
+<a name="ln571">    bool found = false;</a>
+<a name="ln572">    while (secondary_index_iter_-&gt;Valid() &amp;&amp;</a>
+<a name="ln573">           index_-&gt;ShouldContinueLooking(</a>
+<a name="ln574">               *filter_.get(), index_key_.GetSecondaryKey(), direction_)) {</a>
+<a name="ln575">      if (!UpdateJSONDocument()) {</a>
+<a name="ln576">        // corruption happened</a>
+<a name="ln577">        return;</a>
+<a name="ln578">      }</a>
+<a name="ln579">      if (filter_-&gt;SatisfiesFilter(*current_json_document_)) {</a>
+<a name="ln580">        // we found satisfied!</a>
+<a name="ln581">        found = true;</a>
+<a name="ln582">        break;</a>
+<a name="ln583">      } else {</a>
+<a name="ln584">        // doesn't satisfy :(</a>
+<a name="ln585">        Advance();</a>
+<a name="ln586">      }</a>
+<a name="ln587">    }</a>
+<a name="ln588">    if (!found) {</a>
+<a name="ln589">      valid_ = false;</a>
+<a name="ln590">    }</a>
+<a name="ln591">  }</a>
+<a name="ln592"> </a>
+<a name="ln593">  bool UpdateJSONDocument() {</a>
+<a name="ln594">    assert(secondary_index_iter_-&gt;Valid());</a>
+<a name="ln595">    primary_index_iter_-&gt;Seek(index_key_.GetPrimaryKey());</a>
+<a name="ln596">    if (!primary_index_iter_-&gt;Valid()) {</a>
+<a name="ln597">      status_ = STATUS(Corruption,</a>
+<a name="ln598">          &quot;Inconsistency between primary and secondary index&quot;);</a>
+<a name="ln599">      valid_ = false;</a>
+<a name="ln600">      return false;</a>
+<a name="ln601">    }</a>
+<a name="ln602">    current_json_document_.reset(</a>
+<a name="ln603">        JSONDocument::Deserialize(primary_index_iter_-&gt;value()));</a>
+<a name="ln604">    assert(current_json_document_-&gt;IsOwner());</a>
+<a name="ln605">    if (current_json_document_.get() == nullptr) {</a>
+<a name="ln606">      status_ = STATUS(Corruption, &quot;JSON deserialization failed&quot;);</a>
+<a name="ln607">      valid_ = false;</a>
+<a name="ln608">      return false;</a>
+<a name="ln609">    }</a>
+<a name="ln610">    return true;</a>
+<a name="ln611">  }</a>
+<a name="ln612">  void UpdateIndexKey() {</a>
+<a name="ln613">    if (secondary_index_iter_-&gt;Valid()) {</a>
+<a name="ln614">      index_key_ = IndexKey(secondary_index_iter_-&gt;key());</a>
+<a name="ln615">      if (!index_key_.ok()) {</a>
+<a name="ln616">        status_ = STATUS(Corruption, &quot;Invalid index key&quot;);</a>
+<a name="ln617">        valid_ = false;</a>
+<a name="ln618">      }</a>
+<a name="ln619">    }</a>
+<a name="ln620">  }</a>
+<a name="ln621">  std::unique_ptr&lt;Iterator&gt; primary_index_iter_;</a>
+<a name="ln622">  std::unique_ptr&lt;Iterator&gt; secondary_index_iter_;</a>
+<a name="ln623">  // we don't own index_</a>
+<a name="ln624">  const Index* index_;</a>
+<a name="ln625">  Index::Direction direction_;</a>
+<a name="ln626">  std::unique_ptr&lt;const Filter&gt; filter_;</a>
+<a name="ln627">  bool valid_;</a>
+<a name="ln628">  IndexKey index_key_;</a>
+<a name="ln629">  std::unique_ptr&lt;JSONDocument&gt; current_json_document_;</a>
+<a name="ln630">  Status status_;</a>
+<a name="ln631">};</a>
+<a name="ln632"> </a>
+<a name="ln633">class CursorFromIterator : public Cursor {</a>
+<a name="ln634"> public:</a>
+<a name="ln635">  explicit CursorFromIterator(Iterator* iter)</a>
+<a name="ln636">      : iter_(iter), current_json_document_(nullptr) {</a>
+<a name="ln637">    iter_-&gt;SeekToFirst();</a>
+<a name="ln638">    UpdateCurrentJSON();</a>
+<a name="ln639">  }</a>
+<a name="ln640"> </a>
+<a name="ln641">  bool Valid() const override { return status_.ok() &amp;&amp; iter_-&gt;Valid(); }</a>
+<a name="ln642">  void Next() override {</a>
+<a name="ln643">    iter_-&gt;Next();</a>
+<a name="ln644">    UpdateCurrentJSON();</a>
+<a name="ln645">  }</a>
+<a name="ln646">  const JSONDocument&amp; document() const override {</a>
+<a name="ln647">    assert(Valid());</a>
+<a name="ln648">    return *current_json_document_;</a>
+<a name="ln649">  };</a>
+<a name="ln650">  Status status() const override {</a>
+<a name="ln651">    if (!status_.ok()) {</a>
+<a name="ln652">      return status_;</a>
+<a name="ln653">    }</a>
+<a name="ln654">    return iter_-&gt;status();</a>
+<a name="ln655">  }</a>
+<a name="ln656"> </a>
+<a name="ln657">  // not part of public Cursor interface</a>
+<a name="ln658">  Slice key() const { return iter_-&gt;key(); }</a>
+<a name="ln659"> </a>
+<a name="ln660"> private:</a>
+<a name="ln661">  void UpdateCurrentJSON() {</a>
+<a name="ln662">    if (Valid()) {</a>
+<a name="ln663">      current_json_document_.reset(JSONDocument::Deserialize(iter_-&gt;value()));</a>
+<a name="ln664">      if (current_json_document_.get() == nullptr) {</a>
+<a name="ln665">        status_ = STATUS(Corruption, &quot;JSON deserialization failed&quot;);</a>
+<a name="ln666">      }</a>
+<a name="ln667">    }</a>
+<a name="ln668">  }</a>
+<a name="ln669"> </a>
+<a name="ln670">  Status status_;</a>
+<a name="ln671">  std::unique_ptr&lt;Iterator&gt; iter_;</a>
+<a name="ln672">  std::unique_ptr&lt;JSONDocument&gt; current_json_document_;</a>
+<a name="ln673">};</a>
+<a name="ln674"> </a>
+<a name="ln675">class CursorWithFilter : public Cursor {</a>
+<a name="ln676"> public:</a>
+<a name="ln677">  CursorWithFilter(Cursor* base_cursor, const Filter* filter)</a>
+<a name="ln678">      : base_cursor_(base_cursor), filter_(filter) {</a>
+<a name="ln679">    assert(filter_.get() != nullptr);</a>
+<a name="ln680">    SeekToNextSatisfies();</a>
+<a name="ln681">  }</a>
+<a name="ln682">  bool Valid() const override { return base_cursor_-&gt;Valid(); }</a>
+<a name="ln683">  void Next() override {</a>
+<a name="ln684">    assert(Valid());</a>
+<a name="ln685">    base_cursor_-&gt;Next();</a>
+<a name="ln686">    SeekToNextSatisfies();</a>
+<a name="ln687">  }</a>
+<a name="ln688">  const JSONDocument&amp; document() const override {</a>
+<a name="ln689">    assert(Valid());</a>
+<a name="ln690">    return base_cursor_-&gt;document();</a>
+<a name="ln691">  }</a>
+<a name="ln692">  Status status() const override { return base_cursor_-&gt;status(); }</a>
+<a name="ln693"> </a>
+<a name="ln694"> private:</a>
+<a name="ln695">  void SeekToNextSatisfies() {</a>
+<a name="ln696">    for (; base_cursor_-&gt;Valid(); base_cursor_-&gt;Next()) {</a>
+<a name="ln697">      if (filter_-&gt;SatisfiesFilter(base_cursor_-&gt;document())) {</a>
+<a name="ln698">        break;</a>
+<a name="ln699">      }</a>
+<a name="ln700">    }</a>
+<a name="ln701">  }</a>
+<a name="ln702">  std::unique_ptr&lt;Cursor&gt; base_cursor_;</a>
+<a name="ln703">  std::unique_ptr&lt;const Filter&gt; filter_;</a>
+<a name="ln704">};</a>
+<a name="ln705"> </a>
+<a name="ln706">class CursorError : public Cursor {</a>
+<a name="ln707"> public:</a>
+<a name="ln708">  explicit CursorError(Status s) : s_(s) { assert(!s.ok()); }</a>
+<a name="ln709">  Status status() const override { return s_; }</a>
+<a name="ln710">  bool Valid() const override { return false; }</a>
+<a name="ln711">  void Next() override {}</a>
+<a name="ln712">  const JSONDocument&amp; document() const override {</a>
+<a name="ln713">    assert(false);</a>
+<a name="ln714">    // compiler complains otherwise</a>
+<a name="ln715">    return trash_;</a>
+<a name="ln716">  }</a>
+<a name="ln717"> </a>
+<a name="ln718"> private:</a>
+<a name="ln719">  Status s_;</a>
+<a name="ln720">  JSONDocument trash_;</a>
+<a name="ln721">};</a>
+<a name="ln722"> </a>
+<a name="ln723">class DocumentDBImpl : public DocumentDB {</a>
+<a name="ln724"> public:</a>
+<a name="ln725">  DocumentDBImpl(</a>
+<a name="ln726">      DB* db, ColumnFamilyHandle* primary_key_column_family,</a>
+<a name="ln727">      const std::vector&lt;std::pair&lt;Index*, ColumnFamilyHandle*&gt;&gt;&amp; indexes,</a>
+<a name="ln728">      const Options&amp; rocksdb_options)</a>
+<a name="ln729">      : DocumentDB(db),</a>
+<a name="ln730">        primary_key_column_family_(primary_key_column_family),</a>
+<a name="ln731">        rocksdb_options_(rocksdb_options) {</a>
+<a name="ln732">    for (const auto&amp; index : indexes) {</a>
+<a name="ln733">      name_to_index_.insert(</a>
+<a name="ln734">          {index.first-&gt;Name(), IndexColumnFamily(index.first, index.second)});</a>
+<a name="ln735">    }</a>
+<a name="ln736">  }</a>
+<a name="ln737"> </a>
+<a name="ln738">  ~DocumentDBImpl() {</a>
+<a name="ln739">    for (auto&amp; iter : name_to_index_) {</a>
+<a name="ln740">      delete iter.second.index;</a>
+<a name="ln741">      delete iter.second.column_family;</a>
+<a name="ln742">    }</a>
+<a name="ln743">    delete primary_key_column_family_;</a>
+<a name="ln744">  }</a>
+<a name="ln745"> </a>
+<a name="ln746">  virtual Status CreateIndex(const WriteOptions&amp; write_options,</a>
+<a name="ln747">                             const IndexDescriptor&amp; index) override {</a>
+<a name="ln748">    auto index_obj =</a>
+<a name="ln749">        Index::CreateIndexFromDescription(*index.description, index.name);</a>
+<a name="ln750">    if (index_obj == nullptr) {</a>
+<a name="ln751">      return STATUS(InvalidArgument, &quot;Failed parsing index description&quot;);</a>
+<a name="ln752">    }</a>
+<a name="ln753"> </a>
+<a name="ln754">    ColumnFamilyHandle* cf_handle;</a>
+<a name="ln755">    Status s =</a>
+<a name="ln756">        CreateColumnFamily(ColumnFamilyOptions(rocksdb_options_),</a>
+<a name="ln757">                           InternalSecondaryIndexName(index.name), &amp;cf_handle);</a>
+<a name="ln758">    if (!s.ok()) {</a>
+<a name="ln759">      delete index_obj;</a>
+<a name="ln760">      return s;</a>
+<a name="ln761">    }</a>
+<a name="ln762"> </a>
+<a name="ln763">    MutexLock l(&amp;write_mutex_);</a>
+<a name="ln764"> </a>
+<a name="ln765">    std::unique_ptr&lt;CursorFromIterator&gt; cursor(new CursorFromIterator(</a>
+<a name="ln766">        DocumentDB::NewIterator(ReadOptions(), primary_key_column_family_)));</a>
+<a name="ln767"> </a>
+<a name="ln768">    WriteBatch batch;</a>
+<a name="ln769">    for (; cursor-&gt;Valid(); cursor-&gt;Next()) {</a>
+<a name="ln770">      std::string secondary_index_key;</a>
+<a name="ln771">      index_obj-&gt;GetIndexKey(cursor-&gt;document(), &amp;secondary_index_key);</a>
+<a name="ln772">      IndexKey index_key(Slice(secondary_index_key), cursor-&gt;key());</a>
+<a name="ln773">      batch.Put(cf_handle, index_key.GetSliceParts(), SliceParts());</a>
+<a name="ln774">    }</a>
+<a name="ln775"> </a>
+<a name="ln776">    if (!cursor-&gt;status().ok()) {</a>
+<a name="ln777">      delete index_obj;</a>
+<a name="ln778">      return cursor-&gt;status();</a>
+<a name="ln779">    }</a>
+<a name="ln780"> </a>
+<a name="ln781">    {</a>
+<a name="ln782">      MutexLock l_nti(&amp;name_to_index_mutex_);</a>
+<a name="ln783">      name_to_index_.insert(</a>
+<a name="ln784">          {index.name, IndexColumnFamily(index_obj, cf_handle)});</a>
+<a name="ln785">    }</a>
+<a name="ln786"> </a>
+<a name="ln787">    return DocumentDB::Write(write_options, &amp;batch);</a>
+<a name="ln788">  }</a>
+<a name="ln789"> </a>
+<a name="ln790">  Status DropIndex(const std::string&amp; name) override {</a>
+<a name="ln791">    MutexLock l(&amp;write_mutex_);</a>
+<a name="ln792"> </a>
+<a name="ln793">    auto index_iter = name_to_index_.find(name);</a>
+<a name="ln794">    if (index_iter == name_to_index_.end()) {</a>
+<a name="ln795">      return STATUS(InvalidArgument, &quot;No such index&quot;);</a>
+<a name="ln796">    }</a>
+<a name="ln797"> </a>
+<a name="ln798">    Status s = DropColumnFamily(index_iter-&gt;second.column_family);</a>
+<a name="ln799">    if (!s.ok()) {</a>
+<a name="ln800">      return s;</a>
+<a name="ln801">    }</a>
+<a name="ln802"> </a>
+<a name="ln803">    delete index_iter-&gt;second.index;</a>
+<a name="ln804">    delete index_iter-&gt;second.column_family;</a>
+<a name="ln805"> </a>
+<a name="ln806">    // remove from name_to_index_</a>
+<a name="ln807">    {</a>
+<a name="ln808">      MutexLock l_nti(&amp;name_to_index_mutex_);</a>
+<a name="ln809">      name_to_index_.erase(index_iter);</a>
+<a name="ln810">    }</a>
+<a name="ln811"> </a>
+<a name="ln812">    return Status::OK();</a>
+<a name="ln813">  }</a>
+<a name="ln814"> </a>
+<a name="ln815">  virtual Status Insert(const WriteOptions&amp; options,</a>
+<a name="ln816">                        const JSONDocument&amp; document) override {</a>
+<a name="ln817">    WriteBatch batch;</a>
+<a name="ln818"> </a>
+<a name="ln819">    if (!document.IsObject()) {</a>
+<a name="ln820">      return STATUS(InvalidArgument, &quot;Document not an object&quot;);</a>
+<a name="ln821">    }</a>
+<a name="ln822">    if (!document.Contains(kPrimaryKey)) {</a>
+<a name="ln823">      return STATUS(InvalidArgument, &quot;No primary key&quot;);</a>
+<a name="ln824">    }</a>
+<a name="ln825">    auto primary_key = document[kPrimaryKey];</a>
+<a name="ln826">    if (primary_key.IsNull() ||</a>
+<a name="ln827">        (!primary_key.IsString() &amp;&amp; !primary_key.IsInt64())) {</a>
+<a name="ln828">      return STATUS(InvalidArgument,</a>
+<a name="ln829">          &quot;Primary key format error&quot;);</a>
+<a name="ln830">    }</a>
+<a name="ln831">    std::string encoded_document;</a>
+<a name="ln832">    document.Serialize(&amp;encoded_document);</a>
+<a name="ln833">    std::string primary_key_encoded;</a>
+<a name="ln834">    if (!EncodeJSONPrimitive(primary_key, &amp;primary_key_encoded)) {</a>
+<a name="ln835">      // previous call should be guaranteed to pass because of all primary_key</a>
+<a name="ln836">      // conditions checked before</a>
+<a name="ln837">      assert(false);</a>
+<a name="ln838">    }</a>
+<a name="ln839">    Slice primary_key_slice(primary_key_encoded);</a>
+<a name="ln840"> </a>
+<a name="ln841">    // Lock now, since we're starting DB operations</a>
+<a name="ln842">    MutexLock l(&amp;write_mutex_);</a>
+<a name="ln843">    // check if there is already a document with the same primary key</a>
+<a name="ln844">    std::string value;</a>
+<a name="ln845">    Status s = DocumentDB::Get(ReadOptions(), primary_key_column_family_,</a>
+<a name="ln846">                               primary_key_slice, &amp;value);</a>
+<a name="ln847">    if (!s.IsNotFound()) {</a>
+<a name="ln848">      return s.ok() ? STATUS(InvalidArgument, &quot;Duplicate primary key!&quot;) : s;</a>
+<a name="ln849">    }</a>
+<a name="ln850"> </a>
+<a name="ln851">    batch.Put(primary_key_column_family_, primary_key_slice, encoded_document);</a>
+<a name="ln852"> </a>
+<a name="ln853">    for (const auto&amp; iter : name_to_index_) {</a>
+<a name="ln854">      std::string secondary_index_key;</a>
+<a name="ln855">      iter.second.index-&gt;GetIndexKey(document, &amp;secondary_index_key);</a>
+<a name="ln856">      IndexKey index_key(Slice(secondary_index_key), primary_key_slice);</a>
+<a name="ln857">      batch.Put(iter.second.column_family, index_key.GetSliceParts(),</a>
+<a name="ln858">                SliceParts());</a>
+<a name="ln859">    }</a>
+<a name="ln860"> </a>
+<a name="ln861">    return DocumentDB::Write(options, &amp;batch);</a>
+<a name="ln862">  }</a>
+<a name="ln863"> </a>
+<a name="ln864">  virtual Status Remove(const ReadOptions&amp; read_options,</a>
+<a name="ln865">                        const WriteOptions&amp; write_options,</a>
+<a name="ln866">                        const JSONDocument&amp; query) override {</a>
+<a name="ln867">    MutexLock l(&amp;write_mutex_);</a>
+<a name="ln868">    std::unique_ptr&lt;Cursor&gt; cursor(</a>
+<a name="ln869">        ConstructFilterCursor(read_options, nullptr, query));</a>
+<a name="ln870"> </a>
+<a name="ln871">    WriteBatch batch;</a>
+<a name="ln872">    for (; cursor-&gt;status().ok() &amp;&amp; cursor-&gt;Valid(); cursor-&gt;Next()) {</a>
+<a name="ln873">      const auto&amp; document = cursor-&gt;document();</a>
+<a name="ln874">      if (!document.IsObject()) {</a>
+<a name="ln875">        return STATUS(Corruption, &quot;Document corruption&quot;);</a>
+<a name="ln876">      }</a>
+<a name="ln877">      if (!document.Contains(kPrimaryKey)) {</a>
+<a name="ln878">        return STATUS(Corruption, &quot;Document corruption&quot;);</a>
+<a name="ln879">      }</a>
+<a name="ln880">      auto primary_key = document[kPrimaryKey];</a>
+<a name="ln881">      if (primary_key.IsNull() ||</a>
+<a name="ln882">          (!primary_key.IsString() &amp;&amp; !primary_key.IsInt64())) {</a>
+<a name="ln883">        return STATUS(Corruption, &quot;Document corruption&quot;);</a>
+<a name="ln884">      }</a>
+<a name="ln885"> </a>
+<a name="ln886">      // TODO(icanadi) Instead of doing this, just get primary key encoding from</a>
+<a name="ln887">      // cursor, as it already has this information</a>
+<a name="ln888">      std::string primary_key_encoded;</a>
+<a name="ln889">      if (!EncodeJSONPrimitive(primary_key, &amp;primary_key_encoded)) {</a>
+<a name="ln890">        // previous call should be guaranteed to pass because of all primary_key</a>
+<a name="ln891">        // conditions checked before</a>
+<a name="ln892">        assert(false);</a>
+<a name="ln893">      }</a>
+<a name="ln894">      Slice primary_key_slice(primary_key_encoded);</a>
+<a name="ln895">      batch.Delete(primary_key_column_family_, primary_key_slice);</a>
+<a name="ln896"> </a>
+<a name="ln897">      for (const auto&amp; iter : name_to_index_) {</a>
+<a name="ln898">        std::string secondary_index_key;</a>
+<a name="ln899">        iter.second.index-&gt;GetIndexKey(document, &amp;secondary_index_key);</a>
+<a name="ln900">        IndexKey index_key(Slice(secondary_index_key), primary_key_slice);</a>
+<a name="ln901">        batch.Delete(iter.second.column_family, index_key.GetSliceParts());</a>
+<a name="ln902">      }</a>
+<a name="ln903">    }</a>
+<a name="ln904"> </a>
+<a name="ln905">    if (!cursor-&gt;status().ok()) {</a>
+<a name="ln906">      return cursor-&gt;status();</a>
+<a name="ln907">    }</a>
+<a name="ln908"> </a>
+<a name="ln909">    return DocumentDB::Write(write_options, &amp;batch);</a>
+<a name="ln910">  }</a>
+<a name="ln911"> </a>
+<a name="ln912">  virtual Status Update(const ReadOptions&amp; read_options,</a>
+<a name="ln913">                        const WriteOptions&amp; write_options,</a>
+<a name="ln914">                        const JSONDocument&amp; filter,</a>
+<a name="ln915">                        const JSONDocument&amp; updates) override {</a>
+<a name="ln916">    MutexLock l(&amp;write_mutex_);</a>
+<a name="ln917">    std::unique_ptr&lt;Cursor&gt; cursor(</a>
+<a name="ln918">        ConstructFilterCursor(read_options, nullptr, filter));</a>
+<a name="ln919"> </a>
+<a name="ln920">    if (!updates.IsObject()) {</a>
+<a name="ln921">        return STATUS(Corruption, &quot;Bad update document format&quot;);</a>
+<a name="ln922">    }</a>
+<a name="ln923">    WriteBatch batch;</a>
+<a name="ln924">    for (; cursor-&gt;status().ok() &amp;&amp; cursor-&gt;Valid(); cursor-&gt;Next()) {</a>
+<a name="ln925">      const auto&amp; old_document = cursor-&gt;document();</a>
+<a name="ln926">      JSONDocument new_document(old_document);</a>
+<a name="ln927">      if (!new_document.IsObject()) {</a>
+<a name="ln928">        return STATUS(Corruption, &quot;Document corruption&quot;);</a>
+<a name="ln929">      }</a>
+<a name="ln930">      // TODO(icanadi) Make this nicer, something like class Filter</a>
+<a name="ln931">      for (const auto&amp; update : updates.Items()) {</a>
+<a name="ln932">        if (update.first == &quot;$set&quot;) {</a>
+<a name="ln933">          JSONDocumentBuilder builder;</a>
+<a name="ln934">          bool res __attribute__((unused)) = builder.WriteStartObject();</a>
+<a name="ln935">          assert(res);</a>
+<a name="ln936">          for (const auto&amp; itr : update.second.Items()) {</a>
+<a name="ln937">            if (itr.first == kPrimaryKey) {</a>
+<a name="ln938">              return STATUS(NotSupported, &quot;Please don't change primary key&quot;);</a>
+<a name="ln939">            }</a>
+<a name="ln940">            res = builder.WriteKeyValue(itr.first, itr.second);</a>
+<a name="ln941">            assert(res);</a>
+<a name="ln942">          }</a>
+<a name="ln943">          res = builder.WriteEndObject();</a>
+<a name="ln944">          assert(res);</a>
+<a name="ln945">          JSONDocument update_document = builder.GetJSONDocument();</a>
+<a name="ln946">          builder.Reset();</a>
+<a name="ln947">          res = builder.WriteStartObject();</a>
+<a name="ln948">          assert(res);</a>
+<a name="ln949">          for (const auto&amp; itr : new_document.Items()) {</a>
+<a name="ln950">            if (update_document.Contains(itr.first)) {</a>
+<a name="ln951">              res = builder.WriteKeyValue(itr.first,</a>
+<a name="ln952">                                          update_document[itr.first]);</a>
+<a name="ln953">            } else {</a>
+<a name="ln954">              res = builder.WriteKeyValue(itr.first, new_document[itr.first]);</a>
+<a name="ln955">            }</a>
+<a name="ln956">            assert(res);</a>
+<a name="ln957">          }</a>
+<a name="ln958">          res = builder.WriteEndObject();</a>
+<a name="ln959">          assert(res);</a>
+<a name="ln960">          new_document = builder.GetJSONDocument();</a>
+<a name="ln961">          assert(new_document.IsOwner());</a>
+<a name="ln962">        } else {</a>
+<a name="ln963">          // TODO(icanadi) more commands</a>
+<a name="ln964">          return STATUS(InvalidArgument, &quot;Can't understand update command&quot;);</a>
+<a name="ln965">        }</a>
+<a name="ln966">      }</a>
+<a name="ln967"> </a>
+<a name="ln968">      // TODO(icanadi) reuse some of this code</a>
+<a name="ln969">      if (!new_document.Contains(kPrimaryKey)) {</a>
+<a name="ln970">        return STATUS(Corruption, &quot;Corrupted document -- primary key missing&quot;);</a>
+<a name="ln971">      }</a>
+<a name="ln972">      auto primary_key = new_document[kPrimaryKey];</a>
+<a name="ln973">      if (primary_key.IsNull() ||</a>
+<a name="ln974">          (!primary_key.IsString() &amp;&amp; !primary_key.IsInt64())) {</a>
+<a name="ln975">        // This will happen when document on storage doesn't have primary key,</a>
+<a name="ln976">        // since we don't support any update operations on primary key. That's</a>
+<a name="ln977">        // why this is corruption error</a>
+<a name="ln978">        return STATUS(Corruption, &quot;Corrupted document -- primary key missing&quot;);</a>
+<a name="ln979">      }</a>
+<a name="ln980">      std::string encoded_document;</a>
+<a name="ln981">      new_document.Serialize(&amp;encoded_document);</a>
+<a name="ln982">      std::string primary_key_encoded;</a>
+<a name="ln983">      if (!EncodeJSONPrimitive(primary_key, &amp;primary_key_encoded)) {</a>
+<a name="ln984">        // previous call should be guaranteed to pass because of all primary_key</a>
+<a name="ln985">        // conditions checked before</a>
+<a name="ln986">        assert(false);</a>
+<a name="ln987">      }</a>
+<a name="ln988">      Slice primary_key_slice(primary_key_encoded);</a>
+<a name="ln989">      batch.Put(primary_key_column_family_, primary_key_slice,</a>
+<a name="ln990">                encoded_document);</a>
+<a name="ln991"> </a>
+<a name="ln992">      for (const auto&amp; iter : name_to_index_) {</a>
+<a name="ln993">        std::string old_key, new_key;</a>
+<a name="ln994">        iter.second.index-&gt;GetIndexKey(old_document, &amp;old_key);</a>
+<a name="ln995">        iter.second.index-&gt;GetIndexKey(new_document, &amp;new_key);</a>
+<a name="ln996">        if (old_key == new_key) {</a>
+<a name="ln997">          // don't need to update this secondary index</a>
+<a name="ln998">          continue;</a>
+<a name="ln999">        }</a>
+<a name="ln1000"> </a>
+<a name="ln1001">        IndexKey old_index_key(Slice(old_key), primary_key_slice);</a>
+<a name="ln1002">        IndexKey new_index_key(Slice(new_key), primary_key_slice);</a>
+<a name="ln1003"> </a>
+<a name="ln1004">        batch.Delete(iter.second.column_family, old_index_key.GetSliceParts());</a>
+<a name="ln1005">        batch.Put(iter.second.column_family, new_index_key.GetSliceParts(),</a>
+<a name="ln1006">                  SliceParts());</a>
+<a name="ln1007">      }</a>
+<a name="ln1008">    }</a>
+<a name="ln1009"> </a>
+<a name="ln1010">    if (!cursor-&gt;status().ok()) {</a>
+<a name="ln1011">      return cursor-&gt;status();</a>
+<a name="ln1012">    }</a>
+<a name="ln1013"> </a>
+<a name="ln1014">    return DocumentDB::Write(write_options, &amp;batch);</a>
+<a name="ln1015">  }</a>
+<a name="ln1016"> </a>
+<a name="ln1017">  virtual Cursor* Query(const ReadOptions&amp; read_options,</a>
+<a name="ln1018">                        const JSONDocument&amp; query) override {</a>
+<a name="ln1019">    Cursor* cursor = nullptr;</a>
+<a name="ln1020"> </a>
+<a name="ln1021">    if (!query.IsArray()) {</a>
+<a name="ln1022">      return new CursorError(</a>
+<a name="ln1023">          STATUS(InvalidArgument, &quot;Query has to be an array&quot;));</a>
+<a name="ln1024">    }</a>
+<a name="ln1025"> </a>
+<a name="ln1026">    // TODO(icanadi) support index &quot;_id&quot;</a>
+<a name="ln1027">    for (size_t i = 0; i &lt; query.Count(); ++i) {</a>
+<a name="ln1028">      const auto&amp; command_doc = query[i];</a>
+<a name="ln1029">      if (command_doc.Count() != 1) {</a>
+<a name="ln1030">        // there can be only one key-value pair in each of array elements.</a>
+<a name="ln1031">        // key is the command and value are the params</a>
+<a name="ln1032">        delete cursor;</a>
+<a name="ln1033">        return new CursorError(STATUS(InvalidArgument, &quot;Invalid query&quot;));</a>
+<a name="ln1034">      }</a>
+<a name="ln1035">      const auto&amp; command = *command_doc.Items().begin();</a>
+<a name="ln1036"> </a>
+<a name="ln1037">      if (command.first == &quot;$filter&quot;) {</a>
+<a name="ln1038">        cursor = ConstructFilterCursor(read_options, cursor, command.second);</a>
+<a name="ln1039">      } else {</a>
+<a name="ln1040">        // only filter is supported for now</a>
+<a name="ln1041">        delete cursor;</a>
+<a name="ln1042">        return new CursorError(STATUS(InvalidArgument, &quot;Invalid query&quot;));</a>
+<a name="ln1043">      }</a>
+<a name="ln1044">    }</a>
+<a name="ln1045"> </a>
+<a name="ln1046">    if (cursor == nullptr) {</a>
+<a name="ln1047">      cursor = new CursorFromIterator(</a>
+<a name="ln1048">          DocumentDB::NewIterator(read_options, primary_key_column_family_));</a>
+<a name="ln1049">    }</a>
+<a name="ln1050"> </a>
+<a name="ln1051">    return cursor;</a>
+<a name="ln1052">  }</a>
+<a name="ln1053"> </a>
+<a name="ln1054">  // RocksDB functions</a>
+<a name="ln1055">  virtual Status Get(const ReadOptions&amp; options,</a>
+<a name="ln1056">                     ColumnFamilyHandle* column_family, const Slice&amp; key,</a>
+<a name="ln1057">                     std::string* value) override {</a>
+<a name="ln1058">    return STATUS(NotSupported, &quot;&quot;);</a>
+<a name="ln1059">  }</a>
+<a name="ln1060">  virtual Status Get(const ReadOptions&amp; options, const Slice&amp; key,</a>
+<a name="ln1061">                     std::string* value) override {</a>
+<a name="ln1062">    return STATUS(NotSupported, &quot;&quot;);</a>
+<a name="ln1063">  }</a>
+<a name="ln1064">  virtual Status Write(const WriteOptions&amp; options,</a>
+<a name="ln1065">                       WriteBatch* updates) override {</a>
+<a name="ln1066">    return STATUS(NotSupported, &quot;&quot;);</a>
+<a name="ln1067">  }</a>
+<a name="ln1068">  virtual Iterator* NewIterator(const ReadOptions&amp; options,</a>
+<a name="ln1069">                                ColumnFamilyHandle* column_family) override {</a>
+<a name="ln1070">    return nullptr;</a>
+<a name="ln1071">  }</a>
+<a name="ln1072">  Iterator* NewIterator(const ReadOptions&amp; options) override {</a>
+<a name="ln1073">    return nullptr;</a>
+<a name="ln1074">  }</a>
+<a name="ln1075"> </a>
+<a name="ln1076"> private:</a>
+<a name="ln1077">  Cursor* ConstructFilterCursor(ReadOptions read_options, Cursor* cursor,</a>
+<a name="ln1078">                                const JSONDocument&amp; query) {</a>
+<a name="ln1079">    std::unique_ptr&lt;const Filter&gt; filter(Filter::ParseFilter(query));</a>
+<a name="ln1080">    if (filter.get() == nullptr) {</a>
+<a name="ln1081">      return new CursorError(STATUS(InvalidArgument, &quot;Invalid query&quot;));</a>
+<a name="ln1082">    }</a>
+<a name="ln1083"> </a>
+<a name="ln1084">    IndexColumnFamily tmp_storage(nullptr, nullptr);</a>
+<a name="ln1085"> </a>
+<a name="ln1086">    if (cursor == nullptr) {</a>
+<a name="ln1087">      IndexColumnFamily* index_column_family = nullptr;</a>
+<a name="ln1088">      if (query.Contains(&quot;$index&quot;) &amp;&amp; query[&quot;$index&quot;].IsString()) {</a>
+<a name="ln1089">        {</a>
+<a name="ln1090">          auto index_name = query[&quot;$index&quot;];</a>
+<a name="ln1091">          MutexLock l(&amp;name_to_index_mutex_);</a>
+<a name="ln1092">          auto index_iter = name_to_index_.find(index_name.GetString());</a>
+<a name="ln1093">          if (index_iter != name_to_index_.end()) {</a>
+<a name="ln1094">            tmp_storage = index_iter-&gt;second;</a>
+<a name="ln1095">            index_column_family = &amp;tmp_storage;</a>
+<a name="ln1096">          } else {</a>
+<a name="ln1097">            return new CursorError(</a>
+<a name="ln1098">                STATUS(InvalidArgument, &quot;Index does not exist&quot;));</a>
+<a name="ln1099">          }</a>
+<a name="ln1100">        }</a>
+<a name="ln1101">      }</a>
+<a name="ln1102"> </a>
+<a name="ln1103">      if (index_column_family != nullptr &amp;&amp;</a>
+<a name="ln1104">          index_column_family-&gt;index-&gt;UsefulIndex(*filter.get())) {</a>
+<a name="ln1105">        std::vector&lt;Iterator*&gt; iterators;</a>
+<a name="ln1106">        Status s = DocumentDB::NewIterators(</a>
+<a name="ln1107">            read_options,</a>
+<a name="ln1108">            {primary_key_column_family_, index_column_family-&gt;column_family},</a>
+<a name="ln1109">            &amp;iterators);</a>
+<a name="ln1110">        if (!s.ok()) {</a>
+<a name="ln1111">          delete cursor;</a>
+<a name="ln1112">          return new CursorError(s);</a>
+<a name="ln1113">        }</a>
+<a name="ln1114">        assert(iterators.size() == 2);</a>
+<a name="ln1115">        return new CursorWithFilterIndexed(iterators[0], iterators[1],</a>
+<a name="ln1116">                                           index_column_family-&gt;index,</a>
+<a name="ln1117">                                           filter.release());</a>
+<a name="ln1118">      } else {</a>
+<a name="ln1119">        return new CursorWithFilter(</a>
+<a name="ln1120">            new CursorFromIterator(DocumentDB::NewIterator(</a>
+<a name="ln1121">                read_options, primary_key_column_family_)),</a>
+<a name="ln1122">            filter.release());</a>
+<a name="ln1123">      }</a>
+<a name="ln1124">    } else {</a>
+<a name="ln1125">      return new CursorWithFilter(cursor, filter.release());</a>
+<a name="ln1126">    }</a>
+<a name="ln1127">    assert(false);</a>
+<a name="ln1128">    return nullptr;</a>
+<a name="ln1129">  }</a>
+<a name="ln1130"> </a>
+<a name="ln1131">  // currently, we lock and serialize all writes to rocksdb. reads are not</a>
+<a name="ln1132">  // locked and always get consistent view of the database. we should optimize</a>
+<a name="ln1133">  // locking in the future</a>
+<a name="ln1134">  port::Mutex write_mutex_;</a>
+<a name="ln1135">  port::Mutex name_to_index_mutex_;</a>
+<a name="ln1136">  const char* kPrimaryKey = &quot;_id&quot;;</a>
+<a name="ln1137">  struct IndexColumnFamily {</a>
+<a name="ln1138">    IndexColumnFamily(Index* _index, ColumnFamilyHandle* _column_family)</a>
+<a name="ln1139">        : index(_index), column_family(_column_family) {}</a>
+<a name="ln1140">    Index* index;</a>
+<a name="ln1141">    ColumnFamilyHandle* column_family;</a>
+<a name="ln1142">  };</a>
+<a name="ln1143"> </a>
+<a name="ln1144"> </a>
+<a name="ln1145">  // name_to_index_ protected:</a>
+<a name="ln1146">  // 1) when writing -- 1. lock write_mutex_, 2. lock name_to_index_mutex_</a>
+<a name="ln1147">  // 2) when reading -- lock name_to_index_mutex_ OR write_mutex_</a>
+<a name="ln1148">  std::unordered_map&lt;std::string, IndexColumnFamily&gt; name_to_index_;</a>
+<a name="ln1149">  ColumnFamilyHandle* primary_key_column_family_;</a>
+<a name="ln1150">  Options rocksdb_options_;</a>
+<a name="ln1151">};</a>
+<a name="ln1152"> </a>
+<a name="ln1153">namespace {</a>
+<a name="ln1154">Options GetRocksDBOptionsFromOptions(const DocumentDBOptions&amp; options) {</a>
+<a name="ln1155">  Options rocksdb_options;</a>
+<a name="ln1156">  rocksdb_options.max_background_compactions = options.background_threads - 1;</a>
+<a name="ln1157">  rocksdb_options.max_background_flushes = 1;</a>
+<a name="ln1158">  rocksdb_options.write_buffer_size = options.memtable_size;</a>
+<a name="ln1159">  rocksdb_options.max_write_buffer_number = 6;</a>
+<a name="ln1160">  BlockBasedTableOptions table_options;</a>
+<a name="ln1161">  table_options.block_cache = NewLRUCache(options.cache_size);</a>
+<a name="ln1162">  rocksdb_options.table_factory.reset(NewBlockBasedTableFactory(table_options));</a>
+<a name="ln1163">  return rocksdb_options;</a>
+<a name="ln1164">}</a>
+<a name="ln1165">}  // namespace</a>
+<a name="ln1166"> </a>
+<a name="ln1167">Status DocumentDB::Open(const DocumentDBOptions&amp; options,</a>
+<a name="ln1168">                        const std::string&amp; name,</a>
+<a name="ln1169">                        const std::vector&lt;DocumentDB::IndexDescriptor&gt;&amp; indexes,</a>
+<a name="ln1170">                        DocumentDB** db, bool read_only) {</a>
+<a name="ln1171">  Options rocksdb_options = GetRocksDBOptionsFromOptions(options);</a>
+<a name="ln1172">  rocksdb_options.create_if_missing = true;</a>
+<a name="ln1173"> </a>
+<a name="ln1174">  std::vector&lt;ColumnFamilyDescriptor&gt; column_families;</a>
+<a name="ln1175">  column_families.push_back(ColumnFamilyDescriptor(</a>
+<a name="ln1176">      kDefaultColumnFamilyName, ColumnFamilyOptions(rocksdb_options)));</a>
+<a name="ln1177">  for (const auto&amp; index : indexes) {</a>
+<a name="ln1178">    column_families.emplace_back(InternalSecondaryIndexName(index.name),</a>
+<a name="ln1179">                                 ColumnFamilyOptions(rocksdb_options));</a>
+<a name="ln1180">  }</a>
+<a name="ln1181">  std::vector&lt;ColumnFamilyHandle*&gt; handles;</a>
+<a name="ln1182">  DB* base_db;</a>
+<a name="ln1183">  Status s;</a>
+<a name="ln1184">  if (read_only) {</a>
+<a name="ln1185">    s = DB::OpenForReadOnly(DBOptions(rocksdb_options), name, column_families,</a>
+<a name="ln1186">                            &amp;handles, &amp;base_db);</a>
+<a name="ln1187">  } else {</a>
+<a name="ln1188">    s = DB::Open(DBOptions(rocksdb_options), name, column_families, &amp;handles,</a>
+<a name="ln1189">                 &amp;base_db);</a>
+<a name="ln1190">  }</a>
+<a name="ln1191">  if (!s.ok()) {</a>
+<a name="ln1192">    return s;</a>
+<a name="ln1193">  }</a>
+<a name="ln1194"> </a>
+<a name="ln1195">  std::vector&lt;std::pair&lt;Index*, ColumnFamilyHandle*&gt;&gt; index_cf(indexes.size());</a>
+<a name="ln1196">  assert(handles.size() == indexes.size() + 1);</a>
+<a name="ln1197">  for (size_t i = 0; i &lt; indexes.size(); ++i) {</a>
+<a name="ln1198">    auto index = Index::CreateIndexFromDescription(*indexes[i].description,</a>
+<a name="ln1199">                                                   indexes[i].name);</a>
+<a name="ln1200">    index_cf[i] = {index, handles[i + 1]};</a>
+<a name="ln1201">  }</a>
+<a name="ln1202">  *db = new DocumentDBImpl(base_db, handles[0], index_cf, rocksdb_options);</a>
+<a name="ln1203">  return Status::OK();</a>
+<a name="ln1204">}</a>
+<a name="ln1205"> </a>
+<a name="ln1206">}  // namespace rocksdb</a>
+<a name="ln1207">#endif  // ROCKSDB_LITE</a>
+
+</code></pre>
+<div class="balloon" rel="497"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v779/" target="_blank">V779</a> Unreachable code detected. It is possible that an error is present.</p></div>
+<div class="balloon" rel="1127"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v779/" target="_blank">V779</a> Unreachable code detected. It is possible that an error is present.</p></div>
+<div class="balloon" rel="355"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: primary_key_offset_buf_.</p></div>
+<div class="balloon" rel="356"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: primary_key_offset_buf_.</p></div>
+<div class="balloon" rel="372"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: primary_key_offset_buf_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,198 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>consistent_read_point.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/common/consistent_read_point.h&quot;</a>
+<a name="ln15">#include &quot;yb/client/transaction.h&quot;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &quot;yb/util/debug-util.h&quot;</a>
+<a name="ln18"> </a>
+<a name="ln19">namespace yb {</a>
+<a name="ln20"> </a>
+<a name="ln21">ConsistentReadPoint::ConsistentReadPoint(const scoped_refptr&lt;ClockBase&gt;&amp; clock)</a>
+<a name="ln22">    : clock_(clock) {</a>
+<a name="ln23">}</a>
+<a name="ln24"> </a>
+<a name="ln25">void ConsistentReadPoint::SetReadTime(</a>
+<a name="ln26">    const ReadHybridTime&amp; read_time, HybridTimeMap&amp;&amp; local_limits) {</a>
+<a name="ln27">  read_time_ = read_time;</a>
+<a name="ln28">  restart_read_ht_ = read_time_.read;</a>
+<a name="ln29">  local_limits_ = std::move(local_limits);</a>
+<a name="ln30">  restarts_.clear();</a>
+<a name="ln31">}</a>
+<a name="ln32"> </a>
+<a name="ln33">void ConsistentReadPoint::SetCurrentReadTime() {</a>
+<a name="ln34">  read_time_ = ReadHybridTime::FromHybridTimeRange(clock_-&gt;NowRange());</a>
+<a name="ln35">  restart_read_ht_ = read_time_.read;</a>
+<a name="ln36">  local_limits_.clear();</a>
+<a name="ln37">  restarts_.clear();</a>
+<a name="ln38">}</a>
+<a name="ln39"> </a>
+<a name="ln40">ReadHybridTime ConsistentReadPoint::GetReadTime(const TabletId&amp; tablet) const {</a>
+<a name="ln41">  ReadHybridTime read_time = read_time_;</a>
+<a name="ln42">  if (read_time) {</a>
+<a name="ln43">    // Use the local limit for the tablet but no earlier than the read time we want.</a>
+<a name="ln44">    const auto it = local_limits_.find(tablet);</a>
+<a name="ln45">    if (it != local_limits_.end()) {</a>
+<a name="ln46">      read_time.local_limit = std::max(it-&gt;second, read_time.read);</a>
+<a name="ln47">    }</a>
+<a name="ln48">  }</a>
+<a name="ln49">  return read_time;</a>
+<a name="ln50">}</a>
+<a name="ln51"> </a>
+<a name="ln52">void ConsistentReadPoint::RestartRequired(const TabletId&amp; tablet,</a>
+<a name="ln53">                                          const ReadHybridTime&amp; restart_time) {</a>
+<a name="ln54">  DCHECK(read_time_) &lt;&lt; &quot;Unexpected restart without a read time set&quot;;</a>
+<a name="ln55">  std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln56">  restart_read_ht_.MakeAtLeast(restart_time.read);</a>
+<a name="ln57">  // We should inherit per-tablet restart time limits before restart, doing it lazily.</a>
+<a name="ln58">  if (restarts_.empty()) {</a>
+<a name="ln59">    restarts_ = local_limits_;</a>
+<a name="ln60">  }</a>
+<a name="ln61">  auto emplace_result = restarts_.emplace(tablet, restart_time.local_limit);</a>
+<a name="ln62">  bool inserted = emplace_result.second;</a>
+<a name="ln63">  if (!inserted) {</a>
+<a name="ln64">    auto&amp; existing_local_limit = emplace_result.first-&gt;second;</a>
+<a name="ln65">    existing_local_limit = std::min(existing_local_limit, restart_time.local_limit);</a>
+<a name="ln66">  }</a>
+<a name="ln67">}</a>
+<a name="ln68"> </a>
+<a name="ln69">bool ConsistentReadPoint::IsRestartRequired() const {</a>
+<a name="ln70">  return !restarts_.empty();</a>
+<a name="ln71">}</a>
+<a name="ln72"> </a>
+<a name="ln73">void ConsistentReadPoint::Restart() {</a>
+<a name="ln74">  local_limits_ = std::move(restarts_);</a>
+<a name="ln75">  read_time_.read = restart_read_ht_;</a>
+<a name="ln76">}</a>
+<a name="ln77"> </a>
+<a name="ln78">void ConsistentReadPoint::Defer() {</a>
+<a name="ln79">  read_time_.read = read_time_.global_limit;</a>
+<a name="ln80">}</a>
+<a name="ln81"> </a>
+<a name="ln82">void ConsistentReadPoint::UpdateClock(HybridTime propagated_hybrid_time) {</a>
+<a name="ln83">  clock_-&gt;Update(propagated_hybrid_time);</a>
+<a name="ln84">}</a>
+<a name="ln85"> </a>
+<a name="ln86">HybridTime ConsistentReadPoint::Now() const {</a>
+<a name="ln87">  return clock_-&gt;Now();</a>
+<a name="ln88">}</a>
+<a name="ln89"> </a>
+<a name="ln90">void ConsistentReadPoint::PrepareChildTransactionData(ChildTransactionDataPB* data) const {</a>
+<a name="ln91">  read_time_.AddToPB(data);</a>
+<a name="ln92">  auto&amp; local_limits = *data-&gt;mutable_local_limits();</a>
+<a name="ln93">  for (const auto&amp; entry : local_limits_) {</a>
+<a name="ln94">    typedef std::remove_reference&lt;decltype(*local_limits.begin())&gt;::type PairType;</a>
+<a name="ln95">    local_limits.insert(PairType(entry.first, entry.second.ToUint64()));</a>
+<a name="ln96">  }</a>
+<a name="ln97">}</a>
+<a name="ln98"> </a>
+<a name="ln99">void ConsistentReadPoint::FinishChildTransactionResult(</a>
+<a name="ln100">    HadReadTime had_read_time, ChildTransactionResultPB* result) const {</a>
+<a name="ln101">  if (IsRestartRequired()) {</a>
+<a name="ln102">    result-&gt;set_restart_read_ht(restart_read_ht_.ToUint64());</a>
+<a name="ln103">    auto&amp; restarts = *result-&gt;mutable_read_restarts();</a>
+<a name="ln104">    for (const auto&amp; restart : restarts_) {</a>
+<a name="ln105">      typedef std::remove_reference&lt;decltype(*restarts.begin())&gt;::type PairType;</a>
+<a name="ln106">      restarts.insert(PairType(restart.first, restart.second.ToUint64()));</a>
+<a name="ln107">    }</a>
+<a name="ln108">  } else {</a>
+<a name="ln109">    result-&gt;set_restart_read_ht(HybridTime::kInvalid.ToUint64());</a>
+<a name="ln110">  }</a>
+<a name="ln111"> </a>
+<a name="ln112">  if (!had_read_time &amp;&amp; read_time_) {</a>
+<a name="ln113">    read_time_.ToPB(result-&gt;mutable_used_read_time());</a>
+<a name="ln114">  }</a>
+<a name="ln115">}</a>
+<a name="ln116"> </a>
+<a name="ln117">void ConsistentReadPoint::ApplyChildTransactionResult(const ChildTransactionResultPB&amp; result) {</a>
+<a name="ln118">  if (result.has_used_read_time()) {</a>
+<a name="ln119">    LOG_IF(DFATAL, read_time_)</a>
+<a name="ln120">        &lt;&lt; &quot;Read time already picked (&quot; &lt;&lt; read_time_</a>
+<a name="ln121">        &lt;&lt; &quot;, but child result contains used read time: &quot;</a>
+<a name="ln122">        &lt;&lt; result.used_read_time().ShortDebugString();</a>
+<a name="ln123">    read_time_ = ReadHybridTime::FromPB(result.used_read_time());</a>
+<a name="ln124">    restart_read_ht_ = read_time_.read;</a>
+<a name="ln125">  }</a>
+<a name="ln126"> </a>
+<a name="ln127">  HybridTime restart_read_ht(result.restart_read_ht());</a>
+<a name="ln128">  if (restart_read_ht.is_valid()) {</a>
+<a name="ln129">    ReadHybridTime read_time;</a>
+<a name="ln130">    read_time.read = restart_read_ht;</a>
+<a name="ln131">    for (const auto&amp; restart : result.read_restarts()) {</a>
+<a name="ln132">      read_time.local_limit = HybridTime(restart.second);</a>
+<a name="ln133">      RestartRequired(restart.first, read_time);</a>
+<a name="ln134">    }</a>
+<a name="ln135">  }</a>
+<a name="ln136">}</a>
+<a name="ln137"> </a>
+<a name="ln138">void ConsistentReadPoint::SetInTxnLimit(HybridTime value) {</a>
+<a name="ln139">  read_time_.in_txn_limit = value;</a>
+<a name="ln140">}</a>
+<a name="ln141"> </a>
+<a name="ln142">ConsistentReadPoint&amp; ConsistentReadPoint::operator=(ConsistentReadPoint&amp;&amp; other) {</a>
+<a name="ln143">  clock_.swap(other.clock_);</a>
+<a name="ln144">  read_time_ = std::move(other.read_time_);</a>
+<a name="ln145">  restart_read_ht_ = std::move(other.restart_read_ht_);</a>
+<a name="ln146">  local_limits_ = std::move(other.local_limits_);</a>
+<a name="ln147">  restarts_ = std::move(other.restarts_);</a>
+<a name="ln148">  return *this;</a>
+<a name="ln149">}</a>
+<a name="ln150"> </a>
+<a name="ln151">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="54"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="119"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

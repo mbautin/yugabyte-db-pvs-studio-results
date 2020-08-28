@@ -1,0 +1,635 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>yb-bulk_load.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;sched.h&gt;</a>
+<a name="ln15">#include &lt;iostream&gt;</a>
+<a name="ln16">#include &lt;thread&gt;</a>
+<a name="ln17">#include &lt;boost/algorithm/string.hpp&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln20">#include &lt;glog/logging.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln23">#include &quot;yb/client/table.h&quot;</a>
+<a name="ln24">#include &quot;yb/common/entity_ids.h&quot;</a>
+<a name="ln25">#include &quot;yb/common/hybrid_time.h&quot;</a>
+<a name="ln26">#include &quot;yb/common/jsonb.h&quot;</a>
+<a name="ln27">#include &quot;yb/common/ql_protocol.pb.h&quot;</a>
+<a name="ln28">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln29">#include &quot;yb/common/schema.h&quot;</a>
+<a name="ln30">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln31">#include &quot;yb/docdb/cql_operation.h&quot;</a>
+<a name="ln32">#include &quot;yb/docdb/doc_operation.h&quot;</a>
+<a name="ln33">#include &quot;yb/docdb/docdb.h&quot;</a>
+<a name="ln34">#include &quot;yb/master/master_util.h&quot;</a>
+<a name="ln35">#include &quot;yb/rocksdb/db.h&quot;</a>
+<a name="ln36">#include &quot;yb/rocksdb/options.h&quot;</a>
+<a name="ln37">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln38">#include &quot;yb/rpc/rpc_controller.h&quot;</a>
+<a name="ln39">#include &quot;yb/tools/bulk_load_docdb_util.h&quot;</a>
+<a name="ln40">#include &quot;yb/tools/bulk_load_utils.h&quot;</a>
+<a name="ln41">#include &quot;yb/tools/yb-generate_partitions.h&quot;</a>
+<a name="ln42">#include &quot;yb/tserver/tserver_service.proxy.h&quot;</a>
+<a name="ln43">#include &quot;yb/util/env.h&quot;</a>
+<a name="ln44">#include &quot;yb/util/status.h&quot;</a>
+<a name="ln45">#include &quot;yb/util/stol_utils.h&quot;</a>
+<a name="ln46">#include &quot;yb/util/stopwatch.h&quot;</a>
+<a name="ln47">#include &quot;yb/util/size_literals.h&quot;</a>
+<a name="ln48">#include &quot;yb/util/threadpool.h&quot;</a>
+<a name="ln49">#include &quot;yb/util/flags.h&quot;</a>
+<a name="ln50">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln51">#include &quot;yb/util/path_util.h&quot;</a>
+<a name="ln52">#include &quot;yb/util/subprocess.h&quot;</a>
+<a name="ln53"> </a>
+<a name="ln54">using std::pair;</a>
+<a name="ln55">using std::string;</a>
+<a name="ln56">using std::shared_ptr;</a>
+<a name="ln57">using std::unique_ptr;</a>
+<a name="ln58">using std::vector;</a>
+<a name="ln59">using yb::client::YBClient;</a>
+<a name="ln60">using yb::client::YBClientBuilder;</a>
+<a name="ln61">using yb::client::YBTable;</a>
+<a name="ln62">using yb::client::YBTableName;</a>
+<a name="ln63">using yb::docdb::DocWriteBatch;</a>
+<a name="ln64">using yb::docdb::InitMarkerBehavior;</a>
+<a name="ln65">using yb::operator&quot;&quot; _GB;</a>
+<a name="ln66"> </a>
+<a name="ln67">DEFINE_string(master_addresses, &quot;&quot;, &quot;Comma-separated list of YB Master server addresses&quot;);</a>
+<a name="ln68">DEFINE_string(table_name, &quot;&quot;, &quot;Name of the table to generate partitions for&quot;);</a>
+<a name="ln69">DEFINE_string(namespace_name, &quot;&quot;, &quot;Namespace of the table&quot;);</a>
+<a name="ln70">DEFINE_string(base_dir, &quot;&quot;, &quot;Base directory where we will store all the SSTable files&quot;);</a>
+<a name="ln71">DEFINE_int64(memtable_size_bytes, 1_GB, &quot;Amount of bytes to use for the rocksdb memtable&quot;);</a>
+<a name="ln72">DEFINE_int32(row_batch_size, 1000, &quot;The number of rows to batch together in each rocksdb write&quot;);</a>
+<a name="ln73">DEFINE_bool(flush_batch_for_tests, false, &quot;Option used only in tests to flush after each batch. &quot;</a>
+<a name="ln74">    &quot;Used to generate multiple SST files in conjuction with small row_batch_size&quot;);</a>
+<a name="ln75">DEFINE_string(bulk_load_helper_script, &quot;./bulk_load_helper.sh&quot;, &quot;Relative path for bulk load helper&quot;</a>
+<a name="ln76">              &quot; script&quot;);</a>
+<a name="ln77">DEFINE_string(bulk_load_cleanup_script, &quot;./bulk_load_cleanup.sh&quot;, &quot;Relative path for bulk load &quot;</a>
+<a name="ln78">              &quot;cleanup script&quot;);</a>
+<a name="ln79">DEFINE_string(ssh_key_file, &quot;&quot;, &quot;SSH key to push SSTable files to production cluster&quot;);</a>
+<a name="ln80">DEFINE_bool(export_files, false, &quot;Whether or not the files should be exported to a production &quot;</a>
+<a name="ln81">            &quot;cluster.&quot;);</a>
+<a name="ln82">DEFINE_int32(bulk_load_num_threads, 16, &quot;Number of threads to use for bulk load&quot;);</a>
+<a name="ln83">DEFINE_int32(bulk_load_threadpool_queue_size, 10000,</a>
+<a name="ln84">             &quot;Maximum number of entries to queue in the threadpool&quot;);</a>
+<a name="ln85">DEFINE_int32(bulk_load_num_memtables, 3, &quot;Number of memtables to use for rocksdb&quot;);</a>
+<a name="ln86">DEFINE_int32(bulk_load_max_background_flushes, 2, &quot;Number of flushes to perform in the background&quot;);</a>
+<a name="ln87">DEFINE_uint64(bulk_load_num_files_per_tablet, 5,</a>
+<a name="ln88">              &quot;Determines how to compact the data of a tablet to ensure we have only a certain &quot;</a>
+<a name="ln89">              &quot;number of sst files per tablet&quot;);</a>
+<a name="ln90"> </a>
+<a name="ln91">DECLARE_string(skipped_cols);</a>
+<a name="ln92"> </a>
+<a name="ln93">namespace yb {</a>
+<a name="ln94">namespace tools {</a>
+<a name="ln95"> </a>
+<a name="ln96">namespace {</a>
+<a name="ln97"> </a>
+<a name="ln98">class BulkLoadTask : public Runnable {</a>
+<a name="ln99"> public:</a>
+<a name="ln100">  BulkLoadTask(vector&lt;pair&lt;TabletId, string&gt;&gt; rows, BulkLoadDocDBUtil *db_fixture,</a>
+<a name="ln101">               const YBTable *table, YBPartitionGenerator *partition_generator);</a>
+<a name="ln102">  void Run();</a>
+<a name="ln103"> private:</a>
+<a name="ln104">  CHECKED_STATUS PopulateColumnValue(const string &amp;column,</a>
+<a name="ln105">                                     const DataType data_type,</a>
+<a name="ln106">                                     QLExpressionPB *column_value);</a>
+<a name="ln107">  CHECKED_STATUS InsertRow(const string &amp;row,</a>
+<a name="ln108">                           const Schema &amp;schema,</a>
+<a name="ln109">                           const IndexMap&amp; index_map,</a>
+<a name="ln110">                           BulkLoadDocDBUtil *const db_fixture,</a>
+<a name="ln111">                           docdb::DocWriteBatch *const doc_write_batch,</a>
+<a name="ln112">                           YBPartitionGenerator *const partition_generator);</a>
+<a name="ln113">  vector&lt;pair&lt;TabletId, string&gt;&gt; rows_;</a>
+<a name="ln114">  const std::set&lt;int&gt; skipped_cols_;</a>
+<a name="ln115">  BulkLoadDocDBUtil *const db_fixture_;</a>
+<a name="ln116">  const YBTable *const table_;</a>
+<a name="ln117">  YBPartitionGenerator *const partition_generator_;</a>
+<a name="ln118">};</a>
+<a name="ln119"> </a>
+<a name="ln120">class CompactionTask: public Runnable {</a>
+<a name="ln121"> public:</a>
+<a name="ln122">  CompactionTask(const vector&lt;string&gt;&amp; sst_filenames, BulkLoadDocDBUtil* db_fixture);</a>
+<a name="ln123">  void Run();</a>
+<a name="ln124"> private:</a>
+<a name="ln125">  vector &lt;string&gt; sst_filenames_;</a>
+<a name="ln126">  BulkLoadDocDBUtil *const db_fixture_;</a>
+<a name="ln127">};</a>
+<a name="ln128"> </a>
+<a name="ln129">class BulkLoad {</a>
+<a name="ln130"> public:</a>
+<a name="ln131">  CHECKED_STATUS RunBulkLoad();</a>
+<a name="ln132"> </a>
+<a name="ln133"> private:</a>
+<a name="ln134">  CHECKED_STATUS InitYBBulkLoad();</a>
+<a name="ln135">  CHECKED_STATUS InitDBUtil(const TabletId &amp;tablet_id);</a>
+<a name="ln136">  CHECKED_STATUS FinishTabletProcessing(const TabletId &amp;tablet_id,</a>
+<a name="ln137">                                        vector&lt;pair&lt;TabletId, string&gt;&gt; rows);</a>
+<a name="ln138">  CHECKED_STATUS RetryableSubmit(vector&lt;pair&lt;TabletId, string&gt;&gt; rows);</a>
+<a name="ln139">  CHECKED_STATUS CompactFiles();</a>
+<a name="ln140"> </a>
+<a name="ln141">  std::unique_ptr&lt;YBClient&gt; client_;</a>
+<a name="ln142">  shared_ptr&lt;YBTable&gt; table_;</a>
+<a name="ln143">  unique_ptr&lt;YBPartitionGenerator&gt; partition_generator_;</a>
+<a name="ln144">  gscoped_ptr&lt;ThreadPool&gt; thread_pool_;</a>
+<a name="ln145">  unique_ptr&lt;BulkLoadDocDBUtil&gt; db_fixture_;</a>
+<a name="ln146">};</a>
+<a name="ln147"> </a>
+<a name="ln148">CompactionTask::CompactionTask(const vector&lt;string&gt;&amp; sst_filenames, BulkLoadDocDBUtil* db_fixture)</a>
+<a name="ln149">    : sst_filenames_(sst_filenames),</a>
+<a name="ln150">      db_fixture_(db_fixture) {</a>
+<a name="ln151">}</a>
+<a name="ln152"> </a>
+<a name="ln153">void CompactionTask::Run() {</a>
+<a name="ln154">  if (sst_filenames_.size() == 1) {</a>
+<a name="ln155">    LOG(INFO) &lt;&lt; &quot;Skipping compaction since we have only a single file: &quot; &lt;&lt; sst_filenames_[0];</a>
+<a name="ln156">    return;</a>
+<a name="ln157">  }</a>
+<a name="ln158"> </a>
+<a name="ln159">  LOG(INFO) &lt;&lt; &quot;Compacting files: &quot; &lt;&lt; ToString(sst_filenames_);</a>
+<a name="ln160">  CHECK_OK(db_fixture_-&gt;rocksdb()-&gt;CompactFiles(rocksdb::CompactionOptions(),</a>
+<a name="ln161">                                                sst_filenames_,</a>
+<a name="ln162">                                                /* output_level */ 0));</a>
+<a name="ln163">}</a>
+<a name="ln164"> </a>
+<a name="ln165">BulkLoadTask::BulkLoadTask(vector&lt;pair&lt;TabletId, string&gt;&gt; rows,</a>
+<a name="ln166">                           BulkLoadDocDBUtil *db_fixture, const YBTable *table,</a>
+<a name="ln167">                           YBPartitionGenerator *partition_generator)</a>
+<a name="ln168">    : rows_(std::move(rows)),</a>
+<a name="ln169">      skipped_cols_(tools::SkippedColumns()),</a>
+<a name="ln170">      db_fixture_(db_fixture),</a>
+<a name="ln171">      table_(table),</a>
+<a name="ln172">      partition_generator_(partition_generator) {</a>
+<a name="ln173">}</a>
+<a name="ln174"> </a>
+<a name="ln175">void BulkLoadTask::Run() {</a>
+<a name="ln176">  DocWriteBatch doc_write_batch(docdb::DocDB::FromRegularUnbounded(db_fixture_-&gt;rocksdb()),</a>
+<a name="ln177">                                InitMarkerBehavior::kOptional);</a>
+<a name="ln178"> </a>
+<a name="ln179">  for (const auto &amp;entry : rows_) {</a>
+<a name="ln180">    const string &amp;row = entry.second;</a>
+<a name="ln181"> </a>
+<a name="ln182">    // Populate the row.</a>
+<a name="ln183">    CHECK_OK(InsertRow(row, table_-&gt;InternalSchema(), table_-&gt;index_map(), db_fixture_,</a>
+<a name="ln184">                       &amp;doc_write_batch, partition_generator_));</a>
+<a name="ln185">  }</a>
+<a name="ln186"> </a>
+<a name="ln187">  // Flush the batch.</a>
+<a name="ln188">  CHECK_OK(db_fixture_-&gt;WriteToRocksDB(</a>
+<a name="ln189">      doc_write_batch, HybridTime::FromMicros(kYugaByteMicrosecondEpoch),</a>
+<a name="ln190">      /* decode_dockey */ false, /* increment_write_id */ false));</a>
+<a name="ln191"> </a>
+<a name="ln192">  if (FLAGS_flush_batch_for_tests) {</a>
+<a name="ln193">    CHECK_OK(db_fixture_-&gt;FlushRocksDbAndWait());</a>
+<a name="ln194">  }</a>
+<a name="ln195">}</a>
+<a name="ln196"> </a>
+<a name="ln197">Status BulkLoadTask::PopulateColumnValue(const string &amp;column,</a>
+<a name="ln198">                                         const DataType data_type,</a>
+<a name="ln199">                                         QLExpressionPB *column_value) {</a>
+<a name="ln200">  auto ql_valuepb = column_value-&gt;mutable_value();</a>
+<a name="ln201">  switch (data_type) {</a>
+<a name="ln202">    YB_SET_INT_VALUE(ql_valuepb, column, 8);</a>
+<a name="ln203">    YB_SET_INT_VALUE(ql_valuepb, column, 16);</a>
+<a name="ln204">    YB_SET_INT_VALUE(ql_valuepb, column, 32);</a>
+<a name="ln205">    YB_SET_INT_VALUE(ql_valuepb, column, 64);</a>
+<a name="ln206">    case DataType::FLOAT: {</a>
+<a name="ln207">      auto value = CheckedStold(column);</a>
+<a name="ln208">      RETURN_NOT_OK(value);</a>
+<a name="ln209">      ql_valuepb-&gt;set_float_value(*value);</a>
+<a name="ln210">      break;</a>
+<a name="ln211">    }</a>
+<a name="ln212">    case DataType::DOUBLE: {</a>
+<a name="ln213">      auto value = CheckedStold(column);</a>
+<a name="ln214">      RETURN_NOT_OK(value);</a>
+<a name="ln215">      ql_valuepb-&gt;set_double_value(*value);</a>
+<a name="ln216">      break;</a>
+<a name="ln217">    }</a>
+<a name="ln218">    case DataType::STRING: {</a>
+<a name="ln219">      ql_valuepb-&gt;set_string_value(column);</a>
+<a name="ln220">      break;</a>
+<a name="ln221">    }</a>
+<a name="ln222">    case DataType::JSONB: {</a>
+<a name="ln223">      common::Jsonb jsonb;</a>
+<a name="ln224">      RETURN_NOT_OK(jsonb.FromString(column));</a>
+<a name="ln225">      ql_valuepb-&gt;set_jsonb_value(jsonb.MoveSerializedJsonb());</a>
+<a name="ln226">      break;</a>
+<a name="ln227">    }</a>
+<a name="ln228">    case DataType::TIMESTAMP: {</a>
+<a name="ln229">      auto ts = TimestampFromString(column);</a>
+<a name="ln230">      RETURN_NOT_OK(ts);</a>
+<a name="ln231">      ql_valuepb-&gt;set_timestamp_value(ts-&gt;ToInt64());</a>
+<a name="ln232">      break;</a>
+<a name="ln233">    }</a>
+<a name="ln234">    case DataType::BINARY: {</a>
+<a name="ln235">      ql_valuepb-&gt;set_binary_value(column);</a>
+<a name="ln236">      break;</a>
+<a name="ln237">    }</a>
+<a name="ln238">    default:</a>
+<a name="ln239">      FATAL_INVALID_ENUM_VALUE(DataType, data_type);</a>
+<a name="ln240">  }</a>
+<a name="ln241">  return Status::OK();</a>
+<a name="ln242">}</a>
+<a name="ln243"> </a>
+<a name="ln244">Status BulkLoadTask::InsertRow(const string &amp;row,</a>
+<a name="ln245">                               const Schema &amp;schema,</a>
+<a name="ln246">                               const IndexMap&amp; index_map,</a>
+<a name="ln247">                               BulkLoadDocDBUtil *const db_fixture,</a>
+<a name="ln248">                               docdb::DocWriteBatch *const doc_write_batch,</a>
+<a name="ln249">                               YBPartitionGenerator *const partition_generator) {</a>
+<a name="ln250">  // Get individual columns.</a>
+<a name="ln251">  CsvTokenizer tokenizer = Tokenize(row);</a>
+<a name="ln252">  size_t ncolumns = std::distance(tokenizer.begin(), tokenizer.end());</a>
+<a name="ln253">  if (ncolumns != schema.num_columns()) {</a>
+<a name="ln254">    return STATUS_SUBSTITUTE(IllegalState, &quot;row '$0' has $1 columns, need exactly $2&quot;, row,</a>
+<a name="ln255">                             ncolumns, schema.num_columns());</a>
+<a name="ln256">  }</a>
+<a name="ln257"> </a>
+<a name="ln258">  QLResponsePB resp;</a>
+<a name="ln259">  QLWriteRequestPB req;</a>
+<a name="ln260">  req.set_type(QLWriteRequestPB_QLStmtType_QL_STMT_INSERT);</a>
+<a name="ln261">  req.set_client(YQL_CLIENT_CQL);</a>
+<a name="ln262"> </a>
+<a name="ln263">  int col_id = 0;</a>
+<a name="ln264">  auto it = tokenizer.begin();</a>
+<a name="ln265">  // Process the hash keys first.</a>
+<a name="ln266">  for (int i = 0; i &lt; schema.num_key_columns(); it++, col_id++) {</a>
+<a name="ln267">    if (skipped_cols_.find(col_id) != skipped_cols_.end()) {</a>
+<a name="ln268">      continue;</a>
+<a name="ln269">    }</a>
+<a name="ln270">    if (IsNull(*it)) {</a>
+<a name="ln271">      return STATUS_SUBSTITUTE(IllegalState, &quot;Primary key cannot be null: $0&quot;, *it);</a>
+<a name="ln272">    }</a>
+<a name="ln273"> </a>
+<a name="ln274">    QLExpressionPB *column_value = nullptr;</a>
+<a name="ln275">    if (schema.is_hash_key_column(i)) {</a>
+<a name="ln276">      column_value = req.add_hashed_column_values();</a>
+<a name="ln277">    } else {</a>
+<a name="ln278">      column_value = req.add_range_column_values();</a>
+<a name="ln279">    }</a>
+<a name="ln280"> </a>
+<a name="ln281">    RETURN_NOT_OK(PopulateColumnValue(*it, schema.column(i).type_info()-&gt;type(), column_value));</a>
+<a name="ln282">    i++;  // Avoid this if we are skipping the column.</a>
+<a name="ln283">  }</a>
+<a name="ln284"> </a>
+<a name="ln285">  // Finally process the regular columns.</a>
+<a name="ln286">  for (int i = schema.num_key_columns(); i &lt; schema.num_columns(); it++, col_id++) {</a>
+<a name="ln287">    if (skipped_cols_.find(col_id) != skipped_cols_.end()) {</a>
+<a name="ln288">      continue;</a>
+<a name="ln289">    }</a>
+<a name="ln290">    QLColumnValuePB *column_value = req.add_column_values();</a>
+<a name="ln291">    column_value-&gt;set_column_id(kFirstColumnId + i);</a>
+<a name="ln292">    if (IsNull(*it)) {</a>
+<a name="ln293">      // Use empty value for null.</a>
+<a name="ln294">      column_value-&gt;mutable_expr()-&gt;mutable_value();</a>
+<a name="ln295">    } else {</a>
+<a name="ln296">      RETURN_NOT_OK(PopulateColumnValue(*it, schema.column(i).type_info()-&gt;type(),</a>
+<a name="ln297">                                        column_value-&gt;mutable_expr()));</a>
+<a name="ln298">    }</a>
+<a name="ln299">    i++;  // Avoid this if we are skipping the column.</a>
+<a name="ln300">  }</a>
+<a name="ln301"> </a>
+<a name="ln302">  // Add the hash code to the operation.</a>
+<a name="ln303">  string tablet_id;</a>
+<a name="ln304">  string partition_key;</a>
+<a name="ln305">  RETURN_NOT_OK(partition_generator-&gt;LookupTabletIdWithTokenizer(</a>
+<a name="ln306">      tokenizer, skipped_cols_, &amp;tablet_id, &amp;partition_key));</a>
+<a name="ln307">  req.set_hash_code(PartitionSchema::DecodeMultiColumnHashValue(partition_key));</a>
+<a name="ln308"> </a>
+<a name="ln309">  // Finally apply the operation to the doc_write_batch.</a>
+<a name="ln310">  // TODO(dtxn) pass correct TransactionContext.</a>
+<a name="ln311">  // Comment from PritamD: Don't need cross shard transaction support in bulk load, but I guess</a>
+<a name="ln312">  // once we have secondary indexes we probably might need to ensure bulk load builds the indexes</a>
+<a name="ln313">  // as well.</a>
+<a name="ln314">  docdb::QLWriteOperation op(std::shared_ptr&lt;const Schema&gt;(&amp;schema, [](const Schema*){}),</a>
+<a name="ln315">                             index_map, nullptr /* unique_index_key_schema */, boost::none);</a>
+<a name="ln316">  RETURN_NOT_OK(op.Init(&amp;req, &amp;resp));</a>
+<a name="ln317">  RETURN_NOT_OK(op.Apply({</a>
+<a name="ln318">      doc_write_batch,</a>
+<a name="ln319">      CoarseTimePoint::max() /* deadline */,</a>
+<a name="ln320">      ReadHybridTime::SingleTime(HybridTime::FromMicros(kYugaByteMicrosecondEpoch))}));</a>
+<a name="ln321">  return Status::OK();</a>
+<a name="ln322">}</a>
+<a name="ln323"> </a>
+<a name="ln324"> </a>
+<a name="ln325">Status BulkLoad::RetryableSubmit(vector&lt;pair&lt;TabletId, string&gt;&gt; rows) {</a>
+<a name="ln326">  auto runnable = std::make_shared&lt;BulkLoadTask&gt;(</a>
+<a name="ln327">      std::move(rows), db_fixture_.get(), table_.get(), partition_generator_.get());</a>
+<a name="ln328"> </a>
+<a name="ln329">  Status s;</a>
+<a name="ln330">  do {</a>
+<a name="ln331">    s = thread_pool_-&gt;Submit(runnable);</a>
+<a name="ln332"> </a>
+<a name="ln333">    if (!s.IsServiceUnavailable()) {</a>
+<a name="ln334">      return s;</a>
+<a name="ln335">    }</a>
+<a name="ln336"> </a>
+<a name="ln337">    LOG (ERROR) &lt;&lt; &quot;Failed submitting task, sleeping for a while: &quot; &lt;&lt; s.ToString();</a>
+<a name="ln338"> </a>
+<a name="ln339">    // If service is unavailable, the queue might be full. Sleep and try again.</a>
+<a name="ln340">    SleepFor(MonoDelta::FromSeconds(10));</a>
+<a name="ln341">  } while (!s.ok());</a>
+<a name="ln342"> </a>
+<a name="ln343">  return Status::OK();</a>
+<a name="ln344">}</a>
+<a name="ln345"> </a>
+<a name="ln346">Status BulkLoad::CompactFiles() {</a>
+<a name="ln347">  std::vector&lt;rocksdb::LiveFileMetaData&gt; live_files_metadata;</a>
+<a name="ln348">  db_fixture_-&gt;rocksdb()-&gt;GetLiveFilesMetaData(&amp;live_files_metadata);</a>
+<a name="ln349">  if (live_files_metadata.empty()) {</a>
+<a name="ln350">    return STATUS(IllegalState, &quot;Need atleast one sst file&quot;);</a>
+<a name="ln351">  }</a>
+<a name="ln352"> </a>
+<a name="ln353">  // Extract file names.</a>
+<a name="ln354">  vector&lt;string&gt; sst_files;</a>
+<a name="ln355">  sst_files.reserve(live_files_metadata.size());</a>
+<a name="ln356">  for (const rocksdb::LiveFileMetaData&amp; file : live_files_metadata) {</a>
+<a name="ln357">    sst_files.push_back(file.name);</a>
+<a name="ln358">  }</a>
+<a name="ln359"> </a>
+<a name="ln360">  // Batch the files for compaction.</a>
+<a name="ln361">  size_t batch_size = sst_files.size() / FLAGS_bulk_load_num_files_per_tablet;</a>
+<a name="ln362">  // We need to perform compactions only if we have more than 'bulk_load_num_files_per_tablet'</a>
+<a name="ln363">  // files.</a>
+<a name="ln364">  if (batch_size != 0) {</a>
+<a name="ln365">    auto start_iter = sst_files.begin();</a>
+<a name="ln366">    for (size_t i = 0; i &lt; FLAGS_bulk_load_num_files_per_tablet; i++) {</a>
+<a name="ln367">      // Sanity check.</a>
+<a name="ln368">      CHECK_GE(std::distance(start_iter, sst_files.end()), batch_size);</a>
+<a name="ln369"> </a>
+<a name="ln370">      // Include the remaining files for the last batch.</a>
+<a name="ln371">      auto end_iter = (i == FLAGS_bulk_load_num_files_per_tablet - 1) ? sst_files.end()</a>
+<a name="ln372">                                                                      : start_iter + batch_size;</a>
+<a name="ln373">      auto runnable = std::make_shared&lt;CompactionTask&gt;(vector&lt;string&gt;(start_iter, end_iter),</a>
+<a name="ln374">                                                       db_fixture_.get());</a>
+<a name="ln375">      RETURN_NOT_OK(thread_pool_-&gt;Submit(runnable));</a>
+<a name="ln376">      start_iter = end_iter;</a>
+<a name="ln377">    }</a>
+<a name="ln378"> </a>
+<a name="ln379">    // Finally wait for all compactions to finish.</a>
+<a name="ln380">    thread_pool_-&gt;Wait();</a>
+<a name="ln381"> </a>
+<a name="ln382">    // Reopen rocksdb to clean up deleted files.</a>
+<a name="ln383">    return db_fixture_-&gt;ReopenRocksDB();</a>
+<a name="ln384">  }</a>
+<a name="ln385">  return Status::OK();</a>
+<a name="ln386">}</a>
+<a name="ln387"> </a>
+<a name="ln388">Status BulkLoad::FinishTabletProcessing(const TabletId &amp;tablet_id,</a>
+<a name="ln389">                                        vector&lt;pair&lt;TabletId, string&gt;&gt; rows) {</a>
+<a name="ln390">  if (!db_fixture_) {</a>
+<a name="ln391">    // Skip processing since db_fixture wasn't initialized indicating empty input.</a>
+<a name="ln392">    return Status::OK();</a>
+<a name="ln393">  }</a>
+<a name="ln394"> </a>
+<a name="ln395">  // Submit all the work.</a>
+<a name="ln396">  RETURN_NOT_OK(RetryableSubmit(std::move(rows)));</a>
+<a name="ln397"> </a>
+<a name="ln398">  // Wait for all tasks for the tablet to complete.</a>
+<a name="ln399">  thread_pool_-&gt;Wait();</a>
+<a name="ln400"> </a>
+<a name="ln401">  // Now flush the DB.</a>
+<a name="ln402">  RETURN_NOT_OK(db_fixture_-&gt;FlushRocksDbAndWait());</a>
+<a name="ln403"> </a>
+<a name="ln404">  // Perform the necessary compactions.</a>
+<a name="ln405">  RETURN_NOT_OK(CompactFiles());</a>
+<a name="ln406"> </a>
+<a name="ln407">  if (!FLAGS_export_files) {</a>
+<a name="ln408">    return Status::OK();</a>
+<a name="ln409">  }</a>
+<a name="ln410"> </a>
+<a name="ln411">  // Find replicas for the tablet.</a>
+<a name="ln412">  master::TabletLocationsPB tablet_locations;</a>
+<a name="ln413">  RETURN_NOT_OK(client_-&gt;GetTabletLocation(tablet_id, &amp;tablet_locations));</a>
+<a name="ln414">  string csv_replicas;</a>
+<a name="ln415">  std::map&lt;string, int32_t&gt; host_to_rpcport;</a>
+<a name="ln416">  for (const master::TabletLocationsPB_ReplicaPB &amp;replica : tablet_locations.replicas()) {</a>
+<a name="ln417">    if (!csv_replicas.empty()) {</a>
+<a name="ln418">      csv_replicas += &quot;,&quot;;</a>
+<a name="ln419">    }</a>
+<a name="ln420">    const string &amp;host = replica.ts_info().private_rpc_addresses(0).host();</a>
+<a name="ln421">    csv_replicas += host;</a>
+<a name="ln422">    host_to_rpcport[host] = replica.ts_info().private_rpc_addresses(0).port();</a>
+<a name="ln423">  }</a>
+<a name="ln424"> </a>
+<a name="ln425">  // Invoke the bulk_load_helper script.</a>
+<a name="ln426">  vector&lt;string&gt; argv = {FLAGS_bulk_load_helper_script, &quot;-t&quot;, tablet_id, &quot;-r&quot;, csv_replicas, &quot;-i&quot;,</a>
+<a name="ln427">      FLAGS_ssh_key_file, &quot;-d&quot;, db_fixture_-&gt;rocksdb_dir()};</a>
+<a name="ln428">  string bulk_load_helper_stdout;</a>
+<a name="ln429">  RETURN_NOT_OK(Subprocess::Call(argv, &amp;bulk_load_helper_stdout));</a>
+<a name="ln430"> </a>
+<a name="ln431">  // Trim the output.</a>
+<a name="ln432">  boost::trim(bulk_load_helper_stdout);</a>
+<a name="ln433">  LOG(INFO) &lt;&lt; &quot;Helper script stdout: &quot; &lt;&lt; bulk_load_helper_stdout;</a>
+<a name="ln434"> </a>
+<a name="ln435">  // Finalize the import.</a>
+<a name="ln436">  rpc::MessengerBuilder bld(&quot;Client&quot;);</a>
+<a name="ln437">  std::unique_ptr&lt;rpc::Messenger&gt; client_messenger = VERIFY_RESULT(bld.Build());</a>
+<a name="ln438">  rpc::ProxyCache proxy_cache(client_messenger.get());</a>
+<a name="ln439">  vector&lt;string&gt; lines;</a>
+<a name="ln440">  boost::split(lines, bulk_load_helper_stdout, boost::is_any_of(&quot;\n&quot;));</a>
+<a name="ln441">  for (const string &amp;line : lines) {</a>
+<a name="ln442">    vector&lt;string&gt; tokens;</a>
+<a name="ln443">    boost::split(tokens, line, boost::is_any_of(&quot;,&quot;));</a>
+<a name="ln444">    if (tokens.size() != 2) {</a>
+<a name="ln445">      return STATUS_SUBSTITUTE(InvalidArgument, &quot;Invalid line $0&quot;, line);</a>
+<a name="ln446">    }</a>
+<a name="ln447">    const string &amp;replica_host = tokens[0];</a>
+<a name="ln448">    const string &amp;directory = tokens[1];</a>
+<a name="ln449">    HostPort hostport(replica_host, host_to_rpcport[replica_host]);</a>
+<a name="ln450"> </a>
+<a name="ln451">    tserver::TabletServerServiceProxy proxy(&amp;proxy_cache, hostport);</a>
+<a name="ln452">    tserver::ImportDataRequestPB req;</a>
+<a name="ln453">    req.set_tablet_id(tablet_id);</a>
+<a name="ln454">    req.set_source_dir(directory);</a>
+<a name="ln455"> </a>
+<a name="ln456">    tserver::ImportDataResponsePB resp;</a>
+<a name="ln457">    rpc::RpcController controller;</a>
+<a name="ln458">    LOG(INFO) &lt;&lt; &quot;Importing &quot; &lt;&lt; directory &lt;&lt; &quot; on &quot; &lt;&lt; replica_host &lt;&lt; &quot; for tablet_id: &quot;</a>
+<a name="ln459">              &lt;&lt; tablet_id;</a>
+<a name="ln460">    RETURN_NOT_OK(proxy.ImportData(req, &amp;resp, &amp;controller));</a>
+<a name="ln461">    if (resp.has_error()) {</a>
+<a name="ln462">      RETURN_NOT_OK(StatusFromPB(resp.error().status()));</a>
+<a name="ln463">    }</a>
+<a name="ln464"> </a>
+<a name="ln465">    // Now cleanup the files from the production tserver.</a>
+<a name="ln466">    vector&lt;string&gt; cleanup_script = {FLAGS_bulk_load_cleanup_script, &quot;-d&quot;, directory, &quot;-t&quot;,</a>
+<a name="ln467">        replica_host, &quot;-i&quot;, FLAGS_ssh_key_file};</a>
+<a name="ln468">    RETURN_NOT_OK(Subprocess::Call(cleanup_script));</a>
+<a name="ln469">  }</a>
+<a name="ln470"> </a>
+<a name="ln471">  // Delete the data once the import is done.</a>
+<a name="ln472">  return yb::Env::Default()-&gt;DeleteRecursively(db_fixture_-&gt;rocksdb_dir());</a>
+<a name="ln473">}</a>
+<a name="ln474"> </a>
+<a name="ln475"> </a>
+<a name="ln476">CHECKED_STATUS BulkLoad::InitDBUtil(const TabletId &amp;tablet_id) {</a>
+<a name="ln477">  db_fixture_.reset(new BulkLoadDocDBUtil(tablet_id, FLAGS_base_dir,</a>
+<a name="ln478">                                          FLAGS_memtable_size_bytes,</a>
+<a name="ln479">                                          FLAGS_bulk_load_num_memtables,</a>
+<a name="ln480">                                          FLAGS_bulk_load_max_background_flushes));</a>
+<a name="ln481">  RETURN_NOT_OK(db_fixture_-&gt;InitRocksDBOptions());</a>
+<a name="ln482">  RETURN_NOT_OK(db_fixture_-&gt;DisableCompactions()); // This opens rocksdb.</a>
+<a name="ln483">  return Status::OK();</a>
+<a name="ln484">}</a>
+<a name="ln485"> </a>
+<a name="ln486">Status BulkLoad::InitYBBulkLoad() {</a>
+<a name="ln487">  // Convert table_name to lowercase since we store table names in lowercase.</a>
+<a name="ln488">  string table_name_lower = boost::to_lower_copy(FLAGS_table_name);</a>
+<a name="ln489">  YBTableName table_name(</a>
+<a name="ln490">      master::GetDefaultDatabaseType(FLAGS_namespace_name), FLAGS_namespace_name, table_name_lower);</a>
+<a name="ln491"> </a>
+<a name="ln492">  YBClientBuilder builder;</a>
+<a name="ln493">  builder.add_master_server_addr(FLAGS_master_addresses);</a>
+<a name="ln494"> </a>
+<a name="ln495">  client_ = VERIFY_RESULT(builder.Build());</a>
+<a name="ln496">  RETURN_NOT_OK(client_-&gt;OpenTable(table_name, &amp;table_));</a>
+<a name="ln497">  partition_generator_.reset(new YBPartitionGenerator(table_name, {FLAGS_master_addresses}));</a>
+<a name="ln498">  RETURN_NOT_OK(partition_generator_-&gt;Init());</a>
+<a name="ln499"> </a>
+<a name="ln500">  db_fixture_ = nullptr;</a>
+<a name="ln501">  CHECK_OK(</a>
+<a name="ln502">      ThreadPoolBuilder(&quot;bulk_load_tasks&quot;)</a>
+<a name="ln503">          .set_min_threads(FLAGS_bulk_load_num_threads)</a>
+<a name="ln504">          .set_max_threads(FLAGS_bulk_load_num_threads)</a>
+<a name="ln505">          .set_max_queue_size(FLAGS_bulk_load_threadpool_queue_size)</a>
+<a name="ln506">          .set_idle_timeout(MonoDelta::FromMilliseconds(5000))</a>
+<a name="ln507">          .Build(&amp;thread_pool_));</a>
+<a name="ln508">  return Status::OK();</a>
+<a name="ln509">}</a>
+<a name="ln510"> </a>
+<a name="ln511"> </a>
+<a name="ln512">Status BulkLoad::RunBulkLoad() {</a>
+<a name="ln513"> </a>
+<a name="ln514">  RETURN_NOT_OK(InitYBBulkLoad());</a>
+<a name="ln515"> </a>
+<a name="ln516">  TabletId current_tablet_id;</a>
+<a name="ln517"> </a>
+<a name="ln518">  vector&lt;pair&lt;TabletId, string&gt;&gt; rows;</a>
+<a name="ln519">  for (string line; std::getline(std::cin, line);) {</a>
+<a name="ln520">    // Trim the line.</a>
+<a name="ln521">    boost::algorithm::trim(line);</a>
+<a name="ln522"> </a>
+<a name="ln523">    // Get the key and value.</a>
+<a name="ln524">    std::size_t index = line.find(&quot;\t&quot;);</a>
+<a name="ln525">    if (index == std::string::npos) {</a>
+<a name="ln526">      return STATUS_SUBSTITUTE(IllegalState, &quot;Invalid line: $0&quot;, line);</a>
+<a name="ln527">    }</a>
+<a name="ln528">    const TabletId tablet_id = line.substr(0, index);</a>
+<a name="ln529">    const string row = line.substr(index + 1, line.size() - (index + 1));</a>
+<a name="ln530"> </a>
+<a name="ln531">    // Reinitialize rocksdb if needed.</a>
+<a name="ln532">    if (current_tablet_id.empty() || current_tablet_id != tablet_id) {</a>
+<a name="ln533">      // Flush all of the data before opening a new rocksdb.</a>
+<a name="ln534">      RETURN_NOT_OK(FinishTabletProcessing(current_tablet_id, std::move(rows)));</a>
+<a name="ln535">      RETURN_NOT_OK(InitDBUtil(tablet_id));</a>
+<a name="ln536">    }</a>
+<a name="ln537">    current_tablet_id = tablet_id;</a>
+<a name="ln538">    rows.emplace_back(std::move(tablet_id), std::move(row));</a>
+<a name="ln539"> </a>
+<a name="ln540">    // Flush the batch if necessary.</a>
+<a name="ln541">    if (rows.size() &gt;= FLAGS_row_batch_size) {</a>
+<a name="ln542">      RETURN_NOT_OK(RetryableSubmit(std::move(rows)));</a>
+<a name="ln543">    }</a>
+<a name="ln544">  }</a>
+<a name="ln545"> </a>
+<a name="ln546">  // Process last tablet.</a>
+<a name="ln547">  RETURN_NOT_OK(FinishTabletProcessing(current_tablet_id, std::move(rows)));</a>
+<a name="ln548">  return Status::OK();</a>
+<a name="ln549">}</a>
+<a name="ln550"> </a>
+<a name="ln551">} // anonymous namespace</a>
+<a name="ln552"> </a>
+<a name="ln553">} // namespace tools</a>
+<a name="ln554">} // namespace yb</a>
+<a name="ln555"> </a>
+<a name="ln556">int main(int argc, char** argv) {</a>
+<a name="ln557">  yb::ParseCommandLineFlags(&amp;argc, &amp;argv, true);</a>
+<a name="ln558">  yb::InitGoogleLoggingSafe(argv[0]);</a>
+<a name="ln559">  if (FLAGS_master_addresses.empty() || FLAGS_table_name.empty() || FLAGS_namespace_name.empty()</a>
+<a name="ln560">      || FLAGS_base_dir.empty()) {</a>
+<a name="ln561">    LOG(FATAL) &lt;&lt; &quot;Need to specify --master_addresses, --table_name, --namespace_name, &quot;</a>
+<a name="ln562">        &quot;--base_dir&quot;;</a>
+<a name="ln563">  }</a>
+<a name="ln564"> </a>
+<a name="ln565">  if (FLAGS_export_files &amp;&amp; FLAGS_ssh_key_file.empty()) {</a>
+<a name="ln566">    LOG(FATAL) &lt;&lt; &quot;Need to specify --ssh_key_file with --export_files&quot;;</a>
+<a name="ln567">  }</a>
+<a name="ln568"> </a>
+<a name="ln569">  // Verify the bulk load path exists.</a>
+<a name="ln570">  if (!yb::Env::Default()-&gt;FileExists(FLAGS_base_dir)) {</a>
+<a name="ln571">    LOG(FATAL) &lt;&lt; &quot;Bulk load directory doesn't exist: &quot; &lt;&lt; FLAGS_base_dir;</a>
+<a name="ln572">  }</a>
+<a name="ln573"> </a>
+<a name="ln574">  if (FLAGS_bulk_load_num_files_per_tablet &lt;= 0) {</a>
+<a name="ln575">    LOG(FATAL) &lt;&lt; &quot;--bulk_load_num_files_per_tablet needs to be greater than 0&quot;;</a>
+<a name="ln576">  }</a>
+<a name="ln577"> </a>
+<a name="ln578">  yb::tools::BulkLoad bulk_load;</a>
+<a name="ln579">  yb::Status s = bulk_load.RunBulkLoad();</a>
+<a name="ln580">  if (!s.ok()) {</a>
+<a name="ln581">    LOG(FATAL) &lt;&lt; &quot;Error running bulk load: &quot; &lt;&lt; s.ToString();</a>
+<a name="ln582">  }</a>
+<a name="ln583">  return 0;</a>
+<a name="ln584">}</a>
+
+</code></pre>
+<div class="balloon" rel="160"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="183"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="188"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="193"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="294"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_value' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="501"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

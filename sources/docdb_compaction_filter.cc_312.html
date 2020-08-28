@@ -1,0 +1,424 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>docdb_compaction_filter.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/docdb/docdb_compaction_filter.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;memory&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;glog/logging.h&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/rocksdb/compaction_filter.h&quot;</a>
+<a name="ln21">#include &quot;yb/util/string_util.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/docdb/doc_key.h&quot;</a>
+<a name="ln24">#include &quot;yb/docdb/doc_ttl_util.h&quot;</a>
+<a name="ln25">#include &quot;yb/docdb/docdb-internal.h&quot;</a>
+<a name="ln26">#include &quot;yb/docdb/value.h&quot;</a>
+<a name="ln27">#include &quot;yb/docdb/consensus_frontier.h&quot;</a>
+<a name="ln28">#include &quot;yb/rocksutil/yb_rocksdb.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">using std::shared_ptr;</a>
+<a name="ln31">using std::unique_ptr;</a>
+<a name="ln32">using std::unordered_set;</a>
+<a name="ln33">using rocksdb::CompactionFilter;</a>
+<a name="ln34">using rocksdb::VectorToString;</a>
+<a name="ln35">using rocksdb::FilterDecision;</a>
+<a name="ln36"> </a>
+<a name="ln37">namespace yb {</a>
+<a name="ln38">namespace docdb {</a>
+<a name="ln39"> </a>
+<a name="ln40">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln41"> </a>
+<a name="ln42">DocDBCompactionFilter::DocDBCompactionFilter(</a>
+<a name="ln43">    HistoryRetentionDirective retention,</a>
+<a name="ln44">    IsMajorCompaction is_major_compaction,</a>
+<a name="ln45">    const KeyBounds* key_bounds)</a>
+<a name="ln46">    : retention_(std::move(retention)),</a>
+<a name="ln47">      key_bounds_(key_bounds),</a>
+<a name="ln48">      is_major_compaction_(is_major_compaction) {</a>
+<a name="ln49">}</a>
+<a name="ln50"> </a>
+<a name="ln51">DocDBCompactionFilter::~DocDBCompactionFilter() {</a>
+<a name="ln52">}</a>
+<a name="ln53"> </a>
+<a name="ln54">FilterDecision DocDBCompactionFilter::Filter(</a>
+<a name="ln55">    int level, const Slice&amp; key, const Slice&amp; existing_value, std::string* new_value,</a>
+<a name="ln56">    bool* value_changed) {</a>
+<a name="ln57">  auto result = const_cast&lt;DocDBCompactionFilter*&gt;(this)-&gt;DoFilter(</a>
+<a name="ln58">      level, key, existing_value, new_value, value_changed);</a>
+<a name="ln59">  if (!result.ok()) {</a>
+<a name="ln60">    LOG(FATAL) &lt;&lt; &quot;Error filtering &quot; &lt;&lt; key.ToDebugString() &lt;&lt; &quot;: &quot; &lt;&lt; result.status();</a>
+<a name="ln61">  }</a>
+<a name="ln62">  if (*result != FilterDecision::kKeep) {</a>
+<a name="ln63">    VLOG(3) &lt;&lt; &quot;Discarding key: &quot; &lt;&lt; BestEffortDocDBKeyToStr(key);</a>
+<a name="ln64">  } else {</a>
+<a name="ln65">    VLOG(4) &lt;&lt; &quot;Keeping key: &quot; &lt;&lt; BestEffortDocDBKeyToStr(key);</a>
+<a name="ln66">  }</a>
+<a name="ln67">  return *result;</a>
+<a name="ln68">}</a>
+<a name="ln69"> </a>
+<a name="ln70">Result&lt;FilterDecision&gt; DocDBCompactionFilter::DoFilter(</a>
+<a name="ln71">    int level, const Slice&amp; key, const Slice&amp; existing_value, std::string* new_value,</a>
+<a name="ln72">    bool* value_changed) {</a>
+<a name="ln73">  const HybridTime history_cutoff = retention_.history_cutoff;</a>
+<a name="ln74"> </a>
+<a name="ln75">  if (!filter_usage_logged_) {</a>
+<a name="ln76">    // TODO: switch this to VLOG if it becomes too chatty.</a>
+<a name="ln77">    LOG(INFO) &lt;&lt; &quot;DocDB compaction filter is being used for a &quot;</a>
+<a name="ln78">              &lt;&lt; (is_major_compaction_ ? &quot;major&quot; : &quot;minor&quot;) &lt;&lt; &quot; compaction&quot;</a>
+<a name="ln79">              &lt;&lt; &quot;, history_cutoff=&quot; &lt;&lt; history_cutoff;</a>
+<a name="ln80">    filter_usage_logged_ = true;</a>
+<a name="ln81">  }</a>
+<a name="ln82"> </a>
+<a name="ln83">  // Remove regular keys which are not related to this RocksDB anymore (due to split of the tablet).</a>
+<a name="ln84">  if (key_bounds_ &amp;&amp; !key_bounds_-&gt;IsWithinBounds(key)) {</a>
+<a name="ln85">    return FilterDecision::kDiscard;</a>
+<a name="ln86">  }</a>
+<a name="ln87"> </a>
+<a name="ln88">  // Just remove intent records from regular DB, because it was beta feature.</a>
+<a name="ln89">  // Currently intents are stored in separate DB.</a>
+<a name="ln90">  if (DecodeValueType(key) == ValueType::kObsoleteIntentPrefix) {</a>
+<a name="ln91">    return FilterDecision::kDiscard;</a>
+<a name="ln92">  }</a>
+<a name="ln93"> </a>
+<a name="ln94">  auto same_bytes = strings::MemoryDifferencePos(</a>
+<a name="ln95">      key.data(), prev_subdoc_key_.data(), std::min(key.size(), prev_subdoc_key_.size()));</a>
+<a name="ln96"> </a>
+<a name="ln97">  // The number of initial components (including document key and subkeys) that this</a>
+<a name="ln98">  // SubDocKey shares with previous one. This does not care about the hybrid_time field.</a>
+<a name="ln99">  size_t num_shared_components = sub_key_ends_.size();</a>
+<a name="ln100">  while (num_shared_components &gt; 0 &amp;&amp; sub_key_ends_[num_shared_components - 1] &gt; same_bytes) {</a>
+<a name="ln101">    --num_shared_components;</a>
+<a name="ln102">  }</a>
+<a name="ln103"> </a>
+<a name="ln104">  sub_key_ends_.resize(num_shared_components);</a>
+<a name="ln105"> </a>
+<a name="ln106">  RETURN_NOT_OK(SubDocKey::DecodeDocKeyAndSubKeyEnds(key, &amp;sub_key_ends_));</a>
+<a name="ln107">  const size_t new_stack_size = sub_key_ends_.size();</a>
+<a name="ln108"> </a>
+<a name="ln109">  // Remove overwrite hybrid_times for components that are no longer relevant for the current</a>
+<a name="ln110">  // SubDocKey.</a>
+<a name="ln111">  overwrite_.resize(min(overwrite_.size(), num_shared_components));</a>
+<a name="ln112">  DocHybridTime ht;</a>
+<a name="ln113">  RETURN_NOT_OK(ht.DecodeFromEnd(key));</a>
+<a name="ln114">  // We're comparing the hybrid time in this key with the stack top of overwrite_ht_ after</a>
+<a name="ln115">  // truncating the stack to the number of components in the common prefix of previous and current</a>
+<a name="ln116">  // key.</a>
+<a name="ln117">  //</a>
+<a name="ln118">  // Example (history_cutoff_ = 12):</a>
+<a name="ln119">  // --------------------------------------------------------------------------------------------</a>
+<a name="ln120">  // Key          overwrite_ht_ stack and relevant notes</a>
+<a name="ln121">  // --------------------------------------------------------------------------------------------</a>
+<a name="ln122">  // k1 T10       [MinHT]</a>
+<a name="ln123">  //</a>
+<a name="ln124">  // k1 T5        [T10]</a>
+<a name="ln125">  //</a>
+<a name="ln126">  // k1 col1 T11  [T10, T11]</a>
+<a name="ln127">  //</a>
+<a name="ln128">  // k1 col1 T7   The stack does not get truncated (shared prefix length is 2), so</a>
+<a name="ln129">  //              prev_overwrite_ht = 11. Removing this entry because 7 &lt; 11.</a>
+<a name="ln130">  //              The stack stays at [T10, T11].</a>
+<a name="ln131">  //</a>
+<a name="ln132">  // k1 col2 T9   Truncating the stack to [T10], setting prev_overwrite_ht to 10, and therefore</a>
+<a name="ln133">  //              deciding to remove this entry because 9 &lt; 10.</a>
+<a name="ln134">  //</a>
+<a name="ln135">  const DocHybridTime prev_overwrite_ht =</a>
+<a name="ln136">      overwrite_.empty() ? DocHybridTime::kMin : overwrite_.back().doc_ht;</a>
+<a name="ln137">  const Expiration prev_exp =</a>
+<a name="ln138">      overwrite_.empty() ? Expiration() : overwrite_.back().expiration;</a>
+<a name="ln139"> </a>
+<a name="ln140">  // We only keep entries with hybrid_time equal to or later than the latest time the subdocument</a>
+<a name="ln141">  // was fully overwritten or deleted prior to or at the history cutoff time. The intuition is that</a>
+<a name="ln142">  // key/value pairs that were overwritten at or before history cutoff time will not be visible at</a>
+<a name="ln143">  // history cutoff time or any later time anyway.</a>
+<a name="ln144">  //</a>
+<a name="ln145">  // Furthermore, we only need to update the overwrite hybrid_time stack in case we have decided to</a>
+<a name="ln146">  // keep the new entry. Otherwise, the current entry's hybrid time ht is less than the previous</a>
+<a name="ln147">  // overwrite hybrid_time prev_overwrite_ht, and therefore it does not provide any new information</a>
+<a name="ln148">  // about key/value pairs that follow being overwritten at a particular hybrid time. Another way to</a>
+<a name="ln149">  // explain this is to look at the logic that follows. If we don't early-exit here while ht is less</a>
+<a name="ln150">  // than prev_overwrite_ht, we'll end up adding more prev_overwrite_ht values to the overwrite</a>
+<a name="ln151">  // hybrid_time stack, and we might as well do that while handling the next key/value pair that</a>
+<a name="ln152">  // does not get cleaned up the same way as this one.</a>
+<a name="ln153">  //</a>
+<a name="ln154">  // TODO: When more merge records are supported, isTtlRow should be redefined appropriately.</a>
+<a name="ln155">  bool isTtlRow = IsMergeRecord(existing_value);</a>
+<a name="ln156">  if (ht &lt; prev_overwrite_ht &amp;&amp; !isTtlRow) {</a>
+<a name="ln157">    return FilterDecision::kDiscard;</a>
+<a name="ln158">  }</a>
+<a name="ln159"> </a>
+<a name="ln160">  // Every subdocument was fully overwritten at least at the time any of its parents was fully</a>
+<a name="ln161">  // overwritten.</a>
+<a name="ln162">  if (overwrite_.size() &lt; new_stack_size - 1) {</a>
+<a name="ln163">    overwrite_.resize(new_stack_size - 1, {prev_overwrite_ht, prev_exp});</a>
+<a name="ln164">  }</a>
+<a name="ln165"> </a>
+<a name="ln166">  Expiration popped_exp = overwrite_.empty() ? Expiration() : overwrite_.back().expiration;</a>
+<a name="ln167">  // This will happen in case previous key has the same document key and subkeys as the current</a>
+<a name="ln168">  // key, and the only difference is in the hybrid_time. We want to replace the hybrid_time at the</a>
+<a name="ln169">  // top of the overwrite_ht stack in this case.</a>
+<a name="ln170">  if (overwrite_.size() == new_stack_size) {</a>
+<a name="ln171">    overwrite_.pop_back();</a>
+<a name="ln172">  }</a>
+<a name="ln173"> </a>
+<a name="ln174">  // Check whether current key is the same as the previous key, except for the timestamp.</a>
+<a name="ln175">  if (same_bytes != sub_key_ends_.back()) {</a>
+<a name="ln176">    within_merge_block_ = false;</a>
+<a name="ln177">  }</a>
+<a name="ln178"> </a>
+<a name="ln179">  // See if we found a higher hybrid time not exceeding the history cutoff hybrid time at which the</a>
+<a name="ln180">  // subdocument (including a primitive value) rooted at the current key was fully overwritten.</a>
+<a name="ln181">  // In case of ht &gt; history_cutoff_, we just keep the parent document's highest known overwrite</a>
+<a name="ln182">  // hybrid time that does not exceed the cutoff hybrid time. In that case this entry is obviously</a>
+<a name="ln183">  // too new to be garbage-collected.</a>
+<a name="ln184">  if (ht.hybrid_time() &gt; history_cutoff) {</a>
+<a name="ln185">    AssignPrevSubDocKey(key.cdata(), same_bytes);</a>
+<a name="ln186">    overwrite_.push_back({prev_overwrite_ht, prev_exp});</a>
+<a name="ln187">    return FilterDecision::kKeep;</a>
+<a name="ln188">  }</a>
+<a name="ln189"> </a>
+<a name="ln190">  // Check for CQL columns deleted from the schema. This is done regardless of whether this is a</a>
+<a name="ln191">  // major or minor compaction.</a>
+<a name="ln192">  //</a>
+<a name="ln193">  // TODO: could there be a case when there is still a read request running that uses an old schema,</a>
+<a name="ln194">  //       and we end up removing some data that the client expects to see?</a>
+<a name="ln195">  if (sub_key_ends_.size() &gt; 1) {</a>
+<a name="ln196">    // Column ID is the first subkey in every CQL row.</a>
+<a name="ln197">    if (key[sub_key_ends_[0]]  == ValueTypeAsChar::kColumnId) {</a>
+<a name="ln198">      Slice column_id_slice(key.data() + sub_key_ends_[0] + 1, key.data() + sub_key_ends_[1]);</a>
+<a name="ln199">      auto column_id_as_int64 = VERIFY_RESULT(util::FastDecodeSignedVarInt(&amp;column_id_slice));</a>
+<a name="ln200">      ColumnId column_id;</a>
+<a name="ln201">      RETURN_NOT_OK(ColumnId::FromInt64(column_id_as_int64, &amp;column_id));</a>
+<a name="ln202">      if (retention_.deleted_cols-&gt;count(column_id) != 0) {</a>
+<a name="ln203">        return FilterDecision::kDiscard;</a>
+<a name="ln204">      }</a>
+<a name="ln205">    }</a>
+<a name="ln206">  }</a>
+<a name="ln207"> </a>
+<a name="ln208">  auto overwrite_ht = isTtlRow ? prev_overwrite_ht : max(prev_overwrite_ht, ht);</a>
+<a name="ln209"> </a>
+<a name="ln210">  Value value;</a>
+<a name="ln211">  Slice value_slice = existing_value;</a>
+<a name="ln212">  RETURN_NOT_OK(value.DecodeControlFields(&amp;value_slice));</a>
+<a name="ln213">  const auto value_type = static_cast&lt;ValueType&gt;(</a>
+<a name="ln214">      value_slice.FirstByteOr(ValueTypeAsChar::kInvalid));</a>
+<a name="ln215">  const Expiration curr_exp(ht.hybrid_time(), value.ttl());</a>
+<a name="ln216"> </a>
+<a name="ln217">  // If within the merge block.</a>
+<a name="ln218">  //     If the row is a TTL row, delete it.</a>
+<a name="ln219">  //     Otherwise, replace it with the cached TTL (i.e., apply merge).</a>
+<a name="ln220">  // Otherwise,</a>
+<a name="ln221">  //     If this is a TTL row, cache TTL (start merge block).</a>
+<a name="ln222">  //     If normal row, compute its ttl and continue.</a>
+<a name="ln223"> </a>
+<a name="ln224">  Expiration expiration;</a>
+<a name="ln225">  if (within_merge_block_) {</a>
+<a name="ln226">    expiration = popped_exp;</a>
+<a name="ln227">  } else if (ht.hybrid_time() &gt;= prev_exp.write_ht &amp;&amp;</a>
+<a name="ln228">             (curr_exp.ttl != Value::kMaxTtl || isTtlRow)) {</a>
+<a name="ln229">    expiration = curr_exp;</a>
+<a name="ln230">  } else {</a>
+<a name="ln231">    expiration = prev_exp;</a>
+<a name="ln232">  }</a>
+<a name="ln233"> </a>
+<a name="ln234">  overwrite_.push_back({overwrite_ht, expiration});</a>
+<a name="ln235"> </a>
+<a name="ln236">  if (overwrite_.size() != new_stack_size) {</a>
+<a name="ln237">    return STATUS_FORMAT(Corruption, &quot;Overwrite size does not match new_stack_size: $0 vs $1&quot;,</a>
+<a name="ln238">                         overwrite_.size(), new_stack_size);</a>
+<a name="ln239">  }</a>
+<a name="ln240">  AssignPrevSubDocKey(key.cdata(), same_bytes);</a>
+<a name="ln241"> </a>
+<a name="ln242">  // If the entry has the TTL flag, delete the entry.</a>
+<a name="ln243">  if (isTtlRow) {</a>
+<a name="ln244">    within_merge_block_ = true;</a>
+<a name="ln245">    return FilterDecision::kDiscard;</a>
+<a name="ln246">  }</a>
+<a name="ln247"> </a>
+<a name="ln248">  // If the value expires by the time of history cutoff, it is treated as deleted and filtered out.</a>
+<a name="ln249">  bool has_expired = false;</a>
+<a name="ln250"> </a>
+<a name="ln251">  // Only check for expiration if the current hybrid time is at or below history cutoff.</a>
+<a name="ln252">  // The key could not have possibly expired by history_cutoff_ otherwise.</a>
+<a name="ln253">  MonoDelta true_ttl = ComputeTTL(expiration.ttl, retention_.table_ttl);</a>
+<a name="ln254">  RETURN_NOT_OK(HasExpiredTTL(true_ttl == expiration.ttl ?</a>
+<a name="ln255">                              expiration.write_ht : ht.hybrid_time(),</a>
+<a name="ln256">                              true_ttl, history_cutoff, &amp;has_expired));</a>
+<a name="ln257">  // As of 02/2017, we don't have init markers for top level documents in QL. As a result, we can</a>
+<a name="ln258">  // compact away each column if it has expired, including the liveness system column. The init</a>
+<a name="ln259">  // markers in Redis wouldn't be affected since they don't have any TTL associated with them and</a>
+<a name="ln260">  // the TTL would default to kMaxTtl which would make has_expired false.</a>
+<a name="ln261">  if (has_expired) {</a>
+<a name="ln262">    // This is consistent with the condition we're testing for deletes at the bottom of the function</a>
+<a name="ln263">    // because ht_at_or_below_cutoff is implied by has_expired.</a>
+<a name="ln264">    if (is_major_compaction_ &amp;&amp; !retention_.retain_delete_markers_in_major_compaction) {</a>
+<a name="ln265">      return FilterDecision::kDiscard;</a>
+<a name="ln266">    }</a>
+<a name="ln267"> </a>
+<a name="ln268">    // During minor compactions, expired values are written back as tombstones because removing the</a>
+<a name="ln269">    // record might expose earlier values which would be incorrect.</a>
+<a name="ln270">    *value_changed = true;</a>
+<a name="ln271">    *new_value = Value::EncodedTombstone();</a>
+<a name="ln272">  } else if (within_merge_block_) {</a>
+<a name="ln273">    *value_changed = true;</a>
+<a name="ln274"> </a>
+<a name="ln275">    if (expiration.ttl != Value::kMaxTtl) {</a>
+<a name="ln276">      expiration.ttl += MonoDelta::FromMicroseconds(</a>
+<a name="ln277">          overwrite_.back().expiration.write_ht.PhysicalDiff(ht.hybrid_time()));</a>
+<a name="ln278">      overwrite_.back().expiration.ttl = expiration.ttl;</a>
+<a name="ln279">    }</a>
+<a name="ln280"> </a>
+<a name="ln281">    *value.mutable_ttl() = expiration.ttl;</a>
+<a name="ln282">    new_value-&gt;clear();</a>
+<a name="ln283"> </a>
+<a name="ln284">    // We are reusing the existing encoded value without decoding/encoding it.</a>
+<a name="ln285">    value.EncodeAndAppend(new_value, &amp;value_slice);</a>
+<a name="ln286">    within_merge_block_ = false;</a>
+<a name="ln287">  } else if (value.intent_doc_ht().is_valid() &amp;&amp; ht.hybrid_time() &lt; history_cutoff) {</a>
+<a name="ln288">    // Cleanup intent doc hybrid time when we don't need it anymore.</a>
+<a name="ln289">    // See https://github.com/yugabyte/yugabyte-db/issues/4535 for details.</a>
+<a name="ln290">    value.ClearIntentDocHt();</a>
+<a name="ln291"> </a>
+<a name="ln292">    new_value-&gt;clear();</a>
+<a name="ln293"> </a>
+<a name="ln294">    // We are reusing the existing encoded value without decoding/encoding it.</a>
+<a name="ln295">    value.EncodeAndAppend(new_value, &amp;value_slice);</a>
+<a name="ln296">  }</a>
+<a name="ln297"> </a>
+<a name="ln298">  // If we are backfilling an index table, we want to preserve the delete markers in the table</a>
+<a name="ln299">  // until the backfill process is completed. For other normal use cases, delete markers/tombstones</a>
+<a name="ln300">  // can be cleaned up on a major compaction.</a>
+<a name="ln301">  // retention_.retain_delete_markers_in_major_compaction will be set to true until the index</a>
+<a name="ln302">  // backfill is complete.</a>
+<a name="ln303">  //</a>
+<a name="ln304">  // Tombstones at or below the history cutoff hybrid_time can always be cleaned up on full (major)</a>
+<a name="ln305">  // compactions. However, we do need to update the overwrite hybrid time stack in this case (as we</a>
+<a name="ln306">  // just did), because this deletion (tombstone) entry might be the only reason for cleaning up</a>
+<a name="ln307">  // more entries appearing at earlier hybrid times.</a>
+<a name="ln308">  return value_type == ValueType::kTombstone &amp;&amp; is_major_compaction_ &amp;&amp;</a>
+<a name="ln309">                 !retention_.retain_delete_markers_in_major_compaction</a>
+<a name="ln310">             ? FilterDecision::kDiscard</a>
+<a name="ln311">             : FilterDecision::kKeep;</a>
+<a name="ln312">}</a>
+<a name="ln313"> </a>
+<a name="ln314">void DocDBCompactionFilter::AssignPrevSubDocKey(</a>
+<a name="ln315">    const char* data, size_t same_bytes) {</a>
+<a name="ln316">  size_t size = sub_key_ends_.back();</a>
+<a name="ln317">  prev_subdoc_key_.resize(size);</a>
+<a name="ln318">  memcpy(prev_subdoc_key_.data() + same_bytes, data + same_bytes, size - same_bytes);</a>
+<a name="ln319">}</a>
+<a name="ln320"> </a>
+<a name="ln321"> </a>
+<a name="ln322">rocksdb::UserFrontierPtr DocDBCompactionFilter::GetLargestUserFrontier() const {</a>
+<a name="ln323">  auto* consensus_frontier = new ConsensusFrontier();</a>
+<a name="ln324">  consensus_frontier-&gt;set_history_cutoff(retention_.history_cutoff);</a>
+<a name="ln325">  return rocksdb::UserFrontierPtr(consensus_frontier);</a>
+<a name="ln326">}</a>
+<a name="ln327"> </a>
+<a name="ln328">const char* DocDBCompactionFilter::Name() const {</a>
+<a name="ln329">  return &quot;DocDBCompactionFilter&quot;;</a>
+<a name="ln330">}</a>
+<a name="ln331"> </a>
+<a name="ln332">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln333"> </a>
+<a name="ln334">DocDBCompactionFilterFactory::DocDBCompactionFilterFactory(</a>
+<a name="ln335">    std::shared_ptr&lt;HistoryRetentionPolicy&gt; retention_policy, const KeyBounds* key_bounds)</a>
+<a name="ln336">    : retention_policy_(std::move(retention_policy)), key_bounds_(key_bounds) {</a>
+<a name="ln337">}</a>
+<a name="ln338"> </a>
+<a name="ln339">DocDBCompactionFilterFactory::~DocDBCompactionFilterFactory() {</a>
+<a name="ln340">}</a>
+<a name="ln341"> </a>
+<a name="ln342">unique_ptr&lt;CompactionFilter&gt; DocDBCompactionFilterFactory::CreateCompactionFilter(</a>
+<a name="ln343">    const CompactionFilter::Context&amp; context) {</a>
+<a name="ln344">  return std::make_unique&lt;DocDBCompactionFilter&gt;(</a>
+<a name="ln345">      retention_policy_-&gt;GetRetentionDirective(),</a>
+<a name="ln346">      IsMajorCompaction(context.is_full_compaction),</a>
+<a name="ln347">      key_bounds_);</a>
+<a name="ln348">}</a>
+<a name="ln349"> </a>
+<a name="ln350">const char* DocDBCompactionFilterFactory::Name() const {</a>
+<a name="ln351">  return &quot;DocDBCompactionFilterFactory&quot;;</a>
+<a name="ln352">}</a>
+<a name="ln353"> </a>
+<a name="ln354">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln355"> </a>
+<a name="ln356">HistoryRetentionDirective ManualHistoryRetentionPolicy::GetRetentionDirective() {</a>
+<a name="ln357">  std::lock_guard&lt;std::mutex&gt; lock(deleted_cols_mtx_);</a>
+<a name="ln358">  return {history_cutoff_.load(std::memory_order_acquire),</a>
+<a name="ln359">          std::make_shared&lt;ColumnIds&gt;(deleted_cols_), table_ttl_.load(std::memory_order_acquire),</a>
+<a name="ln360">          ShouldRetainDeleteMarkersInMajorCompaction::kFalse};</a>
+<a name="ln361">}</a>
+<a name="ln362"> </a>
+<a name="ln363">void ManualHistoryRetentionPolicy::SetHistoryCutoff(HybridTime history_cutoff) {</a>
+<a name="ln364">  history_cutoff_.store(history_cutoff, std::memory_order_release);</a>
+<a name="ln365">}</a>
+<a name="ln366"> </a>
+<a name="ln367">void ManualHistoryRetentionPolicy::AddDeletedColumn(ColumnId col) {</a>
+<a name="ln368">  std::lock_guard&lt;std::mutex&gt; lock(deleted_cols_mtx_);</a>
+<a name="ln369">  deleted_cols_.insert(col);</a>
+<a name="ln370">}</a>
+<a name="ln371"> </a>
+<a name="ln372">void ManualHistoryRetentionPolicy::SetTableTTLForTests(MonoDelta ttl) {</a>
+<a name="ln373">  table_ttl_.store(ttl, std::memory_order_release);</a>
+<a name="ln374">}</a>
+<a name="ln375"> </a>
+<a name="ln376">}  // namespace docdb</a>
+<a name="ln377">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="63"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="65"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

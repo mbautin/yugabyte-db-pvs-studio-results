@@ -1,0 +1,645 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>cql_processor.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/yql/cql/cqlserver/cql_processor.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/gutil/strings/escaping.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/rpc/connection.h&quot;</a>
+<a name="ln23">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln24">#include &quot;yb/rpc/rpc_context.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/yql/cql/cqlserver/cql_service.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">METRIC_DEFINE_histogram_with_percentiles(</a>
+<a name="ln29">    server, handler_latency_yb_cqlserver_CQLServerService_GetProcessor,</a>
+<a name="ln30">    &quot;Time spent to get a processor for processing a CQL query request.&quot;,</a>
+<a name="ln31">    yb::MetricUnit::kMicroseconds,</a>
+<a name="ln32">    &quot;Time spent to get a processor for processing a CQL query request.&quot;, 60000000LU, 2);</a>
+<a name="ln33">METRIC_DEFINE_histogram_with_percentiles(</a>
+<a name="ln34">    server, handler_latency_yb_cqlserver_CQLServerService_ProcessRequest,</a>
+<a name="ln35">    &quot;Time spent processing a CQL query request. From parsing till executing&quot;,</a>
+<a name="ln36">    yb::MetricUnit::kMicroseconds,</a>
+<a name="ln37">    &quot;Time spent processing a CQL query request. From parsing till executing&quot;, 60000000LU, 2);</a>
+<a name="ln38">METRIC_DEFINE_histogram_with_percentiles(</a>
+<a name="ln39">    server, handler_latency_yb_cqlserver_CQLServerService_ParseRequest,</a>
+<a name="ln40">    &quot;Time spent parsing CQL query request&quot;, yb::MetricUnit::kMicroseconds,</a>
+<a name="ln41">    &quot;Time spent parsing CQL query request&quot;, 60000000LU, 2);</a>
+<a name="ln42">METRIC_DEFINE_histogram_with_percentiles(</a>
+<a name="ln43">    server, handler_latency_yb_cqlserver_CQLServerService_QueueResponse,</a>
+<a name="ln44">    &quot;Time spent to queue the response for a CQL query request back on the network&quot;,</a>
+<a name="ln45">    yb::MetricUnit::kMicroseconds,</a>
+<a name="ln46">    &quot;Time spent after computing the CQL response to queue it onto the connection.&quot;, 60000000LU, 2);</a>
+<a name="ln47">METRIC_DEFINE_histogram_with_percentiles(</a>
+<a name="ln48">    server, handler_latency_yb_cqlserver_CQLServerService_ExecuteRequest,</a>
+<a name="ln49">    &quot;Time spent executing the CQL query request in the handler&quot;, yb::MetricUnit::kMicroseconds,</a>
+<a name="ln50">    &quot;Time spent executing the CQL query request in the handler&quot;, 60000000LU, 2);</a>
+<a name="ln51">METRIC_DEFINE_counter(</a>
+<a name="ln52">    server, yb_cqlserver_CQLServerService_ParsingErrors, &quot;Errors encountered when parsing &quot;,</a>
+<a name="ln53">    yb::MetricUnit::kRequests, &quot;Errors encountered when parsing &quot;);</a>
+<a name="ln54">METRIC_DEFINE_histogram_with_percentiles(</a>
+<a name="ln55">    server, handler_latency_yb_cqlserver_CQLServerService_Any,</a>
+<a name="ln56">    &quot;yb.cqlserver.CQLServerService.AnyMethod RPC Time&quot;, yb::MetricUnit::kMicroseconds,</a>
+<a name="ln57">    &quot;Microseconds spent handling &quot;</a>
+<a name="ln58">    &quot;yb.cqlserver.CQLServerService.AnyMethod() &quot;</a>
+<a name="ln59">    &quot;RPC requests&quot;,</a>
+<a name="ln60">    60000000LU, 2);</a>
+<a name="ln61"> </a>
+<a name="ln62">METRIC_DEFINE_gauge_int64(server, cql_processors_alive,</a>
+<a name="ln63">                          &quot;Number of alive CQL Processors.&quot;,</a>
+<a name="ln64">                          yb::MetricUnit::kUnits,</a>
+<a name="ln65">                          &quot;Number of alive CQL Processors.&quot;);</a>
+<a name="ln66"> </a>
+<a name="ln67">METRIC_DEFINE_counter(server, cql_processors_created,</a>
+<a name="ln68">                      &quot;Number of created CQL Processors.&quot;,</a>
+<a name="ln69">                      yb::MetricUnit::kUnits,</a>
+<a name="ln70">                      &quot;Number of created CQL Processors.&quot;);</a>
+<a name="ln71"> </a>
+<a name="ln72">METRIC_DEFINE_gauge_int64(server, cql_parsers_alive,</a>
+<a name="ln73">                          &quot;Number of alive CQL Parsers.&quot;,</a>
+<a name="ln74">                          yb::MetricUnit::kUnits,</a>
+<a name="ln75">                          &quot;Number of alive CQL Parsers.&quot;);</a>
+<a name="ln76"> </a>
+<a name="ln77">METRIC_DEFINE_counter(server, cql_parsers_created,</a>
+<a name="ln78">                      &quot;Number of created CQL Parsers.&quot;,</a>
+<a name="ln79">                      yb::MetricUnit::kUnits,</a>
+<a name="ln80">                      &quot;Number of created CQL Parsers.&quot;);</a>
+<a name="ln81"> </a>
+<a name="ln82">DECLARE_bool(use_cassandra_authentication);</a>
+<a name="ln83"> </a>
+<a name="ln84">namespace yb {</a>
+<a name="ln85">namespace cqlserver {</a>
+<a name="ln86"> </a>
+<a name="ln87">const unordered_map&lt;string, vector&lt;string&gt;&gt; kSupportedOptions = {</a>
+<a name="ln88">  {CQLMessage::kCQLVersionOption, {&quot;3.0.0&quot; /* minimum */, &quot;3.4.2&quot; /* current */} },</a>
+<a name="ln89">  {CQLMessage::kCompressionOption, {CQLMessage::kLZ4Compression, CQLMessage::kSnappyCompression} }</a>
+<a name="ln90">};</a>
+<a name="ln91"> </a>
+<a name="ln92">constexpr const char* const kCassandraPasswordAuthenticator =</a>
+<a name="ln93">    &quot;org.apache.cassandra.auth.PasswordAuthenticator&quot;;</a>
+<a name="ln94"> </a>
+<a name="ln95">extern const char* const kRoleColumnNameSaltedHash;</a>
+<a name="ln96">extern const char* const kRoleColumnNameCanLogin;</a>
+<a name="ln97"> </a>
+<a name="ln98">using std::shared_ptr;</a>
+<a name="ln99">using std::unique_ptr;</a>
+<a name="ln100"> </a>
+<a name="ln101">using client::YBClient;</a>
+<a name="ln102">using client::YBSession;</a>
+<a name="ln103">using ql::ExecutedResult;</a>
+<a name="ln104">using ql::PreparedResult;</a>
+<a name="ln105">using ql::RowsResult;</a>
+<a name="ln106">using ql::SetKeyspaceResult;</a>
+<a name="ln107">using ql::SchemaChangeResult;</a>
+<a name="ln108">using ql::QLProcessor;</a>
+<a name="ln109">using ql::ParseTree;</a>
+<a name="ln110">using ql::Statement;</a>
+<a name="ln111">using ql::StatementBatch;</a>
+<a name="ln112">using ql::StatementExecutedCallback;</a>
+<a name="ln113">using ql::ErrorCode;</a>
+<a name="ln114">using ql::GetErrorCode;</a>
+<a name="ln115">using strings::Substitute;</a>
+<a name="ln116">using yb::util::bcrypt_checkpw;</a>
+<a name="ln117"> </a>
+<a name="ln118">//------------------------------------------------------------------------------------------------</a>
+<a name="ln119">CQLMetrics::CQLMetrics(const scoped_refptr&lt;yb::MetricEntity&gt;&amp; metric_entity)</a>
+<a name="ln120">    : QLMetrics(metric_entity) {</a>
+<a name="ln121">  time_to_process_request_ =</a>
+<a name="ln122">      METRIC_handler_latency_yb_cqlserver_CQLServerService_ProcessRequest.Instantiate(</a>
+<a name="ln123">          metric_entity);</a>
+<a name="ln124">  time_to_get_cql_processor_ =</a>
+<a name="ln125">      METRIC_handler_latency_yb_cqlserver_CQLServerService_GetProcessor.Instantiate(metric_entity);</a>
+<a name="ln126">  time_to_parse_cql_wrapper_ =</a>
+<a name="ln127">      METRIC_handler_latency_yb_cqlserver_CQLServerService_ParseRequest.Instantiate(metric_entity);</a>
+<a name="ln128">  time_to_execute_cql_request_ =</a>
+<a name="ln129">      METRIC_handler_latency_yb_cqlserver_CQLServerService_ExecuteRequest.Instantiate(</a>
+<a name="ln130">          metric_entity);</a>
+<a name="ln131">  time_to_queue_cql_response_ =</a>
+<a name="ln132">      METRIC_handler_latency_yb_cqlserver_CQLServerService_QueueResponse.Instantiate(metric_entity);</a>
+<a name="ln133">  rpc_method_metrics_.handler_latency =</a>
+<a name="ln134">      METRIC_handler_latency_yb_cqlserver_CQLServerService_Any.Instantiate(metric_entity);</a>
+<a name="ln135">  num_errors_parsing_cql_ =</a>
+<a name="ln136">      METRIC_yb_cqlserver_CQLServerService_ParsingErrors.Instantiate(metric_entity);</a>
+<a name="ln137">  cql_processors_alive_ = METRIC_cql_processors_alive.Instantiate(metric_entity, 0);</a>
+<a name="ln138">  cql_processors_created_ = METRIC_cql_processors_created.Instantiate(metric_entity);</a>
+<a name="ln139">  parsers_alive_ = METRIC_cql_parsers_alive.Instantiate(metric_entity, 0);</a>
+<a name="ln140">  parsers_created_ = METRIC_cql_parsers_created.Instantiate(metric_entity);</a>
+<a name="ln141">}</a>
+<a name="ln142"> </a>
+<a name="ln143">//------------------------------------------------------------------------------------------------</a>
+<a name="ln144">CQLProcessor::CQLProcessor(CQLServiceImpl* service_impl, const CQLProcessorListPos&amp; pos)</a>
+<a name="ln145">    : QLProcessor(service_impl-&gt;client(), service_impl-&gt;metadata_cache(),</a>
+<a name="ln146">                  service_impl-&gt;cql_metrics().get(),</a>
+<a name="ln147">                  &amp;service_impl-&gt;parser_pool(),</a>
+<a name="ln148">                  service_impl-&gt;clock(),</a>
+<a name="ln149">                  std::bind(&amp;CQLServiceImpl::TransactionPool, service_impl)),</a>
+<a name="ln150">      service_impl_(service_impl),</a>
+<a name="ln151">      cql_metrics_(service_impl-&gt;cql_metrics()),</a>
+<a name="ln152">      pos_(pos),</a>
+<a name="ln153">      statement_executed_cb_(Bind(&amp;CQLProcessor::StatementExecuted, Unretained(this))),</a>
+<a name="ln154">      consumption_(service_impl-&gt;processors_mem_tracker(), sizeof(*this)) {</a>
+<a name="ln155">  IncrementCounter(cql_metrics_-&gt;cql_processors_created_);</a>
+<a name="ln156">  IncrementGauge(cql_metrics_-&gt;cql_processors_alive_);</a>
+<a name="ln157">}</a>
+<a name="ln158"> </a>
+<a name="ln159">CQLProcessor::~CQLProcessor() {</a>
+<a name="ln160">  DecrementGauge(cql_metrics_-&gt;cql_processors_alive_);</a>
+<a name="ln161">}</a>
+<a name="ln162"> </a>
+<a name="ln163">void CQLProcessor::Shutdown() {</a>
+<a name="ln164">  auto call = std::move(call_);</a>
+<a name="ln165">  if (call) {</a>
+<a name="ln166">    call-&gt;RespondFailure(</a>
+<a name="ln167">        rpc::ErrorStatusPB::FATAL_SERVER_SHUTTING_DOWN, STATUS(Aborted, &quot;Aborted&quot;));</a>
+<a name="ln168">  }</a>
+<a name="ln169">}</a>
+<a name="ln170"> </a>
+<a name="ln171">void CQLProcessor::ProcessCall(rpc::InboundCallPtr call) {</a>
+<a name="ln172">  call_ = std::dynamic_pointer_cast&lt;CQLInboundCall&gt;(std::move(call));</a>
+<a name="ln173">  unique_ptr&lt;CQLRequest&gt; request;</a>
+<a name="ln174">  unique_ptr&lt;CQLResponse&gt; response;</a>
+<a name="ln175"> </a>
+<a name="ln176">  // Parse the CQL request. If the parser failed, it sets the error message in response.</a>
+<a name="ln177">  parse_begin_ = MonoTime::Now();</a>
+<a name="ln178">  const auto&amp; context = static_cast&lt;const CQLConnectionContext&amp;&gt;(call_-&gt;connection()-&gt;context());</a>
+<a name="ln179">  const auto compression_scheme = context.compression_scheme();</a>
+<a name="ln180">  if (!CQLRequest::ParseRequest(call_-&gt;serialized_request(), compression_scheme,</a>
+<a name="ln181">                                &amp;request, &amp;response)) {</a>
+<a name="ln182">    cql_metrics_-&gt;num_errors_parsing_cql_-&gt;Increment();</a>
+<a name="ln183">    PrepareAndSendResponse(response);</a>
+<a name="ln184">    return;</a>
+<a name="ln185">  }</a>
+<a name="ln186"> </a>
+<a name="ln187">  execute_begin_ = MonoTime::Now();</a>
+<a name="ln188">  cql_metrics_-&gt;time_to_parse_cql_wrapper_-&gt;Increment(</a>
+<a name="ln189">      execute_begin_.GetDeltaSince(parse_begin_).ToMicroseconds());</a>
+<a name="ln190"> </a>
+<a name="ln191">  // Execute the request (perhaps asynchronously).</a>
+<a name="ln192">  SetCurrentSession(call_-&gt;ql_session());</a>
+<a name="ln193">  request_ = std::move(request);</a>
+<a name="ln194">  call_-&gt;SetRequest(request_, service_impl_);</a>
+<a name="ln195">  retry_count_ = 0;</a>
+<a name="ln196">  response.reset(ProcessRequest(*request_));</a>
+<a name="ln197">  PrepareAndSendResponse(response);</a>
+<a name="ln198">}</a>
+<a name="ln199"> </a>
+<a name="ln200">void CQLProcessor::Release() {</a>
+<a name="ln201">  call_ = nullptr;</a>
+<a name="ln202">  request_ = nullptr;</a>
+<a name="ln203">  stmts_.clear();</a>
+<a name="ln204">  parse_trees_.clear();</a>
+<a name="ln205">  SetCurrentSession(nullptr);</a>
+<a name="ln206">  service_impl_-&gt;ReturnProcessor(pos_);</a>
+<a name="ln207">}</a>
+<a name="ln208"> </a>
+<a name="ln209">void CQLProcessor::PrepareAndSendResponse(const unique_ptr&lt;CQLResponse&gt;&amp; response) {</a>
+<a name="ln210">  if (response) {</a>
+<a name="ln211">    const CQLConnectionContext&amp; context =</a>
+<a name="ln212">        static_cast&lt;const CQLConnectionContext&amp;&gt;(call_-&gt;connection()-&gt;context());</a>
+<a name="ln213">    response-&gt;set_registered_events(context.registered_events());</a>
+<a name="ln214">    SendResponse(*response);</a>
+<a name="ln215">  }</a>
+<a name="ln216">}</a>
+<a name="ln217"> </a>
+<a name="ln218">void CQLProcessor::SendResponse(const CQLResponse&amp; response) {</a>
+<a name="ln219">  // Serialize the response to return to the CQL client. In case of error, an error response</a>
+<a name="ln220">  // should still be present.</a>
+<a name="ln221">  MonoTime response_begin = MonoTime::Now();</a>
+<a name="ln222">  const auto&amp; context = static_cast&lt;const CQLConnectionContext&amp;&gt;(call_-&gt;connection()-&gt;context());</a>
+<a name="ln223">  const auto compression_scheme = context.compression_scheme();</a>
+<a name="ln224">  faststring msg;</a>
+<a name="ln225">  response.Serialize(compression_scheme, &amp;msg);</a>
+<a name="ln226">  call_-&gt;RespondSuccess(RefCntBuffer(msg), cql_metrics_-&gt;rpc_method_metrics_);</a>
+<a name="ln227"> </a>
+<a name="ln228">  MonoTime response_done = MonoTime::Now();</a>
+<a name="ln229">  cql_metrics_-&gt;time_to_process_request_-&gt;Increment(</a>
+<a name="ln230">      response_done.GetDeltaSince(parse_begin_).ToMicroseconds());</a>
+<a name="ln231">  if (request_ != nullptr) {</a>
+<a name="ln232">    cql_metrics_-&gt;time_to_execute_cql_request_-&gt;Increment(</a>
+<a name="ln233">        response_begin.GetDeltaSince(execute_begin_).ToMicroseconds());</a>
+<a name="ln234">  }</a>
+<a name="ln235">  cql_metrics_-&gt;time_to_queue_cql_response_-&gt;Increment(</a>
+<a name="ln236">      response_done.GetDeltaSince(response_begin).ToMicroseconds());</a>
+<a name="ln237"> </a>
+<a name="ln238">  Release();</a>
+<a name="ln239">}</a>
+<a name="ln240"> </a>
+<a name="ln241">CQLResponse* CQLProcessor::ProcessRequest(const CQLRequest&amp; req) {</a>
+<a name="ln242">  switch (req.opcode()) {</a>
+<a name="ln243">    case CQLMessage::Opcode::OPTIONS:</a>
+<a name="ln244">      return ProcessRequest(static_cast&lt;const OptionsRequest&amp;&gt;(req));</a>
+<a name="ln245">    case CQLMessage::Opcode::STARTUP:</a>
+<a name="ln246">      return ProcessRequest(static_cast&lt;const StartupRequest&amp;&gt;(req));</a>
+<a name="ln247">    case CQLMessage::Opcode::PREPARE:</a>
+<a name="ln248">      return ProcessRequest(static_cast&lt;const PrepareRequest&amp;&gt;(req));</a>
+<a name="ln249">    case CQLMessage::Opcode::EXECUTE:</a>
+<a name="ln250">      return ProcessRequest(static_cast&lt;const ExecuteRequest&amp;&gt;(req));</a>
+<a name="ln251">    case CQLMessage::Opcode::QUERY:</a>
+<a name="ln252">      return ProcessRequest(static_cast&lt;const QueryRequest&amp;&gt;(req));</a>
+<a name="ln253">    case CQLMessage::Opcode::BATCH:</a>
+<a name="ln254">      return ProcessRequest(static_cast&lt;const BatchRequest&amp;&gt;(req));</a>
+<a name="ln255">    case CQLMessage::Opcode::AUTH_RESPONSE:</a>
+<a name="ln256">      return ProcessRequest(static_cast&lt;const AuthResponseRequest&amp;&gt;(req));</a>
+<a name="ln257">    case CQLMessage::Opcode::REGISTER:</a>
+<a name="ln258">      return ProcessRequest(static_cast&lt;const RegisterRequest&amp;&gt;(req));</a>
+<a name="ln259"> </a>
+<a name="ln260">    case CQLMessage::Opcode::ERROR: FALLTHROUGH_INTENDED;</a>
+<a name="ln261">    case CQLMessage::Opcode::READY: FALLTHROUGH_INTENDED;</a>
+<a name="ln262">    case CQLMessage::Opcode::AUTHENTICATE: FALLTHROUGH_INTENDED;</a>
+<a name="ln263">    case CQLMessage::Opcode::SUPPORTED: FALLTHROUGH_INTENDED;</a>
+<a name="ln264">    case CQLMessage::Opcode::RESULT: FALLTHROUGH_INTENDED;</a>
+<a name="ln265">    case CQLMessage::Opcode::EVENT: FALLTHROUGH_INTENDED;</a>
+<a name="ln266">    case CQLMessage::Opcode::AUTH_CHALLENGE: FALLTHROUGH_INTENDED;</a>
+<a name="ln267">    case CQLMessage::Opcode::AUTH_SUCCESS:</a>
+<a name="ln268">      break;</a>
+<a name="ln269">  }</a>
+<a name="ln270"> </a>
+<a name="ln271">  LOG(FATAL) &lt;&lt; &quot;Invalid CQL request: opcode = &quot; &lt;&lt; static_cast&lt;int&gt;(req.opcode());</a>
+<a name="ln272">  return nullptr;</a>
+<a name="ln273">}</a>
+<a name="ln274"> </a>
+<a name="ln275">CQLResponse* CQLProcessor::ProcessRequest(const OptionsRequest&amp; req) {</a>
+<a name="ln276">  return new SupportedResponse(req, &amp;kSupportedOptions);</a>
+<a name="ln277">}</a>
+<a name="ln278"> </a>
+<a name="ln279">CQLResponse* CQLProcessor::ProcessRequest(const StartupRequest&amp; req) {</a>
+<a name="ln280">  for (const auto&amp; option : req.options()) {</a>
+<a name="ln281">    const auto&amp; name = option.first;</a>
+<a name="ln282">    const auto&amp; value = option.second;</a>
+<a name="ln283">    const auto it = kSupportedOptions.find(name);</a>
+<a name="ln284">    if (it == kSupportedOptions.end() ||</a>
+<a name="ln285">        std::find(it-&gt;second.begin(), it-&gt;second.end(), value) == it-&gt;second.end()) {</a>
+<a name="ln286">      YB_LOG_EVERY_N_SECS(WARNING, 60) &lt;&lt; Format(&quot;Unsupported driver option $0 = $1&quot;, name, value);</a>
+<a name="ln287">    }</a>
+<a name="ln288">    if (name == CQLMessage::kCompressionOption) {</a>
+<a name="ln289">      auto&amp; context = static_cast&lt;CQLConnectionContext&amp;&gt;(call_-&gt;connection()-&gt;context());</a>
+<a name="ln290">      if (value == CQLMessage::kLZ4Compression) {</a>
+<a name="ln291">        context.set_compression_scheme(CQLMessage::CompressionScheme::kLz4);</a>
+<a name="ln292">      } else if (value == CQLMessage::kSnappyCompression) {</a>
+<a name="ln293">        context.set_compression_scheme(CQLMessage::CompressionScheme::kSnappy);</a>
+<a name="ln294">      } else {</a>
+<a name="ln295">        return new ErrorResponse(</a>
+<a name="ln296">            req, ErrorResponse::Code::PROTOCOL_ERROR,</a>
+<a name="ln297">            Substitute(&quot;Unsupported compression scheme $0&quot;, value));</a>
+<a name="ln298">      }</a>
+<a name="ln299">    }</a>
+<a name="ln300">  }</a>
+<a name="ln301">  if (FLAGS_use_cassandra_authentication) {</a>
+<a name="ln302">    return new AuthenticateResponse(req, kCassandraPasswordAuthenticator);</a>
+<a name="ln303">  } else {</a>
+<a name="ln304">    return new ReadyResponse(req);</a>
+<a name="ln305">  }</a>
+<a name="ln306">}</a>
+<a name="ln307"> </a>
+<a name="ln308">CQLResponse* CQLProcessor::ProcessRequest(const PrepareRequest&amp; req) {</a>
+<a name="ln309">  VLOG(1) &lt;&lt; &quot;PREPARE &quot; &lt;&lt; req.query();</a>
+<a name="ln310">  const CQLMessage::QueryId query_id = CQLStatement::GetQueryId(</a>
+<a name="ln311">      ql_env_.CurrentKeyspace(), req.query());</a>
+<a name="ln312">  // To prevent multiple clients from preparing the same new statement in parallel and trying to</a>
+<a name="ln313">  // cache the same statement (a typical &quot;login storm&quot; scenario), each caller will try to allocate</a>
+<a name="ln314">  // the statement in the cached statement first. If it already exists, the existing one will be</a>
+<a name="ln315">  // returned instead. Then, each client will try to prepare the statement. The first one will do</a>
+<a name="ln316">  // the actual prepare while the rest wait. As the rest do the prepare afterwards, the statement</a>
+<a name="ln317">  // is already prepared so it will be an no-op (see Statement::Prepare).</a>
+<a name="ln318">  shared_ptr&lt;CQLStatement&gt; stmt = service_impl_-&gt;AllocatePreparedStatement(</a>
+<a name="ln319">      query_id, ql_env_.CurrentKeyspace(), req.query());</a>
+<a name="ln320">  PreparedResult::UniPtr result;</a>
+<a name="ln321">  const Status s = stmt-&gt;Prepare(this, service_impl_-&gt;prepared_stmts_mem_tracker(),</a>
+<a name="ln322">                                 false /* internal */, &amp;result);</a>
+<a name="ln323">  if (!s.ok()) {</a>
+<a name="ln324">    service_impl_-&gt;DeletePreparedStatement(stmt);</a>
+<a name="ln325">    return ProcessError(s, stmt-&gt;query_id());</a>
+<a name="ln326">  }</a>
+<a name="ln327"> </a>
+<a name="ln328">  return (result != nullptr) ? new PreparedResultResponse(req, query_id, *result)</a>
+<a name="ln329">                             : new PreparedResultResponse(req, query_id);</a>
+<a name="ln330">}</a>
+<a name="ln331"> </a>
+<a name="ln332">CQLResponse* CQLProcessor::ProcessRequest(const ExecuteRequest&amp; req) {</a>
+<a name="ln333">  VLOG(1) &lt;&lt; &quot;EXECUTE &quot; &lt;&lt; b2a_hex(req.query_id());</a>
+<a name="ln334">  const shared_ptr&lt;const CQLStatement&gt; stmt = GetPreparedStatement(req.query_id());</a>
+<a name="ln335">  if (stmt == nullptr) {</a>
+<a name="ln336">    return ProcessError(ErrorStatus(ErrorCode::UNPREPARED_STATEMENT), req.query_id());</a>
+<a name="ln337">  }</a>
+<a name="ln338">  const Status s = stmt-&gt;ExecuteAsync(this, req.params(), statement_executed_cb_);</a>
+<a name="ln339">  return s.ok() ? nullptr : ProcessError(s, stmt-&gt;query_id());</a>
+<a name="ln340">}</a>
+<a name="ln341"> </a>
+<a name="ln342">CQLResponse* CQLProcessor::ProcessRequest(const QueryRequest&amp; req) {</a>
+<a name="ln343">  VLOG(1) &lt;&lt; &quot;QUERY &quot; &lt;&lt; req.query();</a>
+<a name="ln344">  if (service_impl_-&gt;system_cache() != nullptr) {</a>
+<a name="ln345">    auto cached_response = service_impl_-&gt;system_cache()-&gt;Lookup(req.query());</a>
+<a name="ln346">    if (cached_response) {</a>
+<a name="ln347">      VLOG(1) &lt;&lt; &quot;Using cached response for &quot; &lt;&lt; req.query();</a>
+<a name="ln348">      statement_executed_cb_.Run(</a>
+<a name="ln349">          Status::OK(),</a>
+<a name="ln350">          std::static_pointer_cast&lt;ExecutedResult&gt;(*cached_response));</a>
+<a name="ln351">      return nullptr;</a>
+<a name="ln352">    }</a>
+<a name="ln353">  }</a>
+<a name="ln354">  RunAsync(req.query(), req.params(), statement_executed_cb_);</a>
+<a name="ln355">  return nullptr;</a>
+<a name="ln356">}</a>
+<a name="ln357"> </a>
+<a name="ln358">CQLResponse* CQLProcessor::ProcessRequest(const BatchRequest&amp; req) {</a>
+<a name="ln359">  VLOG(1) &lt;&lt; &quot;BATCH &quot; &lt;&lt; req.queries().size();</a>
+<a name="ln360"> </a>
+<a name="ln361">  StatementBatch batch;</a>
+<a name="ln362">  batch.reserve(req.queries().size());</a>
+<a name="ln363"> </a>
+<a name="ln364">  // For each query in the batch, look up the query id if it is a prepared statement, or prepare the</a>
+<a name="ln365">  // query if it is not prepared. Then execute the parse trees with the parameters.</a>
+<a name="ln366">  for (const BatchRequest::Query&amp; query : req.queries()) {</a>
+<a name="ln367">    if (query.is_prepared) {</a>
+<a name="ln368">      VLOG(1) &lt;&lt; &quot;BATCH EXECUTE &quot; &lt;&lt; b2a_hex(query.query_id);</a>
+<a name="ln369">      const shared_ptr&lt;const CQLStatement&gt; stmt = GetPreparedStatement(query.query_id);</a>
+<a name="ln370">      if (stmt == nullptr) {</a>
+<a name="ln371">        return ProcessError(ErrorStatus(ErrorCode::UNPREPARED_STATEMENT), query.query_id);</a>
+<a name="ln372">      }</a>
+<a name="ln373">      const Result&lt;const ParseTree&amp;&gt; parse_tree = stmt-&gt;GetParseTree();</a>
+<a name="ln374">      if (!parse_tree) {</a>
+<a name="ln375">        return ProcessError(parse_tree.status(), query.query_id);</a>
+<a name="ln376">      }</a>
+<a name="ln377">      batch.emplace_back(*parse_tree, query.params);</a>
+<a name="ln378">    } else {</a>
+<a name="ln379">      VLOG(1) &lt;&lt; &quot;BATCH QUERY &quot; &lt;&lt; query.query;</a>
+<a name="ln380">      ParseTree::UniPtr parse_tree;</a>
+<a name="ln381">      const Status s = Prepare(query.query, &amp;parse_tree);</a>
+<a name="ln382">      if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln383">        return ProcessError(s);</a>
+<a name="ln384">      }</a>
+<a name="ln385">      batch.emplace_back(*parse_tree, query.params);</a>
+<a name="ln386">      parse_trees_.insert(std::move(parse_tree));</a>
+<a name="ln387">    }</a>
+<a name="ln388">  }</a>
+<a name="ln389"> </a>
+<a name="ln390">  ExecuteAsync(batch, statement_executed_cb_);</a>
+<a name="ln391"> </a>
+<a name="ln392">  return nullptr;</a>
+<a name="ln393">}</a>
+<a name="ln394"> </a>
+<a name="ln395">CQLResponse* CQLProcessor::ProcessRequest(const AuthResponseRequest&amp; req) {</a>
+<a name="ln396">  const auto&amp; params = req.params();</a>
+<a name="ln397">  shared_ptr&lt;Statement&gt; stmt = service_impl_-&gt;GetAuthPreparedStatement();</a>
+<a name="ln398">  if (!stmt-&gt;Prepare(this, nullptr /* memtracker */, true /* internal */).ok()) {</a>
+<a name="ln399">    return new ErrorResponse(</a>
+<a name="ln400">        req, ErrorResponse::Code::SERVER_ERROR,</a>
+<a name="ln401">        &quot;Could not prepare statement for querying user &quot; + params.username);</a>
+<a name="ln402">  }</a>
+<a name="ln403">  if (!stmt-&gt;ExecuteAsync(this, params, statement_executed_cb_).ok()) {</a>
+<a name="ln404">    LOG(ERROR) &lt;&lt; &quot;Could not execute prepared statement to fetch login info!&quot;;</a>
+<a name="ln405">    return new ErrorResponse(</a>
+<a name="ln406">        req, ErrorResponse::Code::SERVER_ERROR,</a>
+<a name="ln407">        &quot;Could not execute prepared statement for querying roles for user &quot; + params.username);</a>
+<a name="ln408">  }</a>
+<a name="ln409">  return nullptr;</a>
+<a name="ln410">}</a>
+<a name="ln411"> </a>
+<a name="ln412">CQLResponse* CQLProcessor::ProcessRequest(const RegisterRequest&amp; req) {</a>
+<a name="ln413">  CQLConnectionContext&amp; context =</a>
+<a name="ln414">      static_cast&lt;CQLConnectionContext&amp;&gt;(call_-&gt;connection()-&gt;context());</a>
+<a name="ln415">  context.add_registered_events(req.events());</a>
+<a name="ln416">  return new ReadyResponse(req);</a>
+<a name="ln417">}</a>
+<a name="ln418"> </a>
+<a name="ln419">shared_ptr&lt;const CQLStatement&gt; CQLProcessor::GetPreparedStatement(const CQLMessage::QueryId&amp; id) {</a>
+<a name="ln420">  shared_ptr&lt;const CQLStatement&gt; stmt = service_impl_-&gt;GetPreparedStatement(id);</a>
+<a name="ln421">  if (stmt != nullptr) {</a>
+<a name="ln422">    stmt-&gt;clear_reparsed();</a>
+<a name="ln423">    stmts_.insert(stmt);</a>
+<a name="ln424">  }</a>
+<a name="ln425">  return stmt;</a>
+<a name="ln426">}</a>
+<a name="ln427"> </a>
+<a name="ln428">void CQLProcessor::StatementExecuted(const Status&amp; s, const ExecutedResult::SharedPtr&amp; result) {</a>
+<a name="ln429">  unique_ptr&lt;CQLResponse&gt; response(s.ok() ? ProcessResult(result) : ProcessError(s));</a>
+<a name="ln430">  PrepareAndSendResponse(response);</a>
+<a name="ln431">}</a>
+<a name="ln432"> </a>
+<a name="ln433">CQLResponse* CQLProcessor::ProcessError(const Status&amp; s,</a>
+<a name="ln434">                                        boost::optional&lt;CQLMessage::QueryId&gt; query_id) {</a>
+<a name="ln435">  if (s.IsQLError()) {</a>
+<a name="ln436">    ErrorCode ql_errcode = GetErrorCode(s);</a>
+<a name="ln437">    if (ql_errcode == ErrorCode::UNPREPARED_STATEMENT ||</a>
+<a name="ln438">        ql_errcode == ErrorCode::STALE_METADATA) {</a>
+<a name="ln439">      // Delete all stale prepared statements from our cache. Since CQL protocol allows only one</a>
+<a name="ln440">      // unprepared query id to be returned, we will return just the last unprepared / stale one</a>
+<a name="ln441">      // we found.</a>
+<a name="ln442">      for (auto stmt : stmts_) {</a>
+<a name="ln443">        if (stmt-&gt;stale()) {</a>
+<a name="ln444">          service_impl_-&gt;DeletePreparedStatement(stmt);</a>
+<a name="ln445">        }</a>
+<a name="ln446">        if (stmt-&gt;unprepared() || stmt-&gt;stale()) {</a>
+<a name="ln447">          query_id = stmt-&gt;query_id();</a>
+<a name="ln448">        }</a>
+<a name="ln449">      }</a>
+<a name="ln450">      if (query_id) {</a>
+<a name="ln451">        return new UnpreparedErrorResponse(*request_, *query_id);</a>
+<a name="ln452">      }</a>
+<a name="ln453">      // When no unprepared query id is found, it means all statements we executed were queries</a>
+<a name="ln454">      // (non-prepared statements). In that case, just retry the request (once only). The retry</a>
+<a name="ln455">      // needs to be rescheduled in because this callback may not be executed in the RPC worker</a>
+<a name="ln456">      // thread. Also, rescheduling gives other calls a chance to execute first before we do.</a>
+<a name="ln457">      if (++retry_count_ == 1) {</a>
+<a name="ln458">        stmts_.clear();</a>
+<a name="ln459">        parse_trees_.clear();</a>
+<a name="ln460">        Reschedule(&amp;process_request_task_.Bind(this));</a>
+<a name="ln461">        return nullptr;</a>
+<a name="ln462">      }</a>
+<a name="ln463">      return new ErrorResponse(*request_, ErrorResponse::Code::INVALID,</a>
+<a name="ln464">                               &quot;Query failed to execute due to stale metadata cache&quot;);</a>
+<a name="ln465">    } else if (ql_errcode &lt; ErrorCode::SUCCESS) {</a>
+<a name="ln466">      if (ql_errcode == ErrorCode::UNAUTHORIZED) {</a>
+<a name="ln467">        return new ErrorResponse(*request_, ErrorResponse::Code::UNAUTHORIZED, s.ToUserMessage());</a>
+<a name="ln468">      } else if (ql_errcode &gt; ErrorCode::LIMITATION_ERROR) {</a>
+<a name="ln469">        // System errors, internal errors, or crashes.</a>
+<a name="ln470">        return new ErrorResponse(*request_, ErrorResponse::Code::SERVER_ERROR, s.ToUserMessage());</a>
+<a name="ln471">      } else if (ql_errcode &gt; ErrorCode::SEM_ERROR) {</a>
+<a name="ln472">        // Limitation, lexical, or parsing errors.</a>
+<a name="ln473">        return new ErrorResponse(*request_, ErrorResponse::Code::SYNTAX_ERROR, s.ToUserMessage());</a>
+<a name="ln474">      } else {</a>
+<a name="ln475">        // Semantic or execution errors.</a>
+<a name="ln476">        return new ErrorResponse(*request_, ErrorResponse::Code::INVALID, s.ToUserMessage());</a>
+<a name="ln477">      }</a>
+<a name="ln478">    }</a>
+<a name="ln479"> </a>
+<a name="ln480">    LOG(ERROR) &lt;&lt; &quot;Internal error: invalid error code &quot; &lt;&lt; static_cast&lt;int64_t&gt;(GetErrorCode(s));</a>
+<a name="ln481">    return new ErrorResponse(*request_, ErrorResponse::Code::SERVER_ERROR, &quot;Invalid error code&quot;);</a>
+<a name="ln482">  } else if (s.IsNotAuthorized()) {</a>
+<a name="ln483">    return new ErrorResponse(*request_, ErrorResponse::Code::UNAUTHORIZED, s.ToUserMessage());</a>
+<a name="ln484">  }</a>
+<a name="ln485"> </a>
+<a name="ln486">  return new ErrorResponse(*request_, ErrorResponse::Code::SERVER_ERROR, s.ToUserMessage());</a>
+<a name="ln487">}</a>
+<a name="ln488"> </a>
+<a name="ln489">CQLResponse* CQLProcessor::ProcessResult(const ExecutedResult::SharedPtr&amp; result) {</a>
+<a name="ln490">  if (result == nullptr) {</a>
+<a name="ln491">    return new VoidResultResponse(*request_);</a>
+<a name="ln492">  }</a>
+<a name="ln493">  switch (result-&gt;type()) {</a>
+<a name="ln494">    case ExecutedResult::Type::SET_KEYSPACE: {</a>
+<a name="ln495">      const auto&amp; set_keyspace_result = static_cast&lt;const SetKeyspaceResult&amp;&gt;(*result);</a>
+<a name="ln496">      return new SetKeyspaceResultResponse(*request_, set_keyspace_result);</a>
+<a name="ln497">    }</a>
+<a name="ln498">    case ExecutedResult::Type::ROWS: {</a>
+<a name="ln499">      const RowsResult::SharedPtr&amp; rows_result = std::static_pointer_cast&lt;RowsResult&gt;(result);</a>
+<a name="ln500">      if (request_-&gt;opcode() != CQLMessage::Opcode::AUTH_RESPONSE) {</a>
+<a name="ln501">        cql_metrics_-&gt;ql_response_size_bytes_-&gt;Increment(rows_result-&gt;rows_data().size());</a>
+<a name="ln502">      }</a>
+<a name="ln503">      switch (request_-&gt;opcode()) {</a>
+<a name="ln504">        case CQLMessage::Opcode::EXECUTE:</a>
+<a name="ln505">          return new RowsResultResponse(down_cast&lt;const ExecuteRequest&amp;&gt;(*request_), rows_result);</a>
+<a name="ln506">        case CQLMessage::Opcode::QUERY:</a>
+<a name="ln507">          return new RowsResultResponse(down_cast&lt;const QueryRequest&amp;&gt;(*request_), rows_result);</a>
+<a name="ln508">        case CQLMessage::Opcode::BATCH:</a>
+<a name="ln509">          return new RowsResultResponse(down_cast&lt;const BatchRequest&amp;&gt;(*request_), rows_result);</a>
+<a name="ln510"> </a>
+<a name="ln511">        case CQLMessage::Opcode::AUTH_RESPONSE: {</a>
+<a name="ln512">          const auto&amp; req = down_cast&lt;const AuthResponseRequest&amp;&gt;(*request_);</a>
+<a name="ln513">          const auto&amp; params = req.params();</a>
+<a name="ln514">          const auto row_block = rows_result-&gt;GetRowBlock();</a>
+<a name="ln515">          if (row_block-&gt;row_count() != 1) {</a>
+<a name="ln516">            return new ErrorResponse(*request_, ErrorResponse::Code::SERVER_ERROR,</a>
+<a name="ln517">                                     &quot;Could not get data for &quot; + params.username);</a>
+<a name="ln518">          } else {</a>
+<a name="ln519">            const auto&amp; row = row_block-&gt;row(0);</a>
+<a name="ln520">            const auto&amp; schema = row_block-&gt;schema();</a>
+<a name="ln521"> </a>
+<a name="ln522">            const QLValue&amp; salted_hash_value =</a>
+<a name="ln523">                row.column(schema.find_column(kRoleColumnNameSaltedHash));</a>
+<a name="ln524">            const auto&amp; can_login =</a>
+<a name="ln525">                row.column(schema.find_column(kRoleColumnNameCanLogin)).bool_value();</a>
+<a name="ln526">            // Username doesn't have a password, but one is required for authentication. Return</a>
+<a name="ln527">            // an error.</a>
+<a name="ln528">            if (salted_hash_value.IsNull()) {</a>
+<a name="ln529">              return new ErrorResponse(*request_, ErrorResponse::Code::BAD_CREDENTIALS,</a>
+<a name="ln530">                  &quot;Provided username &quot; + params.username + &quot; and/or password are incorrect&quot;);</a>
+<a name="ln531">            }</a>
+<a name="ln532">            const auto&amp; saved_hash = salted_hash_value.string_value();</a>
+<a name="ln533">            if (!service_impl_-&gt;CheckPassword(params.password, saved_hash)) {</a>
+<a name="ln534">              return new ErrorResponse(*request_, ErrorResponse::Code::BAD_CREDENTIALS,</a>
+<a name="ln535">                  &quot;Provided username &quot; + params.username + &quot; and/or password are incorrect&quot;);</a>
+<a name="ln536">            } else if (!can_login) {</a>
+<a name="ln537">              return new ErrorResponse(*request_, ErrorResponse::Code::BAD_CREDENTIALS,</a>
+<a name="ln538">                                       params.username + &quot; is not permitted to log in&quot;);</a>
+<a name="ln539">            }</a>
+<a name="ln540">            call_-&gt;ql_session()-&gt;set_current_role_name(params.username);</a>
+<a name="ln541">            return new AuthSuccessResponse(*request_, &quot;&quot; /* this does not matter */);</a>
+<a name="ln542">          }</a>
+<a name="ln543">          break;</a>
+<a name="ln544">        }</a>
+<a name="ln545">        case CQLMessage::Opcode::ERROR:   FALLTHROUGH_INTENDED;</a>
+<a name="ln546">        case CQLMessage::Opcode::STARTUP: FALLTHROUGH_INTENDED;</a>
+<a name="ln547">        case CQLMessage::Opcode::READY:   FALLTHROUGH_INTENDED;</a>
+<a name="ln548">        case CQLMessage::Opcode::AUTHENTICATE: FALLTHROUGH_INTENDED;</a>
+<a name="ln549">        case CQLMessage::Opcode::OPTIONS:   FALLTHROUGH_INTENDED;</a>
+<a name="ln550">        case CQLMessage::Opcode::SUPPORTED: FALLTHROUGH_INTENDED;</a>
+<a name="ln551">        case CQLMessage::Opcode::RESULT:    FALLTHROUGH_INTENDED;</a>
+<a name="ln552">        case CQLMessage::Opcode::PREPARE:   FALLTHROUGH_INTENDED;</a>
+<a name="ln553">        case CQLMessage::Opcode::REGISTER:  FALLTHROUGH_INTENDED;</a>
+<a name="ln554">        case CQLMessage::Opcode::EVENT:     FALLTHROUGH_INTENDED;</a>
+<a name="ln555">        case CQLMessage::Opcode::AUTH_CHALLENGE: FALLTHROUGH_INTENDED;</a>
+<a name="ln556">        case CQLMessage::Opcode::AUTH_SUCCESS:</a>
+<a name="ln557">          break;</a>
+<a name="ln558">        // default: fall through.</a>
+<a name="ln559">      }</a>
+<a name="ln560">      LOG(FATAL) &lt;&lt; &quot;Internal error: not a request that returns result &quot;</a>
+<a name="ln561">                 &lt;&lt; static_cast&lt;int&gt;(request_-&gt;opcode());</a>
+<a name="ln562">      break;</a>
+<a name="ln563">    }</a>
+<a name="ln564">    case ExecutedResult::Type::SCHEMA_CHANGE: {</a>
+<a name="ln565">      const auto&amp; schema_change_result = static_cast&lt;const SchemaChangeResult&amp;&gt;(*result);</a>
+<a name="ln566">      return new SchemaChangeResultResponse(*request_, schema_change_result);</a>
+<a name="ln567">    }</a>
+<a name="ln568"> </a>
+<a name="ln569">    // default: fall through.</a>
+<a name="ln570">  }</a>
+<a name="ln571">  LOG(ERROR) &lt;&lt; &quot;Internal error: unknown result type &quot; &lt;&lt; static_cast&lt;int&gt;(result-&gt;type());</a>
+<a name="ln572">  return new ErrorResponse(</a>
+<a name="ln573">      *request_, ErrorResponse::Code::SERVER_ERROR, &quot;Internal error: unknown result type&quot;);</a>
+<a name="ln574">}</a>
+<a name="ln575"> </a>
+<a name="ln576">bool CQLProcessor::NeedReschedule() {</a>
+<a name="ln577">  auto messenger = service_impl_-&gt;messenger();</a>
+<a name="ln578">  if (!messenger) {</a>
+<a name="ln579">    return false;</a>
+<a name="ln580">  }</a>
+<a name="ln581">  return !messenger-&gt;ThreadPool(rpc::ServicePriority::kNormal).OwnsThisThread();</a>
+<a name="ln582">}</a>
+<a name="ln583"> </a>
+<a name="ln584">void CQLProcessor::Reschedule(rpc::ThreadPoolTask* task) {</a>
+<a name="ln585">  auto messenger = service_impl_-&gt;messenger();</a>
+<a name="ln586">  DCHECK(messenger != nullptr) &lt;&lt; &quot;No messenger to reschedule CQL call&quot;;</a>
+<a name="ln587">  messenger-&gt;ThreadPool(rpc::ServicePriority::kNormal).Enqueue(task);</a>
+<a name="ln588">}</a>
+<a name="ln589"> </a>
+<a name="ln590">}  // namespace cqlserver</a>
+<a name="ln591">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="309"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="333"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="343"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="347"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="359"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="368"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="379"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="586"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="587"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1004/" target="_blank">V1004</a> The 'messenger' pointer was used unsafely after it was verified against nullptr. Check lines: 586, 587.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,379 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>pt_create_table.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15">// Treenode definitions for CREATE TABLE statements.</a>
+<a name="ln16">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/yql/cql/ql/ptree/pt_create_table.h&quot;</a>
+<a name="ln19">#include &quot;yb/yql/cql/ql/ptree/sem_context.h&quot;</a>
+<a name="ln20">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">DECLARE_bool(use_cassandra_authentication);</a>
+<a name="ln23"> </a>
+<a name="ln24">DEFINE_bool(cql_table_is_transactional_by_default, false,</a>
+<a name="ln25">            &quot;When the 'transactions' property is not specified at CREATE TABLE time &quot;</a>
+<a name="ln26">            &quot;for a YCQL table, this flag determines the default setting for whether &quot;</a>
+<a name="ln27">            &quot;the table is transactional or not.&quot;);</a>
+<a name="ln28">TAG_FLAG(cql_table_is_transactional_by_default, advanced);</a>
+<a name="ln29"> </a>
+<a name="ln30">namespace yb {</a>
+<a name="ln31">namespace ql {</a>
+<a name="ln32"> </a>
+<a name="ln33">using std::shared_ptr;</a>
+<a name="ln34">using std::to_string;</a>
+<a name="ln35">using client::YBColumnSchema;</a>
+<a name="ln36"> </a>
+<a name="ln37">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln38"> </a>
+<a name="ln39">PTCreateTable::PTCreateTable(MemoryContext *memctx,</a>
+<a name="ln40">                             YBLocation::SharedPtr loc,</a>
+<a name="ln41">                             const PTQualifiedName::SharedPtr&amp; name,</a>
+<a name="ln42">                             const PTListNode::SharedPtr&amp; elements,</a>
+<a name="ln43">                             bool create_if_not_exists,</a>
+<a name="ln44">                             const PTTablePropertyListNode::SharedPtr&amp; table_properties)</a>
+<a name="ln45">    : TreeNode(memctx, loc),</a>
+<a name="ln46">      relation_(name),</a>
+<a name="ln47">      elements_(elements),</a>
+<a name="ln48">      columns_(memctx),</a>
+<a name="ln49">      primary_columns_(memctx),</a>
+<a name="ln50">      hash_columns_(memctx),</a>
+<a name="ln51">      create_if_not_exists_(create_if_not_exists),</a>
+<a name="ln52">      contain_counters_(false),</a>
+<a name="ln53">      table_properties_(table_properties) {</a>
+<a name="ln54">}</a>
+<a name="ln55"> </a>
+<a name="ln56">PTCreateTable::~PTCreateTable() {</a>
+<a name="ln57">}</a>
+<a name="ln58"> </a>
+<a name="ln59">CHECKED_STATUS PTCreateTable::Analyze(SemContext *sem_context) {</a>
+<a name="ln60">  SemState sem_state(sem_context);</a>
+<a name="ln61"> </a>
+<a name="ln62">  // Processing table name.</a>
+<a name="ln63">  RETURN_NOT_OK(relation_-&gt;AnalyzeName(sem_context, OBJECT_TABLE));</a>
+<a name="ln64"> </a>
+<a name="ln65">  // For creating an index operation, SemContext::LookupTable should have already checked that the</a>
+<a name="ln66">  // current role has the ALTER permission on the table. We don't need to check for any additional</a>
+<a name="ln67">  // permissions for this operation.</a>
+<a name="ln68">  if (FLAGS_use_cassandra_authentication &amp;&amp; opcode() != TreeNodeOpcode::kPTCreateIndex) {</a>
+<a name="ln69">    RETURN_NOT_OK(sem_context-&gt;CheckHasKeyspacePermission(loc(), PermissionType::CREATE_PERMISSION,</a>
+<a name="ln70">                                                          yb_table_name().namespace_name()));</a>
+<a name="ln71">  }</a>
+<a name="ln72"> </a>
+<a name="ln73">  // Save context state, and set &quot;this&quot; as current column in the context.</a>
+<a name="ln74">  SymbolEntry cached_entry = *sem_context-&gt;current_processing_id();</a>
+<a name="ln75">  sem_context-&gt;set_current_create_table_stmt(this);</a>
+<a name="ln76"> </a>
+<a name="ln77">  // Processing table elements.</a>
+<a name="ln78">  // - First, process all column definitions to collect all symbols.</a>
+<a name="ln79">  // - Process all other elements afterward.</a>
+<a name="ln80">  sem_state.set_processing_column_definition(true);</a>
+<a name="ln81">  RETURN_NOT_OK(elements_-&gt;Analyze(sem_context));</a>
+<a name="ln82"> </a>
+<a name="ln83">  sem_state.set_processing_column_definition(false);</a>
+<a name="ln84">  RETURN_NOT_OK(elements_-&gt;Analyze(sem_context));</a>
+<a name="ln85"> </a>
+<a name="ln86">  // Move the all partition and primary key columns from columns list to appropriate list.</a>
+<a name="ln87">  int32_t order = 0;</a>
+<a name="ln88">  MCList&lt;PTColumnDefinition *&gt;::iterator iter = columns_.begin();</a>
+<a name="ln89">  while (iter != columns_.end()) {</a>
+<a name="ln90">    PTColumnDefinition *coldef = *iter;</a>
+<a name="ln91">    coldef-&gt;set_order(order++);</a>
+<a name="ln92"> </a>
+<a name="ln93">    // Remove a column from regular column list if it's already in hash or primary list.</a>
+<a name="ln94">    if (coldef-&gt;is_hash_key()) {</a>
+<a name="ln95">      if (coldef-&gt;is_static()) {</a>
+<a name="ln96">        return sem_context-&gt;Error(coldef, &quot;Hash column cannot be static&quot;,</a>
+<a name="ln97">                                  ErrorCode::INVALID_TABLE_DEFINITION);</a>
+<a name="ln98">      }</a>
+<a name="ln99">      iter = columns_.erase(iter);</a>
+<a name="ln100">    } else if (coldef-&gt;is_primary_key()) {</a>
+<a name="ln101">      if (coldef-&gt;is_static()) {</a>
+<a name="ln102">        return sem_context-&gt;Error(coldef, &quot;Primary key column cannot be static&quot;,</a>
+<a name="ln103">                                  ErrorCode::INVALID_TABLE_DEFINITION);</a>
+<a name="ln104">      }</a>
+<a name="ln105">      iter = columns_.erase(iter);</a>
+<a name="ln106">    } else {</a>
+<a name="ln107">      if (contain_counters_ != coldef-&gt;is_counter()) {</a>
+<a name="ln108">        return sem_context-&gt;Error(coldef,</a>
+<a name="ln109">                                  &quot;Table cannot contain both counter and non-counter columns&quot;,</a>
+<a name="ln110">                                  ErrorCode::INVALID_TABLE_DEFINITION);</a>
+<a name="ln111">      }</a>
+<a name="ln112">      iter++;</a>
+<a name="ln113">    }</a>
+<a name="ln114">  }</a>
+<a name="ln115"> </a>
+<a name="ln116">  // When partition key is not defined, the first column is assumed to be the partition key.</a>
+<a name="ln117">  if (hash_columns_.empty()) {</a>
+<a name="ln118">    if (primary_columns_.empty()) {</a>
+<a name="ln119">      return sem_context-&gt;Error(elements_, ErrorCode::MISSING_PRIMARY_KEY);</a>
+<a name="ln120">    }</a>
+<a name="ln121">    RETURN_NOT_OK(AppendHashColumn(sem_context, primary_columns_.front()));</a>
+<a name="ln122">    primary_columns_.pop_front();</a>
+<a name="ln123">  }</a>
+<a name="ln124"> </a>
+<a name="ln125">  // After primary key columns are fully analyzed, return error if the table contains no range</a>
+<a name="ln126">  // (primary) column but a static column. With no range column, every non-key column is static</a>
+<a name="ln127">  // by nature and Cassandra raises error in such a case.</a>
+<a name="ln128">  if (primary_columns_.empty()) {</a>
+<a name="ln129">    for (const auto&amp; column : columns_) {</a>
+<a name="ln130">      if (column-&gt;is_static()) {</a>
+<a name="ln131">        return sem_context-&gt;Error(column,</a>
+<a name="ln132">                                  &quot;Static column not allowed in a table without a range column&quot;,</a>
+<a name="ln133">                                  ErrorCode::INVALID_TABLE_DEFINITION);</a>
+<a name="ln134">      }</a>
+<a name="ln135">    }</a>
+<a name="ln136">  }</a>
+<a name="ln137"> </a>
+<a name="ln138">  if (table_properties_ != nullptr) {</a>
+<a name="ln139">    // Process table properties.</a>
+<a name="ln140">    RETURN_NOT_OK(table_properties_-&gt;Analyze(sem_context));</a>
+<a name="ln141">  }</a>
+<a name="ln142"> </a>
+<a name="ln143">  // Restore the context value as we are done with this table.</a>
+<a name="ln144">  sem_context-&gt;set_current_processing_id(cached_entry);</a>
+<a name="ln145">  if (VLOG_IS_ON(3)) {</a>
+<a name="ln146">    PrintSemanticAnalysisResult(sem_context);</a>
+<a name="ln147">  }</a>
+<a name="ln148"> </a>
+<a name="ln149">  return Status::OK();</a>
+<a name="ln150">}</a>
+<a name="ln151"> </a>
+<a name="ln152">bool PTCreateTable::ColumnExists(const MCList&lt;PTColumnDefinition *&gt;&amp; columns,</a>
+<a name="ln153">                                 const PTColumnDefinition* column) {</a>
+<a name="ln154">  return std::find(columns.begin(), columns.end(), column) != columns.end();</a>
+<a name="ln155">}</a>
+<a name="ln156"> </a>
+<a name="ln157">CHECKED_STATUS PTCreateTable::AppendColumn(SemContext *sem_context,</a>
+<a name="ln158">                                           PTColumnDefinition *column,</a>
+<a name="ln159">                                           const bool check_duplicate) {</a>
+<a name="ln160">  if (check_duplicate &amp;&amp; ColumnExists(columns_, column)) {</a>
+<a name="ln161">    return sem_context-&gt;Error(column, ErrorCode::DUPLICATE_COLUMN);</a>
+<a name="ln162">  }</a>
+<a name="ln163">  columns_.push_back(column);</a>
+<a name="ln164"> </a>
+<a name="ln165">  if (column-&gt;is_counter()) {</a>
+<a name="ln166">    contain_counters_ = true;</a>
+<a name="ln167">  }</a>
+<a name="ln168">  return Status::OK();</a>
+<a name="ln169">}</a>
+<a name="ln170"> </a>
+<a name="ln171">CHECKED_STATUS PTCreateTable::AppendPrimaryColumn(SemContext *sem_context,</a>
+<a name="ln172">                                                  PTColumnDefinition *column,</a>
+<a name="ln173">                                                  const bool check_duplicate) {</a>
+<a name="ln174">  // The column and its datatype should already have been analyzed at this point.</a>
+<a name="ln175">  // Check if the column can be used as primary column.</a>
+<a name="ln176">  RETURN_NOT_OK(CheckPrimaryType(sem_context, column));</a>
+<a name="ln177">  if (check_duplicate &amp;&amp; ColumnExists(primary_columns_, column)) {</a>
+<a name="ln178">    return sem_context-&gt;Error(column, ErrorCode::DUPLICATE_COLUMN);</a>
+<a name="ln179">  }</a>
+<a name="ln180">  column-&gt;set_is_primary_key();</a>
+<a name="ln181">  primary_columns_.push_back(column);</a>
+<a name="ln182">  return Status::OK();</a>
+<a name="ln183">}</a>
+<a name="ln184"> </a>
+<a name="ln185">CHECKED_STATUS PTCreateTable::AppendHashColumn(SemContext *sem_context,</a>
+<a name="ln186">                                               PTColumnDefinition *column,</a>
+<a name="ln187">                                               const bool check_duplicate) {</a>
+<a name="ln188">  // The column and its datatype should already have been analyzed at this point.</a>
+<a name="ln189">  // Check if the column can be used as hash column.</a>
+<a name="ln190">  RETURN_NOT_OK(CheckPrimaryType(sem_context, column));</a>
+<a name="ln191">  if (check_duplicate &amp;&amp; ColumnExists(hash_columns_, column)) {</a>
+<a name="ln192">    return sem_context-&gt;Error(column, ErrorCode::DUPLICATE_COLUMN);</a>
+<a name="ln193">  }</a>
+<a name="ln194">  column-&gt;set_is_hash_key();</a>
+<a name="ln195">  hash_columns_.push_back(column);</a>
+<a name="ln196">  return Status::OK();</a>
+<a name="ln197">}</a>
+<a name="ln198"> </a>
+<a name="ln199">CHECKED_STATUS PTCreateTable::CheckPrimaryType(SemContext *sem_context,</a>
+<a name="ln200">                                               const PTColumnDefinition *column) const {</a>
+<a name="ln201">  // Column must have been analyzed. Check if its datatype is allowed for primary column.</a>
+<a name="ln202">  if (!QLType::IsValidPrimaryType(column-&gt;ql_type()-&gt;main())) {</a>
+<a name="ln203">    return sem_context-&gt;Error(column, ErrorCode::INVALID_PRIMARY_COLUMN_TYPE);</a>
+<a name="ln204">  }</a>
+<a name="ln205">  return Status::OK();</a>
+<a name="ln206">}</a>
+<a name="ln207"> </a>
+<a name="ln208">void PTCreateTable::PrintSemanticAnalysisResult(SemContext *sem_context) {</a>
+<a name="ln209">  MCString sem_output(&quot;\tTable &quot;, sem_context-&gt;PTempMem());</a>
+<a name="ln210">  sem_output += yb_table_name().ToString().c_str();</a>
+<a name="ln211">  sem_output += &quot;(&quot;;</a>
+<a name="ln212"> </a>
+<a name="ln213">  MCList&lt;PTColumnDefinition *&gt; columns(sem_context-&gt;PTempMem());</a>
+<a name="ln214">  for (auto column : hash_columns_) {</a>
+<a name="ln215">    columns.push_back(column);</a>
+<a name="ln216">  }</a>
+<a name="ln217">  for (auto column : primary_columns_) {</a>
+<a name="ln218">    columns.push_back(column);</a>
+<a name="ln219">  }</a>
+<a name="ln220">  for (auto column : columns_) {</a>
+<a name="ln221">    columns.push_back(column);</a>
+<a name="ln222">  }</a>
+<a name="ln223"> </a>
+<a name="ln224">  bool is_first = true;</a>
+<a name="ln225">  for (auto column : columns) {</a>
+<a name="ln226">    if (is_first) {</a>
+<a name="ln227">      is_first = false;</a>
+<a name="ln228">    } else {</a>
+<a name="ln229">      sem_output += &quot;, &quot;;</a>
+<a name="ln230">    }</a>
+<a name="ln231">    sem_output += column-&gt;yb_name();</a>
+<a name="ln232">    if (column-&gt;is_hash_key()) {</a>
+<a name="ln233">      sem_output += &quot; &lt;Hash key, Type = &quot;;</a>
+<a name="ln234">    } else if (column-&gt;is_primary_key()) {</a>
+<a name="ln235">      sem_output += &quot; &lt;Primary key, &quot;;</a>
+<a name="ln236">      using SortingType = ColumnSchema::SortingType;</a>
+<a name="ln237">      switch (column-&gt;sorting_type()) {</a>
+<a name="ln238">        case SortingType::kNotSpecified: sem_output += &quot;None&quot;; break;</a>
+<a name="ln239">        case SortingType::kAscending: sem_output += &quot;Asc&quot;; break;</a>
+<a name="ln240">        case SortingType::kDescending: sem_output += &quot;Desc&quot;; break;</a>
+<a name="ln241">        case SortingType::kAscendingNullsLast: sem_output += &quot;Asc nulls last&quot;; break;</a>
+<a name="ln242">        case SortingType::kDescendingNullsLast: sem_output += &quot;Desc nulls last&quot;; break;</a>
+<a name="ln243">      }</a>
+<a name="ln244">      sem_output += &quot;, Type = &quot;;</a>
+<a name="ln245">    } else {</a>
+<a name="ln246">      sem_output += &quot; &lt;Type = &quot;;</a>
+<a name="ln247">    }</a>
+<a name="ln248">    sem_output += column-&gt;ql_type()-&gt;ToString().c_str();</a>
+<a name="ln249">    sem_output += &quot;&gt;&quot;;</a>
+<a name="ln250">  }</a>
+<a name="ln251"> </a>
+<a name="ln252">  sem_output += &quot;)&quot;;</a>
+<a name="ln253">  VLOG(3) &lt;&lt; &quot;SEMANTIC ANALYSIS RESULT (&quot; &lt;&lt; *loc_ &lt;&lt; &quot;):\n&quot; &lt;&lt; sem_output;</a>
+<a name="ln254">}</a>
+<a name="ln255"> </a>
+<a name="ln256">CHECKED_STATUS PTCreateTable::ToTableProperties(TableProperties *table_properties) const {</a>
+<a name="ln257">  // Some external tools need to create indexes for a regular table.</a>
+<a name="ln258">  // For such tools any new table can be created as transactional by default.</a>
+<a name="ln259">  if (PREDICT_FALSE(FLAGS_cql_table_is_transactional_by_default)) {</a>
+<a name="ln260">    // Note: the table property can be overrided below by the user specified value.</a>
+<a name="ln261">    table_properties-&gt;SetTransactional(true);</a>
+<a name="ln262">  }</a>
+<a name="ln263"> </a>
+<a name="ln264">  if (table_properties_ != nullptr) {</a>
+<a name="ln265">    for (PTTableProperty::SharedPtr table_property : table_properties_-&gt;node_list()) {</a>
+<a name="ln266">      RETURN_NOT_OK(table_property-&gt;SetTableProperty(table_properties));</a>
+<a name="ln267">    }</a>
+<a name="ln268">  }</a>
+<a name="ln269"> </a>
+<a name="ln270">  table_properties-&gt;SetContainCounters(contain_counters_);</a>
+<a name="ln271">  return Status::OK();</a>
+<a name="ln272">}</a>
+<a name="ln273"> </a>
+<a name="ln274">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln275"> </a>
+<a name="ln276">PTPrimaryKey::PTPrimaryKey(MemoryContext *memctx,</a>
+<a name="ln277">                           YBLocation::SharedPtr loc,</a>
+<a name="ln278">                           const PTListNode::SharedPtr&amp; columns)</a>
+<a name="ln279">    : PTConstraint(memctx, loc),</a>
+<a name="ln280">      columns_(columns) {</a>
+<a name="ln281">}</a>
+<a name="ln282"> </a>
+<a name="ln283">PTPrimaryKey::~PTPrimaryKey() {</a>
+<a name="ln284">}</a>
+<a name="ln285"> </a>
+<a name="ln286">namespace {</a>
+<a name="ln287"> </a>
+<a name="ln288">CHECKED_STATUS SetupKeyNodeFunc(PTIndexColumn *node, SemContext *sem_context) {</a>
+<a name="ln289">  return node-&gt;SetupPrimaryKey(sem_context);</a>
+<a name="ln290">}</a>
+<a name="ln291"> </a>
+<a name="ln292">CHECKED_STATUS SetupNestedKeyNodeFunc(PTIndexColumn *node, SemContext *sem_context) {</a>
+<a name="ln293">  return node-&gt;SetupHashKey(sem_context);</a>
+<a name="ln294">}</a>
+<a name="ln295"> </a>
+<a name="ln296">} // namespace</a>
+<a name="ln297"> </a>
+<a name="ln298">CHECKED_STATUS PTPrimaryKey::Analyze(SemContext *sem_context) {</a>
+<a name="ln299">  if (sem_context-&gt;processing_column_definition() != is_column_element()) {</a>
+<a name="ln300">    return Status::OK();</a>
+<a name="ln301">  }</a>
+<a name="ln302"> </a>
+<a name="ln303">  // Check if primary key is defined more than one time.</a>
+<a name="ln304">  PTCreateTable *table = sem_context-&gt;current_create_table_stmt();</a>
+<a name="ln305">  if (table-&gt;primary_columns().size() &gt; 0 || table-&gt;hash_columns().size() &gt; 0) {</a>
+<a name="ln306">    return sem_context-&gt;Error(this, &quot;Too many primary key&quot;, ErrorCode::INVALID_TABLE_DEFINITION);</a>
+<a name="ln307">  }</a>
+<a name="ln308"> </a>
+<a name="ln309">  if (columns_ == nullptr) {</a>
+<a name="ln310">    // Decorate the current processing name node as this is a column constraint.</a>
+<a name="ln311">    PTColumnDefinition *column = sem_context-&gt;current_column();</a>
+<a name="ln312">    RETURN_NOT_OK(table-&gt;AppendHashColumn(sem_context, column));</a>
+<a name="ln313">  } else {</a>
+<a name="ln314">    // Decorate all name node of this key as this is a table constraint.</a>
+<a name="ln315">    TreeNodePtrOperator&lt;SemContext, PTIndexColumn&gt; func = &amp;SetupKeyNodeFunc;</a>
+<a name="ln316">    TreeNodePtrOperator&lt;SemContext, PTIndexColumn&gt; nested_func = &amp;SetupNestedKeyNodeFunc;</a>
+<a name="ln317">    RETURN_NOT_OK(</a>
+<a name="ln318">        (columns_-&gt;Apply&lt;SemContext, PTIndexColumn&gt;(sem_context, func, 1, 1, nested_func)));</a>
+<a name="ln319">  }</a>
+<a name="ln320">  return Status::OK();</a>
+<a name="ln321">}</a>
+<a name="ln322"> </a>
+<a name="ln323">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln324"> </a>
+<a name="ln325">CHECKED_STATUS PTStatic::Analyze(SemContext *sem_context) {</a>
+<a name="ln326">  // Decorate the current column as static.</a>
+<a name="ln327">  PTColumnDefinition *column = sem_context-&gt;current_column();</a>
+<a name="ln328">  column-&gt;set_is_static();</a>
+<a name="ln329">  return Status::OK();</a>
+<a name="ln330">}</a>
+<a name="ln331"> </a>
+<a name="ln332">}  // namespace ql</a>
+<a name="ln333">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="253"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

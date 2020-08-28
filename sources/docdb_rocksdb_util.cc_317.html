@@ -1,0 +1,662 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>docdb_rocksdb_util.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/docdb/docdb_rocksdb_util.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;thread&gt;</a>
+<a name="ln17">#include &lt;memory&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &quot;yb/common/transaction.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/rocksdb/memtablerep.h&quot;</a>
+<a name="ln22">#include &quot;yb/rocksdb/rate_limiter.h&quot;</a>
+<a name="ln23">#include &quot;yb/rocksdb/table.h&quot;</a>
+<a name="ln24">#include &quot;yb/rocksdb/db/db_impl.h&quot;</a>
+<a name="ln25">#include &quot;yb/rocksdb/db/version_edit.h&quot;</a>
+<a name="ln26">#include &quot;yb/rocksdb/db/version_set.h&quot;</a>
+<a name="ln27">#include &quot;yb/rocksdb/db/writebuffer.h&quot;</a>
+<a name="ln28">#include &quot;yb/rocksdb/table/filtering_iterator.h&quot;</a>
+<a name="ln29">#include &quot;yb/rocksdb/util/compression.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &quot;yb/docdb/bounded_rocksdb_iterator.h&quot;</a>
+<a name="ln32">#include &quot;yb/docdb/consensus_frontier.h&quot;</a>
+<a name="ln33">#include &quot;yb/docdb/doc_ttl_util.h&quot;</a>
+<a name="ln34">#include &quot;yb/docdb/intent_aware_iterator.h&quot;</a>
+<a name="ln35">#include &quot;yb/rocksutil/yb_rocksdb.h&quot;</a>
+<a name="ln36">#include &quot;yb/rocksutil/yb_rocksdb_logger.h&quot;</a>
+<a name="ln37">#include &quot;yb/server/hybrid_clock.h&quot;</a>
+<a name="ln38">#include &quot;yb/util/priority_thread_pool.h&quot;</a>
+<a name="ln39">#include &quot;yb/util/size_literals.h&quot;</a>
+<a name="ln40">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln41">#include &quot;yb/gutil/sysinfo.h&quot;</a>
+<a name="ln42"> </a>
+<a name="ln43">using namespace yb::size_literals;  // NOLINT.</a>
+<a name="ln44">using namespace std::literals;</a>
+<a name="ln45"> </a>
+<a name="ln46">DEFINE_int32(rocksdb_max_background_flushes, -1, &quot;Number threads to do background flushes.&quot;);</a>
+<a name="ln47">DEFINE_bool(rocksdb_disable_compactions, false, &quot;Disable background compactions.&quot;);</a>
+<a name="ln48">DEFINE_bool(rocksdb_compaction_measure_io_stats, false, &quot;Measure stats for rocksdb compactions.&quot;);</a>
+<a name="ln49">DEFINE_int32(rocksdb_base_background_compactions, -1,</a>
+<a name="ln50">             &quot;Number threads to do background compactions.&quot;);</a>
+<a name="ln51">DEFINE_int32(rocksdb_max_background_compactions, -1,</a>
+<a name="ln52">             &quot;Increased number of threads to do background compactions (used when compactions need &quot;</a>
+<a name="ln53">             &quot;to catch up.)&quot;);</a>
+<a name="ln54">DEFINE_int32(rocksdb_level0_file_num_compaction_trigger, 5,</a>
+<a name="ln55">             &quot;Number of files to trigger level-0 compaction. -1 if compaction should not be &quot;</a>
+<a name="ln56">             &quot;triggered by number of files at all.&quot;);</a>
+<a name="ln57"> </a>
+<a name="ln58">DEFINE_int32(rocksdb_level0_slowdown_writes_trigger, -1,</a>
+<a name="ln59">             &quot;The number of files above which writes are slowed down.&quot;);</a>
+<a name="ln60">DEFINE_int32(rocksdb_level0_stop_writes_trigger, -1,</a>
+<a name="ln61">             &quot;The number of files above which compactions are stopped.&quot;);</a>
+<a name="ln62">DEFINE_int32(rocksdb_universal_compaction_size_ratio, 20,</a>
+<a name="ln63">             &quot;The percentage upto which files that are larger are include in a compaction.&quot;);</a>
+<a name="ln64">DEFINE_uint64(rocksdb_universal_compaction_always_include_size_threshold, 64_MB,</a>
+<a name="ln65">             &quot;Always include files of smaller or equal size in a compaction.&quot;);</a>
+<a name="ln66">DEFINE_int32(rocksdb_universal_compaction_min_merge_width, 4,</a>
+<a name="ln67">             &quot;The minimum number of files in a single compaction run.&quot;);</a>
+<a name="ln68">DEFINE_int64(rocksdb_compact_flush_rate_limit_bytes_per_sec, 256_MB,</a>
+<a name="ln69">             &quot;Use to control write rate of flush and compaction.&quot;);</a>
+<a name="ln70">DEFINE_uint64(rocksdb_compaction_size_threshold_bytes, 2ULL * 1024 * 1024 * 1024,</a>
+<a name="ln71">             &quot;Threshold beyond which compaction is considered large.&quot;);</a>
+<a name="ln72">DEFINE_uint64(rocksdb_max_file_size_for_compaction, 0,</a>
+<a name="ln73">             &quot;Maximal allowed file size to participate in RocksDB compaction. 0 - unlimited.&quot;);</a>
+<a name="ln74">DEFINE_int32(rocksdb_max_write_buffer_number, 2,</a>
+<a name="ln75">             &quot;Maximum number of write buffers that are built up in memory.&quot;);</a>
+<a name="ln76"> </a>
+<a name="ln77">DEFINE_int64(db_block_size_bytes, 32_KB,</a>
+<a name="ln78">             &quot;Size of RocksDB data block (in bytes).&quot;);</a>
+<a name="ln79"> </a>
+<a name="ln80">DEFINE_int64(db_filter_block_size_bytes, 64_KB,</a>
+<a name="ln81">             &quot;Size of RocksDB filter block (in bytes).&quot;);</a>
+<a name="ln82"> </a>
+<a name="ln83">DEFINE_int64(db_index_block_size_bytes, 32_KB,</a>
+<a name="ln84">             &quot;Size of RocksDB index block (in bytes).&quot;);</a>
+<a name="ln85"> </a>
+<a name="ln86">DEFINE_int64(db_min_keys_per_index_block, 100,</a>
+<a name="ln87">             &quot;Minimum number of keys per index block.&quot;);</a>
+<a name="ln88"> </a>
+<a name="ln89">DEFINE_int64(db_write_buffer_size, -1,</a>
+<a name="ln90">             &quot;Size of RocksDB write buffer (in bytes). -1 to use default.&quot;);</a>
+<a name="ln91"> </a>
+<a name="ln92">DEFINE_int32(memstore_size_mb, 128,</a>
+<a name="ln93">             &quot;Max size (in mb) of the memstore, before needing to flush.&quot;);</a>
+<a name="ln94"> </a>
+<a name="ln95">DEFINE_bool(use_docdb_aware_bloom_filter, true,</a>
+<a name="ln96">            &quot;Whether to use the DocDbAwareFilterPolicy for both bloom storage and seeks.&quot;);</a>
+<a name="ln97">// Empirically 2 is a minimal value that provides best performance on sequential scan.</a>
+<a name="ln98">DEFINE_int32(max_nexts_to_avoid_seek, 2,</a>
+<a name="ln99">             &quot;The number of next calls to try before doing resorting to do a rocksdb seek.&quot;);</a>
+<a name="ln100">DEFINE_bool(trace_docdb_calls, false, &quot;Whether we should trace calls into the docdb.&quot;);</a>
+<a name="ln101">DEFINE_bool(use_multi_level_index, true, &quot;Whether to use multi-level data index.&quot;);</a>
+<a name="ln102"> </a>
+<a name="ln103">DEFINE_uint64(initial_seqno, 1ULL &lt;&lt; 50, &quot;Initial seqno for new RocksDB instances.&quot;);</a>
+<a name="ln104"> </a>
+<a name="ln105">DEFINE_int32(num_reserved_small_compaction_threads, -1, &quot;Number of reserved small compaction &quot;</a>
+<a name="ln106">             &quot;threads. It allows splitting small vs. large compactions.&quot;);</a>
+<a name="ln107"> </a>
+<a name="ln108">DEFINE_bool(enable_ondisk_compression, true,</a>
+<a name="ln109">            &quot;Determines whether SSTable compression is enabled or not.&quot;);</a>
+<a name="ln110"> </a>
+<a name="ln111">DEFINE_int32(priority_thread_pool_size, -1,</a>
+<a name="ln112">             &quot;Max running workers in compaction thread pool. &quot;</a>
+<a name="ln113">             &quot;If -1 and max_background_compactions is specified - use max_background_compactions. &quot;</a>
+<a name="ln114">             &quot;If -1 and max_background_compactions is not specified - use sqrt(num_cpus).&quot;);</a>
+<a name="ln115"> </a>
+<a name="ln116">using std::shared_ptr;</a>
+<a name="ln117">using std::string;</a>
+<a name="ln118">using std::unique_ptr;</a>
+<a name="ln119">using strings::Substitute;</a>
+<a name="ln120"> </a>
+<a name="ln121">namespace yb {</a>
+<a name="ln122">namespace docdb {</a>
+<a name="ln123"> </a>
+<a name="ln124">std::shared_ptr&lt;rocksdb::BoundaryValuesExtractor&gt; DocBoundaryValuesExtractorInstance();</a>
+<a name="ln125"> </a>
+<a name="ln126">void SeekForward(const rocksdb::Slice&amp; slice, rocksdb::Iterator *iter) {</a>
+<a name="ln127">  if (!iter-&gt;Valid() || iter-&gt;key().compare(slice) &gt;= 0) {</a>
+<a name="ln128">    return;</a>
+<a name="ln129">  }</a>
+<a name="ln130">  ROCKSDB_SEEK(iter, slice);</a>
+<a name="ln131">}</a>
+<a name="ln132"> </a>
+<a name="ln133">void SeekForward(const KeyBytes&amp; key_bytes, rocksdb::Iterator *iter) {</a>
+<a name="ln134">  SeekForward(key_bytes.AsSlice(), iter);</a>
+<a name="ln135">}</a>
+<a name="ln136"> </a>
+<a name="ln137">KeyBytes AppendDocHt(const Slice&amp; key, const DocHybridTime&amp; doc_ht) {</a>
+<a name="ln138">  char buf[kMaxBytesPerEncodedHybridTime + 1];</a>
+<a name="ln139">  buf[0] = ValueTypeAsChar::kHybridTime;</a>
+<a name="ln140">  auto end = doc_ht.EncodedInDocDbFormat(buf + 1);</a>
+<a name="ln141">  return KeyBytes(key, Slice(buf, end));</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144">void SeekPastSubKey(const Slice&amp; key, rocksdb::Iterator* iter) {</a>
+<a name="ln145">  SeekForward(AppendDocHt(key, DocHybridTime::kMin), iter);</a>
+<a name="ln146">}</a>
+<a name="ln147"> </a>
+<a name="ln148">void SeekOutOfSubKey(KeyBytes* key_bytes, rocksdb::Iterator* iter) {</a>
+<a name="ln149">  key_bytes-&gt;AppendValueType(ValueType::kMaxByte);</a>
+<a name="ln150">  SeekForward(*key_bytes, iter);</a>
+<a name="ln151">  key_bytes-&gt;RemoveValueTypeSuffix(ValueType::kMaxByte);</a>
+<a name="ln152">}</a>
+<a name="ln153"> </a>
+<a name="ln154">void SeekPossiblyUsingNext(rocksdb::Iterator* iter, const Slice&amp; seek_key,</a>
+<a name="ln155">                           int* next_count, int* seek_count) {</a>
+<a name="ln156">  for (int nexts = FLAGS_max_nexts_to_avoid_seek; nexts-- &gt; 0;) {</a>
+<a name="ln157">    if (!iter-&gt;Valid() || iter-&gt;key().compare(seek_key) &gt;= 0) {</a>
+<a name="ln158">      if (FLAGS_trace_docdb_calls) {</a>
+<a name="ln159">        TRACE(&quot;Did $0 Next(s) instead of a Seek&quot;, nexts);</a>
+<a name="ln160">      }</a>
+<a name="ln161">      return;</a>
+<a name="ln162">    }</a>
+<a name="ln163">    VLOG(4) &lt;&lt; &quot;Skipping: &quot; &lt;&lt; SubDocKey::DebugSliceToString(iter-&gt;key());</a>
+<a name="ln164"> </a>
+<a name="ln165">    iter-&gt;Next();</a>
+<a name="ln166">    ++*next_count;</a>
+<a name="ln167">  }</a>
+<a name="ln168"> </a>
+<a name="ln169">  if (FLAGS_trace_docdb_calls) {</a>
+<a name="ln170">    TRACE(&quot;Forced to do an actual Seek after $0 Next(s)&quot;, FLAGS_max_nexts_to_avoid_seek);</a>
+<a name="ln171">  }</a>
+<a name="ln172">  iter-&gt;Seek(seek_key);</a>
+<a name="ln173">  ++*seek_count;</a>
+<a name="ln174">}</a>
+<a name="ln175"> </a>
+<a name="ln176">void PerformRocksDBSeek(</a>
+<a name="ln177">    rocksdb::Iterator *iter,</a>
+<a name="ln178">    const rocksdb::Slice &amp;seek_key,</a>
+<a name="ln179">    const char* file_name,</a>
+<a name="ln180">    int line) {</a>
+<a name="ln181">  int next_count = 0;</a>
+<a name="ln182">  int seek_count = 0;</a>
+<a name="ln183">  if (seek_key.size() == 0) {</a>
+<a name="ln184">    iter-&gt;SeekToFirst();</a>
+<a name="ln185">    ++seek_count;</a>
+<a name="ln186">  } else if (!iter-&gt;Valid() || iter-&gt;key().compare(seek_key) &gt; 0) {</a>
+<a name="ln187">    iter-&gt;Seek(seek_key);</a>
+<a name="ln188">    ++seek_count;</a>
+<a name="ln189">  } else {</a>
+<a name="ln190">    SeekPossiblyUsingNext(iter, seek_key, &amp;next_count, &amp;seek_count);</a>
+<a name="ln191">  }</a>
+<a name="ln192">  VLOG(4) &lt;&lt; Substitute(</a>
+<a name="ln193">      &quot;PerformRocksDBSeek at $0:$1:\n&quot;</a>
+<a name="ln194">      &quot;    Seek key:         $2\n&quot;</a>
+<a name="ln195">      &quot;    Seek key (raw):   $3\n&quot;</a>
+<a name="ln196">      &quot;    Actual key:       $4\n&quot;</a>
+<a name="ln197">      &quot;    Actual key (raw): $5\n&quot;</a>
+<a name="ln198">      &quot;    Actual value:     $6\n&quot;</a>
+<a name="ln199">      &quot;    Next() calls:     $7\n&quot;</a>
+<a name="ln200">      &quot;    Seek() calls:     $8\n&quot;,</a>
+<a name="ln201">      file_name, line,</a>
+<a name="ln202">      BestEffortDocDBKeyToStr(seek_key),</a>
+<a name="ln203">      FormatSliceAsStr(seek_key),</a>
+<a name="ln204">      iter-&gt;Valid() ? BestEffortDocDBKeyToStr(KeyBytes(iter-&gt;key())) : &quot;N/A&quot;,</a>
+<a name="ln205">      iter-&gt;Valid() ? FormatSliceAsStr(iter-&gt;key()) : &quot;N/A&quot;,</a>
+<a name="ln206">      iter-&gt;Valid() ? FormatSliceAsStr(iter-&gt;value()) : &quot;N/A&quot;,</a>
+<a name="ln207">      next_count,</a>
+<a name="ln208">      seek_count);</a>
+<a name="ln209">}</a>
+<a name="ln210"> </a>
+<a name="ln211">namespace {</a>
+<a name="ln212"> </a>
+<a name="ln213">rocksdb::ReadOptions PrepareReadOptions(</a>
+<a name="ln214">    rocksdb::DB* rocksdb,</a>
+<a name="ln215">    BloomFilterMode bloom_filter_mode,</a>
+<a name="ln216">    const boost::optional&lt;const Slice&gt;&amp; user_key_for_filter,</a>
+<a name="ln217">    const rocksdb::QueryId query_id,</a>
+<a name="ln218">    std::shared_ptr&lt;rocksdb::ReadFileFilter&gt; file_filter,</a>
+<a name="ln219">    const Slice* iterate_upper_bound) {</a>
+<a name="ln220">  rocksdb::ReadOptions read_opts;</a>
+<a name="ln221">  read_opts.query_id = query_id;</a>
+<a name="ln222">  if (FLAGS_use_docdb_aware_bloom_filter &amp;&amp;</a>
+<a name="ln223">    bloom_filter_mode == BloomFilterMode::USE_BLOOM_FILTER) {</a>
+<a name="ln224">    DCHECK(user_key_for_filter);</a>
+<a name="ln225">    read_opts.table_aware_file_filter = rocksdb-&gt;GetOptions().table_factory-&gt;</a>
+<a name="ln226">        NewTableAwareReadFileFilter(read_opts, user_key_for_filter.get());</a>
+<a name="ln227">  }</a>
+<a name="ln228">  read_opts.file_filter = std::move(file_filter);</a>
+<a name="ln229">  read_opts.iterate_upper_bound = iterate_upper_bound;</a>
+<a name="ln230">  return read_opts;</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233">} // namespace</a>
+<a name="ln234"> </a>
+<a name="ln235">BoundedRocksDbIterator CreateRocksDBIterator(</a>
+<a name="ln236">    rocksdb::DB* rocksdb,</a>
+<a name="ln237">    const KeyBounds* docdb_key_bounds,</a>
+<a name="ln238">    BloomFilterMode bloom_filter_mode,</a>
+<a name="ln239">    const boost::optional&lt;const Slice&gt;&amp; user_key_for_filter,</a>
+<a name="ln240">    const rocksdb::QueryId query_id,</a>
+<a name="ln241">    std::shared_ptr&lt;rocksdb::ReadFileFilter&gt; file_filter,</a>
+<a name="ln242">    const Slice* iterate_upper_bound) {</a>
+<a name="ln243">  rocksdb::ReadOptions read_opts = PrepareReadOptions(rocksdb, bloom_filter_mode,</a>
+<a name="ln244">      user_key_for_filter, query_id, std::move(file_filter), iterate_upper_bound);</a>
+<a name="ln245">  return BoundedRocksDbIterator(rocksdb, read_opts, docdb_key_bounds);</a>
+<a name="ln246">}</a>
+<a name="ln247"> </a>
+<a name="ln248">unique_ptr&lt;IntentAwareIterator&gt; CreateIntentAwareIterator(</a>
+<a name="ln249">    const DocDB&amp; doc_db,</a>
+<a name="ln250">    BloomFilterMode bloom_filter_mode,</a>
+<a name="ln251">    const boost::optional&lt;const Slice&gt;&amp; user_key_for_filter,</a>
+<a name="ln252">    const rocksdb::QueryId query_id,</a>
+<a name="ln253">    const TransactionOperationContextOpt&amp; txn_op_context,</a>
+<a name="ln254">    CoarseTimePoint deadline,</a>
+<a name="ln255">    const ReadHybridTime&amp; read_time,</a>
+<a name="ln256">    std::shared_ptr&lt;rocksdb::ReadFileFilter&gt; file_filter,</a>
+<a name="ln257">    const Slice* iterate_upper_bound) {</a>
+<a name="ln258">  // TODO(dtxn) do we need separate options for intents db?</a>
+<a name="ln259">  rocksdb::ReadOptions read_opts = PrepareReadOptions(doc_db.regular, bloom_filter_mode,</a>
+<a name="ln260">      user_key_for_filter, query_id, std::move(file_filter), iterate_upper_bound);</a>
+<a name="ln261">  return std::make_unique&lt;IntentAwareIterator&gt;(</a>
+<a name="ln262">      doc_db, read_opts, deadline, read_time, txn_op_context);</a>
+<a name="ln263">}</a>
+<a name="ln264"> </a>
+<a name="ln265">namespace {</a>
+<a name="ln266"> </a>
+<a name="ln267">std::mutex rocksdb_flags_mutex;</a>
+<a name="ln268"> </a>
+<a name="ln269">// Auto initialize some of the RocksDB flags that are defaulted to -1.</a>
+<a name="ln270">void AutoInitRocksDBFlags(rocksdb::Options* options) {</a>
+<a name="ln271">  const int kNumCpus = base::NumCPUs();</a>
+<a name="ln272">  std::unique_lock&lt;std::mutex&gt; lock(rocksdb_flags_mutex);</a>
+<a name="ln273"> </a>
+<a name="ln274">  if (FLAGS_rocksdb_max_background_flushes == -1) {</a>
+<a name="ln275">    constexpr auto kCpusPerFlushThread = 8;</a>
+<a name="ln276">    constexpr auto kAutoMaxBackgroundFlushesHighLimit = 4;</a>
+<a name="ln277">    auto flushes = 1 + kNumCpus / kCpusPerFlushThread;</a>
+<a name="ln278">    FLAGS_rocksdb_max_background_flushes = std::min(flushes, kAutoMaxBackgroundFlushesHighLimit);</a>
+<a name="ln279">    LOG(INFO) &lt;&lt; &quot;Auto setting FLAGS_rocksdb_max_background_flushes to &quot;</a>
+<a name="ln280">              &lt;&lt; FLAGS_rocksdb_max_background_flushes;</a>
+<a name="ln281">  }</a>
+<a name="ln282">  options-&gt;max_background_flushes = FLAGS_rocksdb_max_background_flushes;</a>
+<a name="ln283"> </a>
+<a name="ln284">  if (FLAGS_rocksdb_disable_compactions) {</a>
+<a name="ln285">    return;</a>
+<a name="ln286">  }</a>
+<a name="ln287"> </a>
+<a name="ln288">  bool has_rocksdb_max_background_compactions = false;</a>
+<a name="ln289">  // This controls the maximum number of schedulable compactions, per each instance of rocksdb, of</a>
+<a name="ln290">  // which we will have many. We also do not want to waste resources by having too many queued</a>
+<a name="ln291">  // compactions.</a>
+<a name="ln292">  if (FLAGS_rocksdb_max_background_compactions == -1) {</a>
+<a name="ln293">    if (kNumCpus &lt;= 4) {</a>
+<a name="ln294">      FLAGS_rocksdb_max_background_compactions = 1;</a>
+<a name="ln295">    } else if (kNumCpus &lt;= 8) {</a>
+<a name="ln296">      FLAGS_rocksdb_max_background_compactions = 2;</a>
+<a name="ln297">    } else if (kNumCpus &lt;= 32) {</a>
+<a name="ln298">      FLAGS_rocksdb_max_background_compactions = 3;</a>
+<a name="ln299">    } else {</a>
+<a name="ln300">      FLAGS_rocksdb_max_background_compactions = 4;</a>
+<a name="ln301">    }</a>
+<a name="ln302">    LOG(INFO) &lt;&lt; &quot;Auto setting FLAGS_rocksdb_max_background_compactions to &quot;</a>
+<a name="ln303">              &lt;&lt; FLAGS_rocksdb_max_background_compactions;</a>
+<a name="ln304">  } else {</a>
+<a name="ln305">    // If we have provided an override, note that, so we can use that in the actual thread pool</a>
+<a name="ln306">    // sizing as well.</a>
+<a name="ln307">    has_rocksdb_max_background_compactions = true;</a>
+<a name="ln308">  }</a>
+<a name="ln309">  options-&gt;max_background_compactions = FLAGS_rocksdb_max_background_compactions;</a>
+<a name="ln310"> </a>
+<a name="ln311">  if (FLAGS_rocksdb_base_background_compactions == -1) {</a>
+<a name="ln312">    FLAGS_rocksdb_base_background_compactions = FLAGS_rocksdb_max_background_compactions;</a>
+<a name="ln313">    LOG(INFO) &lt;&lt; &quot;Auto setting FLAGS_rocksdb_base_background_compactions to &quot;</a>
+<a name="ln314">              &lt;&lt; FLAGS_rocksdb_base_background_compactions;</a>
+<a name="ln315">  }</a>
+<a name="ln316">  options-&gt;base_background_compactions = FLAGS_rocksdb_base_background_compactions;</a>
+<a name="ln317"> </a>
+<a name="ln318">  // This controls the number of background threads to use in the compaction thread pool.</a>
+<a name="ln319">  if (FLAGS_priority_thread_pool_size == -1) {</a>
+<a name="ln320">    if (has_rocksdb_max_background_compactions) {</a>
+<a name="ln321">      // If we did override the per-rocksdb flag, but not this one, just port over that value.</a>
+<a name="ln322">      FLAGS_priority_thread_pool_size = FLAGS_rocksdb_max_background_compactions;</a>
+<a name="ln323">    } else {</a>
+<a name="ln324">      // If we did not override the per-rocksdb queue size, then just use a production friendly</a>
+<a name="ln325">      // formula.</a>
+<a name="ln326">      //</a>
+<a name="ln327">      // For less then 8cpus, just manually tune to 1-2 threads. Above that, we can use 3.5/8.</a>
+<a name="ln328">      if (kNumCpus &lt; 4) {</a>
+<a name="ln329">        FLAGS_priority_thread_pool_size = 1;</a>
+<a name="ln330">      } else if (kNumCpus &lt; 8) {</a>
+<a name="ln331">        FLAGS_priority_thread_pool_size = 2;</a>
+<a name="ln332">      } else {</a>
+<a name="ln333">        FLAGS_priority_thread_pool_size = std::floor(kNumCpus * 3.5 / 8.0);</a>
+<a name="ln334">      }</a>
+<a name="ln335">    }</a>
+<a name="ln336">    LOG(INFO) &lt;&lt; &quot;Auto setting FLAGS_priority_thread_pool_size to &quot;</a>
+<a name="ln337">              &lt;&lt; FLAGS_priority_thread_pool_size;</a>
+<a name="ln338">  }</a>
+<a name="ln339">}</a>
+<a name="ln340"> </a>
+<a name="ln341">class HybridTimeFilteringIterator : public rocksdb::FilteringIterator {</a>
+<a name="ln342"> public:</a>
+<a name="ln343">  HybridTimeFilteringIterator(</a>
+<a name="ln344">      rocksdb::InternalIterator* iterator, bool arena_mode, HybridTime hybrid_time_filter)</a>
+<a name="ln345">      : rocksdb::FilteringIterator(iterator, arena_mode), hybrid_time_filter_(hybrid_time_filter) {}</a>
+<a name="ln346"> </a>
+<a name="ln347"> private:</a>
+<a name="ln348">  bool Satisfied(Slice key) override {</a>
+<a name="ln349">    auto user_key = rocksdb::ExtractUserKey(key);</a>
+<a name="ln350">    auto doc_ht = DocHybridTime::DecodeFromEnd(&amp;user_key);</a>
+<a name="ln351">    if (!doc_ht.ok()) {</a>
+<a name="ln352">      LOG(DFATAL) &lt;&lt; &quot;Unable to decode doc ht &quot; &lt;&lt; rocksdb::ExtractUserKey(key) &lt;&lt; &quot;: &quot;</a>
+<a name="ln353">                  &lt;&lt; doc_ht.status();</a>
+<a name="ln354">      return true;</a>
+<a name="ln355">    }</a>
+<a name="ln356">    return doc_ht-&gt;hybrid_time() &lt;= hybrid_time_filter_;</a>
+<a name="ln357">  }</a>
+<a name="ln358"> </a>
+<a name="ln359">  HybridTime hybrid_time_filter_;</a>
+<a name="ln360">};</a>
+<a name="ln361"> </a>
+<a name="ln362">template &lt;class T, class... Args&gt;</a>
+<a name="ln363">T* CreateOnArena(rocksdb::Arena* arena, Args&amp;&amp;... args) {</a>
+<a name="ln364">  if (!arena) {</a>
+<a name="ln365">    return new T(std::forward&lt;Args&gt;(args)...);</a>
+<a name="ln366">  }</a>
+<a name="ln367">  auto mem = arena-&gt;AllocateAligned(sizeof(T));</a>
+<a name="ln368">  return new (mem) T(std::forward&lt;Args&gt;(args)...);</a>
+<a name="ln369">}</a>
+<a name="ln370"> </a>
+<a name="ln371">rocksdb::InternalIterator* WrapIterator(</a>
+<a name="ln372">    rocksdb::InternalIterator* iterator, rocksdb::Arena* arena, const Slice&amp; filter) {</a>
+<a name="ln373">  if (!filter.empty()) {</a>
+<a name="ln374">    HybridTime hybrid_time_filter;</a>
+<a name="ln375">    memcpy(&amp;hybrid_time_filter, filter.data(), sizeof(hybrid_time_filter));</a>
+<a name="ln376">    return CreateOnArena&lt;HybridTimeFilteringIterator&gt;(</a>
+<a name="ln377">        arena, iterator, arena != nullptr, hybrid_time_filter);</a>
+<a name="ln378">  }</a>
+<a name="ln379">  return iterator;</a>
+<a name="ln380">}</a>
+<a name="ln381"> </a>
+<a name="ln382">} // namespace</a>
+<a name="ln383"> </a>
+<a name="ln384">void InitRocksDBOptions(</a>
+<a name="ln385">    rocksdb::Options* options, const string&amp; log_prefix,</a>
+<a name="ln386">    const shared_ptr&lt;rocksdb::Statistics&gt;&amp; statistics,</a>
+<a name="ln387">    const tablet::TabletOptions&amp; tablet_options) {</a>
+<a name="ln388">  AutoInitRocksDBFlags(options);</a>
+<a name="ln389">  SetLogPrefix(options, log_prefix);</a>
+<a name="ln390">  options-&gt;create_if_missing = true;</a>
+<a name="ln391">  options-&gt;disableDataSync = true;</a>
+<a name="ln392">  options-&gt;statistics = statistics;</a>
+<a name="ln393">  options-&gt;info_log_level = YBRocksDBLogger::ConvertToRocksDBLogLevel(FLAGS_minloglevel);</a>
+<a name="ln394">  options-&gt;initial_seqno = FLAGS_initial_seqno;</a>
+<a name="ln395">  options-&gt;boundary_extractor = DocBoundaryValuesExtractorInstance();</a>
+<a name="ln396">  options-&gt;compaction_measure_io_stats = FLAGS_rocksdb_compaction_measure_io_stats;</a>
+<a name="ln397">  options-&gt;memory_monitor = tablet_options.memory_monitor;</a>
+<a name="ln398">  if (FLAGS_db_write_buffer_size != -1) {</a>
+<a name="ln399">    options-&gt;write_buffer_size = FLAGS_db_write_buffer_size;</a>
+<a name="ln400">  } else {</a>
+<a name="ln401">    options-&gt;write_buffer_size = FLAGS_memstore_size_mb * 1_MB;</a>
+<a name="ln402">  }</a>
+<a name="ln403">  options-&gt;env = tablet_options.rocksdb_env;</a>
+<a name="ln404">  options-&gt;checkpoint_env = rocksdb::Env::Default();</a>
+<a name="ln405">  static PriorityThreadPool priority_thread_pool_for_compactions_and_flushes(</a>
+<a name="ln406">      FLAGS_priority_thread_pool_size);</a>
+<a name="ln407">  options-&gt;priority_thread_pool_for_compactions_and_flushes =</a>
+<a name="ln408">      &amp;priority_thread_pool_for_compactions_and_flushes;</a>
+<a name="ln409"> </a>
+<a name="ln410">  if (FLAGS_num_reserved_small_compaction_threads != -1) {</a>
+<a name="ln411">    options-&gt;num_reserved_small_compaction_threads = FLAGS_num_reserved_small_compaction_threads;</a>
+<a name="ln412">  }</a>
+<a name="ln413"> </a>
+<a name="ln414">  options-&gt;compression = rocksdb::Snappy_Supported() &amp;&amp; FLAGS_enable_ondisk_compression</a>
+<a name="ln415">      ? rocksdb::kSnappyCompression : rocksdb::kNoCompression;</a>
+<a name="ln416"> </a>
+<a name="ln417">  options-&gt;listeners.insert(</a>
+<a name="ln418">      options-&gt;listeners.end(), tablet_options.listeners.begin(),</a>
+<a name="ln419">      tablet_options.listeners.end()); // Append listeners</a>
+<a name="ln420"> </a>
+<a name="ln421">  // Set block cache options.</a>
+<a name="ln422">  rocksdb::BlockBasedTableOptions table_options;</a>
+<a name="ln423">  if (tablet_options.block_cache) {</a>
+<a name="ln424">    table_options.block_cache = tablet_options.block_cache;</a>
+<a name="ln425">    // Cache the bloom filters in the block cache.</a>
+<a name="ln426">    table_options.cache_index_and_filter_blocks = true;</a>
+<a name="ln427">  } else {</a>
+<a name="ln428">    table_options.no_block_cache = true;</a>
+<a name="ln429">    table_options.cache_index_and_filter_blocks = false;</a>
+<a name="ln430">  }</a>
+<a name="ln431">  table_options.block_size = FLAGS_db_block_size_bytes;</a>
+<a name="ln432">  table_options.filter_block_size = FLAGS_db_filter_block_size_bytes;</a>
+<a name="ln433">  table_options.index_block_size = FLAGS_db_index_block_size_bytes;</a>
+<a name="ln434">  table_options.min_keys_per_index_block = FLAGS_db_min_keys_per_index_block;</a>
+<a name="ln435"> </a>
+<a name="ln436">  // Set our custom bloom filter that is docdb aware.</a>
+<a name="ln437">  if (FLAGS_use_docdb_aware_bloom_filter) {</a>
+<a name="ln438">    const auto filter_block_size_bits = table_options.filter_block_size * 8;</a>
+<a name="ln439">    table_options.filter_policy = std::make_unique&lt;const DocDbAwareV2FilterPolicy&gt;(</a>
+<a name="ln440">        filter_block_size_bits, options-&gt;info_log.get());</a>
+<a name="ln441">    table_options.supported_filter_policies =</a>
+<a name="ln442">        std::make_shared&lt;rocksdb::BlockBasedTableOptions::FilterPoliciesMap&gt;();</a>
+<a name="ln443">    const auto supported_policy = std::make_shared&lt;const DocDbAwareHashedComponentsFilterPolicy&gt;(</a>
+<a name="ln444">            filter_block_size_bits, options-&gt;info_log.get());</a>
+<a name="ln445">    table_options.supported_filter_policies-&gt;emplace(supported_policy-&gt;Name(), supported_policy);</a>
+<a name="ln446">  }</a>
+<a name="ln447"> </a>
+<a name="ln448">  if (FLAGS_use_multi_level_index) {</a>
+<a name="ln449">    table_options.index_type = rocksdb::IndexType::kMultiLevelBinarySearch;</a>
+<a name="ln450">  } else {</a>
+<a name="ln451">    table_options.index_type = rocksdb::IndexType::kBinarySearch;</a>
+<a name="ln452">  }</a>
+<a name="ln453"> </a>
+<a name="ln454">  options-&gt;table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));</a>
+<a name="ln455"> </a>
+<a name="ln456">  // Compaction related options.</a>
+<a name="ln457"> </a>
+<a name="ln458">  // Enable universal style compactions.</a>
+<a name="ln459">  bool compactions_enabled = !FLAGS_rocksdb_disable_compactions;</a>
+<a name="ln460">  options-&gt;compaction_style = compactions_enabled</a>
+<a name="ln461">    ? rocksdb::CompactionStyle::kCompactionStyleUniversal</a>
+<a name="ln462">    : rocksdb::CompactionStyle::kCompactionStyleNone;</a>
+<a name="ln463">  // Set the number of levels to 1.</a>
+<a name="ln464">  options-&gt;num_levels = 1;</a>
+<a name="ln465"> </a>
+<a name="ln466">  AutoInitRocksDBFlags(options);</a>
+<a name="ln467">  if (compactions_enabled) {</a>
+<a name="ln468">    options-&gt;level0_file_num_compaction_trigger = FLAGS_rocksdb_level0_file_num_compaction_trigger;</a>
+<a name="ln469">    options-&gt;level0_slowdown_writes_trigger = max_if_negative(</a>
+<a name="ln470">        FLAGS_rocksdb_level0_slowdown_writes_trigger);</a>
+<a name="ln471">    options-&gt;level0_stop_writes_trigger = max_if_negative(FLAGS_rocksdb_level0_stop_writes_trigger);</a>
+<a name="ln472">    // This determines the algo used to compute which files will be included. The &quot;total size&quot; based</a>
+<a name="ln473">    // computation compares the size of every new file with the sum of all files included so far.</a>
+<a name="ln474">    options-&gt;compaction_options_universal.stop_style =</a>
+<a name="ln475">        rocksdb::CompactionStopStyle::kCompactionStopStyleTotalSize;</a>
+<a name="ln476">    options-&gt;compaction_options_universal.size_ratio =</a>
+<a name="ln477">        FLAGS_rocksdb_universal_compaction_size_ratio;</a>
+<a name="ln478">    options-&gt;compaction_options_universal.always_include_size_threshold =</a>
+<a name="ln479">        FLAGS_rocksdb_universal_compaction_always_include_size_threshold;</a>
+<a name="ln480">    options-&gt;compaction_options_universal.min_merge_width =</a>
+<a name="ln481">        FLAGS_rocksdb_universal_compaction_min_merge_width;</a>
+<a name="ln482">    options-&gt;compaction_size_threshold_bytes = FLAGS_rocksdb_compaction_size_threshold_bytes;</a>
+<a name="ln483">    if (FLAGS_rocksdb_compact_flush_rate_limit_bytes_per_sec &gt; 0) {</a>
+<a name="ln484">      options-&gt;rate_limiter.reset(</a>
+<a name="ln485">          rocksdb::NewGenericRateLimiter(FLAGS_rocksdb_compact_flush_rate_limit_bytes_per_sec));</a>
+<a name="ln486">    }</a>
+<a name="ln487">  } else {</a>
+<a name="ln488">    options-&gt;level0_slowdown_writes_trigger = std::numeric_limits&lt;int&gt;::max();</a>
+<a name="ln489">    options-&gt;level0_stop_writes_trigger = std::numeric_limits&lt;int&gt;::max();</a>
+<a name="ln490">  }</a>
+<a name="ln491"> </a>
+<a name="ln492">  uint64_t max_file_size_for_compaction = FLAGS_rocksdb_max_file_size_for_compaction;</a>
+<a name="ln493">  if (max_file_size_for_compaction != 0) {</a>
+<a name="ln494">    options-&gt;max_file_size_for_compaction = max_file_size_for_compaction;</a>
+<a name="ln495">  }</a>
+<a name="ln496"> </a>
+<a name="ln497">  options-&gt;max_write_buffer_number = FLAGS_rocksdb_max_write_buffer_number;</a>
+<a name="ln498"> </a>
+<a name="ln499">  options-&gt;memtable_factory = std::make_shared&lt;rocksdb::SkipListFactory&gt;(</a>
+<a name="ln500">      0 /* lookahead */, rocksdb::ConcurrentWrites::kFalse);</a>
+<a name="ln501"> </a>
+<a name="ln502">  options-&gt;iterator_replacer = std::make_shared&lt;rocksdb::IteratorReplacer&gt;(&amp;WrapIterator);</a>
+<a name="ln503">}</a>
+<a name="ln504"> </a>
+<a name="ln505">void SetLogPrefix(rocksdb::Options* options, const std::string&amp; log_prefix) {</a>
+<a name="ln506">  options-&gt;log_prefix = log_prefix;</a>
+<a name="ln507">  options-&gt;info_log = std::make_shared&lt;YBRocksDBLogger&gt;(options-&gt;log_prefix);</a>
+<a name="ln508">}</a>
+<a name="ln509"> </a>
+<a name="ln510">class RocksDBPatcher::Impl {</a>
+<a name="ln511"> public:</a>
+<a name="ln512">  Impl(const std::string&amp; dbpath, const rocksdb::Options&amp; options)</a>
+<a name="ln513">      : options_(SanitizeOptions(dbpath, &amp;comparator_, options)),</a>
+<a name="ln514">        imm_cf_options_(options_),</a>
+<a name="ln515">        env_options_(options_),</a>
+<a name="ln516">        cf_options_(options_),</a>
+<a name="ln517">        version_set_(dbpath, &amp;options_, env_options_, block_cache_.get(), &amp;write_buffer_, nullptr) {</a>
+<a name="ln518">    cf_options_.comparator = comparator_.user_comparator();</a>
+<a name="ln519">  }</a>
+<a name="ln520"> </a>
+<a name="ln521">  CHECKED_STATUS Load() {</a>
+<a name="ln522">    std::vector&lt;rocksdb::ColumnFamilyDescriptor&gt; column_families;</a>
+<a name="ln523">    column_families.emplace_back(&quot;default&quot;, cf_options_);</a>
+<a name="ln524">    return version_set_.Recover(column_families);</a>
+<a name="ln525">  }</a>
+<a name="ln526"> </a>
+<a name="ln527">  CHECKED_STATUS SetHybridTimeFilter(HybridTime value) {</a>
+<a name="ln528">    rocksdb::VersionEdit delete_edit;</a>
+<a name="ln529">    rocksdb::VersionEdit add_edit;</a>
+<a name="ln530">    auto cfd = version_set_.GetColumnFamilySet()-&gt;GetDefault();</a>
+<a name="ln531">    delete_edit.SetColumnFamily(cfd-&gt;GetID());</a>
+<a name="ln532">    add_edit.SetColumnFamily(cfd-&gt;GetID());</a>
+<a name="ln533"> </a>
+<a name="ln534">    for (int level = 0; level &lt; cfd-&gt;NumberLevels(); level++) {</a>
+<a name="ln535">      for (const auto* file : cfd-&gt;current()-&gt;storage_info()-&gt;LevelFiles(level)) {</a>
+<a name="ln536">        rocksdb::FileMetaData fmd = *file;</a>
+<a name="ln537">        if (fmd.largest.user_frontier) {</a>
+<a name="ln538">          auto&amp; consensus_frontier = down_cast&lt;ConsensusFrontier&amp;&gt;(*fmd.largest.user_frontier);</a>
+<a name="ln539">          if (consensus_frontier.hybrid_time() &gt; value) {</a>
+<a name="ln540">            consensus_frontier.set_hybrid_time_filter(value);</a>
+<a name="ln541">            delete_edit.DeleteFile(level, fmd.fd.GetNumber());</a>
+<a name="ln542">            add_edit.AddCleanedFile(level, fmd);</a>
+<a name="ln543">          }</a>
+<a name="ln544">        }</a>
+<a name="ln545">      }</a>
+<a name="ln546">    }</a>
+<a name="ln547"> </a>
+<a name="ln548">    if (add_edit.GetNewFiles().empty()) {</a>
+<a name="ln549">      return Status::OK();</a>
+<a name="ln550">    }</a>
+<a name="ln551"> </a>
+<a name="ln552">    rocksdb::MutableCFOptions mutable_cf_options(options_, imm_cf_options_);</a>
+<a name="ln553">    {</a>
+<a name="ln554">      rocksdb::InstrumentedMutex mutex;</a>
+<a name="ln555">      rocksdb::InstrumentedMutexLock lock(&amp;mutex);</a>
+<a name="ln556">      RETURN_NOT_OK(version_set_.LogAndApply(cfd, mutable_cf_options, &amp;delete_edit, &amp;mutex));</a>
+<a name="ln557">      RETURN_NOT_OK(version_set_.LogAndApply(cfd, mutable_cf_options, &amp;add_edit, &amp;mutex));</a>
+<a name="ln558">    }</a>
+<a name="ln559"> </a>
+<a name="ln560">    return Status::OK();</a>
+<a name="ln561">  }</a>
+<a name="ln562"> </a>
+<a name="ln563"> private:</a>
+<a name="ln564">  const rocksdb::InternalKeyComparator comparator_{rocksdb::BytewiseComparator()};</a>
+<a name="ln565">  rocksdb::WriteBuffer write_buffer_{1_KB};</a>
+<a name="ln566">  std::shared_ptr&lt;rocksdb::Cache&gt; block_cache_{rocksdb::NewLRUCache(1_MB)};</a>
+<a name="ln567"> </a>
+<a name="ln568">  rocksdb::Options options_;</a>
+<a name="ln569">  rocksdb::ImmutableCFOptions imm_cf_options_;</a>
+<a name="ln570">  rocksdb::EnvOptions env_options_;</a>
+<a name="ln571">  rocksdb::ColumnFamilyOptions cf_options_;</a>
+<a name="ln572">  rocksdb::VersionSet version_set_;</a>
+<a name="ln573">};</a>
+<a name="ln574"> </a>
+<a name="ln575">RocksDBPatcher::RocksDBPatcher(const std::string&amp; dbpath, const rocksdb::Options&amp; options)</a>
+<a name="ln576">    : impl_(new Impl(dbpath, options)) {</a>
+<a name="ln577">}</a>
+<a name="ln578"> </a>
+<a name="ln579">RocksDBPatcher::~RocksDBPatcher() {</a>
+<a name="ln580">}</a>
+<a name="ln581"> </a>
+<a name="ln582">Status RocksDBPatcher::Load() {</a>
+<a name="ln583">  return impl_-&gt;Load();</a>
+<a name="ln584">}</a>
+<a name="ln585"> </a>
+<a name="ln586">Status RocksDBPatcher::SetHybridTimeFilter(HybridTime value) {</a>
+<a name="ln587">  return impl_-&gt;SetHybridTimeFilter(value);</a>
+<a name="ln588">}</a>
+<a name="ln589"> </a>
+<a name="ln590">void ForceRocksDBCompact(rocksdb::DB* db) {</a>
+<a name="ln591">  auto status = db-&gt;CompactRange(</a>
+<a name="ln592">      rocksdb::CompactRangeOptions(), /* begin = */ nullptr, /* end = */ nullptr);</a>
+<a name="ln593">  if (!status.ok()) {</a>
+<a name="ln594">    LOG(WARNING) &lt;&lt; &quot;Compact range failed: &quot; &lt;&lt; status;</a>
+<a name="ln595">    return;</a>
+<a name="ln596">  }</a>
+<a name="ln597">  while (true) {</a>
+<a name="ln598">    uint64_t compaction_pending = 0;</a>
+<a name="ln599">    uint64_t running_compactions = 0;</a>
+<a name="ln600">    db-&gt;GetIntProperty(&quot;rocksdb.compaction-pending&quot;, &amp;compaction_pending);</a>
+<a name="ln601">    db-&gt;GetIntProperty(&quot;rocksdb.num-running-compactions&quot;, &amp;running_compactions);</a>
+<a name="ln602">    if (!compaction_pending &amp;&amp; !running_compactions) {</a>
+<a name="ln603">      return;</a>
+<a name="ln604">    }</a>
+<a name="ln605"> </a>
+<a name="ln606">    std::this_thread::sleep_for(10ms);</a>
+<a name="ln607">  }</a>
+<a name="ln608">}</a>
+<a name="ln609"> </a>
+<a name="ln610">}  // namespace docdb</a>
+<a name="ln611">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="163"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="192"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="224"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="226"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1007/" target="_blank">V1007</a> The value from the potentially uninitialized optional 'user_key_for_filter' is used. Probably it is a mistake.</p></div>
+<div class="balloon" rel="429"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1048/" target="_blank">V1048</a> Variable was assigned the same value.</p></div>
+<div class="balloon" rel="449"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1048/" target="_blank">V1048</a> The 'table_options.index_type' variable was assigned the same value.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

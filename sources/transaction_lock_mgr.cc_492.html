@@ -1,0 +1,534 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>transaction_lock_mgr.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20"> </a>
+<a name="ln21">#ifndef ROCKSDB_LITE</a>
+<a name="ln22"> </a>
+<a name="ln23">#ifndef __STDC_FORMAT_MACROS</a>
+<a name="ln24">#define __STDC_FORMAT_MACROS</a>
+<a name="ln25">#endif</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;yb/rocksdb/utilities/transactions/transaction_lock_mgr.h&quot;</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &lt;inttypes.h&gt;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &lt;algorithm&gt;</a>
+<a name="ln32">#include &lt;condition_variable&gt;</a>
+<a name="ln33">#include &lt;functional&gt;</a>
+<a name="ln34">#include &lt;mutex&gt;</a>
+<a name="ln35">#include &lt;string&gt;</a>
+<a name="ln36">#include &lt;vector&gt;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &quot;yb/util/slice.h&quot;</a>
+<a name="ln39">#include &quot;yb/rocksdb/utilities/transaction_db_mutex.h&quot;</a>
+<a name="ln40">#include &quot;yb/rocksdb/util/autovector.h&quot;</a>
+<a name="ln41">#include &quot;yb/rocksdb/util/murmurhash.h&quot;</a>
+<a name="ln42">#include &quot;yb/rocksdb/util/thread_local.h&quot;</a>
+<a name="ln43">#include &quot;yb/rocksdb/util/timeout_error.h&quot;</a>
+<a name="ln44">#include &quot;yb/rocksdb/utilities/transactions/transaction_db_impl.h&quot;</a>
+<a name="ln45"> </a>
+<a name="ln46">namespace rocksdb {</a>
+<a name="ln47"> </a>
+<a name="ln48">struct LockInfo {</a>
+<a name="ln49">  TransactionID txn_id;</a>
+<a name="ln50"> </a>
+<a name="ln51">  // Transaction locks are not valid after this time in us</a>
+<a name="ln52">  uint64_t expiration_time;</a>
+<a name="ln53"> </a>
+<a name="ln54">  LockInfo(TransactionID id, uint64_t time)</a>
+<a name="ln55">      : txn_id(id), expiration_time(time) {}</a>
+<a name="ln56">  LockInfo(const LockInfo&amp; lock_info)</a>
+<a name="ln57">      : txn_id(lock_info.txn_id), expiration_time(lock_info.expiration_time) {}</a>
+<a name="ln58">};</a>
+<a name="ln59"> </a>
+<a name="ln60">struct LockMapStripe {</a>
+<a name="ln61">  explicit LockMapStripe(std::shared_ptr&lt;TransactionDBMutexFactory&gt; factory) {</a>
+<a name="ln62">    stripe_mutex = factory-&gt;AllocateMutex();</a>
+<a name="ln63">    stripe_cv = factory-&gt;AllocateCondVar();</a>
+<a name="ln64">    assert(stripe_mutex);</a>
+<a name="ln65">    assert(stripe_cv);</a>
+<a name="ln66">  }</a>
+<a name="ln67"> </a>
+<a name="ln68">  // Mutex must be held before modifying keys map</a>
+<a name="ln69">  std::shared_ptr&lt;TransactionDBMutex&gt; stripe_mutex;</a>
+<a name="ln70"> </a>
+<a name="ln71">  // Condition Variable per stripe for waiting on a lock</a>
+<a name="ln72">  std::shared_ptr&lt;TransactionDBCondVar&gt; stripe_cv;</a>
+<a name="ln73"> </a>
+<a name="ln74">  // Locked keys mapped to the info about the transactions that locked them.</a>
+<a name="ln75">  // TODO(agiardullo): Explore performance of other data structures.</a>
+<a name="ln76">  std::unordered_map&lt;std::string, LockInfo&gt; keys;</a>
+<a name="ln77">};</a>
+<a name="ln78"> </a>
+<a name="ln79">// Map of #num_stripes LockMapStripes</a>
+<a name="ln80">struct LockMap {</a>
+<a name="ln81">  explicit LockMap(size_t num_stripes,</a>
+<a name="ln82">                   std::shared_ptr&lt;TransactionDBMutexFactory&gt; factory)</a>
+<a name="ln83">      : num_stripes_(num_stripes) {</a>
+<a name="ln84">    lock_map_stripes_.reserve(num_stripes);</a>
+<a name="ln85">    for (size_t i = 0; i &lt; num_stripes; i++) {</a>
+<a name="ln86">      LockMapStripe* stripe = new LockMapStripe(factory);</a>
+<a name="ln87">      lock_map_stripes_.push_back(stripe);</a>
+<a name="ln88">    }</a>
+<a name="ln89">  }</a>
+<a name="ln90"> </a>
+<a name="ln91">  ~LockMap() {</a>
+<a name="ln92">    for (auto stripe : lock_map_stripes_) {</a>
+<a name="ln93">      delete stripe;</a>
+<a name="ln94">    }</a>
+<a name="ln95">  }</a>
+<a name="ln96"> </a>
+<a name="ln97">  // Number of sepearate LockMapStripes to create, each with their own Mutex</a>
+<a name="ln98">  const size_t num_stripes_;</a>
+<a name="ln99"> </a>
+<a name="ln100">  // Count of keys that are currently locked in this column family.</a>
+<a name="ln101">  // (Only maintained if TransactionLockMgr::max_num_locks_ is positive.)</a>
+<a name="ln102">  std::atomic&lt;int64_t&gt; lock_cnt{0};</a>
+<a name="ln103"> </a>
+<a name="ln104">  std::vector&lt;LockMapStripe*&gt; lock_map_stripes_;</a>
+<a name="ln105"> </a>
+<a name="ln106">  size_t GetStripe(const std::string&amp; key) const;</a>
+<a name="ln107">};</a>
+<a name="ln108"> </a>
+<a name="ln109">namespace {</a>
+<a name="ln110">void UnrefLockMapsCache(void* ptr) {</a>
+<a name="ln111">  // Called when a thread exits or a ThreadLocalPtr gets destroyed.</a>
+<a name="ln112">  auto lock_maps_cache =</a>
+<a name="ln113">      static_cast&lt;std::unordered_map&lt;uint32_t, std::shared_ptr&lt;LockMap&gt;&gt;*&gt;(ptr);</a>
+<a name="ln114">  delete lock_maps_cache;</a>
+<a name="ln115">}</a>
+<a name="ln116">}  // anonymous namespace</a>
+<a name="ln117"> </a>
+<a name="ln118">TransactionLockMgr::TransactionLockMgr(</a>
+<a name="ln119">    TransactionDB* txn_db, size_t default_num_stripes, int64_t max_num_locks,</a>
+<a name="ln120">    std::shared_ptr&lt;TransactionDBMutexFactory&gt; mutex_factory)</a>
+<a name="ln121">    : txn_db_impl_(nullptr),</a>
+<a name="ln122">      default_num_stripes_(default_num_stripes),</a>
+<a name="ln123">      max_num_locks_(max_num_locks),</a>
+<a name="ln124">      mutex_factory_(mutex_factory),</a>
+<a name="ln125">      lock_maps_cache_(new ThreadLocalPtr(&amp;UnrefLockMapsCache)) {</a>
+<a name="ln126">  txn_db_impl_ = dynamic_cast&lt;TransactionDBImpl*&gt;(txn_db);</a>
+<a name="ln127">  assert(txn_db_impl_);</a>
+<a name="ln128">}</a>
+<a name="ln129"> </a>
+<a name="ln130">TransactionLockMgr::~TransactionLockMgr() {}</a>
+<a name="ln131"> </a>
+<a name="ln132">size_t LockMap::GetStripe(const std::string&amp; key) const {</a>
+<a name="ln133">  assert(num_stripes_ &gt; 0);</a>
+<a name="ln134">  static murmur_hash hash;</a>
+<a name="ln135">  size_t stripe = hash(key) % num_stripes_;</a>
+<a name="ln136">  return stripe;</a>
+<a name="ln137">}</a>
+<a name="ln138"> </a>
+<a name="ln139">void TransactionLockMgr::AddColumnFamily(uint32_t column_family_id) {</a>
+<a name="ln140">  InstrumentedMutexLock l(&amp;lock_map_mutex_);</a>
+<a name="ln141"> </a>
+<a name="ln142">  if (lock_maps_.find(column_family_id) == lock_maps_.end()) {</a>
+<a name="ln143">    lock_maps_.emplace(column_family_id,</a>
+<a name="ln144">                       std::shared_ptr&lt;LockMap&gt;(</a>
+<a name="ln145">                           new LockMap(default_num_stripes_, mutex_factory_)));</a>
+<a name="ln146">  } else {</a>
+<a name="ln147">    // column_family already exists in lock map</a>
+<a name="ln148">    assert(false);</a>
+<a name="ln149">  }</a>
+<a name="ln150">}</a>
+<a name="ln151"> </a>
+<a name="ln152">void TransactionLockMgr::RemoveColumnFamily(uint32_t column_family_id) {</a>
+<a name="ln153">  // Remove lock_map for this column family.  Since the lock map is stored</a>
+<a name="ln154">  // as a shared ptr, concurrent transactions can still keep keep using it</a>
+<a name="ln155">  // until they release their reference to it.</a>
+<a name="ln156">  {</a>
+<a name="ln157">    InstrumentedMutexLock l(&amp;lock_map_mutex_);</a>
+<a name="ln158"> </a>
+<a name="ln159">    auto lock_maps_iter = lock_maps_.find(column_family_id);</a>
+<a name="ln160">    assert(lock_maps_iter != lock_maps_.end());</a>
+<a name="ln161"> </a>
+<a name="ln162">    lock_maps_.erase(lock_maps_iter);</a>
+<a name="ln163">  }  // lock_map_mutex_</a>
+<a name="ln164"> </a>
+<a name="ln165">  // Clear all thread-local caches</a>
+<a name="ln166">  autovector&lt;void*&gt; local_caches;</a>
+<a name="ln167">  lock_maps_cache_-&gt;Scrape(&amp;local_caches, nullptr);</a>
+<a name="ln168">  for (auto cache : local_caches) {</a>
+<a name="ln169">    delete static_cast&lt;LockMaps*&gt;(cache);</a>
+<a name="ln170">  }</a>
+<a name="ln171">}</a>
+<a name="ln172"> </a>
+<a name="ln173">// Look up the LockMap shared_ptr for a given column_family_id.</a>
+<a name="ln174">// Note:  The LockMap is only valid as long as the caller is still holding on</a>
+<a name="ln175">//   to the returned shared_ptr.</a>
+<a name="ln176">std::shared_ptr&lt;LockMap&gt; TransactionLockMgr::GetLockMap(</a>
+<a name="ln177">    uint32_t column_family_id) {</a>
+<a name="ln178">  // First check thread-local cache</a>
+<a name="ln179">  if (lock_maps_cache_-&gt;Get() == nullptr) {</a>
+<a name="ln180">    lock_maps_cache_-&gt;Reset(new LockMaps());</a>
+<a name="ln181">  }</a>
+<a name="ln182"> </a>
+<a name="ln183">  auto lock_maps_cache = static_cast&lt;LockMaps*&gt;(lock_maps_cache_-&gt;Get());</a>
+<a name="ln184"> </a>
+<a name="ln185">  auto lock_map_iter = lock_maps_cache-&gt;find(column_family_id);</a>
+<a name="ln186">  if (lock_map_iter != lock_maps_cache-&gt;end()) {</a>
+<a name="ln187">    // Found lock map for this column family.</a>
+<a name="ln188">    return lock_map_iter-&gt;second;</a>
+<a name="ln189">  }</a>
+<a name="ln190"> </a>
+<a name="ln191">  // Not found in local cache, grab mutex and check shared LockMaps</a>
+<a name="ln192">  InstrumentedMutexLock l(&amp;lock_map_mutex_);</a>
+<a name="ln193"> </a>
+<a name="ln194">  lock_map_iter = lock_maps_.find(column_family_id);</a>
+<a name="ln195">  if (lock_map_iter == lock_maps_.end()) {</a>
+<a name="ln196">    return std::shared_ptr&lt;LockMap&gt;(nullptr);</a>
+<a name="ln197">  } else {</a>
+<a name="ln198">    // Found lock map.  Store in thread-local cache and return.</a>
+<a name="ln199">    std::shared_ptr&lt;LockMap&gt;&amp; lock_map = lock_map_iter-&gt;second;</a>
+<a name="ln200">    lock_maps_cache-&gt;insert({column_family_id, lock_map});</a>
+<a name="ln201"> </a>
+<a name="ln202">    return lock_map;</a>
+<a name="ln203">  }</a>
+<a name="ln204">}</a>
+<a name="ln205"> </a>
+<a name="ln206">// Returns true if this lock has expired and can be acquired by another</a>
+<a name="ln207">// transaction.</a>
+<a name="ln208">// If false, sets *expire_time to the expiration time of the lock according</a>
+<a name="ln209">// to Env-&gt;GetMicros() or 0 if no expiration.</a>
+<a name="ln210">bool TransactionLockMgr::IsLockExpired(const LockInfo&amp; lock_info, Env* env,</a>
+<a name="ln211">                                       uint64_t* expire_time) {</a>
+<a name="ln212">  auto now = env-&gt;NowMicros();</a>
+<a name="ln213"> </a>
+<a name="ln214">  bool expired =</a>
+<a name="ln215">      (lock_info.expiration_time &gt; 0 &amp;&amp; lock_info.expiration_time &lt;= now);</a>
+<a name="ln216"> </a>
+<a name="ln217">  if (!expired &amp;&amp; lock_info.expiration_time &gt; 0) {</a>
+<a name="ln218">    // return how many microseconds until lock will be expired</a>
+<a name="ln219">    *expire_time = lock_info.expiration_time;</a>
+<a name="ln220">  } else {</a>
+<a name="ln221">    bool success =</a>
+<a name="ln222">        txn_db_impl_-&gt;TryStealingExpiredTransactionLocks(lock_info.txn_id);</a>
+<a name="ln223">    if (!success) {</a>
+<a name="ln224">      expired = false;</a>
+<a name="ln225">    }</a>
+<a name="ln226">    *expire_time = 0;</a>
+<a name="ln227">  }</a>
+<a name="ln228"> </a>
+<a name="ln229">  return expired;</a>
+<a name="ln230">}</a>
+<a name="ln231"> </a>
+<a name="ln232">Status TransactionLockMgr::TryLock(const TransactionImpl* txn,</a>
+<a name="ln233">                                   uint32_t column_family_id,</a>
+<a name="ln234">                                   const std::string&amp; key, Env* env) {</a>
+<a name="ln235">  // Lookup lock map for this column family id</a>
+<a name="ln236">  std::shared_ptr&lt;LockMap&gt; lock_map_ptr = GetLockMap(column_family_id);</a>
+<a name="ln237">  LockMap* lock_map = lock_map_ptr.get();</a>
+<a name="ln238">  if (lock_map == nullptr) {</a>
+<a name="ln239">    char msg[255];</a>
+<a name="ln240">    snprintf(msg, sizeof(msg), &quot;Column family id not found: %&quot; PRIu32,</a>
+<a name="ln241">             column_family_id);</a>
+<a name="ln242"> </a>
+<a name="ln243">    return STATUS(InvalidArgument, msg);</a>
+<a name="ln244">  }</a>
+<a name="ln245"> </a>
+<a name="ln246">  // Need to lock the mutex for the stripe that this key hashes to</a>
+<a name="ln247">  size_t stripe_num = lock_map-&gt;GetStripe(key);</a>
+<a name="ln248">  assert(lock_map-&gt;lock_map_stripes_.size() &gt; stripe_num);</a>
+<a name="ln249">  LockMapStripe* stripe = lock_map-&gt;lock_map_stripes_.at(stripe_num);</a>
+<a name="ln250"> </a>
+<a name="ln251">  LockInfo lock_info(txn-&gt;GetTxnID(), txn-&gt;GetExpirationTime());</a>
+<a name="ln252">  int64_t timeout = txn-&gt;GetLockTimeout();</a>
+<a name="ln253"> </a>
+<a name="ln254">  return AcquireWithTimeout(lock_map, stripe, key, env, timeout, lock_info);</a>
+<a name="ln255">}</a>
+<a name="ln256"> </a>
+<a name="ln257">// Helper function for TryLock().</a>
+<a name="ln258">Status TransactionLockMgr::AcquireWithTimeout(LockMap* lock_map,</a>
+<a name="ln259">                                              LockMapStripe* stripe,</a>
+<a name="ln260">                                              const std::string&amp; key, Env* env,</a>
+<a name="ln261">                                              int64_t timeout,</a>
+<a name="ln262">                                              const LockInfo&amp; lock_info) {</a>
+<a name="ln263">  Status result;</a>
+<a name="ln264">  uint64_t start_time = 0;</a>
+<a name="ln265">  uint64_t end_time = 0;</a>
+<a name="ln266"> </a>
+<a name="ln267">  if (timeout &gt; 0) {</a>
+<a name="ln268">    start_time = env-&gt;NowMicros();</a>
+<a name="ln269">    end_time = start_time + timeout;</a>
+<a name="ln270">  }</a>
+<a name="ln271"> </a>
+<a name="ln272">  if (timeout &lt; 0) {</a>
+<a name="ln273">    // If timeout is negative, we wait indefinitely to acquire the lock</a>
+<a name="ln274">    result = stripe-&gt;stripe_mutex-&gt;Lock();</a>
+<a name="ln275">  } else {</a>
+<a name="ln276">    result = stripe-&gt;stripe_mutex-&gt;TryLockFor(timeout);</a>
+<a name="ln277">  }</a>
+<a name="ln278"> </a>
+<a name="ln279">  if (!result.ok()) {</a>
+<a name="ln280">    // failed to acquire mutex</a>
+<a name="ln281">    return result;</a>
+<a name="ln282">  }</a>
+<a name="ln283"> </a>
+<a name="ln284">  // Acquire lock if we are able to</a>
+<a name="ln285">  uint64_t expire_time_hint = 0;</a>
+<a name="ln286">  result =</a>
+<a name="ln287">      AcquireLocked(lock_map, stripe, key, env, lock_info, &amp;expire_time_hint);</a>
+<a name="ln288"> </a>
+<a name="ln289">  if (!result.ok() &amp;&amp; timeout != 0) {</a>
+<a name="ln290">    // If we weren't able to acquire the lock, we will keep retrying as long</a>
+<a name="ln291">    // as the timeout allows.</a>
+<a name="ln292">    bool timed_out = false;</a>
+<a name="ln293">    do {</a>
+<a name="ln294">      // Decide how long to wait</a>
+<a name="ln295">      int64_t cv_end_time = -1;</a>
+<a name="ln296"> </a>
+<a name="ln297">      // Check if held lock's expiration time is sooner than our timeout</a>
+<a name="ln298">      if (expire_time_hint &gt; 0 &amp;&amp;</a>
+<a name="ln299">          (timeout &lt; 0 || (timeout &gt; 0 &amp;&amp; expire_time_hint &lt; end_time))) {</a>
+<a name="ln300">        // expiration time is sooner than our timeout</a>
+<a name="ln301">        cv_end_time = expire_time_hint;</a>
+<a name="ln302">      } else if (timeout &gt;= 0) {</a>
+<a name="ln303">        cv_end_time = end_time;</a>
+<a name="ln304">      }</a>
+<a name="ln305"> </a>
+<a name="ln306">      if (cv_end_time &lt; 0) {</a>
+<a name="ln307">        // Wait indefinitely</a>
+<a name="ln308">        result = stripe-&gt;stripe_cv-&gt;Wait(stripe-&gt;stripe_mutex);</a>
+<a name="ln309">      } else {</a>
+<a name="ln310">        uint64_t now = env-&gt;NowMicros();</a>
+<a name="ln311">        if (static_cast&lt;uint64_t&gt;(cv_end_time) &gt; now) {</a>
+<a name="ln312">          result = stripe-&gt;stripe_cv-&gt;WaitFor(stripe-&gt;stripe_mutex,</a>
+<a name="ln313">                                              cv_end_time - now);</a>
+<a name="ln314">        }</a>
+<a name="ln315">      }</a>
+<a name="ln316"> </a>
+<a name="ln317">      if (result.IsTimedOut()) {</a>
+<a name="ln318">          timed_out = true;</a>
+<a name="ln319">          // Even though we timed out, we will still make one more attempt to</a>
+<a name="ln320">          // acquire lock below (it is possible the lock expired and we</a>
+<a name="ln321">          // were never signaled).</a>
+<a name="ln322">      }</a>
+<a name="ln323"> </a>
+<a name="ln324">      if (result.ok() || result.IsTimedOut()) {</a>
+<a name="ln325">        result = AcquireLocked(lock_map, stripe, key, env, lock_info,</a>
+<a name="ln326">                               &amp;expire_time_hint);</a>
+<a name="ln327">      }</a>
+<a name="ln328">    } while (!result.ok() &amp;&amp; !timed_out);</a>
+<a name="ln329">  }</a>
+<a name="ln330"> </a>
+<a name="ln331">  stripe-&gt;stripe_mutex-&gt;UnLock();</a>
+<a name="ln332"> </a>
+<a name="ln333">  return result;</a>
+<a name="ln334">}</a>
+<a name="ln335"> </a>
+<a name="ln336">// Try to lock this key after we have acquired the mutex.</a>
+<a name="ln337">// Sets *expire_time to the expiration time in microseconds</a>
+<a name="ln338">//  or 0 if no expiration.</a>
+<a name="ln339">// REQUIRED:  Stripe mutex must be held.</a>
+<a name="ln340">Status TransactionLockMgr::AcquireLocked(LockMap* lock_map,</a>
+<a name="ln341">                                         LockMapStripe* stripe,</a>
+<a name="ln342">                                         const std::string&amp; key, Env* env,</a>
+<a name="ln343">                                         const LockInfo&amp; txn_lock_info,</a>
+<a name="ln344">                                         uint64_t* expire_time) {</a>
+<a name="ln345">  Status result;</a>
+<a name="ln346">  // Check if this key is already locked</a>
+<a name="ln347">  if (stripe-&gt;keys.find(key) != stripe-&gt;keys.end()) {</a>
+<a name="ln348">    // Lock already held</a>
+<a name="ln349"> </a>
+<a name="ln350">    LockInfo&amp; lock_info = stripe-&gt;keys.at(key);</a>
+<a name="ln351">    if (lock_info.txn_id != txn_lock_info.txn_id) {</a>
+<a name="ln352">      // locked by another txn.  Check if it's expired</a>
+<a name="ln353">      if (IsLockExpired(lock_info, env, expire_time)) {</a>
+<a name="ln354">        // lock is expired, can steal it</a>
+<a name="ln355">        lock_info.txn_id = txn_lock_info.txn_id;</a>
+<a name="ln356">        lock_info.expiration_time = txn_lock_info.expiration_time;</a>
+<a name="ln357">        // lock_cnt does not change</a>
+<a name="ln358">      } else {</a>
+<a name="ln359">        result = STATUS(TimedOut, TimeoutError(TimeoutCode::kLock));</a>
+<a name="ln360">      }</a>
+<a name="ln361">    }</a>
+<a name="ln362">  } else {  // Lock not held.</a>
+<a name="ln363">    // Check lock limit</a>
+<a name="ln364">    if (max_num_locks_ &gt; 0 &amp;&amp;</a>
+<a name="ln365">        lock_map-&gt;lock_cnt.load(std::memory_order_acquire) &gt;= max_num_locks_) {</a>
+<a name="ln366">      result = STATUS(Busy, TimeoutError(TimeoutCode::kLockLimit));</a>
+<a name="ln367">    } else {</a>
+<a name="ln368">      // acquire lock</a>
+<a name="ln369">      stripe-&gt;keys.insert({key, txn_lock_info});</a>
+<a name="ln370"> </a>
+<a name="ln371">      // Maintain lock count if there is a limit on the number of locks</a>
+<a name="ln372">      if (max_num_locks_) {</a>
+<a name="ln373">        lock_map-&gt;lock_cnt++;</a>
+<a name="ln374">      }</a>
+<a name="ln375">    }</a>
+<a name="ln376">  }</a>
+<a name="ln377"> </a>
+<a name="ln378">  return result;</a>
+<a name="ln379">}</a>
+<a name="ln380"> </a>
+<a name="ln381">void TransactionLockMgr::UnLock(TransactionImpl* txn, uint32_t column_family_id,</a>
+<a name="ln382">                                const std::string&amp; key, Env* env) {</a>
+<a name="ln383">  std::shared_ptr&lt;LockMap&gt; lock_map_ptr = GetLockMap(column_family_id);</a>
+<a name="ln384">  LockMap* lock_map = lock_map_ptr.get();</a>
+<a name="ln385">  if (lock_map == nullptr) {</a>
+<a name="ln386">    // Column Family must have been dropped.</a>
+<a name="ln387">    return;</a>
+<a name="ln388">  }</a>
+<a name="ln389"> </a>
+<a name="ln390">  // Lock the mutex for the stripe that this key hashes to</a>
+<a name="ln391">  size_t stripe_num = lock_map-&gt;GetStripe(key);</a>
+<a name="ln392">  assert(lock_map-&gt;lock_map_stripes_.size() &gt; stripe_num);</a>
+<a name="ln393">  LockMapStripe* stripe = lock_map-&gt;lock_map_stripes_.at(stripe_num);</a>
+<a name="ln394"> </a>
+<a name="ln395">  TransactionID txn_id = txn-&gt;GetTxnID();</a>
+<a name="ln396"> </a>
+<a name="ln397">  CHECK_OK(stripe-&gt;stripe_mutex-&gt;Lock());</a>
+<a name="ln398"> </a>
+<a name="ln399">  const auto&amp; iter = stripe-&gt;keys.find(key);</a>
+<a name="ln400">  if (iter != stripe-&gt;keys.end() &amp;&amp; iter-&gt;second.txn_id == txn_id) {</a>
+<a name="ln401">    // Found the key we locked.  unlock it.</a>
+<a name="ln402">    stripe-&gt;keys.erase(iter);</a>
+<a name="ln403">    if (max_num_locks_ &gt; 0) {</a>
+<a name="ln404">      // Maintain lock count if there is a limit on the number of locks.</a>
+<a name="ln405">      assert(lock_map-&gt;lock_cnt.load(std::memory_order_relaxed) &gt; 0);</a>
+<a name="ln406">      lock_map-&gt;lock_cnt--;</a>
+<a name="ln407">    }</a>
+<a name="ln408">  } else {</a>
+<a name="ln409">    // This key is either not locked or locked by someone else.  This should</a>
+<a name="ln410">    // only happen if the unlocking transaction has expired.</a>
+<a name="ln411">    assert(txn-&gt;GetExpirationTime() &gt; 0 &amp;&amp;</a>
+<a name="ln412">           txn-&gt;GetExpirationTime() &lt; env-&gt;NowMicros());</a>
+<a name="ln413">  }</a>
+<a name="ln414"> </a>
+<a name="ln415">  stripe-&gt;stripe_mutex-&gt;UnLock();</a>
+<a name="ln416"> </a>
+<a name="ln417">  // Signal waiting threads to retry locking</a>
+<a name="ln418">  stripe-&gt;stripe_cv-&gt;NotifyAll();</a>
+<a name="ln419">}</a>
+<a name="ln420"> </a>
+<a name="ln421">void TransactionLockMgr::UnLock(const TransactionImpl* txn,</a>
+<a name="ln422">                                const TransactionKeyMap* key_map, Env* env) {</a>
+<a name="ln423">  TransactionID txn_id = txn-&gt;GetTxnID();</a>
+<a name="ln424"> </a>
+<a name="ln425">  for (auto&amp; key_map_iter : *key_map) {</a>
+<a name="ln426">    uint32_t column_family_id = key_map_iter.first;</a>
+<a name="ln427">    auto&amp; keys = key_map_iter.second;</a>
+<a name="ln428"> </a>
+<a name="ln429">    std::shared_ptr&lt;LockMap&gt; lock_map_ptr = GetLockMap(column_family_id);</a>
+<a name="ln430">    LockMap* lock_map = lock_map_ptr.get();</a>
+<a name="ln431"> </a>
+<a name="ln432">    if (lock_map == nullptr) {</a>
+<a name="ln433">      // Column Family must have been dropped.</a>
+<a name="ln434">      return;</a>
+<a name="ln435">    }</a>
+<a name="ln436"> </a>
+<a name="ln437">    // Bucket keys by lock_map_ stripe</a>
+<a name="ln438">    std::unordered_map&lt;size_t, std::vector&lt;const std::string*&gt;&gt; keys_by_stripe(</a>
+<a name="ln439">        std::max(keys.size(), lock_map-&gt;num_stripes_));</a>
+<a name="ln440"> </a>
+<a name="ln441">    for (auto&amp; key_iter : keys) {</a>
+<a name="ln442">      const std::string&amp; key = key_iter.first;</a>
+<a name="ln443"> </a>
+<a name="ln444">      size_t stripe_num = lock_map-&gt;GetStripe(key);</a>
+<a name="ln445">      keys_by_stripe[stripe_num].push_back(&amp;key);</a>
+<a name="ln446">    }</a>
+<a name="ln447"> </a>
+<a name="ln448">    // For each stripe, grab the stripe mutex and unlock all keys in this stripe</a>
+<a name="ln449">    for (auto&amp; stripe_iter : keys_by_stripe) {</a>
+<a name="ln450">      size_t stripe_num = stripe_iter.first;</a>
+<a name="ln451">      auto&amp; stripe_keys = stripe_iter.second;</a>
+<a name="ln452"> </a>
+<a name="ln453">      assert(lock_map-&gt;lock_map_stripes_.size() &gt; stripe_num);</a>
+<a name="ln454">      LockMapStripe* stripe = lock_map-&gt;lock_map_stripes_.at(stripe_num);</a>
+<a name="ln455"> </a>
+<a name="ln456">      CHECK_OK(stripe-&gt;stripe_mutex-&gt;Lock());</a>
+<a name="ln457"> </a>
+<a name="ln458">      for (const std::string* key : stripe_keys) {</a>
+<a name="ln459">        const auto&amp; iter = stripe-&gt;keys.find(*key);</a>
+<a name="ln460">        if (iter != stripe-&gt;keys.end() &amp;&amp; iter-&gt;second.txn_id == txn_id) {</a>
+<a name="ln461">          // Found the key we locked.  unlock it.</a>
+<a name="ln462">          stripe-&gt;keys.erase(iter);</a>
+<a name="ln463">          if (max_num_locks_ &gt; 0) {</a>
+<a name="ln464">            // Maintain lock count if there is a limit on the number of locks.</a>
+<a name="ln465">            assert(lock_map-&gt;lock_cnt.load(std::memory_order_relaxed) &gt; 0);</a>
+<a name="ln466">            lock_map-&gt;lock_cnt--;</a>
+<a name="ln467">          }</a>
+<a name="ln468">        } else {</a>
+<a name="ln469">          // This key is either not locked or locked by someone else.  This</a>
+<a name="ln470">          // should only</a>
+<a name="ln471">          // happen if the unlocking transaction has expired.</a>
+<a name="ln472">          assert(txn-&gt;GetExpirationTime() &gt; 0 &amp;&amp;</a>
+<a name="ln473">                 txn-&gt;GetExpirationTime() &lt; env-&gt;NowMicros());</a>
+<a name="ln474">        }</a>
+<a name="ln475">      }</a>
+<a name="ln476"> </a>
+<a name="ln477">      stripe-&gt;stripe_mutex-&gt;UnLock();</a>
+<a name="ln478"> </a>
+<a name="ln479">      // Signal waiting threads to retry locking</a>
+<a name="ln480">      stripe-&gt;stripe_cv-&gt;NotifyAll();</a>
+<a name="ln481">    }</a>
+<a name="ln482">  }</a>
+<a name="ln483">}</a>
+<a name="ln484"> </a>
+<a name="ln485">}  //  namespace rocksdb</a>
+<a name="ln486">#endif  // ROCKSDB_LITE</a>
+
+</code></pre>
+<div class="balloon" rel="299"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v560/" target="_blank">V560</a> A part of conditional expression is always true: timeout > 0.</p></div>
+<div class="balloon" rel="397"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="456"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

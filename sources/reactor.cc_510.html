@@ -1,0 +1,1057 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>reactor.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/rpc/reactor.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;arpa/inet.h&gt;</a>
+<a name="ln36">#include &lt;netinet/in.h&gt;</a>
+<a name="ln37">#include &lt;stdlib.h&gt;</a>
+<a name="ln38">#include &lt;sys/socket.h&gt;</a>
+<a name="ln39">#include &lt;sys/types.h&gt;</a>
+<a name="ln40">#include &lt;unistd.h&gt;</a>
+<a name="ln41"> </a>
+<a name="ln42">#include &lt;functional&gt;</a>
+<a name="ln43">#include &lt;mutex&gt;</a>
+<a name="ln44">#include &lt;string&gt;</a>
+<a name="ln45"> </a>
+<a name="ln46">#include &lt;ev++.h&gt;</a>
+<a name="ln47"> </a>
+<a name="ln48">#include &lt;glog/logging.h&gt;</a>
+<a name="ln49"> </a>
+<a name="ln50">#include &quot;yb/gutil/ref_counted.h&quot;</a>
+<a name="ln51">#include &quot;yb/gutil/stringprintf.h&quot;</a>
+<a name="ln52">#include &quot;yb/rpc/connection.h&quot;</a>
+<a name="ln53">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln54">#include &quot;yb/rpc/rpc_controller.h&quot;</a>
+<a name="ln55">#include &quot;yb/rpc/rpc_introspection.pb.h&quot;</a>
+<a name="ln56">#include &quot;yb/rpc/yb_rpc.h&quot;</a>
+<a name="ln57"> </a>
+<a name="ln58">#include &quot;yb/util/countdown_latch.h&quot;</a>
+<a name="ln59">#include &quot;yb/util/errno.h&quot;</a>
+<a name="ln60">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln61">#include &quot;yb/util/memory/memory.h&quot;</a>
+<a name="ln62">#include &quot;yb/util/monotime.h&quot;</a>
+<a name="ln63">#include &quot;yb/util/scope_exit.h&quot;</a>
+<a name="ln64">#include &quot;yb/util/status.h&quot;</a>
+<a name="ln65">#include &quot;yb/util/thread.h&quot;</a>
+<a name="ln66">#include &quot;yb/util/threadpool.h&quot;</a>
+<a name="ln67">#include &quot;yb/util/thread_restrictions.h&quot;</a>
+<a name="ln68">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln69">#include &quot;yb/util/net/socket.h&quot;</a>
+<a name="ln70"> </a>
+<a name="ln71">using namespace std::literals;</a>
+<a name="ln72"> </a>
+<a name="ln73">DECLARE_string(local_ip_for_outbound_sockets);</a>
+<a name="ln74">DECLARE_int32(num_connections_to_server);</a>
+<a name="ln75">DECLARE_int32(socket_receive_buffer_size);</a>
+<a name="ln76"> </a>
+<a name="ln77">namespace yb {</a>
+<a name="ln78">namespace rpc {</a>
+<a name="ln79"> </a>
+<a name="ln80">namespace {</a>
+<a name="ln81"> </a>
+<a name="ln82">static const char* kShutdownMessage = &quot;Shutdown connection&quot;;</a>
+<a name="ln83"> </a>
+<a name="ln84">const Status&amp; AbortedError() {</a>
+<a name="ln85">  static Status result = STATUS(Aborted, kShutdownMessage, &quot;&quot; /* msg2 */, Errno(ESHUTDOWN));</a>
+<a name="ln86">  return result;</a>
+<a name="ln87">}</a>
+<a name="ln88"> </a>
+<a name="ln89">const Status&amp; ServiceUnavailableError() {</a>
+<a name="ln90">  static Status result = STATUS(</a>
+<a name="ln91">      ServiceUnavailable, kShutdownMessage, &quot;&quot; /* msg2 */, Errno(ESHUTDOWN));</a>
+<a name="ln92">  return result;</a>
+<a name="ln93">}</a>
+<a name="ln94"> </a>
+<a name="ln95">// Callback for libev fatal errors (eg running out of file descriptors).</a>
+<a name="ln96">// Unfortunately libev doesn't plumb these back through to the caller, but</a>
+<a name="ln97">// instead just expects the callback to abort.</a>
+<a name="ln98">//</a>
+<a name="ln99">// This implementation is slightly preferable to the built-in one since</a>
+<a name="ln100">// it uses a FATAL log message instead of printing to stderr, which might</a>
+<a name="ln101">// not end up anywhere useful in a daemonized context.</a>
+<a name="ln102">void LibevSysErr(const char* msg) throw() {</a>
+<a name="ln103">  PLOG(FATAL) &lt;&lt; &quot;LibEV fatal error: &quot; &lt;&lt; msg;</a>
+<a name="ln104">}</a>
+<a name="ln105"> </a>
+<a name="ln106">void DoInitLibEv() {</a>
+<a name="ln107">  ev::set_syserr_cb(LibevSysErr);</a>
+<a name="ln108">}</a>
+<a name="ln109"> </a>
+<a name="ln110">bool HasReactorStartedClosing(ReactorState state) {</a>
+<a name="ln111">  return state == ReactorState::kClosing || state == ReactorState::kClosed;</a>
+<a name="ln112">}</a>
+<a name="ln113"> </a>
+<a name="ln114">} // anonymous namespace</a>
+<a name="ln115"> </a>
+<a name="ln116">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln117">// Reactor class members</a>
+<a name="ln118">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln119"> </a>
+<a name="ln120">Reactor::Reactor(Messenger* messenger,</a>
+<a name="ln121">                 int index,</a>
+<a name="ln122">                 const MessengerBuilder &amp;bld)</a>
+<a name="ln123">    : messenger_(messenger),</a>
+<a name="ln124">      name_(StringPrintf(&quot;%s_R%03d&quot;, messenger-&gt;name().c_str(), index)),</a>
+<a name="ln125">      log_prefix_(name_ + &quot;: &quot;),</a>
+<a name="ln126">      loop_(kDefaultLibEvFlags),</a>
+<a name="ln127">      cur_time_(CoarseMonoClock::Now()),</a>
+<a name="ln128">      last_unused_tcp_scan_(cur_time_),</a>
+<a name="ln129">      connection_keepalive_time_(bld.connection_keepalive_time()),</a>
+<a name="ln130">      coarse_timer_granularity_(bld.coarse_timer_granularity()),</a>
+<a name="ln131">      num_connections_to_server_(bld.num_connections_to_server()) {</a>
+<a name="ln132">  static std::once_flag libev_once;</a>
+<a name="ln133">  std::call_once(libev_once, DoInitLibEv);</a>
+<a name="ln134"> </a>
+<a name="ln135">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Create reactor with keep alive_time: &quot;</a>
+<a name="ln136">                      &lt;&lt; yb::ToString(connection_keepalive_time_)</a>
+<a name="ln137">                      &lt;&lt; &quot;, coarse timer granularity: &quot; &lt;&lt; yb::ToString(coarse_timer_granularity_);</a>
+<a name="ln138"> </a>
+<a name="ln139">  process_outbound_queue_task_ =</a>
+<a name="ln140">      MakeFunctorReactorTask(std::bind(&amp;Reactor::ProcessOutboundQueue, this), SOURCE_LOCATION());</a>
+<a name="ln141">}</a>
+<a name="ln142"> </a>
+<a name="ln143">Reactor::~Reactor() {</a>
+<a name="ln144">  LOG_IF_WITH_PREFIX(DFATAL, !pending_tasks_.empty())</a>
+<a name="ln145">      &lt;&lt; &quot;Not empty pending tasks when destroyed reactor: &quot; &lt;&lt; yb::ToString(pending_tasks_);</a>
+<a name="ln146">}</a>
+<a name="ln147"> </a>
+<a name="ln148">Status Reactor::Init() {</a>
+<a name="ln149">  DCHECK(thread_.get() == nullptr) &lt;&lt; &quot;Already started&quot;;</a>
+<a name="ln150">  DVLOG_WITH_PREFIX(6) &lt;&lt; &quot;Called Reactor::Init()&quot;;</a>
+<a name="ln151">  // Register to get async notifications in our epoll loop.</a>
+<a name="ln152">  async_.set(loop_);</a>
+<a name="ln153">  async_.set&lt;Reactor, &amp;Reactor::AsyncHandler&gt;(this);</a>
+<a name="ln154">  async_.start();</a>
+<a name="ln155"> </a>
+<a name="ln156">  // Register the timer watcher.</a>
+<a name="ln157">  // The timer is used for closing old TCP connections and applying</a>
+<a name="ln158">  // backpressure.</a>
+<a name="ln159">  timer_.set(loop_);</a>
+<a name="ln160">  timer_.set&lt;Reactor, &amp;Reactor::TimerHandler&gt;(this);</a>
+<a name="ln161">  timer_.start(ToSeconds(coarse_timer_granularity_),</a>
+<a name="ln162">               ToSeconds(coarse_timer_granularity_));</a>
+<a name="ln163"> </a>
+<a name="ln164">  // Create Reactor thread.</a>
+<a name="ln165">  const std::string group_name = messenger_-&gt;name() + &quot;_reactor&quot;;</a>
+<a name="ln166">  return yb::Thread::Create(group_name, group_name, &amp;Reactor::RunThread, this, &amp;thread_);</a>
+<a name="ln167">}</a>
+<a name="ln168"> </a>
+<a name="ln169">void Reactor::Shutdown() {</a>
+<a name="ln170">  ReactorState old_state = ReactorState::kRunning;</a>
+<a name="ln171">  do {</a>
+<a name="ln172">    if (state_.compare_exchange_weak(old_state,</a>
+<a name="ln173">                                     ReactorState::kClosing,</a>
+<a name="ln174">                                     std::memory_order_acq_rel)) {</a>
+<a name="ln175">      VLOG_WITH_PREFIX(1) &lt;&lt; &quot;shutting down Reactor thread.&quot;;</a>
+<a name="ln176">      WakeThread();</a>
+<a name="ln177">    }</a>
+<a name="ln178">  } while (!HasReactorStartedClosing(old_state));</a>
+<a name="ln179"> </a>
+<a name="ln180">  // Another thread already switched the state to closing before us.</a>
+<a name="ln181">}</a>
+<a name="ln182"> </a>
+<a name="ln183">void Reactor::ShutdownConnection(const ConnectionPtr&amp; conn) {</a>
+<a name="ln184">  DCHECK(IsCurrentThread());</a>
+<a name="ln185"> </a>
+<a name="ln186">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;shutting down &quot; &lt;&lt; conn-&gt;ToString();</a>
+<a name="ln187">  conn-&gt;Shutdown(ServiceUnavailableError());</a>
+<a name="ln188">  if (!conn-&gt;context().Idle()) {</a>
+<a name="ln189">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;connection is not idle: &quot; &lt;&lt; conn-&gt;ToString();</a>
+<a name="ln190">    std::weak_ptr&lt;Connection&gt; weak_conn(conn);</a>
+<a name="ln191">    conn-&gt;context().ListenIdle([this, weak_conn]() {</a>
+<a name="ln192">      DCHECK(IsCurrentThreadOrStartedClosing());</a>
+<a name="ln193">      auto conn = weak_conn.lock();</a>
+<a name="ln194">      if (conn) {</a>
+<a name="ln195">        VLOG_WITH_PREFIX(1) &lt;&lt; &quot;connection became idle &quot; &lt;&lt; conn-&gt;ToString();</a>
+<a name="ln196">        // The access to waiting_conns_ is safe here, because this code can only be called on the</a>
+<a name="ln197">        // reactor thread or when holding final_abort_mutex_ during shutdown.</a>
+<a name="ln198">        waiting_conns_.erase(conn);</a>
+<a name="ln199">      }</a>
+<a name="ln200">    });</a>
+<a name="ln201">    waiting_conns_.insert(conn);</a>
+<a name="ln202">  } else {</a>
+<a name="ln203">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;connection is idle: &quot; &lt;&lt; conn-&gt;ToString();</a>
+<a name="ln204">  }</a>
+<a name="ln205">}</a>
+<a name="ln206"> </a>
+<a name="ln207">void Reactor::ShutdownInternal() {</a>
+<a name="ln208">  DCHECK(IsCurrentThread());</a>
+<a name="ln209"> </a>
+<a name="ln210">  stopping_ = true;</a>
+<a name="ln211">  stop_start_time_ = CoarseMonoClock::Now();</a>
+<a name="ln212"> </a>
+<a name="ln213">  // Tear down any outbound TCP connections.</a>
+<a name="ln214">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;tearing down outbound TCP connections...&quot;;</a>
+<a name="ln215">  decltype(client_conns_) client_conns = std::move(client_conns_);</a>
+<a name="ln216">  for (auto&amp; pair : client_conns) {</a>
+<a name="ln217">    ShutdownConnection(pair.second);</a>
+<a name="ln218">  }</a>
+<a name="ln219">  client_conns.clear();</a>
+<a name="ln220"> </a>
+<a name="ln221">  // Tear down any inbound TCP connections.</a>
+<a name="ln222">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;tearing down inbound TCP connections...&quot;;</a>
+<a name="ln223">  for (const ConnectionPtr&amp; conn : server_conns_) {</a>
+<a name="ln224">    ShutdownConnection(conn);</a>
+<a name="ln225">  }</a>
+<a name="ln226">  server_conns_.clear();</a>
+<a name="ln227"> </a>
+<a name="ln228">  // Abort any scheduled tasks.</a>
+<a name="ln229">  //</a>
+<a name="ln230">  // These won't be found in the Reactor's list of pending tasks</a>
+<a name="ln231">  // because they've been &quot;run&quot; (that is, they've been scheduled).</a>
+<a name="ln232">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;aborting scheduled tasks&quot;;</a>
+<a name="ln233">  Status aborted = AbortedError();</a>
+<a name="ln234">  for (const auto&amp; task : scheduled_tasks_) {</a>
+<a name="ln235">    task-&gt;Abort(aborted);</a>
+<a name="ln236">  }</a>
+<a name="ln237">  scheduled_tasks_.clear();</a>
+<a name="ln238"> </a>
+<a name="ln239">  // async_handler_tasks_ are the tasks added by ScheduleReactorTask.</a>
+<a name="ln240">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;aborting async handler tasks&quot;;</a>
+<a name="ln241">  for (const auto&amp; task : async_handler_tasks_) {</a>
+<a name="ln242">    task-&gt;Abort(aborted);</a>
+<a name="ln243">  }</a>
+<a name="ln244"> </a>
+<a name="ln245">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;aborting outbound calls&quot;;</a>
+<a name="ln246">  CHECK(processing_outbound_queue_.empty()) &lt;&lt; yb::ToString(processing_outbound_queue_);</a>
+<a name="ln247">  {</a>
+<a name="ln248">    std::lock_guard&lt;simple_spinlock&gt; lock(outbound_queue_lock_);</a>
+<a name="ln249">    outbound_queue_stopped_ = true;</a>
+<a name="ln250">    outbound_queue_.swap(processing_outbound_queue_);</a>
+<a name="ln251">  }</a>
+<a name="ln252">  for (auto&amp; call : processing_outbound_queue_) {</a>
+<a name="ln253">    call-&gt;Transferred(aborted, nullptr);</a>
+<a name="ln254">  }</a>
+<a name="ln255">  processing_outbound_queue_.clear();</a>
+<a name="ln256">}</a>
+<a name="ln257"> </a>
+<a name="ln258">Status Reactor::GetMetrics(ReactorMetrics *metrics) {</a>
+<a name="ln259">  return RunOnReactorThread([metrics](Reactor* reactor) {</a>
+<a name="ln260">    metrics-&gt;num_client_connections_ = reactor-&gt;client_conns_.size();</a>
+<a name="ln261">    metrics-&gt;num_server_connections_ = reactor-&gt;server_conns_.size();</a>
+<a name="ln262">    return Status::OK();</a>
+<a name="ln263">  }, SOURCE_LOCATION());</a>
+<a name="ln264">}</a>
+<a name="ln265"> </a>
+<a name="ln266">void Reactor::Join() {</a>
+<a name="ln267">  auto join_result = ThreadJoiner(thread_.get()).give_up_after(30s).Join();</a>
+<a name="ln268">  if (join_result.ok()) {</a>
+<a name="ln269">    return;</a>
+<a name="ln270">  }</a>
+<a name="ln271">  if (join_result.IsInvalidArgument()) {</a>
+<a name="ln272">    LOG_WITH_PREFIX(WARNING) &lt;&lt; join_result;</a>
+<a name="ln273">    return;</a>
+<a name="ln274">  }</a>
+<a name="ln275">  LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Failed to join Reactor &quot; &lt;&lt; thread_-&gt;ToString() &lt;&lt; &quot;: &quot;</a>
+<a name="ln276">                          &lt;&lt; join_result;</a>
+<a name="ln277">  // Fallback to endless join in release mode.</a>
+<a name="ln278">  thread_-&gt;Join();</a>
+<a name="ln279">}</a>
+<a name="ln280"> </a>
+<a name="ln281">void Reactor::QueueEventOnAllConnections(</a>
+<a name="ln282">    ServerEventListPtr server_event, const SourceLocation&amp; source_location) {</a>
+<a name="ln283">  ScheduleReactorFunctor([server_event = std::move(server_event)](Reactor* reactor) {</a>
+<a name="ln284">    for (const ConnectionPtr&amp; conn : reactor-&gt;server_conns_) {</a>
+<a name="ln285">      conn-&gt;QueueOutboundData(server_event);</a>
+<a name="ln286">    }</a>
+<a name="ln287">  }, source_location);</a>
+<a name="ln288">}</a>
+<a name="ln289"> </a>
+<a name="ln290">Status Reactor::DumpRunningRpcs(const DumpRunningRpcsRequestPB&amp; req,</a>
+<a name="ln291">                                DumpRunningRpcsResponsePB* resp) {</a>
+<a name="ln292">  return RunOnReactorThread([&amp;req, resp](Reactor* reactor) -&gt; Status {</a>
+<a name="ln293">    for (const ConnectionPtr&amp; conn : reactor-&gt;server_conns_) {</a>
+<a name="ln294">      RETURN_NOT_OK(conn-&gt;DumpPB(req, resp-&gt;add_inbound_connections()));</a>
+<a name="ln295">    }</a>
+<a name="ln296">    for (const auto&amp; entry : reactor-&gt;client_conns_) {</a>
+<a name="ln297">      Connection* conn = entry.second.get();</a>
+<a name="ln298">      RETURN_NOT_OK(conn-&gt;DumpPB(req, resp-&gt;add_outbound_connections()));</a>
+<a name="ln299">    }</a>
+<a name="ln300">    return Status::OK();</a>
+<a name="ln301">  }, SOURCE_LOCATION());</a>
+<a name="ln302">}</a>
+<a name="ln303"> </a>
+<a name="ln304">void Reactor::WakeThread() {</a>
+<a name="ln305">  async_.send();</a>
+<a name="ln306">}</a>
+<a name="ln307"> </a>
+<a name="ln308">void Reactor::CheckReadyToStop() {</a>
+<a name="ln309">  DCHECK(IsCurrentThread());</a>
+<a name="ln310"> </a>
+<a name="ln311">  VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Check ready to stop: &quot; &lt;&lt; thread_-&gt;ToString() &lt;&lt; &quot;, &quot;</a>
+<a name="ln312">          &lt;&lt; &quot;waiting connections: &quot; &lt;&lt; yb::ToString(waiting_conns_);</a>
+<a name="ln313"> </a>
+<a name="ln314">  if (VLOG_IS_ON(4)) {</a>
+<a name="ln315">    for (const auto&amp; conn : waiting_conns_) {</a>
+<a name="ln316">      VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Connection: &quot; &lt;&lt; conn-&gt;ToString() &lt;&lt; &quot;, idle=&quot; &lt;&lt; conn-&gt;Idle()</a>
+<a name="ln317">                          &lt;&lt; &quot;, why: &quot; &lt;&lt; conn-&gt;ReasonNotIdle();</a>
+<a name="ln318">    }</a>
+<a name="ln319">  }</a>
+<a name="ln320"> </a>
+<a name="ln321">  if (waiting_conns_.empty()) {</a>
+<a name="ln322">    VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Reactor ready to stop, breaking loop: &quot; &lt;&lt; this;</a>
+<a name="ln323"> </a>
+<a name="ln324">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Marking reactor as closed: &quot; &lt;&lt; thread_.get()-&gt;ToString();</a>
+<a name="ln325">    ReactorTasks final_tasks;</a>
+<a name="ln326">    {</a>
+<a name="ln327">      std::lock_guard&lt;simple_spinlock&gt; lock(pending_tasks_mtx_);</a>
+<a name="ln328">      state_.store(ReactorState::kClosed, std::memory_order_release);</a>
+<a name="ln329">      final_tasks.swap(pending_tasks_);</a>
+<a name="ln330">    }</a>
+<a name="ln331">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Running final pending task aborts: &quot; &lt;&lt; thread_.get()-&gt;ToString();;</a>
+<a name="ln332">    for (auto task : final_tasks) {</a>
+<a name="ln333">      task-&gt;Abort(ServiceUnavailableError());</a>
+<a name="ln334">    }</a>
+<a name="ln335">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Breaking reactor loop: &quot; &lt;&lt; thread_.get()-&gt;ToString();;</a>
+<a name="ln336">    loop_.break_loop(); // break the epoll loop and terminate the thread</a>
+<a name="ln337">  }</a>
+<a name="ln338">}</a>
+<a name="ln339"> </a>
+<a name="ln340">// Handle async events.  These events are sent to the reactor by other threads that want to bring</a>
+<a name="ln341">// something to our attention, like the fact that we're shutting down, or the fact that there is a</a>
+<a name="ln342">// new outbound Transfer ready to send.</a>
+<a name="ln343">void Reactor::AsyncHandler(ev::async &amp;watcher, int revents) {</a>
+<a name="ln344">  DCHECK(IsCurrentThread());</a>
+<a name="ln345"> </a>
+<a name="ln346">  auto se = ScopeExit([this] {</a>
+<a name="ln347">    async_handler_tasks_.clear();</a>
+<a name="ln348">  });</a>
+<a name="ln349"> </a>
+<a name="ln350">  if (PREDICT_FALSE(DrainTaskQueueAndCheckIfClosing())) {</a>
+<a name="ln351">    ShutdownInternal();</a>
+<a name="ln352">    CheckReadyToStop();</a>
+<a name="ln353">    return;</a>
+<a name="ln354">  }</a>
+<a name="ln355"> </a>
+<a name="ln356">  for (const auto &amp;task : async_handler_tasks_) {</a>
+<a name="ln357">    task-&gt;Run(this);</a>
+<a name="ln358">  }</a>
+<a name="ln359">}</a>
+<a name="ln360"> </a>
+<a name="ln361">void Reactor::RegisterConnection(const ConnectionPtr&amp; conn) {</a>
+<a name="ln362">  DCHECK(IsCurrentThread());</a>
+<a name="ln363"> </a>
+<a name="ln364">  Status s = conn-&gt;Start(&amp;loop_);</a>
+<a name="ln365">  if (s.ok()) {</a>
+<a name="ln366">    server_conns_.push_back(conn);</a>
+<a name="ln367">  } else {</a>
+<a name="ln368">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Failed to start connection: &quot; &lt;&lt; conn-&gt;ToString() &lt;&lt; &quot;: &quot; &lt;&lt; s;</a>
+<a name="ln369">  }</a>
+<a name="ln370">}</a>
+<a name="ln371"> </a>
+<a name="ln372">ConnectionPtr Reactor::AssignOutboundCall(const OutboundCallPtr&amp; call) {</a>
+<a name="ln373">  DCHECK(IsCurrentThread());</a>
+<a name="ln374">  ConnectionPtr conn;</a>
+<a name="ln375"> </a>
+<a name="ln376">  // TODO: Move call deadline timeout computation into OutboundCall constructor.</a>
+<a name="ln377">  const MonoDelta &amp;timeout = call-&gt;controller()-&gt;timeout();</a>
+<a name="ln378">  MonoTime deadline;</a>
+<a name="ln379">  if (!timeout.Initialized()) {</a>
+<a name="ln380">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Client call &quot; &lt;&lt; call-&gt;remote_method().ToString()</a>
+<a name="ln381">                 &lt;&lt; &quot; has no timeout set for connection id: &quot;</a>
+<a name="ln382">                 &lt;&lt; call-&gt;conn_id().ToString();</a>
+<a name="ln383">    deadline = MonoTime::Max();</a>
+<a name="ln384">  } else {</a>
+<a name="ln385">    deadline = MonoTime::Now();</a>
+<a name="ln386">    deadline.AddDelta(timeout);</a>
+<a name="ln387">  }</a>
+<a name="ln388"> </a>
+<a name="ln389">  Status s = FindOrStartConnection(call-&gt;conn_id(), call-&gt;hostname(), deadline, &amp;conn);</a>
+<a name="ln390">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln391">    call-&gt;SetFailed(s);</a>
+<a name="ln392">    return ConnectionPtr();</a>
+<a name="ln393">  }</a>
+<a name="ln394"> </a>
+<a name="ln395">  conn-&gt;QueueOutboundCall(call);</a>
+<a name="ln396">  return conn;</a>
+<a name="ln397">}</a>
+<a name="ln398"> </a>
+<a name="ln399">//</a>
+<a name="ln400">// Handles timer events.  The periodic timer:</a>
+<a name="ln401">//</a>
+<a name="ln402">// 1. updates Reactor::cur_time_</a>
+<a name="ln403">// 2. every tcp_conn_timeo_ seconds, close down connections older than</a>
+<a name="ln404">//    tcp_conn_timeo_ seconds.</a>
+<a name="ln405">//</a>
+<a name="ln406">void Reactor::TimerHandler(ev::timer &amp;watcher, int revents) {</a>
+<a name="ln407">  DCHECK(IsCurrentThread());</a>
+<a name="ln408"> </a>
+<a name="ln409">  if (EV_ERROR &amp; revents) {</a>
+<a name="ln410">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Reactor got an error in the timer handler.&quot;;</a>
+<a name="ln411">    return;</a>
+<a name="ln412">  }</a>
+<a name="ln413"> </a>
+<a name="ln414">  if (stopping_) {</a>
+<a name="ln415">    CheckReadyToStop();</a>
+<a name="ln416">    return;</a>
+<a name="ln417">  }</a>
+<a name="ln418"> </a>
+<a name="ln419">  auto now = CoarseMonoClock::Now();</a>
+<a name="ln420">  VLOG_WITH_PREFIX(4) &lt;&lt; &quot;timer tick at &quot; &lt;&lt; ToSeconds(now.time_since_epoch());</a>
+<a name="ln421">  cur_time_ = now;</a>
+<a name="ln422"> </a>
+<a name="ln423">  ScanIdleConnections();</a>
+<a name="ln424">}</a>
+<a name="ln425"> </a>
+<a name="ln426">void Reactor::ScanIdleConnections() {</a>
+<a name="ln427">  DCHECK(IsCurrentThread());</a>
+<a name="ln428">  if (connection_keepalive_time_ == CoarseMonoClock::Duration::zero()) {</a>
+<a name="ln429">    VLOG_WITH_PREFIX(3) &lt;&lt; &quot;Skipping Idle connections check since connection_keepalive_time_ = 0&quot;;</a>
+<a name="ln430">    return;</a>
+<a name="ln431">  }</a>
+<a name="ln432"> </a>
+<a name="ln433">  // enforce TCP connection timeouts</a>
+<a name="ln434">  auto c = server_conns_.begin();</a>
+<a name="ln435">  auto c_end = server_conns_.end();</a>
+<a name="ln436">  uint64_t timed_out = 0;</a>
+<a name="ln437">  for (; c != c_end; ) {</a>
+<a name="ln438">    const ConnectionPtr&amp; conn = *c;</a>
+<a name="ln439">    if (!conn-&gt;Idle()) {</a>
+<a name="ln440">      VLOG_WITH_PREFIX(3) &lt;&lt; &quot;Connection &quot; &lt;&lt; conn-&gt;ToString() &lt;&lt; &quot; not idle&quot;;</a>
+<a name="ln441">      ++c; // TODO: clean up this loop</a>
+<a name="ln442">      continue;</a>
+<a name="ln443">    }</a>
+<a name="ln444"> </a>
+<a name="ln445">    auto last_activity_time = conn-&gt;last_activity_time();</a>
+<a name="ln446">    auto connection_delta = cur_time_ - last_activity_time;</a>
+<a name="ln447">    if (connection_delta &gt; connection_keepalive_time_) {</a>
+<a name="ln448">      conn-&gt;Shutdown(STATUS_FORMAT(</a>
+<a name="ln449">          NetworkError, &quot;Connection timed out after $0&quot;, ToSeconds(connection_delta)));</a>
+<a name="ln450">      LOG_WITH_PREFIX(INFO)</a>
+<a name="ln451">          &lt;&lt; &quot;DEBUG: Closing idle connection: &quot; &lt;&lt; conn-&gt;ToString()</a>
+<a name="ln452">          &lt;&lt; &quot; - it has been idle for &quot; &lt;&lt; ToSeconds(connection_delta) &lt;&lt; &quot;s&quot;;</a>
+<a name="ln453">      VLOG(1) &lt;&lt; &quot;(delta: &quot; &lt;&lt; ToSeconds(connection_delta)</a>
+<a name="ln454">          &lt;&lt; &quot;, current time: &quot; &lt;&lt; ToSeconds(cur_time_.time_since_epoch())</a>
+<a name="ln455">          &lt;&lt; &quot;, last activity time: &quot; &lt;&lt; ToSeconds(last_activity_time.time_since_epoch()) &lt;&lt; &quot;)&quot;;</a>
+<a name="ln456">      server_conns_.erase(c++);</a>
+<a name="ln457">      ++timed_out;</a>
+<a name="ln458">    } else {</a>
+<a name="ln459">      ++c;</a>
+<a name="ln460">    }</a>
+<a name="ln461">  }</a>
+<a name="ln462"> </a>
+<a name="ln463">  // TODO: above only times out on the server side.</a>
+<a name="ln464">  // Clients may want to set their keepalive timeout as well.</a>
+<a name="ln465"> </a>
+<a name="ln466">  VLOG_IF_WITH_PREFIX(1, timed_out &gt; 0) &lt;&lt; &quot;timed out &quot; &lt;&lt; timed_out &lt;&lt; &quot; TCP connections.&quot;;</a>
+<a name="ln467">}</a>
+<a name="ln468"> </a>
+<a name="ln469">bool Reactor::IsCurrentThread() const {</a>
+<a name="ln470">  return thread_.get() == yb::Thread::current_thread();</a>
+<a name="ln471">}</a>
+<a name="ln472"> </a>
+<a name="ln473">bool Reactor::IsCurrentThreadOrStartedClosing() const {</a>
+<a name="ln474">  return thread_.get() == yb::Thread::current_thread() ||</a>
+<a name="ln475">         HasReactorStartedClosing(state_.load(std::memory_order_acquire));</a>
+<a name="ln476">}</a>
+<a name="ln477"> </a>
+<a name="ln478">void Reactor::RunThread() {</a>
+<a name="ln479">  ThreadRestrictions::SetWaitAllowed(false);</a>
+<a name="ln480">  ThreadRestrictions::SetIOAllowed(false);</a>
+<a name="ln481">  DVLOG_WITH_PREFIX(6) &lt;&lt; &quot;Calling Reactor::RunThread()...&quot;;</a>
+<a name="ln482">  loop_.run(/* flags */ 0);</a>
+<a name="ln483">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;thread exiting.&quot;;</a>
+<a name="ln484">}</a>
+<a name="ln485"> </a>
+<a name="ln486">namespace {</a>
+<a name="ln487"> </a>
+<a name="ln488">Result&lt;Socket&gt; CreateClientSocket(const Endpoint&amp; remote) {</a>
+<a name="ln489">  int flags = Socket::FLAG_NONBLOCKING;</a>
+<a name="ln490">  if (remote.address().is_v6()) {</a>
+<a name="ln491">    flags |= Socket::FLAG_IPV6;</a>
+<a name="ln492">  }</a>
+<a name="ln493">  Socket socket;</a>
+<a name="ln494">  Status status = socket.Init(flags);</a>
+<a name="ln495">  if (status.ok()) {</a>
+<a name="ln496">    status = socket.SetNoDelay(true);</a>
+<a name="ln497">  }</a>
+<a name="ln498">  LOG_IF(WARNING, !status.ok()) &lt;&lt; &quot;failed to create an &quot;</a>
+<a name="ln499">      &quot;outbound connection because a new socket could not &quot;</a>
+<a name="ln500">      &quot;be created: &quot; &lt;&lt; status.ToString();</a>
+<a name="ln501">  if (!status.ok())</a>
+<a name="ln502">    return status;</a>
+<a name="ln503">  return std::move(socket);</a>
+<a name="ln504">}</a>
+<a name="ln505"> </a>
+<a name="ln506">template &lt;class... Args&gt;</a>
+<a name="ln507">Result&lt;std::unique_ptr&lt;Stream&gt;&gt; CreateStream(</a>
+<a name="ln508">    const StreamFactories&amp; factories, const Protocol* protocol, const StreamCreateData&amp; data) {</a>
+<a name="ln509">  auto it = factories.find(protocol);</a>
+<a name="ln510">  if (it == factories.end()) {</a>
+<a name="ln511">    return STATUS_FORMAT(NotFound, &quot;Unknown protocol: $0&quot;, protocol);</a>
+<a name="ln512">  }</a>
+<a name="ln513">  return it-&gt;second-&gt;Create(data);</a>
+<a name="ln514">}</a>
+<a name="ln515"> </a>
+<a name="ln516">} // namespace</a>
+<a name="ln517"> </a>
+<a name="ln518">Status Reactor::FindOrStartConnection(const ConnectionId &amp;conn_id,</a>
+<a name="ln519">                                      const std::string&amp; hostname,</a>
+<a name="ln520">                                      const MonoTime &amp;deadline,</a>
+<a name="ln521">                                      ConnectionPtr* conn) {</a>
+<a name="ln522">  DCHECK(IsCurrentThread());</a>
+<a name="ln523">  auto c = client_conns_.find(conn_id);</a>
+<a name="ln524">  if (c != client_conns_.end()) {</a>
+<a name="ln525">    *conn = (*c).second;</a>
+<a name="ln526">    return Status::OK();</a>
+<a name="ln527">  }</a>
+<a name="ln528"> </a>
+<a name="ln529">  if (HasReactorStartedClosing(state_.load(std::memory_order_acquire))) {</a>
+<a name="ln530">    return ServiceUnavailableError();</a>
+<a name="ln531">  }</a>
+<a name="ln532"> </a>
+<a name="ln533">  // No connection to this remote. Need to create one.</a>
+<a name="ln534">  VLOG_WITH_PREFIX(2) &lt;&lt; &quot;FindOrStartConnection: creating new connection for &quot;</a>
+<a name="ln535">                      &lt;&lt; conn_id.ToString();</a>
+<a name="ln536"> </a>
+<a name="ln537">  // Create a new socket and start connecting to the remote.</a>
+<a name="ln538">  auto sock = VERIFY_RESULT(CreateClientSocket(conn_id.remote()));</a>
+<a name="ln539">  if (messenger_-&gt;has_outbound_ip_base_.load(std::memory_order_acquire) &amp;&amp;</a>
+<a name="ln540">      !messenger_-&gt;test_outbound_ip_base_.is_unspecified()) {</a>
+<a name="ln541">    auto address_bytes(messenger_-&gt;test_outbound_ip_base_.to_v4().to_bytes());</a>
+<a name="ln542">    // Use different addresses for public/private endpoints.</a>
+<a name="ln543">    // Private addresses are even, and public are odd.</a>
+<a name="ln544">    // So if base address is &quot;private&quot; and destination address is &quot;public&quot; we will modify</a>
+<a name="ln545">    // originating address to be &quot;public&quot; also.</a>
+<a name="ln546">    address_bytes[3] |= conn_id.remote().address().to_v4().to_bytes()[3] &amp; 1;</a>
+<a name="ln547">    boost::asio::ip::address_v4 outbound_address(address_bytes);</a>
+<a name="ln548">    auto status = sock.Bind(Endpoint(outbound_address, 0));</a>
+<a name="ln549">    LOG_IF_WITH_PREFIX(WARNING, !status.ok()) &lt;&lt; &quot;Bind &quot; &lt;&lt; outbound_address &lt;&lt; &quot; failed: &quot;</a>
+<a name="ln550">                                              &lt;&lt; status;</a>
+<a name="ln551">  } else if (FLAGS_local_ip_for_outbound_sockets.empty()) {</a>
+<a name="ln552">    auto outbound_address = conn_id.remote().address().is_v6()</a>
+<a name="ln553">        ? messenger_-&gt;outbound_address_v6()</a>
+<a name="ln554">        : messenger_-&gt;outbound_address_v4();</a>
+<a name="ln555">    if (!outbound_address.is_unspecified()) {</a>
+<a name="ln556">      auto status = sock.Bind(Endpoint(outbound_address, 0));</a>
+<a name="ln557">      LOG_IF_WITH_PREFIX(WARNING, !status.ok()) &lt;&lt; &quot;Bind &quot; &lt;&lt; outbound_address &lt;&lt; &quot; failed: &quot;</a>
+<a name="ln558">                                                &lt;&lt; status;</a>
+<a name="ln559">    }</a>
+<a name="ln560">  }</a>
+<a name="ln561"> </a>
+<a name="ln562">  if (FLAGS_socket_receive_buffer_size) {</a>
+<a name="ln563">    WARN_NOT_OK(sock.SetReceiveBufferSize(FLAGS_socket_receive_buffer_size),</a>
+<a name="ln564">                &quot;Set receive buffer size failed: &quot;);</a>
+<a name="ln565">  }</a>
+<a name="ln566"> </a>
+<a name="ln567">  auto receive_buffer_size = VERIFY_RESULT(sock.GetReceiveBufferSize());</a>
+<a name="ln568"> </a>
+<a name="ln569">  auto context = messenger_-&gt;connection_context_factory_-&gt;Create(receive_buffer_size);</a>
+<a name="ln570">  auto stream = VERIFY_RESULT(CreateStream(</a>
+<a name="ln571">      messenger_-&gt;stream_factories_, conn_id.protocol(),</a>
+<a name="ln572">      {conn_id.remote(), hostname, &amp;sock,</a>
+<a name="ln573">       messenger_-&gt;connection_context_factory_-&gt;buffer_tracker()}));</a>
+<a name="ln574"> </a>
+<a name="ln575">  // Register the new connection in our map.</a>
+<a name="ln576">  auto connection = std::make_shared&lt;Connection&gt;(</a>
+<a name="ln577">      this,</a>
+<a name="ln578">      std::move(stream),</a>
+<a name="ln579">      ConnectionDirection::CLIENT,</a>
+<a name="ln580">      &amp;messenger()-&gt;rpc_metrics(),</a>
+<a name="ln581">      std::move(context));</a>
+<a name="ln582"> </a>
+<a name="ln583">  RETURN_NOT_OK(connection-&gt;Start(&amp;loop_));</a>
+<a name="ln584"> </a>
+<a name="ln585">  // Insert into the client connection map to avoid duplicate connection requests.</a>
+<a name="ln586">  CHECK(client_conns_.emplace(conn_id, connection).second);</a>
+<a name="ln587"> </a>
+<a name="ln588">  conn-&gt;swap(connection);</a>
+<a name="ln589">  return Status::OK();</a>
+<a name="ln590">}</a>
+<a name="ln591"> </a>
+<a name="ln592">namespace {</a>
+<a name="ln593"> </a>
+<a name="ln594">void ShutdownIfRemoteAddressIs(const ConnectionPtr&amp; conn, const IpAddress&amp; address) {</a>
+<a name="ln595">  Endpoint peer = conn-&gt;remote();</a>
+<a name="ln596"> </a>
+<a name="ln597">  if (peer.address() != address) {</a>
+<a name="ln598">    return;</a>
+<a name="ln599">  }</a>
+<a name="ln600"> </a>
+<a name="ln601">  conn-&gt;Close();</a>
+<a name="ln602">  LOG(INFO) &lt;&lt; &quot;Dropped connection: &quot; &lt;&lt; conn-&gt;ToString();</a>
+<a name="ln603">}</a>
+<a name="ln604"> </a>
+<a name="ln605">} // namespace</a>
+<a name="ln606"> </a>
+<a name="ln607">void Reactor::DropWithRemoteAddress(const IpAddress&amp; address) {</a>
+<a name="ln608">  DropIncomingWithRemoteAddress(address);</a>
+<a name="ln609">  DropOutgoingWithRemoteAddress(address);</a>
+<a name="ln610">}</a>
+<a name="ln611">void Reactor::DropIncomingWithRemoteAddress(const IpAddress&amp; address) {</a>
+<a name="ln612">  DCHECK(IsCurrentThread());</a>
+<a name="ln613"> </a>
+<a name="ln614">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Dropping Incoming connections from &quot; &lt;&lt; address;</a>
+<a name="ln615">  for (auto&amp; conn : server_conns_) {</a>
+<a name="ln616">    ShutdownIfRemoteAddressIs(conn, address);</a>
+<a name="ln617">  }</a>
+<a name="ln618">}</a>
+<a name="ln619"> </a>
+<a name="ln620">void Reactor::DropOutgoingWithRemoteAddress(const IpAddress&amp; address) {</a>
+<a name="ln621">  DCHECK(IsCurrentThread());</a>
+<a name="ln622">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Dropping Outgoing connections to &quot; &lt;&lt; address;</a>
+<a name="ln623">  for (auto&amp; pair : client_conns_) {</a>
+<a name="ln624">    ShutdownIfRemoteAddressIs(pair.second, address);</a>
+<a name="ln625">  }</a>
+<a name="ln626">}</a>
+<a name="ln627"> </a>
+<a name="ln628">void Reactor::DestroyConnection(Connection *conn, const Status &amp;conn_status) {</a>
+<a name="ln629">  DCHECK(IsCurrentThread());</a>
+<a name="ln630"> </a>
+<a name="ln631">  VLOG_WITH_PREFIX(3) &lt;&lt; &quot;DestroyConnection(&quot; &lt;&lt; conn-&gt;ToString() &lt;&lt; &quot;, &quot; &lt;&lt; conn_status.ToString()</a>
+<a name="ln632">                      &lt;&lt; &quot;)&quot;;</a>
+<a name="ln633"> </a>
+<a name="ln634">  ConnectionPtr retained_conn = conn-&gt;shared_from_this();</a>
+<a name="ln635">  conn-&gt;Shutdown(conn_status);</a>
+<a name="ln636"> </a>
+<a name="ln637">  // Unlink connection from lists.</a>
+<a name="ln638">  if (conn-&gt;direction() == ConnectionDirection::CLIENT) {</a>
+<a name="ln639">    bool erased = false;</a>
+<a name="ln640">    for (int idx = 0; idx &lt; num_connections_to_server_; idx++) {</a>
+<a name="ln641">      auto it = client_conns_.find(ConnectionId(conn-&gt;remote(), idx, conn-&gt;protocol()));</a>
+<a name="ln642">      if (it != client_conns_.end() &amp;&amp; it-&gt;second.get() == conn) {</a>
+<a name="ln643">        client_conns_.erase(it);</a>
+<a name="ln644">        erased = true;</a>
+<a name="ln645">      }</a>
+<a name="ln646">    }</a>
+<a name="ln647">    if (!erased) {</a>
+<a name="ln648">      LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Looking for &quot; &lt;&lt; conn-&gt;ToString();</a>
+<a name="ln649">      for (auto &amp;p : client_conns_) {</a>
+<a name="ln650">        LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;  Client connection: &quot; &lt;&lt; p.first.ToString() &lt;&lt; &quot;, &quot;</a>
+<a name="ln651">                     &lt;&lt; p.second-&gt;ToString();</a>
+<a name="ln652">      }</a>
+<a name="ln653">    }</a>
+<a name="ln654">    CHECK(erased) &lt;&lt; &quot;Couldn't find connection for any index to &quot; &lt;&lt; conn-&gt;ToString();</a>
+<a name="ln655">  } else if (conn-&gt;direction() == ConnectionDirection::SERVER) {</a>
+<a name="ln656">    auto it = server_conns_.begin();</a>
+<a name="ln657">    while (it != server_conns_.end()) {</a>
+<a name="ln658">      if ((*it).get() == conn) {</a>
+<a name="ln659">        server_conns_.erase(it);</a>
+<a name="ln660">        break;</a>
+<a name="ln661">      }</a>
+<a name="ln662">      ++it;</a>
+<a name="ln663">    }</a>
+<a name="ln664">  }</a>
+<a name="ln665"> </a>
+<a name="ln666">  ShutdownConnection(retained_conn);</a>
+<a name="ln667">}</a>
+<a name="ln668"> </a>
+<a name="ln669">void Reactor::ProcessOutboundQueue() {</a>
+<a name="ln670">  CHECK(processing_outbound_queue_.empty()) &lt;&lt; yb::ToString(processing_outbound_queue_);</a>
+<a name="ln671">  {</a>
+<a name="ln672">    std::lock_guard&lt;simple_spinlock&gt; lock(outbound_queue_lock_);</a>
+<a name="ln673">    outbound_queue_.swap(processing_outbound_queue_);</a>
+<a name="ln674">  }</a>
+<a name="ln675">  if (processing_outbound_queue_.empty()) {</a>
+<a name="ln676">    return;</a>
+<a name="ln677">  }</a>
+<a name="ln678"> </a>
+<a name="ln679">  processing_connections_.reserve(processing_outbound_queue_.size());</a>
+<a name="ln680">  for (auto&amp; call : processing_outbound_queue_) {</a>
+<a name="ln681">    auto conn = AssignOutboundCall(call);</a>
+<a name="ln682">    processing_connections_.push_back(std::move(conn));</a>
+<a name="ln683">  }</a>
+<a name="ln684">  processing_outbound_queue_.clear();</a>
+<a name="ln685"> </a>
+<a name="ln686">  std::sort(processing_connections_.begin(), processing_connections_.end());</a>
+<a name="ln687">  auto new_end = std::unique(processing_connections_.begin(), processing_connections_.end());</a>
+<a name="ln688">  processing_connections_.erase(new_end, processing_connections_.end());</a>
+<a name="ln689">  for (auto&amp; conn : processing_connections_) {</a>
+<a name="ln690">    if (conn) {</a>
+<a name="ln691">      conn-&gt;OutboundQueued();</a>
+<a name="ln692">    }</a>
+<a name="ln693">  }</a>
+<a name="ln694">  processing_connections_.clear();</a>
+<a name="ln695">}</a>
+<a name="ln696"> </a>
+<a name="ln697">void Reactor::QueueOutboundCall(OutboundCallPtr call) {</a>
+<a name="ln698">  DVLOG_WITH_PREFIX(3) &lt;&lt; &quot;Queueing outbound call &quot;</a>
+<a name="ln699">                       &lt;&lt; call-&gt;ToString() &lt;&lt; &quot; to remote &quot; &lt;&lt; call-&gt;conn_id().remote();</a>
+<a name="ln700"> </a>
+<a name="ln701">  bool was_empty = false;</a>
+<a name="ln702">  bool closing = false;</a>
+<a name="ln703">  {</a>
+<a name="ln704">    std::lock_guard&lt;simple_spinlock&gt; lock(outbound_queue_lock_);</a>
+<a name="ln705">    if (!outbound_queue_stopped_) {</a>
+<a name="ln706">      was_empty = outbound_queue_.empty();</a>
+<a name="ln707">      outbound_queue_.push_back(call);</a>
+<a name="ln708">    } else {</a>
+<a name="ln709">      closing = true;</a>
+<a name="ln710">    }</a>
+<a name="ln711">  }</a>
+<a name="ln712">  if (closing) {</a>
+<a name="ln713">    call-&gt;Transferred(AbortedError(), nullptr /* conn */);</a>
+<a name="ln714">    return;</a>
+<a name="ln715">  }</a>
+<a name="ln716">  if (was_empty) {</a>
+<a name="ln717">    auto scheduled = ScheduleReactorTask(process_outbound_queue_task_);</a>
+<a name="ln718">    LOG_IF_WITH_PREFIX(WARNING, !scheduled) &lt;&lt; &quot;Failed to schedule process outbound queue task&quot;;</a>
+<a name="ln719">  }</a>
+<a name="ln720">  TRACE_TO(call-&gt;trace(), &quot;Scheduled.&quot;);</a>
+<a name="ln721">}</a>
+<a name="ln722"> </a>
+<a name="ln723">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln724">// ReactorTask class members</a>
+<a name="ln725">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln726"> </a>
+<a name="ln727">ReactorTask::ReactorTask(const SourceLocation&amp; source_location)</a>
+<a name="ln728">    : source_location_(source_location) {</a>
+<a name="ln729">}</a>
+<a name="ln730"> </a>
+<a name="ln731">ReactorTask::~ReactorTask() {</a>
+<a name="ln732">}</a>
+<a name="ln733"> </a>
+<a name="ln734">void ReactorTask::Abort(const Status&amp; abort_status) {</a>
+<a name="ln735">  if (!abort_called_.exchange(true, std::memory_order_acq_rel)) {</a>
+<a name="ln736">    DoAbort(abort_status);</a>
+<a name="ln737">  }</a>
+<a name="ln738">}</a>
+<a name="ln739"> </a>
+<a name="ln740">std::string ReactorTask::ToString() const {</a>
+<a name="ln741">  return Format(&quot;{ source: $0 }&quot;, source_location_);</a>
+<a name="ln742">}</a>
+<a name="ln743"> </a>
+<a name="ln744">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln745">// DelayedTask class members</a>
+<a name="ln746">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln747"> </a>
+<a name="ln748">DelayedTask::DelayedTask(StatusFunctor func, MonoDelta when, int64_t id,</a>
+<a name="ln749">                         const SourceLocation&amp; source_location, Messenger* messenger)</a>
+<a name="ln750">    : ReactorTask(source_location),</a>
+<a name="ln751">      func_(std::move(func)),</a>
+<a name="ln752">      when_(when),</a>
+<a name="ln753">      id_(id),</a>
+<a name="ln754">      messenger_(messenger) {</a>
+<a name="ln755">}</a>
+<a name="ln756"> </a>
+<a name="ln757">void DelayedTask::Run(Reactor* reactor) {</a>
+<a name="ln758">  DCHECK(reactor_ == nullptr) &lt;&lt; &quot;Task has already been scheduled&quot;;</a>
+<a name="ln759">  DCHECK(reactor-&gt;IsCurrentThread());</a>
+<a name="ln760"> </a>
+<a name="ln761">  // Acquire lock to prevent task from being aborted in the middle of scheduling, in case abort</a>
+<a name="ln762">  // will be requested in the middle of scheduling - task will be aborted right after return</a>
+<a name="ln763">  // from this method.</a>
+<a name="ln764">  std::lock_guard&lt;LockType&gt; l(lock_);</a>
+<a name="ln765">  if (done_) {</a>
+<a name="ln766">    // Task has been aborted.</a>
+<a name="ln767">    return;</a>
+<a name="ln768">  }</a>
+<a name="ln769"> </a>
+<a name="ln770">  // Schedule the task to run later.</a>
+<a name="ln771">  reactor_ = reactor;</a>
+<a name="ln772">  timer_.set(reactor-&gt;loop_);</a>
+<a name="ln773"> </a>
+<a name="ln774">  // timer_ is owned by this task and will be stopped through AbortTask/Abort before this task</a>
+<a name="ln775">  // is removed from list of scheduled tasks, so it is safe for timer_ to remember pointer to task.</a>
+<a name="ln776">  timer_.set&lt;DelayedTask, &amp;DelayedTask::TimerHandler&gt;(this);</a>
+<a name="ln777"> </a>
+<a name="ln778">  timer_.start(when_.ToSeconds(), // after</a>
+<a name="ln779">               0);                // repeat</a>
+<a name="ln780">  reactor_-&gt;scheduled_tasks_.insert(shared_from(this));</a>
+<a name="ln781">}</a>
+<a name="ln782"> </a>
+<a name="ln783">MarkAsDoneResult DelayedTask::MarkAsDone() {</a>
+<a name="ln784">  std::lock_guard&lt;LockType&gt; l(lock_);</a>
+<a name="ln785">  if (done_) {</a>
+<a name="ln786">    return MarkAsDoneResult::kAlreadyDone;</a>
+<a name="ln787">  }</a>
+<a name="ln788">  done_ = true;</a>
+<a name="ln789"> </a>
+<a name="ln790">  // ENG-2879: we need to check if reactor_ is nullptr, because that would mean that the task has</a>
+<a name="ln791">  // not even started.  AbortTask uses the return value of this function to check if it needs to</a>
+<a name="ln792">  // stop the timer, and that is only possible / necessary if Run has been called and reactor_ is</a>
+<a name="ln793">  // not nullptr.</a>
+<a name="ln794">  return reactor_ == nullptr ? MarkAsDoneResult::kNotScheduled</a>
+<a name="ln795">                             : MarkAsDoneResult::kSuccess;</a>
+<a name="ln796">}</a>
+<a name="ln797"> </a>
+<a name="ln798">std::string DelayedTask::ToString() const {</a>
+<a name="ln799">  return Format(&quot;{ id: $0 source: $1 }&quot;, id_, source_location_);</a>
+<a name="ln800">}</a>
+<a name="ln801"> </a>
+<a name="ln802">void DelayedTask::AbortTask(const Status&amp; abort_status) {</a>
+<a name="ln803">  auto mark_as_done_result = MarkAsDone();</a>
+<a name="ln804">  if (mark_as_done_result == MarkAsDoneResult::kSuccess) {</a>
+<a name="ln805">    // Stop the libev timer. We don't need to do this in the kNotScheduled case, because the timer</a>
+<a name="ln806">    // has not started in that case.</a>
+<a name="ln807">    if (reactor_-&gt;IsCurrentThread()) {</a>
+<a name="ln808">      timer_.stop();</a>
+<a name="ln809">    } else {</a>
+<a name="ln810">      // Must call timer_.stop() on the reactor thread. Keep a refcount to prevent this DelayedTask</a>
+<a name="ln811">      // from being deleted. If the reactor thread has already been shut down, this will be a no-op.</a>
+<a name="ln812">      reactor_-&gt;ScheduleReactorFunctor([this, holder = shared_from(this)](Reactor* reactor) {</a>
+<a name="ln813">        timer_.stop();</a>
+<a name="ln814">      }, SOURCE_LOCATION());</a>
+<a name="ln815">    }</a>
+<a name="ln816">  }</a>
+<a name="ln817">  if (mark_as_done_result != MarkAsDoneResult::kAlreadyDone) {</a>
+<a name="ln818">    // We need to call the callback whenever we successfully switch the done_ flag to true, whether</a>
+<a name="ln819">    // or not the task has been scheduled.</a>
+<a name="ln820">    func_(abort_status);</a>
+<a name="ln821">  }</a>
+<a name="ln822">}</a>
+<a name="ln823"> </a>
+<a name="ln824">void DelayedTask::DoAbort(const Status&amp; abort_status) {</a>
+<a name="ln825">  if (messenger_ != nullptr) {</a>
+<a name="ln826">    messenger_-&gt;RemoveScheduledTask(id_);</a>
+<a name="ln827">  }</a>
+<a name="ln828"> </a>
+<a name="ln829">  AbortTask(abort_status);</a>
+<a name="ln830">}</a>
+<a name="ln831"> </a>
+<a name="ln832">void DelayedTask::TimerHandler(ev::timer&amp; watcher, int revents) {</a>
+<a name="ln833">  DCHECK(reactor_-&gt;IsCurrentThread());</a>
+<a name="ln834"> </a>
+<a name="ln835">  auto mark_as_done_result = MarkAsDone();</a>
+<a name="ln836">  if (mark_as_done_result != MarkAsDoneResult::kSuccess) {</a>
+<a name="ln837">    DCHECK_EQ(MarkAsDoneResult::kAlreadyDone, mark_as_done_result)</a>
+<a name="ln838">        &lt;&lt; &quot;Can't get kNotScheduled here, because the timer handler is already being called&quot;;</a>
+<a name="ln839">    return;</a>
+<a name="ln840">  }</a>
+<a name="ln841"> </a>
+<a name="ln842">  // Hold shared_ptr, so this task wouldn't be destroyed upon removal below until func_ is called.</a>
+<a name="ln843">  auto holder = shared_from_this();</a>
+<a name="ln844"> </a>
+<a name="ln845">  reactor_-&gt;scheduled_tasks_.erase(shared_from(this));</a>
+<a name="ln846">  if (messenger_ != nullptr) {</a>
+<a name="ln847">    messenger_-&gt;RemoveScheduledTask(id_);</a>
+<a name="ln848">  }</a>
+<a name="ln849"> </a>
+<a name="ln850">  if (EV_ERROR &amp; revents) {</a>
+<a name="ln851">    std::string msg = &quot;Delayed task got an error in its timer handler&quot;;</a>
+<a name="ln852">    LOG(WARNING) &lt;&lt; msg;</a>
+<a name="ln853">    func_(STATUS(Aborted, msg));</a>
+<a name="ln854">  } else {</a>
+<a name="ln855">    func_(Status::OK());</a>
+<a name="ln856">  }</a>
+<a name="ln857">}</a>
+<a name="ln858"> </a>
+<a name="ln859">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln860">// More Reactor class members</a>
+<a name="ln861">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln862"> </a>
+<a name="ln863">void Reactor::RegisterInboundSocket(</a>
+<a name="ln864">    Socket *socket, const Endpoint&amp; remote, std::unique_ptr&lt;ConnectionContext&gt; connection_context,</a>
+<a name="ln865">    const MemTrackerPtr&amp; mem_tracker) {</a>
+<a name="ln866">  VLOG_WITH_PREFIX(3) &lt;&lt; &quot;New inbound connection to &quot; &lt;&lt; remote;</a>
+<a name="ln867"> </a>
+<a name="ln868">  auto stream = CreateStream(</a>
+<a name="ln869">      messenger_-&gt;stream_factories_, messenger_-&gt;listen_protocol_,</a>
+<a name="ln870">      {remote, std::string(), socket, mem_tracker});</a>
+<a name="ln871">  if (!stream.ok()) {</a>
+<a name="ln872">    LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Failed to create stream for &quot; &lt;&lt; remote &lt;&lt; &quot;: &quot; &lt;&lt; stream.status();</a>
+<a name="ln873">    return;</a>
+<a name="ln874">  }</a>
+<a name="ln875">  auto conn = std::make_shared&lt;Connection&gt;(this,</a>
+<a name="ln876">                                           std::move(*stream),</a>
+<a name="ln877">                                           ConnectionDirection::SERVER,</a>
+<a name="ln878">                                           &amp;messenger()-&gt;rpc_metrics(),</a>
+<a name="ln879">                                           std::move(connection_context));</a>
+<a name="ln880">  ScheduleReactorFunctor([conn = std::move(conn)](Reactor* reactor) {</a>
+<a name="ln881">    reactor-&gt;RegisterConnection(conn);</a>
+<a name="ln882">  }, SOURCE_LOCATION());</a>
+<a name="ln883">}</a>
+<a name="ln884"> </a>
+<a name="ln885">bool Reactor::ScheduleReactorTask(ReactorTaskPtr task, bool schedule_even_closing) {</a>
+<a name="ln886">  bool was_empty;</a>
+<a name="ln887">  {</a>
+<a name="ln888">    // Even though state_ is atomic, we still need to take the lock to make sure state_</a>
+<a name="ln889">    // and pending_tasks_mtx_ are being modified in a consistent way.</a>
+<a name="ln890">    std::unique_lock&lt;simple_spinlock&gt; pending_lock(pending_tasks_mtx_);</a>
+<a name="ln891">    auto state = state_.load(std::memory_order_acquire);</a>
+<a name="ln892">    bool failure = schedule_even_closing ? state == ReactorState::kClosed</a>
+<a name="ln893">                                         : HasReactorStartedClosing(state);</a>
+<a name="ln894">    if (failure) {</a>
+<a name="ln895">      return false;</a>
+<a name="ln896">    }</a>
+<a name="ln897">    was_empty = pending_tasks_.empty();</a>
+<a name="ln898">    pending_tasks_.emplace_back(std::move(task));</a>
+<a name="ln899">  }</a>
+<a name="ln900">  if (was_empty) {</a>
+<a name="ln901">    WakeThread();</a>
+<a name="ln902">  }</a>
+<a name="ln903"> </a>
+<a name="ln904">  return true;</a>
+<a name="ln905">}</a>
+<a name="ln906"> </a>
+<a name="ln907">bool Reactor::DrainTaskQueueAndCheckIfClosing() {</a>
+<a name="ln908">  CHECK(async_handler_tasks_.empty());</a>
+<a name="ln909"> </a>
+<a name="ln910">  std::lock_guard&lt;simple_spinlock&gt; lock(pending_tasks_mtx_);</a>
+<a name="ln911">  async_handler_tasks_.swap(pending_tasks_);</a>
+<a name="ln912">  return HasReactorStartedClosing(state_.load(std::memory_order_acquire));</a>
+<a name="ln913">}</a>
+<a name="ln914"> </a>
+<a name="ln915">// Task to call an arbitrary function within the reactor thread.</a>
+<a name="ln916">template&lt;class F&gt;</a>
+<a name="ln917">class RunFunctionTask : public ReactorTask {</a>
+<a name="ln918"> public:</a>
+<a name="ln919">  RunFunctionTask(const F&amp; f, const SourceLocation&amp; source_location)</a>
+<a name="ln920">      : ReactorTask(source_location), function_(f) {}</a>
+<a name="ln921"> </a>
+<a name="ln922">  void Run(Reactor *reactor) override {</a>
+<a name="ln923">    status_ = function_(reactor);</a>
+<a name="ln924">    latch_.CountDown();</a>
+<a name="ln925">  }</a>
+<a name="ln926"> </a>
+<a name="ln927">  // Wait until the function has completed, and return the Status returned by the function.</a>
+<a name="ln928">  Status Wait() {</a>
+<a name="ln929">    latch_.Wait();</a>
+<a name="ln930">    return status_;</a>
+<a name="ln931">  }</a>
+<a name="ln932"> </a>
+<a name="ln933"> private:</a>
+<a name="ln934">  void DoAbort(const Status &amp;status) override {</a>
+<a name="ln935">    status_ = status;</a>
+<a name="ln936">    latch_.CountDown();</a>
+<a name="ln937">  }</a>
+<a name="ln938"> </a>
+<a name="ln939">  F function_;</a>
+<a name="ln940">  Status status_;</a>
+<a name="ln941">  CountDownLatch latch_{1};</a>
+<a name="ln942">};</a>
+<a name="ln943"> </a>
+<a name="ln944">template&lt;class F&gt;</a>
+<a name="ln945">Status Reactor::RunOnReactorThread(const F&amp; f, const SourceLocation&amp; source_location) {</a>
+<a name="ln946">  auto task = std::make_shared&lt;RunFunctionTask&lt;F&gt;&gt;(f, source_location);</a>
+<a name="ln947">  if (!ScheduleReactorTask(task)) {</a>
+<a name="ln948">    return ServiceUnavailableError();</a>
+<a name="ln949">  }</a>
+<a name="ln950">  return task-&gt;Wait();</a>
+<a name="ln951">}</a>
+<a name="ln952"> </a>
+<a name="ln953">}  // namespace rpc</a>
+<a name="ln954">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="135"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="144"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="149"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="150"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="175"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="184"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="186"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="189"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="192"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="195"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="203"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="208"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="214"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="222"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="232"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="240"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="245"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="246"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="309"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="311"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="316"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="322"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="324"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="331"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="335"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="344"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="362"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="373"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="407"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="420"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="427"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="429"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="440"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="453"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="466"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="481"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="483"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="498"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="522"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="534"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="549"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="557"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="586"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="612"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="614"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="621"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="622"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="629"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="631"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="654"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="670"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="698"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="718"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="758"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="759"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="833"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="866"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="908"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

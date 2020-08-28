@@ -1,0 +1,999 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>memtable.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Copyright (c) 2011 The LevelDB Authors. All rights reserved.</a>
+<a name="ln21">// Use of this source code is governed by a BSD-style license that can be</a>
+<a name="ln22">// found in the LICENSE file. See the AUTHORS file for names of contributors.</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;yb/rocksdb/db/memtable.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;memory&gt;</a>
+<a name="ln27">#include &lt;algorithm&gt;</a>
+<a name="ln28">#include &lt;limits&gt;</a>
+<a name="ln29">#include &lt;sstream&gt;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &quot;yb/rocksdb/db/dbformat.h&quot;</a>
+<a name="ln32">#include &quot;yb/rocksdb/db/merge_context.h&quot;</a>
+<a name="ln33">#include &quot;yb/rocksdb/db/writebuffer.h&quot;</a>
+<a name="ln34">#include &quot;yb/rocksdb/comparator.h&quot;</a>
+<a name="ln35">#include &quot;yb/rocksdb/env.h&quot;</a>
+<a name="ln36">#include &quot;yb/rocksdb/iterator.h&quot;</a>
+<a name="ln37">#include &quot;yb/rocksdb/merge_operator.h&quot;</a>
+<a name="ln38">#include &quot;yb/rocksdb/slice_transform.h&quot;</a>
+<a name="ln39">#include &quot;yb/rocksdb/table/internal_iterator.h&quot;</a>
+<a name="ln40">#include &quot;yb/rocksdb/table/merger.h&quot;</a>
+<a name="ln41">#include &quot;yb/rocksdb/util/arena.h&quot;</a>
+<a name="ln42">#include &quot;yb/rocksdb/util/coding.h&quot;</a>
+<a name="ln43">#include &quot;yb/rocksdb/util/murmurhash.h&quot;</a>
+<a name="ln44">#include &quot;yb/rocksdb/util/mutexlock.h&quot;</a>
+<a name="ln45">#include &quot;yb/rocksdb/util/perf_context_imp.h&quot;</a>
+<a name="ln46">#include &quot;yb/rocksdb/util/statistics.h&quot;</a>
+<a name="ln47">#include &quot;yb/rocksdb/util/stop_watch.h&quot;</a>
+<a name="ln48"> </a>
+<a name="ln49">#include &quot;yb/gutil/macros.h&quot;</a>
+<a name="ln50"> </a>
+<a name="ln51">#include &quot;yb/util/mem_tracker.h&quot;</a>
+<a name="ln52"> </a>
+<a name="ln53">using std::ostringstream;</a>
+<a name="ln54"> </a>
+<a name="ln55">namespace rocksdb {</a>
+<a name="ln56"> </a>
+<a name="ln57">MemTableOptions::MemTableOptions(</a>
+<a name="ln58">    const ImmutableCFOptions&amp; ioptions,</a>
+<a name="ln59">    const MutableCFOptions&amp; mutable_cf_options)</a>
+<a name="ln60">  : write_buffer_size(mutable_cf_options.write_buffer_size),</a>
+<a name="ln61">    arena_block_size(mutable_cf_options.arena_block_size),</a>
+<a name="ln62">    memtable_prefix_bloom_bits(mutable_cf_options.memtable_prefix_bloom_bits),</a>
+<a name="ln63">    memtable_prefix_bloom_probes(</a>
+<a name="ln64">        mutable_cf_options.memtable_prefix_bloom_probes),</a>
+<a name="ln65">    memtable_prefix_bloom_huge_page_tlb_size(</a>
+<a name="ln66">        mutable_cf_options.memtable_prefix_bloom_huge_page_tlb_size),</a>
+<a name="ln67">    inplace_update_support(ioptions.inplace_update_support),</a>
+<a name="ln68">    inplace_update_num_locks(mutable_cf_options.inplace_update_num_locks),</a>
+<a name="ln69">    inplace_callback(ioptions.inplace_callback),</a>
+<a name="ln70">    max_successive_merges(mutable_cf_options.max_successive_merges),</a>
+<a name="ln71">    filter_deletes(mutable_cf_options.filter_deletes),</a>
+<a name="ln72">    statistics(ioptions.statistics),</a>
+<a name="ln73">    merge_operator(ioptions.merge_operator),</a>
+<a name="ln74">    info_log(ioptions.info_log) {</a>
+<a name="ln75">  if (ioptions.mem_tracker) {</a>
+<a name="ln76">    mem_tracker = yb::MemTracker::FindOrCreateTracker(&quot;MemTable&quot;, ioptions.mem_tracker);</a>
+<a name="ln77">  }</a>
+<a name="ln78">}</a>
+<a name="ln79"> </a>
+<a name="ln80">MemTable::MemTable(const InternalKeyComparator&amp; cmp,</a>
+<a name="ln81">                   const ImmutableCFOptions&amp; ioptions,</a>
+<a name="ln82">                   const MutableCFOptions&amp; mutable_cf_options,</a>
+<a name="ln83">                   WriteBuffer* write_buffer, SequenceNumber earliest_seq)</a>
+<a name="ln84">    : comparator_(cmp),</a>
+<a name="ln85">      moptions_(ioptions, mutable_cf_options),</a>
+<a name="ln86">      refs_(0),</a>
+<a name="ln87">      kArenaBlockSize(OptimizeBlockSize(moptions_.arena_block_size)),</a>
+<a name="ln88">      arena_(moptions_.arena_block_size, 0),</a>
+<a name="ln89">      allocator_(&amp;arena_, write_buffer),</a>
+<a name="ln90">      table_(ioptions.memtable_factory-&gt;CreateMemTableRep(</a>
+<a name="ln91">          comparator_, &amp;allocator_, ioptions.prefix_extractor,</a>
+<a name="ln92">          ioptions.info_log)),</a>
+<a name="ln93">      data_size_(0),</a>
+<a name="ln94">      num_entries_(0),</a>
+<a name="ln95">      num_deletes_(0),</a>
+<a name="ln96">      flush_in_progress_(false),</a>
+<a name="ln97">      flush_completed_(false),</a>
+<a name="ln98">      file_number_(0),</a>
+<a name="ln99">      first_seqno_(0),</a>
+<a name="ln100">      earliest_seqno_(earliest_seq),</a>
+<a name="ln101">      mem_next_logfile_number_(0),</a>
+<a name="ln102">      locks_(moptions_.inplace_update_support</a>
+<a name="ln103">                 ? moptions_.inplace_update_num_locks</a>
+<a name="ln104">                 : 0),</a>
+<a name="ln105">      prefix_extractor_(ioptions.prefix_extractor),</a>
+<a name="ln106">      flush_state_(FlushState::kNotRequested),</a>
+<a name="ln107">      env_(ioptions.env) {</a>
+<a name="ln108">  UpdateFlushState();</a>
+<a name="ln109">  // something went wrong if we need to flush before inserting anything</a>
+<a name="ln110">  assert(!ShouldScheduleFlush());</a>
+<a name="ln111"> </a>
+<a name="ln112">  if (prefix_extractor_ &amp;&amp; moptions_.memtable_prefix_bloom_bits &gt; 0) {</a>
+<a name="ln113">    prefix_bloom_.reset(new DynamicBloom(</a>
+<a name="ln114">        &amp;allocator_,</a>
+<a name="ln115">        moptions_.memtable_prefix_bloom_bits, ioptions.bloom_locality,</a>
+<a name="ln116">        moptions_.memtable_prefix_bloom_probes, nullptr,</a>
+<a name="ln117">        moptions_.memtable_prefix_bloom_huge_page_tlb_size,</a>
+<a name="ln118">        ioptions.info_log));</a>
+<a name="ln119">  }</a>
+<a name="ln120"> </a>
+<a name="ln121">  if (moptions_.mem_tracker) {</a>
+<a name="ln122">    arena_.SetMemTracker(moptions_.mem_tracker);</a>
+<a name="ln123">  }</a>
+<a name="ln124">}</a>
+<a name="ln125"> </a>
+<a name="ln126">MemTable::~MemTable() { DCHECK_EQ(refs_, 0); }</a>
+<a name="ln127"> </a>
+<a name="ln128">size_t MemTable::ApproximateMemoryUsage() {</a>
+<a name="ln129">  size_t arena_usage = arena_.ApproximateMemoryUsage();</a>
+<a name="ln130">  size_t table_usage = table_-&gt;ApproximateMemoryUsage();</a>
+<a name="ln131">  // let MAX_USAGE =  std::numeric_limits&lt;size_t&gt;::max()</a>
+<a name="ln132">  // then if arena_usage + total_usage &gt;= MAX_USAGE, return MAX_USAGE.</a>
+<a name="ln133">  // the following variation is to avoid numeric overflow.</a>
+<a name="ln134">  if (arena_usage &gt;= std::numeric_limits&lt;size_t&gt;::max() - table_usage) {</a>
+<a name="ln135">    return std::numeric_limits&lt;size_t&gt;::max();</a>
+<a name="ln136">  }</a>
+<a name="ln137">  // otherwise, return the actual usage</a>
+<a name="ln138">  return arena_usage + table_usage;</a>
+<a name="ln139">}</a>
+<a name="ln140"> </a>
+<a name="ln141">bool MemTable::ShouldFlushNow() const {</a>
+<a name="ln142">  // In a lot of times, we cannot allocate arena blocks that exactly matches the</a>
+<a name="ln143">  // buffer size. Thus we have to decide if we should over-allocate or</a>
+<a name="ln144">  // under-allocate.</a>
+<a name="ln145">  // This constant variable can be interpreted as: if we still have more than</a>
+<a name="ln146">  // &quot;kAllowOverAllocationRatio * kArenaBlockSize&quot; space left, we'd try to over</a>
+<a name="ln147">  // allocate one more block.</a>
+<a name="ln148">  const double kAllowOverAllocationRatio = 0.6;</a>
+<a name="ln149"> </a>
+<a name="ln150">  // If arena still have room for new block allocation, we can safely say it</a>
+<a name="ln151">  // shouldn't flush.</a>
+<a name="ln152">  auto allocated_memory =</a>
+<a name="ln153">      table_-&gt;ApproximateMemoryUsage() + arena_.MemoryAllocatedBytes();</a>
+<a name="ln154"> </a>
+<a name="ln155">  // if we can still allocate one more block without exceeding the</a>
+<a name="ln156">  // over-allocation ratio, then we should not flush.</a>
+<a name="ln157">  if (allocated_memory + kArenaBlockSize &lt;</a>
+<a name="ln158">      moptions_.write_buffer_size +</a>
+<a name="ln159">      kArenaBlockSize * kAllowOverAllocationRatio) {</a>
+<a name="ln160">    return false;</a>
+<a name="ln161">  }</a>
+<a name="ln162"> </a>
+<a name="ln163">  // if user keeps adding entries that exceeds moptions.write_buffer_size,</a>
+<a name="ln164">  // we need to flush earlier even though we still have much available</a>
+<a name="ln165">  // memory left.</a>
+<a name="ln166">  if (allocated_memory &gt; moptions_.write_buffer_size +</a>
+<a name="ln167">      kArenaBlockSize * kAllowOverAllocationRatio) {</a>
+<a name="ln168">    return true;</a>
+<a name="ln169">  }</a>
+<a name="ln170"> </a>
+<a name="ln171">  // In this code path, Arena has already allocated its &quot;last block&quot;, which</a>
+<a name="ln172">  // means the total allocatedmemory size is either:</a>
+<a name="ln173">  //  (1) &quot;moderately&quot; over allocated the memory (no more than `0.6 * arena</a>
+<a name="ln174">  // block size`. Or,</a>
+<a name="ln175">  //  (2) the allocated memory is less than write buffer size, but we'll stop</a>
+<a name="ln176">  // here since if we allocate a new arena block, we'll over allocate too much</a>
+<a name="ln177">  // more (half of the arena block size) memory.</a>
+<a name="ln178">  //</a>
+<a name="ln179">  // In either case, to avoid over-allocate, the last block will stop allocation</a>
+<a name="ln180">  // when its usage reaches a certain ratio, which we carefully choose &quot;0.75</a>
+<a name="ln181">  // full&quot; as the stop condition because it addresses the following issue with</a>
+<a name="ln182">  // great simplicity: What if the next inserted entry's size is</a>
+<a name="ln183">  // bigger than AllocatedAndUnused()?</a>
+<a name="ln184">  //</a>
+<a name="ln185">  // The answer is: if the entry size is also bigger than 0.25 *</a>
+<a name="ln186">  // kArenaBlockSize, a dedicated block will be allocated for it; otherwise</a>
+<a name="ln187">  // arena will anyway skip the AllocatedAndUnused() and allocate a new, empty</a>
+<a name="ln188">  // and regular block. In either case, we *overly* over-allocated.</a>
+<a name="ln189">  //</a>
+<a name="ln190">  // Therefore, setting the last block to be at most &quot;0.75 full&quot; avoids both</a>
+<a name="ln191">  // cases.</a>
+<a name="ln192">  //</a>
+<a name="ln193">  // NOTE: the average percentage of waste space of this approach can be counted</a>
+<a name="ln194">  // as: &quot;arena block size * 0.25 / write buffer size&quot;. User who specify a small</a>
+<a name="ln195">  // write buffer size and/or big arena block size may suffer.</a>
+<a name="ln196">  return arena_.AllocatedAndUnused() &lt; kArenaBlockSize / 4;</a>
+<a name="ln197">}</a>
+<a name="ln198"> </a>
+<a name="ln199">void MemTable::UpdateFlushState() {</a>
+<a name="ln200">  auto state = flush_state_.load(std::memory_order_relaxed);</a>
+<a name="ln201">  if (state == FlushState::kNotRequested &amp;&amp; ShouldFlushNow()) {</a>
+<a name="ln202">    // ignore CAS failure, because that means somebody else requested</a>
+<a name="ln203">    // a flush</a>
+<a name="ln204">    flush_state_.compare_exchange_strong(state, FlushState::kRequested,</a>
+<a name="ln205">                                         std::memory_order_relaxed,</a>
+<a name="ln206">                                         std::memory_order_relaxed);</a>
+<a name="ln207">  }</a>
+<a name="ln208">}</a>
+<a name="ln209"> </a>
+<a name="ln210">int MemTable::KeyComparator::operator()(const char* prefix_len_key1,</a>
+<a name="ln211">                                        const char* prefix_len_key2) const {</a>
+<a name="ln212">  // Internal keys are encoded as length-prefixed strings.</a>
+<a name="ln213">  Slice k1 = GetLengthPrefixedSlice(prefix_len_key1);</a>
+<a name="ln214">  Slice k2 = GetLengthPrefixedSlice(prefix_len_key2);</a>
+<a name="ln215">  return comparator.Compare(k1, k2);</a>
+<a name="ln216">}</a>
+<a name="ln217"> </a>
+<a name="ln218">int MemTable::KeyComparator::operator()(const char* prefix_len_key,</a>
+<a name="ln219">                                        const Slice&amp; key)</a>
+<a name="ln220">    const {</a>
+<a name="ln221">  // Internal keys are encoded as length-prefixed strings.</a>
+<a name="ln222">  Slice a = GetLengthPrefixedSlice(prefix_len_key);</a>
+<a name="ln223">  return comparator.Compare(a, key);</a>
+<a name="ln224">}</a>
+<a name="ln225"> </a>
+<a name="ln226">Slice MemTableRep::UserKey(const char* key) const {</a>
+<a name="ln227">  Slice slice = GetLengthPrefixedSlice(key);</a>
+<a name="ln228">  return Slice(slice.data(), slice.size() - 8);</a>
+<a name="ln229">}</a>
+<a name="ln230"> </a>
+<a name="ln231">KeyHandle MemTableRep::Allocate(const size_t len, char** buf) {</a>
+<a name="ln232">  *buf = allocator_-&gt;Allocate(len);</a>
+<a name="ln233">  return static_cast&lt;KeyHandle&gt;(*buf);</a>
+<a name="ln234">}</a>
+<a name="ln235"> </a>
+<a name="ln236">// Encode a suitable internal key target for &quot;target&quot; and return it.</a>
+<a name="ln237">// Uses *scratch as scratch space, and the returned pointer will point</a>
+<a name="ln238">// into this scratch space.</a>
+<a name="ln239">const char* EncodeKey(std::string* scratch, const Slice&amp; target) {</a>
+<a name="ln240">  scratch-&gt;clear();</a>
+<a name="ln241">  PutVarint32(scratch, static_cast&lt;uint32_t&gt;(target.size()));</a>
+<a name="ln242">  scratch-&gt;append(target.cdata(), target.size());</a>
+<a name="ln243">  return scratch-&gt;data();</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246">class MemTableIterator : public InternalIterator {</a>
+<a name="ln247"> public:</a>
+<a name="ln248">  MemTableIterator(</a>
+<a name="ln249">      const MemTable&amp; mem, const ReadOptions&amp; read_options, Arena* arena)</a>
+<a name="ln250">      : bloom_(nullptr),</a>
+<a name="ln251">        prefix_extractor_(mem.prefix_extractor_),</a>
+<a name="ln252">        valid_(false),</a>
+<a name="ln253">        arena_mode_(arena != nullptr) {</a>
+<a name="ln254">    if (prefix_extractor_ != nullptr &amp;&amp; !read_options.total_order_seek) {</a>
+<a name="ln255">      bloom_ = mem.prefix_bloom_.get();</a>
+<a name="ln256">      iter_ = mem.table_-&gt;GetDynamicPrefixIterator(arena);</a>
+<a name="ln257">    } else {</a>
+<a name="ln258">      iter_ = mem.table_-&gt;GetIterator(arena);</a>
+<a name="ln259">    }</a>
+<a name="ln260">  }</a>
+<a name="ln261"> </a>
+<a name="ln262">  ~MemTableIterator() {</a>
+<a name="ln263">    if (arena_mode_) {</a>
+<a name="ln264">      iter_-&gt;~Iterator();</a>
+<a name="ln265">    } else {</a>
+<a name="ln266">      delete iter_;</a>
+<a name="ln267">    }</a>
+<a name="ln268">  }</a>
+<a name="ln269"> </a>
+<a name="ln270">  bool Valid() const override { return valid_; }</a>
+<a name="ln271">  void Seek(const Slice&amp; k) override {</a>
+<a name="ln272">    PERF_TIMER_GUARD(seek_on_memtable_time);</a>
+<a name="ln273">    PERF_COUNTER_ADD(seek_on_memtable_count, 1);</a>
+<a name="ln274">    if (bloom_ != nullptr) {</a>
+<a name="ln275">      if (!bloom_-&gt;MayContain(</a>
+<a name="ln276">              prefix_extractor_-&gt;Transform(ExtractUserKey(k)))) {</a>
+<a name="ln277">        PERF_COUNTER_ADD(bloom_memtable_miss_count, 1);</a>
+<a name="ln278">        valid_ = false;</a>
+<a name="ln279">        return;</a>
+<a name="ln280">      } else {</a>
+<a name="ln281">        PERF_COUNTER_ADD(bloom_memtable_hit_count, 1);</a>
+<a name="ln282">      }</a>
+<a name="ln283">    }</a>
+<a name="ln284">    iter_-&gt;Seek(k, nullptr);</a>
+<a name="ln285">    valid_ = iter_-&gt;Valid();</a>
+<a name="ln286">  }</a>
+<a name="ln287">  void SeekToFirst() override {</a>
+<a name="ln288">    iter_-&gt;SeekToFirst();</a>
+<a name="ln289">    valid_ = iter_-&gt;Valid();</a>
+<a name="ln290">  }</a>
+<a name="ln291">  void SeekToLast() override {</a>
+<a name="ln292">    iter_-&gt;SeekToLast();</a>
+<a name="ln293">    valid_ = iter_-&gt;Valid();</a>
+<a name="ln294">  }</a>
+<a name="ln295">  void Next() override {</a>
+<a name="ln296">    assert(Valid());</a>
+<a name="ln297">    iter_-&gt;Next();</a>
+<a name="ln298">    valid_ = iter_-&gt;Valid();</a>
+<a name="ln299">  }</a>
+<a name="ln300">  void Prev() override {</a>
+<a name="ln301">    assert(Valid());</a>
+<a name="ln302">    iter_-&gt;Prev();</a>
+<a name="ln303">    valid_ = iter_-&gt;Valid();</a>
+<a name="ln304">  }</a>
+<a name="ln305">  Slice key() const override {</a>
+<a name="ln306">    assert(Valid());</a>
+<a name="ln307">    return GetLengthPrefixedSlice(iter_-&gt;key());</a>
+<a name="ln308">  }</a>
+<a name="ln309">  Slice value() const override {</a>
+<a name="ln310">    assert(Valid());</a>
+<a name="ln311">    Slice key_slice = GetLengthPrefixedSlice(iter_-&gt;key());</a>
+<a name="ln312">    return GetLengthPrefixedSlice(key_slice.cdata() + key_slice.size());</a>
+<a name="ln313">  }</a>
+<a name="ln314"> </a>
+<a name="ln315">  Status status() const override { return Status::OK(); }</a>
+<a name="ln316"> </a>
+<a name="ln317">  Status PinData() override {</a>
+<a name="ln318">    // memtable data is always pinned</a>
+<a name="ln319">    return Status::OK();</a>
+<a name="ln320">  }</a>
+<a name="ln321"> </a>
+<a name="ln322">  Status ReleasePinnedData() override {</a>
+<a name="ln323">    // memtable data is always pinned</a>
+<a name="ln324">    return Status::OK();</a>
+<a name="ln325">  }</a>
+<a name="ln326"> </a>
+<a name="ln327">  bool IsKeyPinned() const override {</a>
+<a name="ln328">    // memtable data is always pinned</a>
+<a name="ln329">    return true;</a>
+<a name="ln330">  }</a>
+<a name="ln331"> </a>
+<a name="ln332"> private:</a>
+<a name="ln333">  DynamicBloom* bloom_;</a>
+<a name="ln334">  const SliceTransform* const prefix_extractor_;</a>
+<a name="ln335">  MemTableRep::Iterator* iter_;</a>
+<a name="ln336">  bool valid_;</a>
+<a name="ln337">  bool arena_mode_;</a>
+<a name="ln338"> </a>
+<a name="ln339">  // No copying allowed</a>
+<a name="ln340">  MemTableIterator(const MemTableIterator&amp;);</a>
+<a name="ln341">  void operator=(const MemTableIterator&amp;);</a>
+<a name="ln342">};</a>
+<a name="ln343"> </a>
+<a name="ln344">InternalIterator* MemTable::NewIterator(const ReadOptions&amp; read_options,</a>
+<a name="ln345">                                        Arena* arena) {</a>
+<a name="ln346">  assert(arena != nullptr);</a>
+<a name="ln347">  auto mem = arena-&gt;AllocateAligned(sizeof(MemTableIterator));</a>
+<a name="ln348">  return new (mem) MemTableIterator(*this, read_options, arena);</a>
+<a name="ln349">}</a>
+<a name="ln350"> </a>
+<a name="ln351">port::RWMutex* MemTable::GetLock(const Slice&amp; key) {</a>
+<a name="ln352">  static murmur_hash hash;</a>
+<a name="ln353">  return &amp;locks_[hash(key) % locks_.size()];</a>
+<a name="ln354">}</a>
+<a name="ln355"> </a>
+<a name="ln356">std::string MemTable::ToString() const {</a>
+<a name="ln357">  ostringstream ss;</a>
+<a name="ln358">  auto* frontiers = Frontiers();</a>
+<a name="ln359">  ss &lt;&lt; &quot;MemTable {&quot;</a>
+<a name="ln360">     &lt;&lt; &quot; num_entries: &quot; &lt;&lt; num_entries()</a>
+<a name="ln361">     &lt;&lt; &quot; num_deletes: &quot; &lt;&lt; num_deletes()</a>
+<a name="ln362">     &lt;&lt; &quot; IsEmpty: &quot; &lt;&lt; IsEmpty()</a>
+<a name="ln363">     &lt;&lt; &quot; flush_state: &quot; &lt;&lt; flush_state_</a>
+<a name="ln364">     &lt;&lt; &quot; first_seqno: &quot; &lt;&lt; GetFirstSequenceNumber()</a>
+<a name="ln365">     &lt;&lt; &quot; eariest_seqno: &quot; &lt;&lt; GetEarliestSequenceNumber()</a>
+<a name="ln366">     &lt;&lt; &quot; frontiers: &quot;;</a>
+<a name="ln367">  if (frontiers) {</a>
+<a name="ln368">    ss &lt;&lt; frontiers-&gt;ToString();</a>
+<a name="ln369">  } else {</a>
+<a name="ln370">    ss &lt;&lt; &quot;N/A&quot;;</a>
+<a name="ln371">  }</a>
+<a name="ln372">  ss &lt;&lt; &quot; }&quot;;</a>
+<a name="ln373">  return ss.str();</a>
+<a name="ln374">}</a>
+<a name="ln375"> </a>
+<a name="ln376">uint64_t MemTable::ApproximateSize(const Slice&amp; start_ikey,</a>
+<a name="ln377">                                   const Slice&amp; end_ikey) {</a>
+<a name="ln378">  uint64_t entry_count = table_-&gt;ApproximateNumEntries(start_ikey, end_ikey);</a>
+<a name="ln379">  if (entry_count == 0) {</a>
+<a name="ln380">    return 0;</a>
+<a name="ln381">  }</a>
+<a name="ln382">  uint64_t n = num_entries_.load(std::memory_order_relaxed);</a>
+<a name="ln383">  if (n == 0) {</a>
+<a name="ln384">    return 0;</a>
+<a name="ln385">  }</a>
+<a name="ln386">  if (entry_count &gt; n) {</a>
+<a name="ln387">    // table_-&gt;ApproximateNumEntries() is just an estimate so it can be larger</a>
+<a name="ln388">    // than actual entries we have. Cap it to entries we have to limit the</a>
+<a name="ln389">    // inaccuracy.</a>
+<a name="ln390">    entry_count = n;</a>
+<a name="ln391">  }</a>
+<a name="ln392">  uint64_t data_size = data_size_.load(std::memory_order_relaxed);</a>
+<a name="ln393">  return entry_count * (data_size / n);</a>
+<a name="ln394">}</a>
+<a name="ln395"> </a>
+<a name="ln396">void MemTable::Add(SequenceNumber s, ValueType type,</a>
+<a name="ln397">                   const Slice&amp; key, /* user key */</a>
+<a name="ln398">                   const Slice&amp; value, bool allow_concurrent) {</a>
+<a name="ln399">  // Format of an entry is concatenation of:</a>
+<a name="ln400">  //  key_size     : varint32 of internal_key.size()</a>
+<a name="ln401">  //  key bytes    : char[internal_key.size()]</a>
+<a name="ln402">  //  value_size   : varint32 of value.size()</a>
+<a name="ln403">  //  value bytes  : char[value.size()]</a>
+<a name="ln404">  uint32_t key_size = static_cast&lt;uint32_t&gt;(key.size());</a>
+<a name="ln405">  uint32_t val_size = static_cast&lt;uint32_t&gt;(value.size());</a>
+<a name="ln406">  uint32_t internal_key_size = key_size + 8;</a>
+<a name="ln407">  const uint32_t encoded_len = VarintLength(internal_key_size) +</a>
+<a name="ln408">                               internal_key_size + VarintLength(val_size) +</a>
+<a name="ln409">                               val_size;</a>
+<a name="ln410">  char* buf = nullptr;</a>
+<a name="ln411">  KeyHandle handle = table_-&gt;Allocate(encoded_len, &amp;buf);</a>
+<a name="ln412"> </a>
+<a name="ln413">  char* p = EncodeVarint32(buf, internal_key_size);</a>
+<a name="ln414">  memcpy(p, key.data(), key_size);</a>
+<a name="ln415">  p += key_size;</a>
+<a name="ln416">  uint64_t packed = PackSequenceAndType(s, type);</a>
+<a name="ln417">  EncodeFixed64(p, packed);</a>
+<a name="ln418">  p += 8;</a>
+<a name="ln419">  p = EncodeVarint32(p, val_size);</a>
+<a name="ln420">  memcpy(p, value.data(), val_size);</a>
+<a name="ln421">  assert((unsigned)(p + val_size - buf) == (unsigned)encoded_len);</a>
+<a name="ln422">  if (!allow_concurrent) {</a>
+<a name="ln423">    table_-&gt;Insert(handle);</a>
+<a name="ln424"> </a>
+<a name="ln425">    // this is a bit ugly, but is the way to avoid locked instructions</a>
+<a name="ln426">    // when incrementing an atomic</a>
+<a name="ln427">    num_entries_.store(num_entries_.load(std::memory_order_relaxed) + 1,</a>
+<a name="ln428">                       std::memory_order_relaxed);</a>
+<a name="ln429">    data_size_.store(data_size_.load(std::memory_order_relaxed) + encoded_len,</a>
+<a name="ln430">                     std::memory_order_relaxed);</a>
+<a name="ln431">    if (type == kTypeDeletion) {</a>
+<a name="ln432">      num_deletes_.store(num_deletes_.load(std::memory_order_relaxed) + 1,</a>
+<a name="ln433">                         std::memory_order_relaxed);</a>
+<a name="ln434">    }</a>
+<a name="ln435"> </a>
+<a name="ln436">    if (prefix_bloom_) {</a>
+<a name="ln437">      assert(prefix_extractor_);</a>
+<a name="ln438">      prefix_bloom_-&gt;Add(prefix_extractor_-&gt;Transform(key));</a>
+<a name="ln439">    }</a>
+<a name="ln440"> </a>
+<a name="ln441">    // The first sequence number inserted into the memtable.</a>
+<a name="ln442">    // Multiple occurences of the same sequence number in the write batch are allowed</a>
+<a name="ln443">    // as long as they touch different keys.</a>
+<a name="ln444">    assert(first_seqno_ == 0 || s &gt;= first_seqno_);</a>
+<a name="ln445">    if (first_seqno_ == 0) {</a>
+<a name="ln446">      first_seqno_.store(s, std::memory_order_relaxed);</a>
+<a name="ln447"> </a>
+<a name="ln448">      if (earliest_seqno_ == kMaxSequenceNumber) {</a>
+<a name="ln449">        earliest_seqno_.store(GetFirstSequenceNumber(),</a>
+<a name="ln450">                              std::memory_order_relaxed);</a>
+<a name="ln451">      }</a>
+<a name="ln452">      DCHECK_GE(first_seqno_.load(), earliest_seqno_.load());</a>
+<a name="ln453">    }</a>
+<a name="ln454">  } else {</a>
+<a name="ln455">    table_-&gt;InsertConcurrently(handle);</a>
+<a name="ln456"> </a>
+<a name="ln457">    num_entries_.fetch_add(1, std::memory_order_relaxed);</a>
+<a name="ln458">    data_size_.fetch_add(encoded_len, std::memory_order_relaxed);</a>
+<a name="ln459">    if (type == kTypeDeletion) {</a>
+<a name="ln460">      num_deletes_.fetch_add(1, std::memory_order_relaxed);</a>
+<a name="ln461">    }</a>
+<a name="ln462"> </a>
+<a name="ln463">    if (prefix_bloom_) {</a>
+<a name="ln464">      assert(prefix_extractor_);</a>
+<a name="ln465">      prefix_bloom_-&gt;AddConcurrently(prefix_extractor_-&gt;Transform(key));</a>
+<a name="ln466">    }</a>
+<a name="ln467"> </a>
+<a name="ln468">    // atomically update first_seqno_ and earliest_seqno_.</a>
+<a name="ln469">    uint64_t cur_seq_num = first_seqno_.load(std::memory_order_relaxed);</a>
+<a name="ln470">    while ((cur_seq_num == 0 || s &lt; cur_seq_num) &amp;&amp;</a>
+<a name="ln471">           !first_seqno_.compare_exchange_weak(cur_seq_num, s)) {</a>
+<a name="ln472">    }</a>
+<a name="ln473">    uint64_t cur_earliest_seqno =</a>
+<a name="ln474">        earliest_seqno_.load(std::memory_order_relaxed);</a>
+<a name="ln475">    while (</a>
+<a name="ln476">        (cur_earliest_seqno == kMaxSequenceNumber || s &lt; cur_earliest_seqno) &amp;&amp;</a>
+<a name="ln477">        !first_seqno_.compare_exchange_weak(cur_earliest_seqno, s)) {</a>
+<a name="ln478">    }</a>
+<a name="ln479">  }</a>
+<a name="ln480"> </a>
+<a name="ln481">  UpdateFlushState();</a>
+<a name="ln482">}</a>
+<a name="ln483"> </a>
+<a name="ln484">// This comparator is used for deciding whether to erase a found key from a memtable instead of</a>
+<a name="ln485">// writing a deletion mark. This is exactly what we need for erasing records in memory</a>
+<a name="ln486">// (without writing new deletion marks). It expects a special key consisting of the user key being</a>
+<a name="ln487">// erased followed by 8 0xff bytes as the first argument, and a key from a memtable as the second</a>
+<a name="ln488">// argument (with the usual user_key + value_type + seqno format).</a>
+<a name="ln489">// It returns zero if the user key parts of both arguments match and the second argument's value</a>
+<a name="ln490">// type is not a deletion.</a>
+<a name="ln491">//</a>
+<a name="ln492">// Note: this comparator's return value cannot be used to establish order,</a>
+<a name="ln493">// only to test for &quot;equality&quot; as defined above.</a>
+<a name="ln494">class EraseHelperKeyComparator : public MemTableRep::KeyComparator {</a>
+<a name="ln495"> public:</a>
+<a name="ln496">  explicit EraseHelperKeyComparator(const Comparator* user_comparator, bool* had_delete)</a>
+<a name="ln497">      : user_comparator_(user_comparator), had_delete_(had_delete) {}</a>
+<a name="ln498"> </a>
+<a name="ln499">  int operator()(const char* prefix_len_key1, const char* prefix_len_key2) const override {</a>
+<a name="ln500">    // Internal keys are encoded as length-prefixed strings.</a>
+<a name="ln501">    Slice k1 = GetLengthPrefixedSlice(prefix_len_key1);</a>
+<a name="ln502">    Slice k2 = GetLengthPrefixedSlice(prefix_len_key2);</a>
+<a name="ln503">    return Compare(k1, k2);</a>
+<a name="ln504">  }</a>
+<a name="ln505"> </a>
+<a name="ln506">  int operator()(const char* prefix_len_key, const Slice&amp; key) const override {</a>
+<a name="ln507">    // Internal keys are encoded as length-prefixed strings.</a>
+<a name="ln508">    Slice a = GetLengthPrefixedSlice(prefix_len_key);</a>
+<a name="ln509">    return Compare(a, key);</a>
+<a name="ln510">  }</a>
+<a name="ln511"> </a>
+<a name="ln512">  int Compare(const Slice&amp; a, const Slice&amp; b) const {</a>
+<a name="ln513">    auto user_b = ExtractUserKey(b);</a>
+<a name="ln514">    auto result = user_comparator_-&gt;Compare(ExtractUserKey(a), user_b);</a>
+<a name="ln515">    if (result == 0) {</a>
+<a name="ln516">      // This comparator is used only to check whether we should delete the entry we found.</a>
+<a name="ln517">      // So any non zero result should satisfy our needs.</a>
+<a name="ln518">      // `b` is a value stored in mem table, so we check only it.</a>
+<a name="ln519">      // `a` is key that we created for erase and user key is always followed by eight 0xff.</a>
+<a name="ln520">      auto value_type = static_cast&lt;ValueType&gt;(b[user_b.size()]);</a>
+<a name="ln521">      DCHECK_LE(value_type, ValueType::kTypeColumnFamilySingleDeletion);</a>
+<a name="ln522">      if (value_type == ValueType::kTypeSingleDeletion ||</a>
+<a name="ln523">          value_type == ValueType::kTypeColumnFamilySingleDeletion) {</a>
+<a name="ln524">        *had_delete_ = true;</a>
+<a name="ln525">        return -1;</a>
+<a name="ln526">      }</a>
+<a name="ln527">    }</a>
+<a name="ln528">    return result;</a>
+<a name="ln529">  }</a>
+<a name="ln530"> </a>
+<a name="ln531"> private:</a>
+<a name="ln532">  const Comparator* user_comparator_;</a>
+<a name="ln533">  bool* had_delete_;</a>
+<a name="ln534">};</a>
+<a name="ln535"> </a>
+<a name="ln536">bool MemTable::Erase(const Slice&amp; user_key) {</a>
+<a name="ln537">  uint32_t user_key_size = static_cast&lt;uint32_t&gt;(user_key.size());</a>
+<a name="ln538">  uint32_t internal_key_size = user_key_size + 8;</a>
+<a name="ln539">  const uint32_t encoded_len = VarintLength(internal_key_size) + internal_key_size;</a>
+<a name="ln540"> </a>
+<a name="ln541">  if (erase_key_buffer_.size() &lt; encoded_len) {</a>
+<a name="ln542">    erase_key_buffer_.resize(encoded_len);</a>
+<a name="ln543">  }</a>
+<a name="ln544">  char* buf = erase_key_buffer_.data();</a>
+<a name="ln545">  char* p = EncodeVarint32(buf, internal_key_size);</a>
+<a name="ln546">  memcpy(p, user_key.data(), user_key_size);</a>
+<a name="ln547">  p += user_key_size;</a>
+<a name="ln548">  // Fill key tail with 0xffffffffffffffff so it we be less than actual user key.</a>
+<a name="ln549">  // Please note descending order is used for key tail.</a>
+<a name="ln550">  EncodeFixed64(p, -1LL);</a>
+<a name="ln551">  bool had_delete = false;</a>
+<a name="ln552">  EraseHelperKeyComparator only_user_key_comparator(</a>
+<a name="ln553">      comparator_.comparator.user_comparator(), &amp;had_delete);</a>
+<a name="ln554">  if (table_-&gt;Erase(buf, only_user_key_comparator)) {</a>
+<a name="ln555">    // this is a bit ugly, but is the way to avoid locked instructions</a>
+<a name="ln556">    // when incrementing an atomic</a>
+<a name="ln557">    num_erased_.store(num_erased_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);</a>
+<a name="ln558"> </a>
+<a name="ln559">    UpdateFlushState();</a>
+<a name="ln560">    return true;</a>
+<a name="ln561">  } else if (had_delete) { // Do nothing in case when we already had delete.</a>
+<a name="ln562">    return true;</a>
+<a name="ln563">  }</a>
+<a name="ln564"> </a>
+<a name="ln565">  return false;</a>
+<a name="ln566">}</a>
+<a name="ln567"> </a>
+<a name="ln568">// Callback from MemTable::Get()</a>
+<a name="ln569">namespace {</a>
+<a name="ln570"> </a>
+<a name="ln571">struct Saver {</a>
+<a name="ln572">  Status* status;</a>
+<a name="ln573">  const LookupKey* key;</a>
+<a name="ln574">  bool* found_final_value;  // Is value set correctly? Used by KeyMayExist</a>
+<a name="ln575">  bool* merge_in_progress;</a>
+<a name="ln576">  std::string* value;</a>
+<a name="ln577">  SequenceNumber seq;</a>
+<a name="ln578">  const MergeOperator* merge_operator;</a>
+<a name="ln579">  // the merge operations encountered;</a>
+<a name="ln580">  MergeContext* merge_context;</a>
+<a name="ln581">  MemTable* mem;</a>
+<a name="ln582">  Logger* logger;</a>
+<a name="ln583">  Statistics* statistics;</a>
+<a name="ln584">  bool inplace_update_support;</a>
+<a name="ln585">  Env* env_;</a>
+<a name="ln586">};</a>
+<a name="ln587">}  // namespace</a>
+<a name="ln588"> </a>
+<a name="ln589">static bool SaveValue(void* arg, const char* entry) {</a>
+<a name="ln590">  Saver* s = reinterpret_cast&lt;Saver*&gt;(arg);</a>
+<a name="ln591">  MergeContext* merge_context = s-&gt;merge_context;</a>
+<a name="ln592">  const MergeOperator* merge_operator = s-&gt;merge_operator;</a>
+<a name="ln593"> </a>
+<a name="ln594">  assert(s != nullptr &amp;&amp; merge_context != nullptr);</a>
+<a name="ln595"> </a>
+<a name="ln596">  // entry format is:</a>
+<a name="ln597">  //    klength  varint32</a>
+<a name="ln598">  //    userkey  char[klength-8]</a>
+<a name="ln599">  //    tag      uint64</a>
+<a name="ln600">  //    vlength  varint32</a>
+<a name="ln601">  //    value    char[vlength]</a>
+<a name="ln602">  // Check that it belongs to same user key.  We do not check the</a>
+<a name="ln603">  // sequence number since the Seek() call above should have skipped</a>
+<a name="ln604">  // all entries with overly large sequence numbers.</a>
+<a name="ln605">  uint32_t key_length;</a>
+<a name="ln606">  const char* key_ptr = GetVarint32Ptr(entry, entry + 5, &amp;key_length);</a>
+<a name="ln607">  if (s-&gt;mem-&gt;GetInternalKeyComparator().user_comparator()-&gt;Equal(</a>
+<a name="ln608">          Slice(key_ptr, key_length - 8), s-&gt;key-&gt;user_key())) {</a>
+<a name="ln609">    // Correct user key</a>
+<a name="ln610">    const uint64_t tag = DecodeFixed64(key_ptr + key_length - 8);</a>
+<a name="ln611">    ValueType type;</a>
+<a name="ln612">    UnPackSequenceAndType(tag, &amp;s-&gt;seq, &amp;type);</a>
+<a name="ln613"> </a>
+<a name="ln614">    switch (type) {</a>
+<a name="ln615">      case kTypeValue: {</a>
+<a name="ln616">        if (s-&gt;inplace_update_support) {</a>
+<a name="ln617">          s-&gt;mem-&gt;GetLock(s-&gt;key-&gt;user_key())-&gt;ReadLock();</a>
+<a name="ln618">        }</a>
+<a name="ln619">        Slice v = GetLengthPrefixedSlice(key_ptr + key_length);</a>
+<a name="ln620">        *(s-&gt;status) = Status::OK();</a>
+<a name="ln621">        if (*(s-&gt;merge_in_progress)) {</a>
+<a name="ln622">          assert(merge_operator);</a>
+<a name="ln623">          bool merge_success = false;</a>
+<a name="ln624">          {</a>
+<a name="ln625">            StopWatchNano timer(s-&gt;env_, s-&gt;statistics != nullptr);</a>
+<a name="ln626">            PERF_TIMER_GUARD(merge_operator_time_nanos);</a>
+<a name="ln627">            merge_success = merge_operator-&gt;FullMerge(</a>
+<a name="ln628">                s-&gt;key-&gt;user_key(), &amp;v, merge_context-&gt;GetOperands(), s-&gt;value,</a>
+<a name="ln629">                s-&gt;logger);</a>
+<a name="ln630">            RecordTick(s-&gt;statistics, MERGE_OPERATION_TOTAL_TIME,</a>
+<a name="ln631">                       timer.ElapsedNanos());</a>
+<a name="ln632">          }</a>
+<a name="ln633">          if (!merge_success) {</a>
+<a name="ln634">            RecordTick(s-&gt;statistics, NUMBER_MERGE_FAILURES);</a>
+<a name="ln635">            *(s-&gt;status) =</a>
+<a name="ln636">                STATUS(Corruption, &quot;Error: Could not perform merge.&quot;);</a>
+<a name="ln637">          }</a>
+<a name="ln638">        } else if (s-&gt;value != nullptr) {</a>
+<a name="ln639">          s-&gt;value-&gt;assign(v.cdata(), v.size());</a>
+<a name="ln640">        }</a>
+<a name="ln641">        if (s-&gt;inplace_update_support) {</a>
+<a name="ln642">          s-&gt;mem-&gt;GetLock(s-&gt;key-&gt;user_key())-&gt;ReadUnlock();</a>
+<a name="ln643">        }</a>
+<a name="ln644">        *(s-&gt;found_final_value) = true;</a>
+<a name="ln645">        return false;</a>
+<a name="ln646">      }</a>
+<a name="ln647">      case kTypeDeletion:</a>
+<a name="ln648">      case kTypeSingleDeletion: {</a>
+<a name="ln649">        if (*(s-&gt;merge_in_progress)) {</a>
+<a name="ln650">          assert(merge_operator != nullptr);</a>
+<a name="ln651">          *(s-&gt;status) = Status::OK();</a>
+<a name="ln652">          bool merge_success = false;</a>
+<a name="ln653">          {</a>
+<a name="ln654">            StopWatchNano timer(s-&gt;env_, s-&gt;statistics != nullptr);</a>
+<a name="ln655">            PERF_TIMER_GUARD(merge_operator_time_nanos);</a>
+<a name="ln656">            merge_success = merge_operator-&gt;FullMerge(</a>
+<a name="ln657">                s-&gt;key-&gt;user_key(), nullptr, merge_context-&gt;GetOperands(),</a>
+<a name="ln658">                s-&gt;value, s-&gt;logger);</a>
+<a name="ln659">            RecordTick(s-&gt;statistics, MERGE_OPERATION_TOTAL_TIME,</a>
+<a name="ln660">                       timer.ElapsedNanos());</a>
+<a name="ln661">          }</a>
+<a name="ln662">          if (!merge_success) {</a>
+<a name="ln663">            RecordTick(s-&gt;statistics, NUMBER_MERGE_FAILURES);</a>
+<a name="ln664">            *(s-&gt;status) =</a>
+<a name="ln665">                STATUS(Corruption, &quot;Error: Could not perform merge.&quot;);</a>
+<a name="ln666">          }</a>
+<a name="ln667">        } else {</a>
+<a name="ln668">          *(s-&gt;status) = STATUS(NotFound, &quot;&quot;);</a>
+<a name="ln669">        }</a>
+<a name="ln670">        *(s-&gt;found_final_value) = true;</a>
+<a name="ln671">        return false;</a>
+<a name="ln672">      }</a>
+<a name="ln673">      case kTypeMerge: {</a>
+<a name="ln674">        if (!merge_operator) {</a>
+<a name="ln675">          *(s-&gt;status) = STATUS(InvalidArgument,</a>
+<a name="ln676">              &quot;merge_operator is not properly initialized.&quot;);</a>
+<a name="ln677">          // Normally we continue the loop (return true) when we see a merge</a>
+<a name="ln678">          // operand.  But in case of an error, we should stop the loop</a>
+<a name="ln679">          // immediately and pretend we have found the value to stop further</a>
+<a name="ln680">          // seek.  Otherwise, the later call will override this error status.</a>
+<a name="ln681">          *(s-&gt;found_final_value) = true;</a>
+<a name="ln682">          return false;</a>
+<a name="ln683">        }</a>
+<a name="ln684">        Slice v = GetLengthPrefixedSlice(key_ptr + key_length);</a>
+<a name="ln685">        *(s-&gt;merge_in_progress) = true;</a>
+<a name="ln686">        merge_context-&gt;PushOperand(v);</a>
+<a name="ln687">        return true;</a>
+<a name="ln688">      }</a>
+<a name="ln689">      default:</a>
+<a name="ln690">        assert(false);</a>
+<a name="ln691">        return true;</a>
+<a name="ln692">    }</a>
+<a name="ln693">  }</a>
+<a name="ln694"> </a>
+<a name="ln695">  // s-&gt;state could be Corrupt, merge or notfound</a>
+<a name="ln696">  return false;</a>
+<a name="ln697">}</a>
+<a name="ln698"> </a>
+<a name="ln699">bool MemTable::Get(const LookupKey&amp; key, std::string* value, Status* s,</a>
+<a name="ln700">                   MergeContext* merge_context, SequenceNumber* seq) {</a>
+<a name="ln701">  // The sequence number is updated synchronously in version_set.h</a>
+<a name="ln702">  if (IsEmpty()) {</a>
+<a name="ln703">    // Avoiding recording stats for speed.</a>
+<a name="ln704">    return false;</a>
+<a name="ln705">  }</a>
+<a name="ln706">  PERF_TIMER_GUARD(get_from_memtable_time);</a>
+<a name="ln707"> </a>
+<a name="ln708">  Slice user_key = key.user_key();</a>
+<a name="ln709">  bool found_final_value = false;</a>
+<a name="ln710">  bool merge_in_progress = s-&gt;IsMergeInProgress();</a>
+<a name="ln711">  bool const may_contain =</a>
+<a name="ln712">      nullptr == prefix_bloom_</a>
+<a name="ln713">          ? false</a>
+<a name="ln714">          : prefix_bloom_-&gt;MayContain(prefix_extractor_-&gt;Transform(user_key));</a>
+<a name="ln715">  if (prefix_bloom_ &amp;&amp; !may_contain) {</a>
+<a name="ln716">    // iter is null if prefix bloom says the key does not exist</a>
+<a name="ln717">    PERF_COUNTER_ADD(bloom_memtable_miss_count, 1);</a>
+<a name="ln718">    *seq = kMaxSequenceNumber;</a>
+<a name="ln719">  } else {</a>
+<a name="ln720">    if (prefix_bloom_) {</a>
+<a name="ln721">      PERF_COUNTER_ADD(bloom_memtable_hit_count, 1);</a>
+<a name="ln722">    }</a>
+<a name="ln723">    Saver saver;</a>
+<a name="ln724">    saver.status = s;</a>
+<a name="ln725">    saver.found_final_value = &amp;found_final_value;</a>
+<a name="ln726">    saver.merge_in_progress = &amp;merge_in_progress;</a>
+<a name="ln727">    saver.key = &amp;key;</a>
+<a name="ln728">    saver.value = value;</a>
+<a name="ln729">    saver.seq = kMaxSequenceNumber;</a>
+<a name="ln730">    saver.mem = this;</a>
+<a name="ln731">    saver.merge_context = merge_context;</a>
+<a name="ln732">    saver.merge_operator = moptions_.merge_operator;</a>
+<a name="ln733">    saver.logger = moptions_.info_log;</a>
+<a name="ln734">    saver.inplace_update_support = moptions_.inplace_update_support;</a>
+<a name="ln735">    saver.statistics = moptions_.statistics;</a>
+<a name="ln736">    saver.env_ = env_;</a>
+<a name="ln737">    table_-&gt;Get(key, &amp;saver, SaveValue);</a>
+<a name="ln738"> </a>
+<a name="ln739">    *seq = saver.seq;</a>
+<a name="ln740">  }</a>
+<a name="ln741"> </a>
+<a name="ln742">  // No change to value, since we have not yet found a Put/Delete</a>
+<a name="ln743">  if (!found_final_value &amp;&amp; merge_in_progress) {</a>
+<a name="ln744">    *s = STATUS(MergeInProgress, &quot;&quot;);</a>
+<a name="ln745">  }</a>
+<a name="ln746">  PERF_COUNTER_ADD(get_from_memtable_count, 1);</a>
+<a name="ln747">  return found_final_value;</a>
+<a name="ln748">}</a>
+<a name="ln749"> </a>
+<a name="ln750">void MemTable::Update(SequenceNumber seq,</a>
+<a name="ln751">                      const Slice&amp; key,</a>
+<a name="ln752">                      const Slice&amp; value) {</a>
+<a name="ln753">  LookupKey lkey(key, seq);</a>
+<a name="ln754">  Slice mem_key = lkey.memtable_key();</a>
+<a name="ln755"> </a>
+<a name="ln756">  std::unique_ptr&lt;MemTableRep::Iterator&gt; iter(</a>
+<a name="ln757">      table_-&gt;GetDynamicPrefixIterator());</a>
+<a name="ln758">  iter-&gt;Seek(lkey.internal_key(), mem_key.cdata());</a>
+<a name="ln759"> </a>
+<a name="ln760">  if (iter-&gt;Valid()) {</a>
+<a name="ln761">    // entry format is:</a>
+<a name="ln762">    //    key_length  varint32</a>
+<a name="ln763">    //    userkey  char[klength-8]</a>
+<a name="ln764">    //    tag      uint64</a>
+<a name="ln765">    //    vlength  varint32</a>
+<a name="ln766">    //    value    char[vlength]</a>
+<a name="ln767">    // Check that it belongs to same user key.  We do not check the</a>
+<a name="ln768">    // sequence number since the Seek() call above should have skipped</a>
+<a name="ln769">    // all entries with overly large sequence numbers.</a>
+<a name="ln770">    const char* entry = iter-&gt;key();</a>
+<a name="ln771">    uint32_t key_length = 0;</a>
+<a name="ln772">    const char* key_ptr = GetVarint32Ptr(entry, entry + 5, &amp;key_length);</a>
+<a name="ln773">    if (comparator_.comparator.user_comparator()-&gt;Equal(</a>
+<a name="ln774">            Slice(key_ptr, key_length - 8), lkey.user_key())) {</a>
+<a name="ln775">      // Correct user key</a>
+<a name="ln776">      const uint64_t tag = DecodeFixed64(key_ptr + key_length - 8);</a>
+<a name="ln777">      ValueType type;</a>
+<a name="ln778">      SequenceNumber unused;</a>
+<a name="ln779">      UnPackSequenceAndType(tag, &amp;unused, &amp;type);</a>
+<a name="ln780">      switch (type) {</a>
+<a name="ln781">        case kTypeValue: {</a>
+<a name="ln782">          Slice prev_value = GetLengthPrefixedSlice(key_ptr + key_length);</a>
+<a name="ln783">          uint32_t prev_size = static_cast&lt;uint32_t&gt;(prev_value.size());</a>
+<a name="ln784">          uint32_t new_size = static_cast&lt;uint32_t&gt;(value.size());</a>
+<a name="ln785"> </a>
+<a name="ln786">          // Update value, if new value size  &lt;= previous value size</a>
+<a name="ln787">          if (new_size &lt;= prev_size ) {</a>
+<a name="ln788">            char* p = EncodeVarint32(const_cast&lt;char*&gt;(key_ptr) + key_length,</a>
+<a name="ln789">                                     new_size);</a>
+<a name="ln790">            WriteLock wl(GetLock(lkey.user_key()));</a>
+<a name="ln791">            memcpy(p, value.data(), value.size());</a>
+<a name="ln792">            assert((unsigned)((p + value.size()) - entry) ==</a>
+<a name="ln793">                   (unsigned)(VarintLength(key_length) + key_length +</a>
+<a name="ln794">                              VarintLength(value.size()) + value.size()));</a>
+<a name="ln795">            return;</a>
+<a name="ln796">          }</a>
+<a name="ln797">          // TODO (YugaByte): verify this is not a bug. The behavior for kTypeValue in case there</a>
+<a name="ln798">          // is not enough room for an in-place update, .</a>
+<a name="ln799">          FALLTHROUGH_INTENDED;</a>
+<a name="ln800">        }</a>
+<a name="ln801">        default:</a>
+<a name="ln802">          // If the latest value is kTypeDeletion, kTypeMerge or kTypeLogData</a>
+<a name="ln803">          // we don't have enough space for update inplace</a>
+<a name="ln804">            Add(seq, kTypeValue, key, value);</a>
+<a name="ln805">            return;</a>
+<a name="ln806">      }</a>
+<a name="ln807">    }</a>
+<a name="ln808">  }</a>
+<a name="ln809"> </a>
+<a name="ln810">  // key doesn't exist</a>
+<a name="ln811">  Add(seq, kTypeValue, key, value);</a>
+<a name="ln812">}</a>
+<a name="ln813"> </a>
+<a name="ln814">bool MemTable::UpdateCallback(SequenceNumber seq,</a>
+<a name="ln815">                              const Slice&amp; key,</a>
+<a name="ln816">                              const Slice&amp; delta) {</a>
+<a name="ln817">  LookupKey lkey(key, seq);</a>
+<a name="ln818">  Slice memkey = lkey.memtable_key();</a>
+<a name="ln819"> </a>
+<a name="ln820">  std::unique_ptr&lt;MemTableRep::Iterator&gt; iter(</a>
+<a name="ln821">      table_-&gt;GetDynamicPrefixIterator());</a>
+<a name="ln822">  iter-&gt;Seek(lkey.internal_key(), memkey.cdata());</a>
+<a name="ln823"> </a>
+<a name="ln824">  if (iter-&gt;Valid()) {</a>
+<a name="ln825">    // entry format is:</a>
+<a name="ln826">    //    key_length  varint32</a>
+<a name="ln827">    //    userkey  char[klength-8]</a>
+<a name="ln828">    //    tag      uint64</a>
+<a name="ln829">    //    vlength  varint32</a>
+<a name="ln830">    //    value    char[vlength]</a>
+<a name="ln831">    // Check that it belongs to same user key.  We do not check the</a>
+<a name="ln832">    // sequence number since the Seek() call above should have skipped</a>
+<a name="ln833">    // all entries with overly large sequence numbers.</a>
+<a name="ln834">    const char* entry = iter-&gt;key();</a>
+<a name="ln835">    uint32_t key_length = 0;</a>
+<a name="ln836">    const char* key_ptr = GetVarint32Ptr(entry, entry + 5, &amp;key_length);</a>
+<a name="ln837">    if (comparator_.comparator.user_comparator()-&gt;Equal(</a>
+<a name="ln838">            Slice(key_ptr, key_length - 8), lkey.user_key())) {</a>
+<a name="ln839">      // Correct user key</a>
+<a name="ln840">      const uint64_t tag = DecodeFixed64(key_ptr + key_length - 8);</a>
+<a name="ln841">      ValueType type;</a>
+<a name="ln842">      uint64_t unused;</a>
+<a name="ln843">      UnPackSequenceAndType(tag, &amp;unused, &amp;type);</a>
+<a name="ln844">      switch (type) {</a>
+<a name="ln845">        case kTypeValue: {</a>
+<a name="ln846">          Slice prev_value = GetLengthPrefixedSlice(key_ptr + key_length);</a>
+<a name="ln847">          uint32_t prev_size = static_cast&lt;uint32_t&gt;(prev_value.size());</a>
+<a name="ln848"> </a>
+<a name="ln849">          char* prev_buffer = const_cast&lt;char*&gt;(prev_value.cdata());</a>
+<a name="ln850">          uint32_t new_prev_size = prev_size;</a>
+<a name="ln851"> </a>
+<a name="ln852">          std::string str_value;</a>
+<a name="ln853">          WriteLock wl(GetLock(lkey.user_key()));</a>
+<a name="ln854">          auto status = moptions_.inplace_callback(prev_buffer, &amp;new_prev_size,</a>
+<a name="ln855">                                                   delta, &amp;str_value);</a>
+<a name="ln856">          if (status == UpdateStatus::UPDATED_INPLACE) {</a>
+<a name="ln857">            // Value already updated by callback.</a>
+<a name="ln858">            assert(new_prev_size &lt;= prev_size);</a>
+<a name="ln859">            if (new_prev_size &lt; prev_size) {</a>
+<a name="ln860">              // overwrite the new prev_size</a>
+<a name="ln861">              char* p = EncodeVarint32(const_cast&lt;char*&gt;(key_ptr) + key_length,</a>
+<a name="ln862">                                       new_prev_size);</a>
+<a name="ln863">              if (VarintLength(new_prev_size) &lt; VarintLength(prev_size)) {</a>
+<a name="ln864">                // shift the value buffer as well.</a>
+<a name="ln865">                memcpy(p, prev_buffer, new_prev_size);</a>
+<a name="ln866">              }</a>
+<a name="ln867">            }</a>
+<a name="ln868">            RecordTick(moptions_.statistics, NUMBER_KEYS_UPDATED);</a>
+<a name="ln869">            UpdateFlushState();</a>
+<a name="ln870">            return true;</a>
+<a name="ln871">          } else if (status == UpdateStatus::UPDATED) {</a>
+<a name="ln872">            Add(seq, kTypeValue, key, Slice(str_value));</a>
+<a name="ln873">            RecordTick(moptions_.statistics, NUMBER_KEYS_WRITTEN);</a>
+<a name="ln874">            UpdateFlushState();</a>
+<a name="ln875">            return true;</a>
+<a name="ln876">          } else if (status == UpdateStatus::UPDATE_FAILED) {</a>
+<a name="ln877">            // No action required. Return.</a>
+<a name="ln878">            UpdateFlushState();</a>
+<a name="ln879">            return true;</a>
+<a name="ln880">          }</a>
+<a name="ln881">          FALLTHROUGH_INTENDED;</a>
+<a name="ln882">        }</a>
+<a name="ln883">        default:</a>
+<a name="ln884">          break;</a>
+<a name="ln885">      }</a>
+<a name="ln886">    }</a>
+<a name="ln887">  }</a>
+<a name="ln888">  // If the latest value is not kTypeValue</a>
+<a name="ln889">  // or key doesn't exist</a>
+<a name="ln890">  return false;</a>
+<a name="ln891">}</a>
+<a name="ln892"> </a>
+<a name="ln893">size_t MemTable::CountSuccessiveMergeEntries(const LookupKey&amp; key) {</a>
+<a name="ln894">  Slice memkey = key.memtable_key();</a>
+<a name="ln895"> </a>
+<a name="ln896">  // A total ordered iterator is costly for some memtablerep (prefix aware</a>
+<a name="ln897">  // reps). By passing in the user key, we allow efficient iterator creation.</a>
+<a name="ln898">  // The iterator only needs to be ordered within the same user key.</a>
+<a name="ln899">  std::unique_ptr&lt;MemTableRep::Iterator&gt; iter(</a>
+<a name="ln900">      table_-&gt;GetDynamicPrefixIterator());</a>
+<a name="ln901">  iter-&gt;Seek(key.internal_key(), memkey.cdata());</a>
+<a name="ln902"> </a>
+<a name="ln903">  size_t num_successive_merges = 0;</a>
+<a name="ln904"> </a>
+<a name="ln905">  for (; iter-&gt;Valid(); iter-&gt;Next()) {</a>
+<a name="ln906">    const char* entry = iter-&gt;key();</a>
+<a name="ln907">    uint32_t key_length = 0;</a>
+<a name="ln908">    const char* iter_key_ptr = GetVarint32Ptr(entry, entry + 5, &amp;key_length);</a>
+<a name="ln909">    if (!comparator_.comparator.user_comparator()-&gt;Equal(</a>
+<a name="ln910">            Slice(iter_key_ptr, key_length - 8), key.user_key())) {</a>
+<a name="ln911">      break;</a>
+<a name="ln912">    }</a>
+<a name="ln913"> </a>
+<a name="ln914">    const uint64_t tag = DecodeFixed64(iter_key_ptr + key_length - 8);</a>
+<a name="ln915">    ValueType type;</a>
+<a name="ln916">    uint64_t unused;</a>
+<a name="ln917">    UnPackSequenceAndType(tag, &amp;unused, &amp;type);</a>
+<a name="ln918">    if (type != kTypeMerge) {</a>
+<a name="ln919">      break;</a>
+<a name="ln920">    }</a>
+<a name="ln921"> </a>
+<a name="ln922">    ++num_successive_merges;</a>
+<a name="ln923">  }</a>
+<a name="ln924"> </a>
+<a name="ln925">  return num_successive_merges;</a>
+<a name="ln926">}</a>
+<a name="ln927"> </a>
+<a name="ln928">UserFrontierPtr MemTable::GetFrontier(UpdateUserValueType type) const {</a>
+<a name="ln929">  std::lock_guard&lt;SpinMutex&gt; l(frontiers_mutex_);</a>
+<a name="ln930">  if (!frontiers_) {</a>
+<a name="ln931">    return nullptr;</a>
+<a name="ln932">  }</a>
+<a name="ln933"> </a>
+<a name="ln934">  switch (type) {</a>
+<a name="ln935">    case UpdateUserValueType::kSmallest:</a>
+<a name="ln936">      return frontiers_-&gt;Smallest().Clone();</a>
+<a name="ln937">    case UpdateUserValueType::kLargest:</a>
+<a name="ln938">      return frontiers_-&gt;Largest().Clone();</a>
+<a name="ln939">  }</a>
+<a name="ln940"> </a>
+<a name="ln941">  FATAL_INVALID_ENUM_VALUE(UpdateUserValueType, type);</a>
+<a name="ln942">}</a>
+<a name="ln943"> </a>
+<a name="ln944">void MemTableRep::Get(const LookupKey&amp; k, void* callback_args,</a>
+<a name="ln945">                      bool (*callback_func)(void* arg, const char* entry)) {</a>
+<a name="ln946">  auto iter = GetDynamicPrefixIterator();</a>
+<a name="ln947">  for (iter-&gt;Seek(k.internal_key(), k.memtable_key().cdata());</a>
+<a name="ln948">       iter-&gt;Valid() &amp;&amp; callback_func(callback_args, iter-&gt;key());</a>
+<a name="ln949">       iter-&gt;Next()) {</a>
+<a name="ln950">  }</a>
+<a name="ln951">}</a>
+<a name="ln952"> </a>
+<a name="ln953">}  // namespace rocksdb</a>
+
+</code></pre>
+<div class="balloon" rel="591"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v595/" target="_blank">V595</a> The 's' pointer was utilized before it was verified against nullptr. Check lines: 591, 594.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

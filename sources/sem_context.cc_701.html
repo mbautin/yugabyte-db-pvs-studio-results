@@ -1,0 +1,398 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>sem_context.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/yql/cql/ql/ptree/sem_context.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln19">#include &quot;yb/client/table.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/common/roles_permissions.h&quot;</a>
+<a name="ln22">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln23">#include &quot;yb/yql/cql/ql/util/ql_env.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">DECLARE_bool(use_cassandra_authentication);</a>
+<a name="ln26"> </a>
+<a name="ln27">namespace yb {</a>
+<a name="ln28">namespace ql {</a>
+<a name="ln29"> </a>
+<a name="ln30">DEFINE_bool(allow_index_table_read_write, false, &quot;Allow direct read and write of index tables&quot;);</a>
+<a name="ln31">TAG_FLAG(allow_index_table_read_write, hidden);</a>
+<a name="ln32"> </a>
+<a name="ln33">using std::shared_ptr;</a>
+<a name="ln34">using client::YBTable;</a>
+<a name="ln35">using client::YBTableName;</a>
+<a name="ln36">using client::YBColumnSchema;</a>
+<a name="ln37">using client::YBSchema;</a>
+<a name="ln38"> </a>
+<a name="ln39">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln40"> </a>
+<a name="ln41">SemContext::SemContext(ParseTree::UniPtr parse_tree, QLEnv *ql_env)</a>
+<a name="ln42">    : ProcessContext(std::move(parse_tree)),</a>
+<a name="ln43">      symtab_(PTempMem()),</a>
+<a name="ln44">      ql_env_(ql_env) {</a>
+<a name="ln45">}</a>
+<a name="ln46"> </a>
+<a name="ln47">SemContext::~SemContext() {</a>
+<a name="ln48">}</a>
+<a name="ln49"> </a>
+<a name="ln50">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln51"> </a>
+<a name="ln52">Status SemContext::LoadSchema(const shared_ptr&lt;YBTable&gt;&amp; table,</a>
+<a name="ln53">                              MCVector&lt;ColumnDesc&gt;* col_descs) {</a>
+<a name="ln54">  const YBSchema&amp; schema = table-&gt;schema();</a>
+<a name="ln55">  const int num_columns = schema.num_columns();</a>
+<a name="ln56">  const int num_key_columns = schema.num_key_columns();</a>
+<a name="ln57">  const int num_hash_key_columns = schema.num_hash_key_columns();</a>
+<a name="ln58"> </a>
+<a name="ln59">  if (col_descs != nullptr) {</a>
+<a name="ln60">    col_descs-&gt;reserve(num_columns);</a>
+<a name="ln61">    for (int idx = 0; idx &lt; num_columns; idx++) {</a>
+<a name="ln62">      // Find the column descriptor.</a>
+<a name="ln63">      const YBColumnSchema col = schema.Column(idx);</a>
+<a name="ln64">      col_descs-&gt;emplace_back(idx,</a>
+<a name="ln65">                              schema.ColumnId(idx),</a>
+<a name="ln66">                              col.name(),</a>
+<a name="ln67">                              idx &lt; num_hash_key_columns,</a>
+<a name="ln68">                              idx &lt; num_key_columns,</a>
+<a name="ln69">                              col.is_static(),</a>
+<a name="ln70">                              col.is_counter(),</a>
+<a name="ln71">                              col.type(),</a>
+<a name="ln72">                              YBColumnSchema::ToInternalDataType(col.type()),</a>
+<a name="ln73">                              schema.table_properties().use_mangled_column_name());</a>
+<a name="ln74"> </a>
+<a name="ln75">      // Insert the column descriptor, and column definition if requested, to symbol table.</a>
+<a name="ln76">      MCSharedPtr&lt;MCString&gt; col_name = MCMakeShared&lt;MCString&gt;(PSemMem(), col.name().c_str());</a>
+<a name="ln77">      RETURN_NOT_OK(MapSymbol(*col_name, &amp;(*col_descs)[idx]));</a>
+<a name="ln78">    }</a>
+<a name="ln79">  }</a>
+<a name="ln80"> </a>
+<a name="ln81">  return Status::OK();</a>
+<a name="ln82">}</a>
+<a name="ln83"> </a>
+<a name="ln84">Status SemContext::LookupTable(const YBTableName&amp; name,</a>
+<a name="ln85">                               const YBLocation&amp; loc,</a>
+<a name="ln86">                               const bool write_table,</a>
+<a name="ln87">                               const PermissionType permission,</a>
+<a name="ln88">                               shared_ptr&lt;YBTable&gt;* table,</a>
+<a name="ln89">                               bool* is_system,</a>
+<a name="ln90">                               MCVector&lt;ColumnDesc&gt;* col_descs) {</a>
+<a name="ln91">  if (FLAGS_use_cassandra_authentication) {</a>
+<a name="ln92">    RETURN_NOT_OK(CheckHasTablePermission(loc, permission, name.namespace_name(),</a>
+<a name="ln93">                                          name.table_name()));</a>
+<a name="ln94">  }</a>
+<a name="ln95">  *is_system = name.is_system();</a>
+<a name="ln96">  if (*is_system &amp;&amp; write_table &amp;&amp; client::FLAGS_yb_system_namespace_readonly) {</a>
+<a name="ln97">    return Error(loc, ErrorCode::SYSTEM_NAMESPACE_READONLY);</a>
+<a name="ln98">  }</a>
+<a name="ln99"> </a>
+<a name="ln100">  VLOG(3) &lt;&lt; &quot;Loading table descriptor for &quot; &lt;&lt; name.ToString();</a>
+<a name="ln101">  *table = GetTableDesc(name);</a>
+<a name="ln102">  if (*table == nullptr || ((*table)-&gt;IsIndex() &amp;&amp; !FLAGS_allow_index_table_read_write) ||</a>
+<a name="ln103">      // Only looking for CQL tables.</a>
+<a name="ln104">      (*table)-&gt;table_type() != client::YBTableType::YQL_TABLE_TYPE) {</a>
+<a name="ln105">    return Error(loc, ErrorCode::OBJECT_NOT_FOUND);</a>
+<a name="ln106">  }</a>
+<a name="ln107"> </a>
+<a name="ln108">  return LoadSchema(*table, col_descs);</a>
+<a name="ln109">}</a>
+<a name="ln110"> </a>
+<a name="ln111">Status SemContext::MapSymbol(const MCString&amp; name, PTColumnDefinition *entry) {</a>
+<a name="ln112">  if (symtab_[name].column_ != nullptr) {</a>
+<a name="ln113">    return Error(entry, ErrorCode::DUPLICATE_COLUMN);</a>
+<a name="ln114">  }</a>
+<a name="ln115">  symtab_[name].column_ = entry;</a>
+<a name="ln116">  return Status::OK();</a>
+<a name="ln117">}</a>
+<a name="ln118"> </a>
+<a name="ln119">Status SemContext::MapSymbol(const MCString&amp; name, PTAlterColumnDefinition *entry) {</a>
+<a name="ln120">  if (symtab_[name].alter_column_ != nullptr) {</a>
+<a name="ln121">    return Error(entry, ErrorCode::DUPLICATE_COLUMN);</a>
+<a name="ln122">  }</a>
+<a name="ln123">  symtab_[name].alter_column_ = entry;</a>
+<a name="ln124">  return Status::OK();</a>
+<a name="ln125">}</a>
+<a name="ln126"> </a>
+<a name="ln127">Status SemContext::MapSymbol(const MCString&amp; name, PTCreateTable *entry) {</a>
+<a name="ln128">  if (symtab_[name].create_table_ != nullptr) {</a>
+<a name="ln129">    return Error(entry, ErrorCode::DUPLICATE_OBJECT);</a>
+<a name="ln130">  }</a>
+<a name="ln131">  symtab_[name].create_table_ = entry;</a>
+<a name="ln132">  return Status::OK();</a>
+<a name="ln133">}</a>
+<a name="ln134"> </a>
+<a name="ln135">Status SemContext::MapSymbol(const MCString&amp; name, ColumnDesc *entry) {</a>
+<a name="ln136">  if (symtab_[name].column_desc_ != nullptr) {</a>
+<a name="ln137">    LOG(FATAL) &lt;&lt; &quot;Entries of the same symbol are inserted&quot;</a>
+<a name="ln138">               &lt;&lt; &quot;, Existing entry = &quot; &lt;&lt; symtab_[name].column_desc_</a>
+<a name="ln139">               &lt;&lt; &quot;, New entry = &quot; &lt;&lt; entry;</a>
+<a name="ln140">  }</a>
+<a name="ln141">  symtab_[name].column_desc_ = entry;</a>
+<a name="ln142">  return Status::OK();</a>
+<a name="ln143">}</a>
+<a name="ln144"> </a>
+<a name="ln145">Status SemContext::MapSymbol(const MCString&amp; name, PTTypeField *entry) {</a>
+<a name="ln146">  if (symtab_[name].type_field_ != nullptr) {</a>
+<a name="ln147">    return Error(entry, ErrorCode::DUPLICATE_TYPE_FIELD);</a>
+<a name="ln148">  }</a>
+<a name="ln149">  symtab_[name].type_field_ = entry;</a>
+<a name="ln150">  return Status::OK();</a>
+<a name="ln151">}</a>
+<a name="ln152"> </a>
+<a name="ln153">shared_ptr&lt;YBTable&gt; SemContext::GetTableDesc(const client::YBTableName&amp; table_name) {</a>
+<a name="ln154">  bool cache_used = false;</a>
+<a name="ln155">  shared_ptr&lt;YBTable&gt; table = ql_env_-&gt;GetTableDesc(table_name, &amp;cache_used);</a>
+<a name="ln156">  if (table != nullptr) {</a>
+<a name="ln157">    parse_tree_-&gt;AddAnalyzedTable(table_name);</a>
+<a name="ln158">    if (cache_used) {</a>
+<a name="ln159">      // Remember cache was used.</a>
+<a name="ln160">      cache_used_ = true;</a>
+<a name="ln161">    }</a>
+<a name="ln162">  }</a>
+<a name="ln163">  return table;</a>
+<a name="ln164">}</a>
+<a name="ln165"> </a>
+<a name="ln166">shared_ptr&lt;YBTable&gt; SemContext::GetTableDesc(const TableId&amp; table_id) {</a>
+<a name="ln167">  bool cache_used = false;</a>
+<a name="ln168">  shared_ptr&lt;YBTable&gt; table = ql_env_-&gt;GetTableDesc(table_id, &amp;cache_used);</a>
+<a name="ln169">  if (table != nullptr) {</a>
+<a name="ln170">    parse_tree_-&gt;AddAnalyzedTable(table-&gt;name());</a>
+<a name="ln171">    if (cache_used) {</a>
+<a name="ln172">      // Remember cache was used.</a>
+<a name="ln173">      cache_used_ = true;</a>
+<a name="ln174">    }</a>
+<a name="ln175">  }</a>
+<a name="ln176">  return table;</a>
+<a name="ln177">}</a>
+<a name="ln178"> </a>
+<a name="ln179">std::shared_ptr&lt;QLType&gt; SemContext::GetUDType(const string &amp;keyspace_name,</a>
+<a name="ln180">                                              const string &amp;type_name) {</a>
+<a name="ln181">  bool cache_used = false;</a>
+<a name="ln182">  shared_ptr&lt;QLType&gt; type = ql_env_-&gt;GetUDType(keyspace_name, type_name, &amp;cache_used);</a>
+<a name="ln183"> </a>
+<a name="ln184">  if (type != nullptr) {</a>
+<a name="ln185">    parse_tree_-&gt;AddAnalyzedUDType(keyspace_name, type_name);</a>
+<a name="ln186">    if (cache_used) {</a>
+<a name="ln187">      // Remember cache was used.</a>
+<a name="ln188">      cache_used_ = true;</a>
+<a name="ln189">    }</a>
+<a name="ln190">  }</a>
+<a name="ln191"> </a>
+<a name="ln192">  return type;</a>
+<a name="ln193">}</a>
+<a name="ln194"> </a>
+<a name="ln195">const SymbolEntry *SemContext::SeekSymbol(const MCString&amp; name) const {</a>
+<a name="ln196">  MCMap&lt;MCString, SymbolEntry&gt;::const_iterator iter = symtab_.find(name);</a>
+<a name="ln197">  if (iter != symtab_.end()) {</a>
+<a name="ln198">    return &amp;iter-&gt;second;</a>
+<a name="ln199">  }</a>
+<a name="ln200">  return nullptr;</a>
+<a name="ln201">}</a>
+<a name="ln202"> </a>
+<a name="ln203">PTColumnDefinition *SemContext::GetColumnDefinition(const MCString&amp; col_name) {</a>
+<a name="ln204">  const SymbolEntry * entry = SeekSymbol(col_name);</a>
+<a name="ln205">  if (entry == nullptr) {</a>
+<a name="ln206">    return nullptr;</a>
+<a name="ln207">  }</a>
+<a name="ln208">  return entry-&gt;column_;</a>
+<a name="ln209">}</a>
+<a name="ln210"> </a>
+<a name="ln211">const ColumnDesc *SemContext::GetColumnDesc(const MCString&amp; col_name) const {</a>
+<a name="ln212">  const SymbolEntry * entry = SeekSymbol(col_name);</a>
+<a name="ln213">  if (entry == nullptr) {</a>
+<a name="ln214">    return nullptr;</a>
+<a name="ln215">  }</a>
+<a name="ln216"> </a>
+<a name="ln217">  if (current_dml_stmt_ != nullptr) {</a>
+<a name="ln218">    // To indicate that DocDB must read a columm value to execute an expression, the column is added</a>
+<a name="ln219">    // to the column_refs list.</a>
+<a name="ln220">    bool reading_column = false;</a>
+<a name="ln221"> </a>
+<a name="ln222">    switch (current_dml_stmt_-&gt;opcode()) {</a>
+<a name="ln223">      case TreeNodeOpcode::kPTSelectStmt:</a>
+<a name="ln224">        reading_column = true;</a>
+<a name="ln225">        break;</a>
+<a name="ln226">      case TreeNodeOpcode::kPTUpdateStmt:</a>
+<a name="ln227">        if (sem_state() != nullptr &amp;&amp; processing_set_clause() &amp;&amp; !processing_assignee()) {</a>
+<a name="ln228">          reading_column = true;</a>
+<a name="ln229">          break;</a>
+<a name="ln230">        }</a>
+<a name="ln231">        FALLTHROUGH_INTENDED;</a>
+<a name="ln232">      case TreeNodeOpcode::kPTInsertStmt:</a>
+<a name="ln233">      case TreeNodeOpcode::kPTDeleteStmt:</a>
+<a name="ln234">        if (sem_state() != nullptr &amp;&amp; processing_if_clause()) {</a>
+<a name="ln235">          reading_column = true;</a>
+<a name="ln236">          break;</a>
+<a name="ln237">        }</a>
+<a name="ln238">        break;</a>
+<a name="ln239">      default:</a>
+<a name="ln240">        break;</a>
+<a name="ln241">    }</a>
+<a name="ln242"> </a>
+<a name="ln243">    if (reading_column) {</a>
+<a name="ln244">      // TODO(neil) Currently AddColumnRef() relies on MCSet datatype to guarantee that we have a</a>
+<a name="ln245">      // unique list of IDs, but we should take advantage to &quot;symbol table&quot; when collecting data</a>
+<a name="ln246">      // for execution. Symbol table and &quot;column_read_count_&quot; need to be corrected so that we can</a>
+<a name="ln247">      // use MCList instead.</a>
+<a name="ln248"> </a>
+<a name="ln249">      // Indicate that this column must be read for the statement execution.</a>
+<a name="ln250">      current_dml_stmt_-&gt;AddColumnRef(*entry-&gt;column_desc_);</a>
+<a name="ln251">    }</a>
+<a name="ln252">  }</a>
+<a name="ln253"> </a>
+<a name="ln254">  // Setup the column to which the INDEX column is referencing.</a>
+<a name="ln255">  if (sem_state_) {</a>
+<a name="ln256">    sem_state_-&gt;add_index_column_ref(entry-&gt;column_desc_-&gt;id());</a>
+<a name="ln257">  }</a>
+<a name="ln258"> </a>
+<a name="ln259">  return entry-&gt;column_desc_;</a>
+<a name="ln260">}</a>
+<a name="ln261"> </a>
+<a name="ln262">Status SemContext::HasKeyspacePermission(PermissionType permission,</a>
+<a name="ln263">                                         const NamespaceName&amp; keyspace_name) {</a>
+<a name="ln264"> </a>
+<a name="ln265">  DFATAL_OR_RETURN_ERROR_IF(keyspace_name.empty(),</a>
+<a name="ln266">                            STATUS(InvalidArgument, &quot;Invalid empty keyspace&quot;));</a>
+<a name="ln267">  return ql_env_-&gt;HasResourcePermission(get_canonical_keyspace(keyspace_name),</a>
+<a name="ln268">                                        ObjectType::OBJECT_SCHEMA, permission, keyspace_name);</a>
+<a name="ln269">}</a>
+<a name="ln270"> </a>
+<a name="ln271">Status SemContext::CheckHasKeyspacePermission(const YBLocation&amp; loc,</a>
+<a name="ln272">                                              const PermissionType permission,</a>
+<a name="ln273">                                              const NamespaceName&amp; keyspace_name) {</a>
+<a name="ln274">  auto s = HasKeyspacePermission(permission, keyspace_name);</a>
+<a name="ln275">  if (!s.ok()) {</a>
+<a name="ln276">    return Error(loc, s.message().ToBuffer().c_str(), ErrorCode::UNAUTHORIZED);</a>
+<a name="ln277">  }</a>
+<a name="ln278">  return Status::OK();</a>
+<a name="ln279">}</a>
+<a name="ln280"> </a>
+<a name="ln281">Status SemContext::CheckHasTablePermission(const YBLocation &amp;loc,</a>
+<a name="ln282">                                           PermissionType permission,</a>
+<a name="ln283">                                           const NamespaceName&amp; keyspace_name,</a>
+<a name="ln284">                                           const TableName&amp; table_name) {</a>
+<a name="ln285">  DFATAL_OR_RETURN_ERROR_IF(keyspace_name.empty(),</a>
+<a name="ln286">                            STATUS_SUBSTITUTE(InvalidArgument, &quot;Empty keyspace for table $0&quot;,</a>
+<a name="ln287">                                              table_name));</a>
+<a name="ln288">  DFATAL_OR_RETURN_ERROR_IF(table_name.empty(),</a>
+<a name="ln289">                            STATUS(InvalidArgument, &quot;Table name cannot be empty&quot;));</a>
+<a name="ln290"> </a>
+<a name="ln291">  auto s = ql_env_-&gt;HasTablePermission(keyspace_name, table_name, permission);</a>
+<a name="ln292">  if (!s.ok()) {</a>
+<a name="ln293">    return Error(loc, s.message().ToBuffer().c_str(), ErrorCode::UNAUTHORIZED);</a>
+<a name="ln294">  }</a>
+<a name="ln295">  return Status::OK();</a>
+<a name="ln296">}</a>
+<a name="ln297"> </a>
+<a name="ln298">Status SemContext::CheckHasTablePermission(const YBLocation&amp; loc,</a>
+<a name="ln299">                                           const PermissionType permission,</a>
+<a name="ln300">                                           client::YBTableName table_name) {</a>
+<a name="ln301">  return CheckHasTablePermission(loc, permission, table_name.namespace_name(),</a>
+<a name="ln302">                                 table_name.table_name());</a>
+<a name="ln303">}</a>
+<a name="ln304"> </a>
+<a name="ln305">Status SemContext::CheckHasRolePermission(const YBLocation&amp; loc,</a>
+<a name="ln306">                                          PermissionType permission,</a>
+<a name="ln307">                                          const RoleName&amp; role_name) {</a>
+<a name="ln308"> </a>
+<a name="ln309">  auto s = ql_env_-&gt;HasRolePermission(role_name, permission);</a>
+<a name="ln310">  if (!s.ok()) {</a>
+<a name="ln311">    return Error(loc, s.message().ToBuffer().c_str(), ErrorCode::UNAUTHORIZED);</a>
+<a name="ln312">  }</a>
+<a name="ln313">  return Status::OK();</a>
+<a name="ln314">}</a>
+<a name="ln315"> </a>
+<a name="ln316">Status SemContext::CheckHasAllKeyspacesPermission(const YBLocation&amp; loc,</a>
+<a name="ln317">                                                  PermissionType permission) {</a>
+<a name="ln318"> </a>
+<a name="ln319">  auto s = ql_env_-&gt;HasResourcePermission(kRolesDataResource, ObjectType::OBJECT_SCHEMA,</a>
+<a name="ln320">                                          permission);</a>
+<a name="ln321">  if (!s.ok()) {</a>
+<a name="ln322">    return Error(loc, s.message().ToBuffer().c_str(), ErrorCode::UNAUTHORIZED);</a>
+<a name="ln323">  }</a>
+<a name="ln324">  return Status::OK();</a>
+<a name="ln325">}</a>
+<a name="ln326"> </a>
+<a name="ln327">Status SemContext::CheckHasAllRolesPermission(const YBLocation&amp; loc,</a>
+<a name="ln328">                                              PermissionType permission) {</a>
+<a name="ln329"> </a>
+<a name="ln330">  auto s = ql_env_-&gt;HasResourcePermission(kRolesRoleResource, ObjectType::OBJECT_ROLE, permission);</a>
+<a name="ln331">  if (!s.ok()) {</a>
+<a name="ln332">    return Error(loc, s.message().ToBuffer().c_str(), ErrorCode::UNAUTHORIZED);</a>
+<a name="ln333">  }</a>
+<a name="ln334">  return Status::OK();</a>
+<a name="ln335">}</a>
+<a name="ln336"> </a>
+<a name="ln337">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln338"> </a>
+<a name="ln339">bool SemContext::IsConvertible(const std::shared_ptr&lt;QLType&gt;&amp; lhs_type,</a>
+<a name="ln340">                               const std::shared_ptr&lt;QLType&gt;&amp; rhs_type) const {</a>
+<a name="ln341">  return QLType::IsImplicitlyConvertible(lhs_type, rhs_type);</a>
+<a name="ln342">}</a>
+<a name="ln343"> </a>
+<a name="ln344">bool SemContext::IsComparable(DataType lhs_type, DataType rhs_type) const {</a>
+<a name="ln345">  return QLType::IsComparable(lhs_type, rhs_type);</a>
+<a name="ln346">}</a>
+<a name="ln347"> </a>
+<a name="ln348">}  // namespace ql</a>
+<a name="ln349">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="100"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="265"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="285"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="288"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

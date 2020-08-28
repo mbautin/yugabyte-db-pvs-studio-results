@@ -1,0 +1,446 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>pg_dml_read.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/yql/pggate/pg_dml_read.h&quot;</a>
+<a name="ln17">#include &quot;yb/yql/pggate/pg_select_index.h&quot;</a>
+<a name="ln18">#include &quot;yb/yql/pggate/util/pg_doc_data.h&quot;</a>
+<a name="ln19">#include &quot;yb/client/yb_op.h&quot;</a>
+<a name="ln20">#include &quot;yb/common/pg_system_attr.h&quot;</a>
+<a name="ln21">#include &quot;yb/docdb/primitive_value.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">namespace yb {</a>
+<a name="ln24">namespace pggate {</a>
+<a name="ln25"> </a>
+<a name="ln26">using std::make_shared;</a>
+<a name="ln27"> </a>
+<a name="ln28">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln29">// PgDmlRead</a>
+<a name="ln30">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln31"> </a>
+<a name="ln32">PgDmlRead::PgDmlRead(PgSession::ScopedRefPtr pg_session, const PgObjectId&amp; table_id,</a>
+<a name="ln33">                     const PgObjectId&amp; index_id, const PgPrepareParameters *prepare_params)</a>
+<a name="ln34">    : PgDml(std::move(pg_session), table_id, index_id, prepare_params) {</a>
+<a name="ln35">}</a>
+<a name="ln36"> </a>
+<a name="ln37">PgDmlRead::~PgDmlRead() {</a>
+<a name="ln38">}</a>
+<a name="ln39"> </a>
+<a name="ln40">void PgDmlRead::PrepareBinds() {</a>
+<a name="ln41">  if (!bind_desc_) {</a>
+<a name="ln42">    // This statement doesn't have bindings.</a>
+<a name="ln43">    return;</a>
+<a name="ln44">  }</a>
+<a name="ln45"> </a>
+<a name="ln46">  for (PgColumn &amp;col : bind_desc_-&gt;columns()) {</a>
+<a name="ln47">    col.AllocPrimaryBindPB(read_req_);</a>
+<a name="ln48">  }</a>
+<a name="ln49">}</a>
+<a name="ln50"> </a>
+<a name="ln51">void PgDmlRead::SetForwardScan(const bool is_forward_scan) {</a>
+<a name="ln52">  if (secondary_index_query_) {</a>
+<a name="ln53">    return secondary_index_query_-&gt;SetForwardScan(is_forward_scan);</a>
+<a name="ln54">  }</a>
+<a name="ln55">  read_req_-&gt;set_is_forward_scan(is_forward_scan);</a>
+<a name="ln56">}</a>
+<a name="ln57"> </a>
+<a name="ln58">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln59">// DML support.</a>
+<a name="ln60">// TODO(neil) WHERE clause is not yet supported. Revisit this function when it is.</a>
+<a name="ln61"> </a>
+<a name="ln62">PgsqlExpressionPB *PgDmlRead::AllocColumnBindPB(PgColumn *col) {</a>
+<a name="ln63">  return col-&gt;AllocBindPB(read_req_);</a>
+<a name="ln64">}</a>
+<a name="ln65"> </a>
+<a name="ln66">PgsqlExpressionPB *PgDmlRead::AllocColumnBindConditionExprPB(PgColumn *col) {</a>
+<a name="ln67">  return col-&gt;AllocBindConditionExprPB(read_req_);</a>
+<a name="ln68">}</a>
+<a name="ln69"> </a>
+<a name="ln70">PgsqlExpressionPB *PgDmlRead::AllocColumnAssignPB(PgColumn *col) {</a>
+<a name="ln71">  // SELECT statement should not have an assign expression (SET clause).</a>
+<a name="ln72">  LOG(FATAL) &lt;&lt; &quot;Pure virtual function is being call&quot;;</a>
+<a name="ln73">  return nullptr;</a>
+<a name="ln74">}</a>
+<a name="ln75"> </a>
+<a name="ln76">PgsqlExpressionPB *PgDmlRead::AllocTargetPB() {</a>
+<a name="ln77">  return read_req_-&gt;add_targets();</a>
+<a name="ln78">}</a>
+<a name="ln79"> </a>
+<a name="ln80">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln81">// RESULT SET SUPPORT.</a>
+<a name="ln82">// For now, selected expressions are just a list of column names (ref).</a>
+<a name="ln83">//   SELECT column_l, column_m, column_n FROM ...</a>
+<a name="ln84"> </a>
+<a name="ln85">void PgDmlRead::SetColumnRefs() {</a>
+<a name="ln86">  if (secondary_index_query_) {</a>
+<a name="ln87">    DCHECK(!has_aggregate_targets()) &lt;&lt; &quot;Aggregate pushdown should not happen with index&quot;;</a>
+<a name="ln88">  }</a>
+<a name="ln89">  read_req_-&gt;set_is_aggregate(has_aggregate_targets());</a>
+<a name="ln90">  ColumnRefsToPB(read_req_-&gt;mutable_column_refs());</a>
+<a name="ln91">}</a>
+<a name="ln92"> </a>
+<a name="ln93">Status PgDmlRead::DeleteEmptyPrimaryBinds() {</a>
+<a name="ln94">  if (secondary_index_query_) {</a>
+<a name="ln95">    RETURN_NOT_OK(secondary_index_query_-&gt;DeleteEmptyPrimaryBinds());</a>
+<a name="ln96">  }</a>
+<a name="ln97"> </a>
+<a name="ln98">  if (!bind_desc_) {</a>
+<a name="ln99">    // This query does not have any binds.</a>
+<a name="ln100">    read_req_-&gt;clear_partition_column_values();</a>
+<a name="ln101">    read_req_-&gt;clear_range_column_values();</a>
+<a name="ln102">    return Status::OK();</a>
+<a name="ln103">  }</a>
+<a name="ln104"> </a>
+<a name="ln105">  // NOTE: ybctid is a system column and not processed as bind.</a>
+<a name="ln106">  bool miss_partition_columns = false;</a>
+<a name="ln107">  bool has_partition_columns = false;</a>
+<a name="ln108"> </a>
+<a name="ln109">  for (size_t i = 0; i &lt; bind_desc_-&gt;num_hash_key_columns(); i++) {</a>
+<a name="ln110">    PgColumn&amp; col = bind_desc_-&gt;columns()[i];</a>
+<a name="ln111">    PgsqlExpressionPB* expr = col.bind_pb();</a>
+<a name="ln112">    if (expr_binds_.find(expr) == expr_binds_.end() &amp;&amp; !expr-&gt;has_condition()) {</a>
+<a name="ln113">      // For IN clause on hash_column, expr-&gt;has_condition() returns 'true'.</a>
+<a name="ln114">      miss_partition_columns = true;</a>
+<a name="ln115">    } else {</a>
+<a name="ln116">      has_partition_columns = true;</a>
+<a name="ln117">    }</a>
+<a name="ln118">  }</a>
+<a name="ln119"> </a>
+<a name="ln120">  if (miss_partition_columns) {</a>
+<a name="ln121">    VLOG(1) &lt;&lt; &quot;Full scan is needed&quot;;</a>
+<a name="ln122">    read_req_-&gt;clear_partition_column_values();</a>
+<a name="ln123">    read_req_-&gt;clear_range_column_values();</a>
+<a name="ln124">  }</a>
+<a name="ln125"> </a>
+<a name="ln126">  if (has_partition_columns &amp;&amp; miss_partition_columns) {</a>
+<a name="ln127">    return STATUS(InvalidArgument, &quot;Partition key must be fully specified&quot;);</a>
+<a name="ln128">  }</a>
+<a name="ln129"> </a>
+<a name="ln130">  bool miss_range_columns = false;</a>
+<a name="ln131">  size_t num_bound_range_columns = 0;</a>
+<a name="ln132"> </a>
+<a name="ln133">  for (size_t i = bind_desc_-&gt;num_hash_key_columns(); i &lt; bind_desc_-&gt;num_key_columns(); i++) {</a>
+<a name="ln134">    PgColumn &amp;col = bind_desc_-&gt;columns()[i];</a>
+<a name="ln135">    if (expr_binds_.find(col.bind_pb()) == expr_binds_.end()) {</a>
+<a name="ln136">      miss_range_columns = true;</a>
+<a name="ln137">    } else if (miss_range_columns) {</a>
+<a name="ln138">      return STATUS(InvalidArgument,</a>
+<a name="ln139">                    &quot;Unspecified range key column must be at the end of the range key&quot;);</a>
+<a name="ln140">    } else {</a>
+<a name="ln141">      num_bound_range_columns++;</a>
+<a name="ln142">    }</a>
+<a name="ln143">  }</a>
+<a name="ln144"> </a>
+<a name="ln145">  auto *range_column_values = read_req_-&gt;mutable_range_column_values();</a>
+<a name="ln146">  range_column_values-&gt;DeleteSubrange(num_bound_range_columns,</a>
+<a name="ln147">                                      range_column_values-&gt;size() - num_bound_range_columns);</a>
+<a name="ln148">  return Status::OK();</a>
+<a name="ln149">}</a>
+<a name="ln150"> </a>
+<a name="ln151">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln152"> </a>
+<a name="ln153">Status PgDmlRead::Exec(const PgExecParameters *exec_params) {</a>
+<a name="ln154">  // Initialize doc operator.</a>
+<a name="ln155">  if (doc_op_) {</a>
+<a name="ln156">    doc_op_-&gt;ExecuteInit(exec_params);</a>
+<a name="ln157">  }</a>
+<a name="ln158"> </a>
+<a name="ln159">  // Set column references in protobuf and whether query is aggregate.</a>
+<a name="ln160">  SetColumnRefs();</a>
+<a name="ln161"> </a>
+<a name="ln162">  // Delete key columns that are not bound to any values.</a>
+<a name="ln163">  RETURN_NOT_OK(DeleteEmptyPrimaryBinds());</a>
+<a name="ln164"> </a>
+<a name="ln165">  // First, process the secondary index request.</a>
+<a name="ln166">  bool has_ybctid = VERIFY_RESULT(ProcessSecondaryIndexRequest(exec_params));</a>
+<a name="ln167"> </a>
+<a name="ln168">  if (!has_ybctid &amp;&amp; secondary_index_query_ &amp;&amp; secondary_index_query_-&gt;has_doc_op()) {</a>
+<a name="ln169">    // No ybctid is found from the IndexScan. Instruct &quot;doc_op_&quot; to abandon the execution and not</a>
+<a name="ln170">    // querying any data from tablet server.</a>
+<a name="ln171">    //</a>
+<a name="ln172">    // Note: For system catalog (colocated table), the secondary_index_query_ won't send a separate</a>
+<a name="ln173">    // scan read request to DocDB.  For this case, the index request is embedded inside the SELECT</a>
+<a name="ln174">    // request (PgsqlReadRequestPB::index_request).</a>
+<a name="ln175">    doc_op_-&gt;AbandonExecution();</a>
+<a name="ln176"> </a>
+<a name="ln177">  } else {</a>
+<a name="ln178">    // Update bind values for constants and placeholders.</a>
+<a name="ln179">    RETURN_NOT_OK(UpdateBindPBs());</a>
+<a name="ln180"> </a>
+<a name="ln181">    // Execute select statement and prefetching data from DocDB.</a>
+<a name="ln182">    // Note: For SysTable, doc_op_ === null, IndexScan doesn't send separate request.</a>
+<a name="ln183">    if (doc_op_) {</a>
+<a name="ln184">      SCHECK_EQ(VERIFY_RESULT(doc_op_-&gt;Execute()), RequestSent::kTrue, IllegalState,</a>
+<a name="ln185">                &quot;YSQL read operation was not sent&quot;);</a>
+<a name="ln186">    }</a>
+<a name="ln187">  }</a>
+<a name="ln188"> </a>
+<a name="ln189">  return Status::OK();</a>
+<a name="ln190">}</a>
+<a name="ln191"> </a>
+<a name="ln192">Status PgDmlRead::BindColumnCondEq(int attr_num, PgExpr *attr_value) {</a>
+<a name="ln193">  if (secondary_index_query_) {</a>
+<a name="ln194">    // Bind by secondary key.</a>
+<a name="ln195">    return secondary_index_query_-&gt;BindColumnCondEq(attr_num, attr_value);</a>
+<a name="ln196">  }</a>
+<a name="ln197"> </a>
+<a name="ln198">  // Find column.</a>
+<a name="ln199">  PgColumn *col = VERIFY_RESULT(bind_desc_-&gt;FindColumn(attr_num));</a>
+<a name="ln200"> </a>
+<a name="ln201">  // Check datatype.</a>
+<a name="ln202">  if (attr_value) {</a>
+<a name="ln203">    SCHECK_EQ(col-&gt;internal_type(), attr_value-&gt;internal_type(), Corruption,</a>
+<a name="ln204">              &quot;Attribute value type does not match column type&quot;);</a>
+<a name="ln205">  }</a>
+<a name="ln206"> </a>
+<a name="ln207">  // Alloc the protobuf.</a>
+<a name="ln208">  PgsqlExpressionPB *condition_expr_pb = AllocColumnBindConditionExprPB(col);</a>
+<a name="ln209"> </a>
+<a name="ln210">  if (attr_value != nullptr) {</a>
+<a name="ln211">    condition_expr_pb-&gt;mutable_condition()-&gt;set_op(QL_OP_EQUAL);</a>
+<a name="ln212"> </a>
+<a name="ln213">    auto op1_pb = condition_expr_pb-&gt;mutable_condition()-&gt;add_operands();</a>
+<a name="ln214">    auto op2_pb = condition_expr_pb-&gt;mutable_condition()-&gt;add_operands();</a>
+<a name="ln215"> </a>
+<a name="ln216">    op1_pb-&gt;set_column_id(col-&gt;id());</a>
+<a name="ln217"> </a>
+<a name="ln218">    RETURN_NOT_OK(attr_value-&gt;Eval(this, op2_pb-&gt;mutable_value()));</a>
+<a name="ln219">  }</a>
+<a name="ln220"> </a>
+<a name="ln221">  if (attr_num == static_cast&lt;int&gt;(PgSystemAttrNum::kYBTupleId)) {</a>
+<a name="ln222">    CHECK(attr_value-&gt;is_constant()) &lt;&lt; &quot;Column ybctid must be bound to constant&quot;;</a>
+<a name="ln223">    ybctid_bind_ = true;</a>
+<a name="ln224">  }</a>
+<a name="ln225"> </a>
+<a name="ln226">  return Status::OK();</a>
+<a name="ln227">}</a>
+<a name="ln228"> </a>
+<a name="ln229">Status PgDmlRead::BindColumnCondBetween(int attr_num, PgExpr *attr_value, PgExpr *attr_value_end) {</a>
+<a name="ln230">  if (secondary_index_query_) {</a>
+<a name="ln231">    // Bind by secondary key.</a>
+<a name="ln232">    return secondary_index_query_-&gt;BindColumnCondBetween(attr_num, attr_value, attr_value_end);</a>
+<a name="ln233">  }</a>
+<a name="ln234"> </a>
+<a name="ln235">  DCHECK(attr_num != static_cast&lt;int&gt;(PgSystemAttrNum::kYBTupleId))</a>
+<a name="ln236">    &lt;&lt; &quot;Operator BETWEEN cannot be applied to ROWID&quot;;</a>
+<a name="ln237"> </a>
+<a name="ln238">  // Find column.</a>
+<a name="ln239">  PgColumn *col = VERIFY_RESULT(bind_desc_-&gt;FindColumn(attr_num));</a>
+<a name="ln240"> </a>
+<a name="ln241">  // Check datatype.</a>
+<a name="ln242">  if (attr_value) {</a>
+<a name="ln243">    SCHECK_EQ(col-&gt;internal_type(), attr_value-&gt;internal_type(), Corruption,</a>
+<a name="ln244">              &quot;Attribute value type does not match column type&quot;);</a>
+<a name="ln245">  }</a>
+<a name="ln246"> </a>
+<a name="ln247">  if (attr_value_end) {</a>
+<a name="ln248">    SCHECK_EQ(col-&gt;internal_type(), attr_value_end-&gt;internal_type(), Corruption,</a>
+<a name="ln249">              &quot;Attribute value type does not match column type&quot;);</a>
+<a name="ln250">  }</a>
+<a name="ln251"> </a>
+<a name="ln252">  CHECK(!col-&gt;desc()-&gt;is_partition()) &lt;&lt; &quot;This method cannot be used for binding partition column!&quot;;</a>
+<a name="ln253"> </a>
+<a name="ln254">  // Alloc the protobuf.</a>
+<a name="ln255">  PgsqlExpressionPB *condition_expr_pb = AllocColumnBindConditionExprPB(col);</a>
+<a name="ln256"> </a>
+<a name="ln257">  if (attr_value != nullptr) {</a>
+<a name="ln258">    if (attr_value_end != nullptr) {</a>
+<a name="ln259">      condition_expr_pb-&gt;mutable_condition()-&gt;set_op(QL_OP_BETWEEN);</a>
+<a name="ln260"> </a>
+<a name="ln261">      auto op1_pb = condition_expr_pb-&gt;mutable_condition()-&gt;add_operands();</a>
+<a name="ln262">      auto op2_pb = condition_expr_pb-&gt;mutable_condition()-&gt;add_operands();</a>
+<a name="ln263">      auto op3_pb = condition_expr_pb-&gt;mutable_condition()-&gt;add_operands();</a>
+<a name="ln264"> </a>
+<a name="ln265">      op1_pb-&gt;set_column_id(col-&gt;id());</a>
+<a name="ln266"> </a>
+<a name="ln267">      RETURN_NOT_OK(attr_value-&gt;Eval(this, op2_pb-&gt;mutable_value()));</a>
+<a name="ln268">      RETURN_NOT_OK(attr_value_end-&gt;Eval(this, op3_pb-&gt;mutable_value()));</a>
+<a name="ln269">    } else {</a>
+<a name="ln270">      condition_expr_pb-&gt;mutable_condition()-&gt;set_op(QL_OP_GREATER_THAN_EQUAL);</a>
+<a name="ln271"> </a>
+<a name="ln272">      auto op1_pb = condition_expr_pb-&gt;mutable_condition()-&gt;add_operands();</a>
+<a name="ln273">      auto op2_pb = condition_expr_pb-&gt;mutable_condition()-&gt;add_operands();</a>
+<a name="ln274"> </a>
+<a name="ln275">      op1_pb-&gt;set_column_id(col-&gt;id());</a>
+<a name="ln276"> </a>
+<a name="ln277">      RETURN_NOT_OK(attr_value-&gt;Eval(this, op2_pb-&gt;mutable_value()));</a>
+<a name="ln278">    }</a>
+<a name="ln279">  } else {</a>
+<a name="ln280">    if (attr_value_end != nullptr) {</a>
+<a name="ln281">      condition_expr_pb-&gt;mutable_condition()-&gt;set_op(QL_OP_LESS_THAN_EQUAL);</a>
+<a name="ln282"> </a>
+<a name="ln283">      auto op1_pb = condition_expr_pb-&gt;mutable_condition()-&gt;add_operands();</a>
+<a name="ln284">      auto op2_pb = condition_expr_pb-&gt;mutable_condition()-&gt;add_operands();</a>
+<a name="ln285"> </a>
+<a name="ln286">      op1_pb-&gt;set_column_id(col-&gt;id());</a>
+<a name="ln287"> </a>
+<a name="ln288">      RETURN_NOT_OK(attr_value_end-&gt;Eval(this, op2_pb-&gt;mutable_value()));</a>
+<a name="ln289">    } else {</a>
+<a name="ln290">      // Unreachable.</a>
+<a name="ln291">    }</a>
+<a name="ln292">  }</a>
+<a name="ln293"> </a>
+<a name="ln294">  return Status::OK();</a>
+<a name="ln295">}</a>
+<a name="ln296"> </a>
+<a name="ln297">Status PgDmlRead::BindColumnCondIn(int attr_num, int n_attr_values, PgExpr **attr_values) {</a>
+<a name="ln298">  if (secondary_index_query_) {</a>
+<a name="ln299">    // Bind by secondary key.</a>
+<a name="ln300">    return secondary_index_query_-&gt;BindColumnCondIn(attr_num, n_attr_values, attr_values);</a>
+<a name="ln301">  }</a>
+<a name="ln302"> </a>
+<a name="ln303">  DCHECK(attr_num != static_cast&lt;int&gt;(PgSystemAttrNum::kYBTupleId))</a>
+<a name="ln304">    &lt;&lt; &quot;Operator IN cannot be applied to ROWID&quot;;</a>
+<a name="ln305"> </a>
+<a name="ln306">  // Find column.</a>
+<a name="ln307">  PgColumn *col = VERIFY_RESULT(bind_desc_-&gt;FindColumn(attr_num));</a>
+<a name="ln308"> </a>
+<a name="ln309">  // Check datatype.</a>
+<a name="ln310">  // TODO(neil) Current code combine TEXT and BINARY datatypes into ONE representation.  Once that</a>
+<a name="ln311">  // is fixed, we can remove the special if() check for BINARY type.</a>
+<a name="ln312">  if (col-&gt;internal_type() != InternalType::kBinaryValue) {</a>
+<a name="ln313">    for (int i = 0; i &lt; n_attr_values; i++) {</a>
+<a name="ln314">      if (attr_values[i]) {</a>
+<a name="ln315">        SCHECK_EQ(col-&gt;internal_type(), attr_values[i]-&gt;internal_type(), Corruption,</a>
+<a name="ln316">            &quot;Attribute value type does not match column type&quot;);</a>
+<a name="ln317">      }</a>
+<a name="ln318">    }</a>
+<a name="ln319">  }</a>
+<a name="ln320"> </a>
+<a name="ln321">  if (col-&gt;desc()-&gt;is_partition()) {</a>
+<a name="ln322">    // Alloc the protobuf.</a>
+<a name="ln323">    PgsqlExpressionPB* bind_pb = col-&gt;bind_pb();</a>
+<a name="ln324">    if (bind_pb == nullptr) {</a>
+<a name="ln325">      bind_pb = AllocColumnBindPB(col);</a>
+<a name="ln326">    } else {</a>
+<a name="ln327">      if (expr_binds_.find(bind_pb) != expr_binds_.end()) {</a>
+<a name="ln328">        LOG(WARNING) &lt;&lt; strings::Substitute(&quot;Column $0 is already bound to another value.&quot;,</a>
+<a name="ln329">                                            attr_num);</a>
+<a name="ln330">      }</a>
+<a name="ln331">    }</a>
+<a name="ln332"> </a>
+<a name="ln333">    bind_pb-&gt;mutable_condition()-&gt;set_op(QL_OP_IN);</a>
+<a name="ln334">    bind_pb-&gt;mutable_condition()-&gt;add_operands()-&gt;set_column_id(col-&gt;id());</a>
+<a name="ln335"> </a>
+<a name="ln336">    // There's no &quot;list of expressions&quot; field so we simulate it with an artificial nested OR</a>
+<a name="ln337">    // with repeated operands, one per bind expression.</a>
+<a name="ln338">    // This is only used for operation unrolling in pg_doc_op and is not understood by DocDB.</a>
+<a name="ln339">    auto op2_pb = bind_pb-&gt;mutable_condition()-&gt;add_operands();</a>
+<a name="ln340">    op2_pb-&gt;mutable_condition()-&gt;set_op(QL_OP_OR);</a>
+<a name="ln341"> </a>
+<a name="ln342">    for (int i = 0; i &lt; n_attr_values; i++) {</a>
+<a name="ln343">      auto* attr_pb = op2_pb-&gt;mutable_condition()-&gt;add_operands();</a>
+<a name="ln344">      // Link the expression and protobuf. During execution, expr will write result to the pb.</a>
+<a name="ln345">      RETURN_NOT_OK(attr_values[i]-&gt;PrepareForRead(this, attr_pb));</a>
+<a name="ln346"> </a>
+<a name="ln347">      expr_binds_[attr_pb] = attr_values[i];</a>
+<a name="ln348"> </a>
+<a name="ln349">      if (attr_num == static_cast&lt;int&gt;(PgSystemAttrNum::kYBTupleId)) {</a>
+<a name="ln350">        CHECK(attr_values[i]-&gt;is_constant()) &lt;&lt; &quot;Column ybctid must be bound to constant&quot;;</a>
+<a name="ln351">        ybctid_bind_ = true;</a>
+<a name="ln352">      }</a>
+<a name="ln353">    }</a>
+<a name="ln354">  } else {</a>
+<a name="ln355">    // Alloc the protobuf.</a>
+<a name="ln356">    PgsqlExpressionPB *condition_expr_pb = AllocColumnBindConditionExprPB(col);</a>
+<a name="ln357"> </a>
+<a name="ln358">    condition_expr_pb-&gt;mutable_condition()-&gt;set_op(QL_OP_IN);</a>
+<a name="ln359"> </a>
+<a name="ln360">    auto op1_pb = condition_expr_pb-&gt;mutable_condition()-&gt;add_operands();</a>
+<a name="ln361">    auto op2_pb = condition_expr_pb-&gt;mutable_condition()-&gt;add_operands();</a>
+<a name="ln362"> </a>
+<a name="ln363">    op1_pb-&gt;set_column_id(col-&gt;id());</a>
+<a name="ln364"> </a>
+<a name="ln365">    for (int i = 0; i &lt; n_attr_values; i++) {</a>
+<a name="ln366">      // Link the given expression &quot;attr_value&quot; with the allocated protobuf.</a>
+<a name="ln367">      // Note that except for constants and place_holders, all other expressions can be setup</a>
+<a name="ln368">      // just one time during prepare.</a>
+<a name="ln369">      // Examples:</a>
+<a name="ln370">      // - Bind values for primary columns in where clause.</a>
+<a name="ln371">      //     WHERE hash = ?</a>
+<a name="ln372">      // - Bind values for a column in INSERT statement.</a>
+<a name="ln373">      //     INSERT INTO a_table(hash, key, col) VALUES(?, ?, ?)</a>
+<a name="ln374"> </a>
+<a name="ln375">      if (attr_values[i]) {</a>
+<a name="ln376">        RETURN_NOT_OK(attr_values[i]-&gt;Eval(this,</a>
+<a name="ln377">              op2_pb-&gt;mutable_value()-&gt;mutable_list_value()-&gt;add_elems()));</a>
+<a name="ln378">      }</a>
+<a name="ln379"> </a>
+<a name="ln380">      if (attr_num == static_cast&lt;int&gt;(PgSystemAttrNum::kYBTupleId)) {</a>
+<a name="ln381">        CHECK(attr_values[i]-&gt;is_constant()) &lt;&lt; &quot;Column ybctid must be bound to constant&quot;;</a>
+<a name="ln382">        ybctid_bind_ = true;</a>
+<a name="ln383">      }</a>
+<a name="ln384">    }</a>
+<a name="ln385">  }</a>
+<a name="ln386"> </a>
+<a name="ln387">  return Status::OK();</a>
+<a name="ln388">}</a>
+<a name="ln389"> </a>
+<a name="ln390">}  // namespace pggate</a>
+<a name="ln391">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="87"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="110"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v758/" target="_blank">V758</a> The 'col' reference becomes invalid when temporary object returned by a function is destroyed.</p></div>
+<div class="balloon" rel="121"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="134"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v758/" target="_blank">V758</a> The 'col' reference becomes invalid when temporary object returned by a function is destroyed.</p></div>
+<div class="balloon" rel="222"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="235"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="252"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="303"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="350"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="381"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

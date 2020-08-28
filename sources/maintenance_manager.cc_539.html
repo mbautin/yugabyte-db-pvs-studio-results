@@ -1,0 +1,491 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>maintenance_manager.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/tablet/maintenance_manager.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;stdint.h&gt;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &lt;memory&gt;</a>
+<a name="ln38">#include &lt;string&gt;</a>
+<a name="ln39">#include &lt;utility&gt;</a>
+<a name="ln40"> </a>
+<a name="ln41">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln42"> </a>
+<a name="ln43">#include &quot;yb/gutil/stringprintf.h&quot;</a>
+<a name="ln44">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln45">#include &quot;yb/util/debug/trace_event.h&quot;</a>
+<a name="ln46">#include &quot;yb/util/debug/trace_logging.h&quot;</a>
+<a name="ln47">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln48">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln49">#include &quot;yb/util/mem_tracker.h&quot;</a>
+<a name="ln50">#include &quot;yb/util/metrics.h&quot;</a>
+<a name="ln51">#include &quot;yb/util/stopwatch.h&quot;</a>
+<a name="ln52">#include &quot;yb/util/thread.h&quot;</a>
+<a name="ln53"> </a>
+<a name="ln54">using std::pair;</a>
+<a name="ln55">using std::shared_ptr;</a>
+<a name="ln56">using strings::Substitute;</a>
+<a name="ln57"> </a>
+<a name="ln58">DEFINE_int32(maintenance_manager_num_threads, 1,</a>
+<a name="ln59">       &quot;Size of the maintenance manager thread pool. Beyond a value of '1', one thread is &quot;</a>
+<a name="ln60">       &quot;reserved for emergency flushes. For spinning disks, the number of threads should &quot;</a>
+<a name="ln61">       &quot;not be above the number of devices.&quot;);</a>
+<a name="ln62">TAG_FLAG(maintenance_manager_num_threads, stable);</a>
+<a name="ln63"> </a>
+<a name="ln64">DEFINE_int32(maintenance_manager_polling_interval_ms, 250,</a>
+<a name="ln65">       &quot;Polling interval for the maintenance manager scheduler, &quot;</a>
+<a name="ln66">       &quot;in milliseconds.&quot;);</a>
+<a name="ln67">TAG_FLAG(maintenance_manager_polling_interval_ms, hidden);</a>
+<a name="ln68"> </a>
+<a name="ln69">DEFINE_int32(maintenance_manager_history_size, 8,</a>
+<a name="ln70">       &quot;Number of completed operations the manager is keeping track of.&quot;);</a>
+<a name="ln71">TAG_FLAG(maintenance_manager_history_size, hidden);</a>
+<a name="ln72"> </a>
+<a name="ln73">DEFINE_bool(enable_maintenance_manager, true,</a>
+<a name="ln74">       &quot;Enable the maintenance manager, runs compaction and tablet cleaning tasks.&quot;);</a>
+<a name="ln75">TAG_FLAG(enable_maintenance_manager, unsafe);</a>
+<a name="ln76"> </a>
+<a name="ln77">namespace yb {</a>
+<a name="ln78"> </a>
+<a name="ln79">using yb::tablet::MaintenanceManagerStatusPB;</a>
+<a name="ln80">using yb::tablet::MaintenanceManagerStatusPB_CompletedOpPB;</a>
+<a name="ln81">using yb::tablet::MaintenanceManagerStatusPB_MaintenanceOpPB;</a>
+<a name="ln82"> </a>
+<a name="ln83">MaintenanceOpStats::MaintenanceOpStats() {</a>
+<a name="ln84">  Clear();</a>
+<a name="ln85">}</a>
+<a name="ln86"> </a>
+<a name="ln87">void MaintenanceOpStats::Clear() {</a>
+<a name="ln88">  valid_ = false;</a>
+<a name="ln89">  runnable_ = false;</a>
+<a name="ln90">  ram_anchored_ = 0;</a>
+<a name="ln91">  logs_retained_bytes_ = 0;</a>
+<a name="ln92">  perf_improvement_ = 0;</a>
+<a name="ln93">}</a>
+<a name="ln94"> </a>
+<a name="ln95">MaintenanceOp::MaintenanceOp(std::string name, IOUsage io_usage)</a>
+<a name="ln96">    : name_(std::move(name)), running_(0), io_usage_(io_usage) {}</a>
+<a name="ln97"> </a>
+<a name="ln98">MaintenanceOp::~MaintenanceOp() {</a>
+<a name="ln99">  CHECK(!manager_.get()) &lt;&lt; &quot;You must unregister the &quot; &lt;&lt; name_</a>
+<a name="ln100">         &lt;&lt; &quot; Op before destroying it.&quot;;</a>
+<a name="ln101">}</a>
+<a name="ln102"> </a>
+<a name="ln103">void MaintenanceOp::Unregister() {</a>
+<a name="ln104">  CHECK(manager_.get()) &lt;&lt; &quot;Op &quot; &lt;&lt; name_ &lt;&lt; &quot; was never registered.&quot;;</a>
+<a name="ln105">  manager_-&gt;UnregisterOp(this);</a>
+<a name="ln106">}</a>
+<a name="ln107"> </a>
+<a name="ln108">const MaintenanceManager::Options MaintenanceManager::DEFAULT_OPTIONS = {</a>
+<a name="ln109">  0,</a>
+<a name="ln110">  0,</a>
+<a name="ln111">  0,</a>
+<a name="ln112">  shared_ptr&lt;MemTracker&gt;(),</a>
+<a name="ln113">};</a>
+<a name="ln114"> </a>
+<a name="ln115">MaintenanceManager::MaintenanceManager(const Options&amp; options)</a>
+<a name="ln116">  : num_threads_(options.num_threads &lt;= 0 ?</a>
+<a name="ln117">      FLAGS_maintenance_manager_num_threads : options.num_threads),</a>
+<a name="ln118">    cond_(&amp;lock_),</a>
+<a name="ln119">    shutdown_(false),</a>
+<a name="ln120">    running_ops_(0),</a>
+<a name="ln121">    polling_interval_ms_(options.polling_interval_ms &lt;= 0 ?</a>
+<a name="ln122">          FLAGS_maintenance_manager_polling_interval_ms :</a>
+<a name="ln123">          options.polling_interval_ms),</a>
+<a name="ln124">    completed_ops_count_(0),</a>
+<a name="ln125">    parent_mem_tracker_(!options.parent_mem_tracker ?</a>
+<a name="ln126">        MemTracker::GetRootTracker() : options.parent_mem_tracker) {</a>
+<a name="ln127">  CHECK_OK(ThreadPoolBuilder(&quot;MaintenanceMgr&quot;).set_min_threads(num_threads_)</a>
+<a name="ln128">               .set_max_threads(num_threads_).Build(&amp;thread_pool_));</a>
+<a name="ln129">  uint32_t history_size = options.history_size == 0 ?</a>
+<a name="ln130">                          FLAGS_maintenance_manager_history_size :</a>
+<a name="ln131">                          options.history_size;</a>
+<a name="ln132">  completed_ops_.resize(history_size);</a>
+<a name="ln133">}</a>
+<a name="ln134"> </a>
+<a name="ln135">MaintenanceManager::~MaintenanceManager() {</a>
+<a name="ln136">  Shutdown();</a>
+<a name="ln137">}</a>
+<a name="ln138"> </a>
+<a name="ln139">Status MaintenanceManager::Init() {</a>
+<a name="ln140">  RETURN_NOT_OK(Thread::Create(</a>
+<a name="ln141">      &quot;maintenance&quot;, &quot;maintenance_scheduler&quot;,</a>
+<a name="ln142">      std::bind(&amp;MaintenanceManager::RunSchedulerThread, this), &amp;monitor_thread_));</a>
+<a name="ln143">  return Status::OK();</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146">void MaintenanceManager::Shutdown() {</a>
+<a name="ln147">  {</a>
+<a name="ln148">    std::lock_guard&lt;Mutex&gt; guard(lock_);</a>
+<a name="ln149">    if (shutdown_) {</a>
+<a name="ln150">      return;</a>
+<a name="ln151">    }</a>
+<a name="ln152">    shutdown_ = true;</a>
+<a name="ln153">    cond_.Broadcast();</a>
+<a name="ln154">  }</a>
+<a name="ln155">  if (monitor_thread_.get()) {</a>
+<a name="ln156">    CHECK_OK(ThreadJoiner(monitor_thread_.get()).Join());</a>
+<a name="ln157">    monitor_thread_.reset();</a>
+<a name="ln158">    thread_pool_-&gt;Shutdown();</a>
+<a name="ln159">  }</a>
+<a name="ln160">}</a>
+<a name="ln161"> </a>
+<a name="ln162">void MaintenanceManager::RegisterOp(MaintenanceOp* op) {</a>
+<a name="ln163">  std::lock_guard&lt;Mutex&gt; guard(lock_);</a>
+<a name="ln164">  CHECK(!op-&gt;manager_.get()) &lt;&lt; &quot;Tried to register &quot; &lt;&lt; op-&gt;name()</a>
+<a name="ln165">          &lt;&lt; &quot;, but it was already registered.&quot;;</a>
+<a name="ln166">  pair&lt;OpMapTy::iterator, bool&gt; val</a>
+<a name="ln167">    (ops_.insert(OpMapTy::value_type(op, MaintenanceOpStats())));</a>
+<a name="ln168">  CHECK(val.second)</a>
+<a name="ln169">      &lt;&lt; &quot;Tried to register &quot; &lt;&lt; op-&gt;name()</a>
+<a name="ln170">      &lt;&lt; &quot;, but it already exists in ops_.&quot;;</a>
+<a name="ln171">  op-&gt;manager_ = shared_from_this();</a>
+<a name="ln172">  op-&gt;cond_.reset(new ConditionVariable(&amp;lock_));</a>
+<a name="ln173">  VLOG_AND_TRACE(&quot;maintenance&quot;, 1) &lt;&lt; &quot;Registered &quot; &lt;&lt; op-&gt;name();</a>
+<a name="ln174">}</a>
+<a name="ln175"> </a>
+<a name="ln176">void MaintenanceManager::UnregisterOp(MaintenanceOp* op) {</a>
+<a name="ln177">  {</a>
+<a name="ln178">    std::lock_guard&lt;Mutex&gt; guard(lock_);</a>
+<a name="ln179">    CHECK(op-&gt;manager_.get() == this) &lt;&lt; &quot;Tried to unregister &quot; &lt;&lt; op-&gt;name()</a>
+<a name="ln180">          &lt;&lt; &quot;, but it is not currently registered with this maintenance manager.&quot;;</a>
+<a name="ln181">    auto iter = ops_.find(op);</a>
+<a name="ln182">    CHECK(iter != ops_.end()) &lt;&lt; &quot;Tried to unregister &quot; &lt;&lt; op-&gt;name()</a>
+<a name="ln183">        &lt;&lt; &quot;, but it was never registered&quot;;</a>
+<a name="ln184">    // While the op is running, wait for it to be finished.</a>
+<a name="ln185">    if (iter-&gt;first-&gt;running_ &gt; 0) {</a>
+<a name="ln186">      VLOG_AND_TRACE(&quot;maintenance&quot;, 1) &lt;&lt; &quot;Waiting for op &quot; &lt;&lt; op-&gt;name() &lt;&lt; &quot; to finish so &quot;</a>
+<a name="ln187">            &lt;&lt; &quot;we can unregister it.&quot;;</a>
+<a name="ln188">    }</a>
+<a name="ln189">    while (iter-&gt;first-&gt;running_ &gt; 0) {</a>
+<a name="ln190">      op-&gt;cond_-&gt;Wait();</a>
+<a name="ln191">      iter = ops_.find(op);</a>
+<a name="ln192">      CHECK(iter != ops_.end()) &lt;&lt; &quot;Tried to unregister &quot; &lt;&lt; op-&gt;name()</a>
+<a name="ln193">          &lt;&lt; &quot;, but another thread unregistered it while we were &quot;</a>
+<a name="ln194">          &lt;&lt; &quot;waiting for it to complete&quot;;</a>
+<a name="ln195">    }</a>
+<a name="ln196">    ops_.erase(iter);</a>
+<a name="ln197">  }</a>
+<a name="ln198">  LOG(INFO) &lt;&lt; &quot;Unregistered op &quot; &lt;&lt; op-&gt;name();</a>
+<a name="ln199">  op-&gt;cond_.reset();</a>
+<a name="ln200">  // Remove the op's shared_ptr reference to us.  This might 'delete this'.</a>
+<a name="ln201">  op-&gt;manager_.reset();</a>
+<a name="ln202">}</a>
+<a name="ln203"> </a>
+<a name="ln204">void MaintenanceManager::RunSchedulerThread() {</a>
+<a name="ln205">  MonoDelta polling_interval = MonoDelta::FromMilliseconds(polling_interval_ms_);</a>
+<a name="ln206"> </a>
+<a name="ln207">  std::unique_lock&lt;Mutex&gt; guard(lock_);</a>
+<a name="ln208">  while (true) {</a>
+<a name="ln209">    // Loop until we are shutting down or it is time to run another op.</a>
+<a name="ln210">    cond_.TimedWait(polling_interval);</a>
+<a name="ln211">    if (shutdown_) {</a>
+<a name="ln212">      VLOG_AND_TRACE(&quot;maintenance&quot;, 1) &lt;&lt; &quot;Shutting down maintenance manager.&quot;;</a>
+<a name="ln213">      return;</a>
+<a name="ln214">    }</a>
+<a name="ln215"> </a>
+<a name="ln216">    // Find the best op.</a>
+<a name="ln217">    MaintenanceOp* op = FindBestOp();</a>
+<a name="ln218">    if (!op) {</a>
+<a name="ln219">      VLOG_AND_TRACE(&quot;maintenance&quot;, 2) &lt;&lt; &quot;No maintenance operations look worth doing.&quot;;</a>
+<a name="ln220">      continue;</a>
+<a name="ln221">    }</a>
+<a name="ln222"> </a>
+<a name="ln223">    // Prepare the maintenance operation.</a>
+<a name="ln224">    op-&gt;running_++;</a>
+<a name="ln225">    running_ops_++;</a>
+<a name="ln226">    guard.unlock();</a>
+<a name="ln227">    bool ready = op-&gt;Prepare();</a>
+<a name="ln228">    guard.lock();</a>
+<a name="ln229">    if (!ready) {</a>
+<a name="ln230">      LOG(INFO) &lt;&lt; &quot;Prepare failed for &quot; &lt;&lt; op-&gt;name()</a>
+<a name="ln231">                &lt;&lt; &quot;.  Re-running scheduler.&quot;;</a>
+<a name="ln232">      op-&gt;running_--;</a>
+<a name="ln233">      op-&gt;cond_-&gt;Signal();</a>
+<a name="ln234">      continue;</a>
+<a name="ln235">    }</a>
+<a name="ln236"> </a>
+<a name="ln237">    // Run the maintenance operation.</a>
+<a name="ln238">    Status s = thread_pool_-&gt;SubmitFunc(std::bind(&amp;MaintenanceManager::LaunchOp, this, op));</a>
+<a name="ln239">    CHECK(s.ok());</a>
+<a name="ln240">  }</a>
+<a name="ln241">}</a>
+<a name="ln242"> </a>
+<a name="ln243">// Finding the best operation goes through four filters:</a>
+<a name="ln244">// - If there's an Op that we can run quickly that frees log retention, we run it.</a>
+<a name="ln245">// - If we've hit the overall process memory limit (note: this includes memory that the Ops cannot</a>
+<a name="ln246">//   free), we run the Op with the highest RAM usage.</a>
+<a name="ln247">// - If there are Ops that retain logs, we run the one that has the highest retention (and if many</a>
+<a name="ln248">//   qualify, then we run the one that also frees up the most RAM).</a>
+<a name="ln249">// - Finally, if there's nothing else that we really need to do, we run the Op that will improve</a>
+<a name="ln250">//   performance the most.</a>
+<a name="ln251">//</a>
+<a name="ln252">// The reason it's done this way is that we want to prioritize limiting the amount of resources we</a>
+<a name="ln253">// hold on to. Low IO Ops go first since we can quickly run them, then we can look at memory usage.</a>
+<a name="ln254">// Reversing those can starve the low IO Ops when the system is under intense memory pressure.</a>
+<a name="ln255">//</a>
+<a name="ln256">// In the third priority we're at a point where nothing's urgent and there's nothing we can run</a>
+<a name="ln257">// quickly.</a>
+<a name="ln258">// TODO We currently optimize for freeing log retention but we could consider having some sort of</a>
+<a name="ln259">// sliding priority between log retention and RAM usage. For example, is an Op that frees</a>
+<a name="ln260">// 128MB of log retention and 12MB of RAM always better than an op that frees 12MB of log retention</a>
+<a name="ln261">// and 128MB of RAM? Maybe a more holistic approach would be better.</a>
+<a name="ln262">MaintenanceOp* MaintenanceManager::FindBestOp() {</a>
+<a name="ln263">  TRACE_EVENT0(&quot;maintenance&quot;, &quot;MaintenanceManager::FindBestOp&quot;);</a>
+<a name="ln264">  if (!FLAGS_enable_maintenance_manager) {</a>
+<a name="ln265">    VLOG_AND_TRACE(&quot;maintenance&quot;, 1) &lt;&lt; &quot;Maintenance manager is disabled. Doing nothing&quot;;</a>
+<a name="ln266">    return nullptr;</a>
+<a name="ln267">  }</a>
+<a name="ln268">  size_t free_threads = num_threads_ - running_ops_;</a>
+<a name="ln269">  if (free_threads == 0) {</a>
+<a name="ln270">    VLOG_AND_TRACE(&quot;maintenance&quot;, 1) &lt;&lt; &quot;there are no free threads, so we can't run anything.&quot;;</a>
+<a name="ln271">    return nullptr;</a>
+<a name="ln272">  }</a>
+<a name="ln273"> </a>
+<a name="ln274">  int64_t low_io_most_logs_retained_bytes = 0;</a>
+<a name="ln275">  MaintenanceOp* low_io_most_logs_retained_bytes_op = nullptr;</a>
+<a name="ln276"> </a>
+<a name="ln277">  uint64_t most_mem_anchored = 0;</a>
+<a name="ln278">  MaintenanceOp* most_mem_anchored_op = nullptr;</a>
+<a name="ln279"> </a>
+<a name="ln280">  int64_t most_logs_retained_bytes = 0;</a>
+<a name="ln281">  int64_t most_logs_retained_bytes_ram_anchored = 0;</a>
+<a name="ln282">  MaintenanceOp* most_logs_retained_bytes_op = nullptr;</a>
+<a name="ln283"> </a>
+<a name="ln284">  double best_perf_improvement = 0;</a>
+<a name="ln285">  MaintenanceOp* best_perf_improvement_op = nullptr;</a>
+<a name="ln286">  for (OpMapTy::value_type &amp;val : ops_) {</a>
+<a name="ln287">    MaintenanceOp* op(val.first);</a>
+<a name="ln288">    MaintenanceOpStats&amp; stats(val.second);</a>
+<a name="ln289">    // Update op stats.</a>
+<a name="ln290">    stats.Clear();</a>
+<a name="ln291">    op-&gt;UpdateStats(&amp;stats);</a>
+<a name="ln292">    if (!stats.valid() || !stats.runnable()) {</a>
+<a name="ln293">      continue;</a>
+<a name="ln294">    }</a>
+<a name="ln295">    if (stats.logs_retained_bytes() &gt; low_io_most_logs_retained_bytes &amp;&amp;</a>
+<a name="ln296">        op-&gt;io_usage_ == MaintenanceOp::LOW_IO_USAGE) {</a>
+<a name="ln297">      low_io_most_logs_retained_bytes_op = op;</a>
+<a name="ln298">      low_io_most_logs_retained_bytes = stats.logs_retained_bytes();</a>
+<a name="ln299">    }</a>
+<a name="ln300"> </a>
+<a name="ln301">    if (stats.ram_anchored() &gt; most_mem_anchored) {</a>
+<a name="ln302">      most_mem_anchored_op = op;</a>
+<a name="ln303">      most_mem_anchored = stats.ram_anchored();</a>
+<a name="ln304">    }</a>
+<a name="ln305">    // We prioritize ops that can free more logs, but when it's the same we pick the one that</a>
+<a name="ln306">    // also frees up the most memory.</a>
+<a name="ln307">    if (stats.logs_retained_bytes() &gt; 0 &amp;&amp;</a>
+<a name="ln308">        (stats.logs_retained_bytes() &gt; most_logs_retained_bytes ||</a>
+<a name="ln309">            (stats.logs_retained_bytes() == most_logs_retained_bytes &amp;&amp;</a>
+<a name="ln310">                stats.ram_anchored() &gt; most_logs_retained_bytes_ram_anchored))) {</a>
+<a name="ln311">      most_logs_retained_bytes_op = op;</a>
+<a name="ln312">      most_logs_retained_bytes = stats.logs_retained_bytes();</a>
+<a name="ln313">      most_logs_retained_bytes_ram_anchored = stats.ram_anchored();</a>
+<a name="ln314">    }</a>
+<a name="ln315">    if ((!best_perf_improvement_op) ||</a>
+<a name="ln316">        (stats.perf_improvement() &gt; best_perf_improvement)) {</a>
+<a name="ln317">      best_perf_improvement_op = op;</a>
+<a name="ln318">      best_perf_improvement = stats.perf_improvement();</a>
+<a name="ln319">    }</a>
+<a name="ln320">  }</a>
+<a name="ln321"> </a>
+<a name="ln322">  // Look at ops that we can run quickly that free up log retention.</a>
+<a name="ln323">  if (low_io_most_logs_retained_bytes_op) {</a>
+<a name="ln324">    if (low_io_most_logs_retained_bytes &gt; 0) {</a>
+<a name="ln325">      VLOG_AND_TRACE(&quot;maintenance&quot;, 1)</a>
+<a name="ln326">                    &lt;&lt; &quot;Performing &quot; &lt;&lt; low_io_most_logs_retained_bytes_op-&gt;name() &lt;&lt; &quot;, &quot;</a>
+<a name="ln327">                    &lt;&lt; &quot;because it can free up more logs &quot;</a>
+<a name="ln328">                    &lt;&lt; &quot;at &quot; &lt;&lt; low_io_most_logs_retained_bytes</a>
+<a name="ln329">                    &lt;&lt; &quot; bytes with a low IO cost&quot;;</a>
+<a name="ln330">      return low_io_most_logs_retained_bytes_op;</a>
+<a name="ln331">    }</a>
+<a name="ln332">  }</a>
+<a name="ln333"> </a>
+<a name="ln334">  // Look at free memory. If it is dangerously low, we must select something</a>
+<a name="ln335">  // that frees memory-- the op with the most anchored memory.</a>
+<a name="ln336">  auto soft_limit_exceeded_result = parent_mem_tracker_-&gt;AnySoftLimitExceeded(0.0 /* score */);</a>
+<a name="ln337">  if (soft_limit_exceeded_result.exceeded) {</a>
+<a name="ln338">    if (!most_mem_anchored_op) {</a>
+<a name="ln339">      string msg = StringPrintf(&quot;we have exceeded our soft memory limit &quot;</a>
+<a name="ln340">          &quot;(current capacity is %.2f%%).  However, there are no ops currently &quot;</a>
+<a name="ln341">          &quot;runnable which would free memory.&quot;, soft_limit_exceeded_result.current_capacity_pct);</a>
+<a name="ln342">      YB_LOG_EVERY_N_SECS(INFO, 5) &lt;&lt; msg;</a>
+<a name="ln343">      return nullptr;</a>
+<a name="ln344">    }</a>
+<a name="ln345">    VLOG_AND_TRACE(&quot;maintenance&quot;, 1) &lt;&lt; &quot;we have exceeded our soft memory limit &quot;</a>
+<a name="ln346">            &lt;&lt; &quot;(current capacity is &quot; &lt;&lt; soft_limit_exceeded_result.current_capacity_pct &lt;&lt; &quot;%). &quot;</a>
+<a name="ln347">            &lt;&lt; &quot;Running the op which anchors the most memory: &quot; &lt;&lt; most_mem_anchored_op-&gt;name();</a>
+<a name="ln348">    return most_mem_anchored_op;</a>
+<a name="ln349">  }</a>
+<a name="ln350"> </a>
+<a name="ln351">  if (most_logs_retained_bytes_op) {</a>
+<a name="ln352">    VLOG_AND_TRACE(&quot;maintenance&quot;, 1)</a>
+<a name="ln353">            &lt;&lt; &quot;Performing &quot; &lt;&lt; most_logs_retained_bytes_op-&gt;name() &lt;&lt; &quot;, &quot;</a>
+<a name="ln354">            &lt;&lt; &quot;because it can free up more logs &quot; &lt;&lt; &quot;at &quot; &lt;&lt; most_logs_retained_bytes</a>
+<a name="ln355">            &lt;&lt; &quot; bytes&quot;;</a>
+<a name="ln356">    return most_logs_retained_bytes_op;</a>
+<a name="ln357">  }</a>
+<a name="ln358"> </a>
+<a name="ln359">  if (best_perf_improvement_op) {</a>
+<a name="ln360">    if (best_perf_improvement &gt; 0) {</a>
+<a name="ln361">      VLOG_AND_TRACE(&quot;maintenance&quot;, 1) &lt;&lt; &quot;Performing &quot; &lt;&lt; best_perf_improvement_op-&gt;name() &lt;&lt; &quot;, &quot;</a>
+<a name="ln362">                 &lt;&lt; &quot;because it had the best perf_improvement score, &quot;</a>
+<a name="ln363">                 &lt;&lt; &quot;at &quot; &lt;&lt; best_perf_improvement;</a>
+<a name="ln364">      return best_perf_improvement_op;</a>
+<a name="ln365">    }</a>
+<a name="ln366">  }</a>
+<a name="ln367">  return nullptr;</a>
+<a name="ln368">}</a>
+<a name="ln369"> </a>
+<a name="ln370">void MaintenanceManager::LaunchOp(MaintenanceOp* op) {</a>
+<a name="ln371">  MonoTime start_time(MonoTime::Now());</a>
+<a name="ln372">  op-&gt;RunningGauge()-&gt;Increment();</a>
+<a name="ln373">  LOG_TIMING(INFO, Substitute(&quot;running $0&quot;, op-&gt;name())) {</a>
+<a name="ln374">    TRACE_EVENT1(&quot;maintenance&quot;, &quot;MaintenanceManager::LaunchOp&quot;,</a>
+<a name="ln375">                 &quot;name&quot;, op-&gt;name());</a>
+<a name="ln376">    op-&gt;Perform();</a>
+<a name="ln377">  }</a>
+<a name="ln378">  op-&gt;RunningGauge()-&gt;Decrement();</a>
+<a name="ln379">  MonoTime end_time(MonoTime::Now());</a>
+<a name="ln380">  MonoDelta delta(end_time.GetDeltaSince(start_time));</a>
+<a name="ln381">  std::lock_guard&lt;Mutex&gt; guard(lock_);</a>
+<a name="ln382"> </a>
+<a name="ln383">  CompletedOp&amp; completed_op = completed_ops_[completed_ops_count_ % completed_ops_.size()];</a>
+<a name="ln384">  completed_op.name = op-&gt;name();</a>
+<a name="ln385">  completed_op.duration = delta;</a>
+<a name="ln386">  completed_op.start_mono_time = start_time;</a>
+<a name="ln387">  completed_ops_count_++;</a>
+<a name="ln388"> </a>
+<a name="ln389">  op-&gt;DurationHistogram()-&gt;Increment(delta.ToMilliseconds());</a>
+<a name="ln390"> </a>
+<a name="ln391">  running_ops_--;</a>
+<a name="ln392">  op-&gt;running_--;</a>
+<a name="ln393">  op-&gt;cond_-&gt;Signal();</a>
+<a name="ln394">}</a>
+<a name="ln395"> </a>
+<a name="ln396">void MaintenanceManager::GetMaintenanceManagerStatusDump(MaintenanceManagerStatusPB* out_pb) {</a>
+<a name="ln397">  DCHECK(out_pb != nullptr);</a>
+<a name="ln398">  std::lock_guard&lt;Mutex&gt; guard(lock_);</a>
+<a name="ln399">  MaintenanceOp* best_op = FindBestOp();</a>
+<a name="ln400">  for (MaintenanceManager::OpMapTy::value_type&amp; val : ops_) {</a>
+<a name="ln401">    MaintenanceManagerStatusPB_MaintenanceOpPB* op_pb = out_pb-&gt;add_registered_operations();</a>
+<a name="ln402">    MaintenanceOp* op(val.first);</a>
+<a name="ln403">    MaintenanceOpStats&amp; stat(val.second);</a>
+<a name="ln404">    op_pb-&gt;set_name(op-&gt;name());</a>
+<a name="ln405">    op_pb-&gt;set_running(op-&gt;running());</a>
+<a name="ln406">    if (stat.valid()) {</a>
+<a name="ln407">      op_pb-&gt;set_runnable(stat.runnable());</a>
+<a name="ln408">      op_pb-&gt;set_ram_anchored_bytes(stat.ram_anchored());</a>
+<a name="ln409">      op_pb-&gt;set_logs_retained_bytes(stat.logs_retained_bytes());</a>
+<a name="ln410">      op_pb-&gt;set_perf_improvement(stat.perf_improvement());</a>
+<a name="ln411">    } else {</a>
+<a name="ln412">      op_pb-&gt;set_runnable(false);</a>
+<a name="ln413">      op_pb-&gt;set_ram_anchored_bytes(0);</a>
+<a name="ln414">      op_pb-&gt;set_logs_retained_bytes(0);</a>
+<a name="ln415">      op_pb-&gt;set_perf_improvement(0);</a>
+<a name="ln416">    }</a>
+<a name="ln417"> </a>
+<a name="ln418">    if (best_op == op) {</a>
+<a name="ln419">      out_pb-&gt;mutable_best_op()-&gt;CopyFrom(*op_pb);</a>
+<a name="ln420">    }</a>
+<a name="ln421">  }</a>
+<a name="ln422"> </a>
+<a name="ln423">  for (const CompletedOp&amp; completed_op : completed_ops_) {</a>
+<a name="ln424">    if (!completed_op.name.empty()) {</a>
+<a name="ln425">      MaintenanceManagerStatusPB_CompletedOpPB* completed_pb = out_pb-&gt;add_completed_operations();</a>
+<a name="ln426">      completed_pb-&gt;set_name(completed_op.name);</a>
+<a name="ln427">      completed_pb-&gt;set_duration_millis(completed_op.duration.ToMilliseconds());</a>
+<a name="ln428"> </a>
+<a name="ln429">      MonoDelta delta(MonoTime::Now().GetDeltaSince(completed_op.start_mono_time));</a>
+<a name="ln430">      completed_pb-&gt;set_secs_since_start(delta.ToSeconds());</a>
+<a name="ln431">    }</a>
+<a name="ln432">  }</a>
+<a name="ln433">}</a>
+<a name="ln434"> </a>
+<a name="ln435">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="99"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="104"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="127"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="156"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="164"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="168"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="179"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="182"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="192"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="239"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="397"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

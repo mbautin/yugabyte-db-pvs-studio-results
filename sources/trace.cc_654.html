@@ -1,0 +1,453 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>trace.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;iomanip&gt;</a>
+<a name="ln36">#include &lt;ios&gt;</a>
+<a name="ln37">#include &lt;iostream&gt;</a>
+<a name="ln38">#include &lt;strstream&gt;</a>
+<a name="ln39">#include &lt;string&gt;</a>
+<a name="ln40">#include &lt;vector&gt;</a>
+<a name="ln41"> </a>
+<a name="ln42">#include &lt;boost/range/iterator_range.hpp&gt;</a>
+<a name="ln43">#include &lt;boost/range/adaptor/indirected.hpp&gt;</a>
+<a name="ln44"> </a>
+<a name="ln45">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln46">#include &quot;yb/gutil/walltime.h&quot;</a>
+<a name="ln47"> </a>
+<a name="ln48">#include &quot;yb/util/memory/arena.h&quot;</a>
+<a name="ln49">#include &quot;yb/util/memory/memory.h&quot;</a>
+<a name="ln50">#include &quot;yb/util/object_pool.h&quot;</a>
+<a name="ln51">#include &quot;yb/util/size_literals.h&quot;</a>
+<a name="ln52"> </a>
+<a name="ln53">DEFINE_bool(enable_tracing, false, &quot;Flag to enable/disable tracing across the code.&quot;);</a>
+<a name="ln54"> </a>
+<a name="ln55">namespace yb {</a>
+<a name="ln56"> </a>
+<a name="ln57">using strings::internal::SubstituteArg;</a>
+<a name="ln58"> </a>
+<a name="ln59">__thread Trace* Trace::threadlocal_trace_;</a>
+<a name="ln60"> </a>
+<a name="ln61">namespace {</a>
+<a name="ln62"> </a>
+<a name="ln63">// Get the part of filepath after the last path separator.</a>
+<a name="ln64">// (Doesn't modify filepath, contrary to basename() in libgen.h.)</a>
+<a name="ln65">// Borrowed from glog.</a>
+<a name="ln66">const char* const_basename(const char* filepath) {</a>
+<a name="ln67">  const char* base = strrchr(filepath, '/');</a>
+<a name="ln68">  return base ? (base + 1) : filepath;</a>
+<a name="ln69">}</a>
+<a name="ln70"> </a>
+<a name="ln71">template&lt;class Children&gt;</a>
+<a name="ln72">void DumpChildren(std::ostream* out, bool include_time_deltas, const Children* children) {</a>
+<a name="ln73">  for (auto &amp;child_trace : *children) {</a>
+<a name="ln74">    *out &lt;&lt; &quot;Related trace:&quot; &lt;&lt; std::endl;</a>
+<a name="ln75">    *out &lt;&lt; child_trace-&gt;DumpToString(include_time_deltas);</a>
+<a name="ln76">  }</a>
+<a name="ln77">}</a>
+<a name="ln78"> </a>
+<a name="ln79">void DumpChildren(std::ostream* out, bool include_time_deltas, std::nullptr_t children) {</a>
+<a name="ln80">}</a>
+<a name="ln81"> </a>
+<a name="ln82">template&lt;class Entries&gt;</a>
+<a name="ln83">void DumpEntries(std::ostream* out,</a>
+<a name="ln84">                 bool include_time_deltas,</a>
+<a name="ln85">                 int64_t start,</a>
+<a name="ln86">                 const Entries&amp; entries) {</a>
+<a name="ln87">  if (entries.empty()) {</a>
+<a name="ln88">    return;</a>
+<a name="ln89">  }</a>
+<a name="ln90"> </a>
+<a name="ln91">  auto time_usec = entries.begin()-&gt;timestamp.GetDeltaSinceMin().ToMicroseconds();</a>
+<a name="ln92">  const int64_t time_correction_usec = start - time_usec;</a>
+<a name="ln93">  int64_t prev_usecs = time_usec;</a>
+<a name="ln94">  for (const auto&amp; e : entries) {</a>
+<a name="ln95">    time_usec = e.timestamp.GetDeltaSinceMin().ToMicroseconds();</a>
+<a name="ln96">    const int64_t usecs_since_prev = time_usec - prev_usecs;</a>
+<a name="ln97">    prev_usecs = time_usec;</a>
+<a name="ln98"> </a>
+<a name="ln99">    const auto absolute_time_usec = time_usec + time_correction_usec;</a>
+<a name="ln100">    const time_t secs_since_epoch = absolute_time_usec / 1000000;</a>
+<a name="ln101">    const int usecs = absolute_time_usec % 1000000;</a>
+<a name="ln102">    struct tm tm_time;</a>
+<a name="ln103">    localtime_r(&amp;secs_since_epoch, &amp;tm_time);</a>
+<a name="ln104"> </a>
+<a name="ln105">    // Log format borrowed from glog/logging.cc</a>
+<a name="ln106">    using std::setw;</a>
+<a name="ln107">    out-&gt;fill('0');</a>
+<a name="ln108"> </a>
+<a name="ln109">    *out &lt;&lt; setw(2) &lt;&lt; (1 + tm_time.tm_mon)</a>
+<a name="ln110">         &lt;&lt; setw(2) &lt;&lt; tm_time.tm_mday</a>
+<a name="ln111">         &lt;&lt; ' '</a>
+<a name="ln112">         &lt;&lt; setw(2) &lt;&lt; tm_time.tm_hour  &lt;&lt; ':'</a>
+<a name="ln113">         &lt;&lt; setw(2) &lt;&lt; tm_time.tm_min   &lt;&lt; ':'</a>
+<a name="ln114">         &lt;&lt; setw(2) &lt;&lt; tm_time.tm_sec   &lt;&lt; '.'</a>
+<a name="ln115">         &lt;&lt; setw(6) &lt;&lt; usecs &lt;&lt; ' ';</a>
+<a name="ln116">    if (include_time_deltas) {</a>
+<a name="ln117">      out-&gt;fill(' ');</a>
+<a name="ln118">      *out &lt;&lt; &quot;(+&quot; &lt;&lt; setw(6) &lt;&lt; usecs_since_prev &lt;&lt; &quot;us) &quot;;</a>
+<a name="ln119">    }</a>
+<a name="ln120">    e.Dump(out);</a>
+<a name="ln121">    *out &lt;&lt; std::endl;</a>
+<a name="ln122">  }</a>
+<a name="ln123">}</a>
+<a name="ln124"> </a>
+<a name="ln125">template&lt;class Entries, class Children&gt;</a>
+<a name="ln126">void DoDump(std::ostream* out,</a>
+<a name="ln127">            bool include_time_deltas,</a>
+<a name="ln128">            int64_t start,</a>
+<a name="ln129">            const Entries&amp; entries,</a>
+<a name="ln130">            Children children) {</a>
+<a name="ln131">  // Save original flags.</a>
+<a name="ln132">  std::ios::fmtflags save_flags(out-&gt;flags());</a>
+<a name="ln133"> </a>
+<a name="ln134">  DumpEntries(out, include_time_deltas, start, entries);</a>
+<a name="ln135">  DumpChildren(out, include_time_deltas, children);</a>
+<a name="ln136"> </a>
+<a name="ln137">  // Restore stream flags.</a>
+<a name="ln138">  out-&gt;flags(save_flags);</a>
+<a name="ln139">}</a>
+<a name="ln140"> </a>
+<a name="ln141">std::once_flag init_get_current_micros_fast_flag;</a>
+<a name="ln142">int64_t initial_micros_offset;</a>
+<a name="ln143"> </a>
+<a name="ln144">void InitGetCurrentMicrosFast() {</a>
+<a name="ln145">  auto before = MonoTime::Now();</a>
+<a name="ln146">  initial_micros_offset = GetCurrentTimeMicros();</a>
+<a name="ln147">  auto after = MonoTime::Now();</a>
+<a name="ln148">  auto mid = after.GetDeltaSinceMin().ToMicroseconds();</a>
+<a name="ln149">  mid += before.GetDeltaSinceMin().ToMicroseconds();</a>
+<a name="ln150">  mid /= 2;</a>
+<a name="ln151">  initial_micros_offset -= mid;</a>
+<a name="ln152">}</a>
+<a name="ln153"> </a>
+<a name="ln154">int64_t GetCurrentMicrosFast(MonoTime now) {</a>
+<a name="ln155">  std::call_once(init_get_current_micros_fast_flag, InitGetCurrentMicrosFast);</a>
+<a name="ln156">  return initial_micros_offset + now.GetDeltaSinceMin().ToMicroseconds();</a>
+<a name="ln157">}</a>
+<a name="ln158"> </a>
+<a name="ln159">} // namespace</a>
+<a name="ln160"> </a>
+<a name="ln161">ScopedAdoptTrace::ScopedAdoptTrace(Trace* t)</a>
+<a name="ln162">    : old_trace_(Trace::threadlocal_trace_), is_enabled_(GetAtomicFlag(&amp;FLAGS_enable_tracing)) {</a>
+<a name="ln163">  if (is_enabled_) {</a>
+<a name="ln164">    trace_ = t;</a>
+<a name="ln165">    Trace::threadlocal_trace_ = t;</a>
+<a name="ln166">    DFAKE_SCOPED_LOCK_THREAD_LOCKED(ctor_dtor_);</a>
+<a name="ln167">  }</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170">ScopedAdoptTrace::~ScopedAdoptTrace() {</a>
+<a name="ln171">  if (is_enabled_) {</a>
+<a name="ln172">    Trace::threadlocal_trace_ = old_trace_;</a>
+<a name="ln173">    // It's critical that we Release() the reference count on 't' only</a>
+<a name="ln174">    // after we've unset the thread-local variable. Otherwise, we can hit</a>
+<a name="ln175">    // a nasty interaction with tcmalloc contention profiling. Consider</a>
+<a name="ln176">    // the following sequence:</a>
+<a name="ln177">    //</a>
+<a name="ln178">    //   1. threadlocal_trace_ has refcount = 1</a>
+<a name="ln179">    //   2. we call threadlocal_trace_-&gt;Release() which decrements refcount to 0</a>
+<a name="ln180">    //   3. this calls 'delete' on the Trace object</a>
+<a name="ln181">    //   3a. this calls tcmalloc free() on the Trace and various sub-objects</a>
+<a name="ln182">    //   3b. the free() calls may end up experiencing contention in tcmalloc</a>
+<a name="ln183">    //   3c. we try to account the contention in threadlocal_trace_'s TraceMetrics,</a>
+<a name="ln184">    //       but it has already been freed.</a>
+<a name="ln185">    //</a>
+<a name="ln186">    // In the best case, we just scribble into some free tcmalloc memory. In the</a>
+<a name="ln187">    // worst case, tcmalloc would have already re-used this memory for a new</a>
+<a name="ln188">    // allocation on another thread, and we end up overwriting someone else's memory.</a>
+<a name="ln189">    //</a>
+<a name="ln190">    // Waiting to Release() only after 'unpublishing' the trace solves this.</a>
+<a name="ln191">    trace_.reset();</a>
+<a name="ln192">    DFAKE_SCOPED_LOCK_THREAD_LOCKED(ctor_dtor_);</a>
+<a name="ln193">  }</a>
+<a name="ln194">}</a>
+<a name="ln195"> </a>
+<a name="ln196">// Struct which precedes each entry in the trace.</a>
+<a name="ln197">struct TraceEntry {</a>
+<a name="ln198">  MonoTime timestamp;</a>
+<a name="ln199"> </a>
+<a name="ln200">  // The source file and line number which generated the trace message.</a>
+<a name="ln201">  const char* file_path;</a>
+<a name="ln202">  int line_number;</a>
+<a name="ln203"> </a>
+<a name="ln204">  uint32_t message_len;</a>
+<a name="ln205">  TraceEntry* next;</a>
+<a name="ln206">  char message[0];</a>
+<a name="ln207"> </a>
+<a name="ln208">  void Dump(std::ostream* out) const {</a>
+<a name="ln209">    *out &lt;&lt; const_basename(file_path) &lt;&lt; ':' &lt;&lt; line_number</a>
+<a name="ln210">         &lt;&lt; &quot;] &quot;;</a>
+<a name="ln211">    out-&gt;write(message, message_len);</a>
+<a name="ln212">  }</a>
+<a name="ln213">};</a>
+<a name="ln214"> </a>
+<a name="ln215">Trace::Trace() {</a>
+<a name="ln216">}</a>
+<a name="ln217"> </a>
+<a name="ln218">ThreadSafeObjectPool&lt;ThreadSafeArena&gt;&amp; ArenaPool() {</a>
+<a name="ln219">  static ThreadSafeObjectPool&lt;ThreadSafeArena&gt; result([] {</a>
+<a name="ln220">    return new ThreadSafeArena(8_KB, 128_KB);</a>
+<a name="ln221">  });</a>
+<a name="ln222">  return result;</a>
+<a name="ln223">}</a>
+<a name="ln224"> </a>
+<a name="ln225">Trace::~Trace() {</a>
+<a name="ln226">  auto* arena = arena_.load(std::memory_order_acquire);</a>
+<a name="ln227">  if (arena) {</a>
+<a name="ln228">    arena-&gt;Reset();</a>
+<a name="ln229">    ArenaPool().Release(arena);</a>
+<a name="ln230">  }</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233">ThreadSafeArena* Trace::GetAndInitArena() {</a>
+<a name="ln234">  auto* arena = arena_.load(std::memory_order_acquire);</a>
+<a name="ln235">  if (arena == nullptr) {</a>
+<a name="ln236">    arena = ArenaPool().Take();</a>
+<a name="ln237">    ThreadSafeArena* existing_arena = nullptr;</a>
+<a name="ln238">    if (arena_.compare_exchange_strong(existing_arena, arena, std::memory_order_release)) {</a>
+<a name="ln239">      return arena;</a>
+<a name="ln240">    } else {</a>
+<a name="ln241">      ArenaPool().Release(arena);</a>
+<a name="ln242">      return existing_arena;</a>
+<a name="ln243">    }</a>
+<a name="ln244">  }</a>
+<a name="ln245">  return arena;</a>
+<a name="ln246">}</a>
+<a name="ln247"> </a>
+<a name="ln248">void Trace::SubstituteAndTrace(</a>
+<a name="ln249">    const char* file_path, int line_number, MonoTime now, GStringPiece format) {</a>
+<a name="ln250">  int msg_len = format.size();</a>
+<a name="ln251">  DCHECK_NE(msg_len, 0) &lt;&lt; &quot;Bad format specification&quot;;</a>
+<a name="ln252">  TraceEntry* entry = NewEntry(msg_len, file_path, line_number, now);</a>
+<a name="ln253">  if (entry == nullptr) return;</a>
+<a name="ln254">  memcpy(entry-&gt;message, format.data(), msg_len);</a>
+<a name="ln255">  AddEntry(entry);</a>
+<a name="ln256">}</a>
+<a name="ln257"> </a>
+<a name="ln258">void Trace::SubstituteAndTrace(const char* file_path,</a>
+<a name="ln259">                               int line_number,</a>
+<a name="ln260">                               MonoTime now,</a>
+<a name="ln261">                               GStringPiece format,</a>
+<a name="ln262">                               const SubstituteArg&amp; arg0, const SubstituteArg&amp; arg1,</a>
+<a name="ln263">                               const SubstituteArg&amp; arg2, const SubstituteArg&amp; arg3,</a>
+<a name="ln264">                               const SubstituteArg&amp; arg4, const SubstituteArg&amp; arg5,</a>
+<a name="ln265">                               const SubstituteArg&amp; arg6, const SubstituteArg&amp; arg7,</a>
+<a name="ln266">                               const SubstituteArg&amp; arg8, const SubstituteArg&amp; arg9) {</a>
+<a name="ln267">  const SubstituteArg* const args_array[] = {</a>
+<a name="ln268">    &amp;arg0, &amp;arg1, &amp;arg2, &amp;arg3, &amp;arg4, &amp;arg5, &amp;arg6, &amp;arg7, &amp;arg8, &amp;arg9, nullptr</a>
+<a name="ln269">  };</a>
+<a name="ln270"> </a>
+<a name="ln271">  int msg_len = strings::internal::SubstitutedSize(format, args_array);</a>
+<a name="ln272">  DCHECK_NE(msg_len, 0) &lt;&lt; &quot;Bad format specification&quot;;</a>
+<a name="ln273">  TraceEntry* entry = NewEntry(msg_len, file_path, line_number, now);</a>
+<a name="ln274">  if (entry == nullptr) return;</a>
+<a name="ln275">  SubstituteToBuffer(format, args_array, entry-&gt;message);</a>
+<a name="ln276">  AddEntry(entry);</a>
+<a name="ln277">}</a>
+<a name="ln278"> </a>
+<a name="ln279">TraceEntry* Trace::NewEntry(int msg_len, const char* file_path, int line_number, MonoTime now) {</a>
+<a name="ln280">  auto* arena = GetAndInitArena();</a>
+<a name="ln281">  size_t size = offsetof(TraceEntry, message) + msg_len;</a>
+<a name="ln282">  void* dst = arena-&gt;AllocateBytesAligned(size, alignof(TraceEntry));</a>
+<a name="ln283">  if (dst == nullptr) {</a>
+<a name="ln284">    LOG(ERROR) &lt;&lt; &quot;NewEntry(msg_len, &quot; &lt;&lt; file_path &lt;&lt; &quot;, &quot; &lt;&lt; line_number</a>
+<a name="ln285">        &lt;&lt; &quot;) received nullptr from AllocateBytes.\n So far:&quot; &lt;&lt; DumpToString(true);</a>
+<a name="ln286">    return nullptr;</a>
+<a name="ln287">  }</a>
+<a name="ln288">  TraceEntry* entry = new (dst) TraceEntry;</a>
+<a name="ln289">  entry-&gt;timestamp = now;</a>
+<a name="ln290">  entry-&gt;message_len = msg_len;</a>
+<a name="ln291">  entry-&gt;file_path = file_path;</a>
+<a name="ln292">  entry-&gt;line_number = line_number;</a>
+<a name="ln293">  return entry;</a>
+<a name="ln294">}</a>
+<a name="ln295"> </a>
+<a name="ln296">void Trace::AddEntry(TraceEntry* entry) {</a>
+<a name="ln297">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln298">  entry-&gt;next = nullptr;</a>
+<a name="ln299"> </a>
+<a name="ln300">  if (entries_tail_ != nullptr) {</a>
+<a name="ln301">    entries_tail_-&gt;next = entry;</a>
+<a name="ln302">  } else {</a>
+<a name="ln303">    DCHECK(entries_head_ == nullptr);</a>
+<a name="ln304">    entries_head_ = entry;</a>
+<a name="ln305">    trace_start_time_usec_ = GetCurrentMicrosFast(entry-&gt;timestamp);</a>
+<a name="ln306">  }</a>
+<a name="ln307">  entries_tail_ = entry;</a>
+<a name="ln308">}</a>
+<a name="ln309"> </a>
+<a name="ln310">void Trace::Dump(std::ostream *out, bool include_time_deltas) const {</a>
+<a name="ln311">  // Gather a copy of the list of entries under the lock. This is fast</a>
+<a name="ln312">  // enough that we aren't worried about stalling concurrent tracers</a>
+<a name="ln313">  // (whereas doing the logging itself while holding the lock might be</a>
+<a name="ln314">  // too slow, if the output stream is a file, for example).</a>
+<a name="ln315">  vector&lt;TraceEntry*&gt; entries;</a>
+<a name="ln316">  vector&lt;scoped_refptr&lt;Trace&gt; &gt; child_traces;</a>
+<a name="ln317">  decltype(trace_start_time_usec_) trace_start_time_usec;</a>
+<a name="ln318">  {</a>
+<a name="ln319">    std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln320">    for (TraceEntry* cur = entries_head_;</a>
+<a name="ln321">        cur != nullptr;</a>
+<a name="ln322">        cur = cur-&gt;next) {</a>
+<a name="ln323">      entries.push_back(cur);</a>
+<a name="ln324">    }</a>
+<a name="ln325"> </a>
+<a name="ln326">    child_traces = child_traces_;</a>
+<a name="ln327">    trace_start_time_usec = trace_start_time_usec_;</a>
+<a name="ln328">  }</a>
+<a name="ln329"> </a>
+<a name="ln330">  DoDump(out,</a>
+<a name="ln331">         include_time_deltas,</a>
+<a name="ln332">         trace_start_time_usec,</a>
+<a name="ln333">         entries | boost::adaptors::indirected,</a>
+<a name="ln334">         &amp;child_traces);</a>
+<a name="ln335">}</a>
+<a name="ln336"> </a>
+<a name="ln337">string Trace::DumpToString(bool include_time_deltas) const {</a>
+<a name="ln338">  std::stringstream s;</a>
+<a name="ln339">  Dump(&amp;s, include_time_deltas);</a>
+<a name="ln340">  return s.str();</a>
+<a name="ln341">}</a>
+<a name="ln342"> </a>
+<a name="ln343">void Trace::DumpCurrentTrace() {</a>
+<a name="ln344">  Trace* t = CurrentTrace();</a>
+<a name="ln345">  if (t == nullptr) {</a>
+<a name="ln346">    LOG(INFO) &lt;&lt; &quot;No trace is currently active.&quot;;</a>
+<a name="ln347">    return;</a>
+<a name="ln348">  }</a>
+<a name="ln349">  t-&gt;Dump(&amp;std::cerr, true);</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352">void Trace::AddChildTrace(Trace* child_trace) {</a>
+<a name="ln353">  CHECK_NOTNULL(child_trace);</a>
+<a name="ln354">  {</a>
+<a name="ln355">    std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln356">    scoped_refptr&lt;Trace&gt; ptr(child_trace);</a>
+<a name="ln357">    child_traces_.push_back(ptr);</a>
+<a name="ln358">  }</a>
+<a name="ln359">  CHECK(!child_trace-&gt;HasOneRef());</a>
+<a name="ln360">}</a>
+<a name="ln361"> </a>
+<a name="ln362">size_t Trace::DynamicMemoryUsage() const {</a>
+<a name="ln363">  auto arena = arena_.load();</a>
+<a name="ln364">  return arena ? arena-&gt;memory_footprint() : 0;</a>
+<a name="ln365">}</a>
+<a name="ln366"> </a>
+<a name="ln367">PlainTrace::PlainTrace() {</a>
+<a name="ln368">}</a>
+<a name="ln369"> </a>
+<a name="ln370">void PlainTrace::Trace(const char *file_path, int line_number, const char *message) {</a>
+<a name="ln371">  auto timestamp = MonoTime::Now();</a>
+<a name="ln372">  {</a>
+<a name="ln373">    std::lock_guard&lt;decltype(mutex_)&gt; lock(mutex_);</a>
+<a name="ln374">    if (size_ &lt; kMaxEntries) {</a>
+<a name="ln375">      if (size_ == 0) {</a>
+<a name="ln376">        trace_start_time_usec_ = GetCurrentMicrosFast(timestamp);</a>
+<a name="ln377">      }</a>
+<a name="ln378">      entries_[size_] = {file_path, line_number, message, timestamp};</a>
+<a name="ln379">      ++size_;</a>
+<a name="ln380">    }</a>
+<a name="ln381">  }</a>
+<a name="ln382">}</a>
+<a name="ln383"> </a>
+<a name="ln384">void PlainTrace::Dump(std::ostream *out, bool include_time_deltas) const {</a>
+<a name="ln385">  size_t size;</a>
+<a name="ln386">  decltype(trace_start_time_usec_) trace_start_time_usec;</a>
+<a name="ln387">  {</a>
+<a name="ln388">    std::lock_guard&lt;decltype(mutex_)&gt; lock(mutex_);</a>
+<a name="ln389">    size = size_;</a>
+<a name="ln390">    trace_start_time_usec = trace_start_time_usec_;</a>
+<a name="ln391">  }</a>
+<a name="ln392">  auto entries = boost::make_iterator_range(entries_, entries_ + size);</a>
+<a name="ln393">  DoDump(out, include_time_deltas, trace_start_time_usec, entries, /* children */ nullptr);</a>
+<a name="ln394">}</a>
+<a name="ln395"> </a>
+<a name="ln396">std::string PlainTrace::DumpToString(bool include_time_deltas) const {</a>
+<a name="ln397">  std::stringstream s;</a>
+<a name="ln398">  Dump(&amp;s, include_time_deltas);</a>
+<a name="ln399">  return s.str();</a>
+<a name="ln400">}</a>
+<a name="ln401"> </a>
+<a name="ln402">void PlainTrace::Entry::Dump(std::ostream *out) const {</a>
+<a name="ln403">  *out &lt;&lt; const_basename(file_path) &lt;&lt; ':' &lt;&lt; line_number &lt;&lt; &quot;] &quot; &lt;&lt; message;</a>
+<a name="ln404">}</a>
+<a name="ln405"> </a>
+<a name="ln406">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="303"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="359"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

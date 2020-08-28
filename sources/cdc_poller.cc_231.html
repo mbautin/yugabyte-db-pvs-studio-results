@@ -1,0 +1,259 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>cdc_poller.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/tserver/cdc_poller.h&quot;</a>
+<a name="ln15">#include &quot;yb/tserver/cdc_consumer.h&quot;</a>
+<a name="ln16">#include &quot;yb/tserver/twodc_output_client.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/cdc/cdc_rpc.h&quot;</a>
+<a name="ln19">#include &quot;yb/cdc/cdc_service.pb.h&quot;</a>
+<a name="ln20">#include &quot;yb/cdc/cdc_service.proxy.h&quot;</a>
+<a name="ln21">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/consensus/opid_util.h&quot;</a>
+<a name="ln24">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln25">#include &quot;yb/util/threadpool.h&quot;</a>
+<a name="ln26"> </a>
+<a name="ln27">DEFINE_int32(async_replication_polling_delay_ms, 0,</a>
+<a name="ln28">             &quot;How long to delay in ms between applying and repolling.&quot;);</a>
+<a name="ln29">DEFINE_int32(replication_failure_delay_exponent, 16 /* ~ 2^16/1000 ~= 65 sec */,</a>
+<a name="ln30">             &quot;Max number of failures (N) to use when calculating exponential backoff (2^N-1).&quot;);</a>
+<a name="ln31">DEFINE_bool(cdc_consumer_use_proxy_forwarding, false,</a>
+<a name="ln32">            &quot;When enabled, read requests from the CDC Consumer that go to the wrong node are &quot;</a>
+<a name="ln33">            &quot;forwarded to the correct node by the Producer.&quot;);</a>
+<a name="ln34"> </a>
+<a name="ln35">DECLARE_int32(cdc_read_rpc_timeout_ms);</a>
+<a name="ln36"> </a>
+<a name="ln37">namespace yb {</a>
+<a name="ln38">namespace tserver {</a>
+<a name="ln39">namespace enterprise {</a>
+<a name="ln40"> </a>
+<a name="ln41">CDCPoller::CDCPoller(const cdc::ProducerTabletInfo&amp; producer_tablet_info,</a>
+<a name="ln42">                     const cdc::ConsumerTabletInfo&amp; consumer_tablet_info,</a>
+<a name="ln43">                     std::function&lt;bool(void)&gt; should_continue_polling,</a>
+<a name="ln44">                     std::function&lt;void(void)&gt; remove_self_from_pollers_map,</a>
+<a name="ln45">                     ThreadPool* thread_pool,</a>
+<a name="ln46">                     const std::shared_ptr&lt;CDCClient&gt;&amp; local_client,</a>
+<a name="ln47">                     const std::shared_ptr&lt;CDCClient&gt;&amp; producer_client,</a>
+<a name="ln48">                     CDCConsumer* cdc_consumer,</a>
+<a name="ln49">                     bool use_local_tserver) :</a>
+<a name="ln50">    producer_tablet_info_(producer_tablet_info),</a>
+<a name="ln51">    consumer_tablet_info_(consumer_tablet_info),</a>
+<a name="ln52">    should_continue_polling_(std::move(should_continue_polling)),</a>
+<a name="ln53">    remove_self_from_pollers_map_(std::move(remove_self_from_pollers_map)),</a>
+<a name="ln54">    op_id_(consensus::MinimumOpId()),</a>
+<a name="ln55">    resp_(std::make_unique&lt;cdc::GetChangesResponsePB&gt;()),</a>
+<a name="ln56">    output_client_(CreateTwoDCOutputClient(</a>
+<a name="ln57">        cdc_consumer,</a>
+<a name="ln58">        consumer_tablet_info,</a>
+<a name="ln59">        local_client,</a>
+<a name="ln60">        std::bind(&amp;CDCPoller::HandleApplyChanges, this, std::placeholders::_1),</a>
+<a name="ln61">        use_local_tserver)),</a>
+<a name="ln62">    producer_client_(producer_client),</a>
+<a name="ln63">    thread_pool_(thread_pool),</a>
+<a name="ln64">    cdc_consumer_(cdc_consumer) {}</a>
+<a name="ln65"> </a>
+<a name="ln66">std::string CDCPoller::LogPrefixUnlocked() const {</a>
+<a name="ln67">  return strings::Substitute(&quot;P [$0:$1] C [$2:$3]: &quot;,</a>
+<a name="ln68">                             producer_tablet_info_.stream_id,</a>
+<a name="ln69">                             producer_tablet_info_.tablet_id,</a>
+<a name="ln70">                             consumer_tablet_info_.table_id,</a>
+<a name="ln71">                             consumer_tablet_info_.tablet_id);</a>
+<a name="ln72">}</a>
+<a name="ln73"> </a>
+<a name="ln74">bool CDCPoller::CheckOnline() {</a>
+<a name="ln75">  return cdc_consumer_ != nullptr;</a>
+<a name="ln76">}</a>
+<a name="ln77"> </a>
+<a name="ln78">#define RETURN_WHEN_OFFLINE() \</a>
+<a name="ln79">  if (!CheckOnline()) { \</a>
+<a name="ln80">    LOG_WITH_PREFIX_UNLOCKED(WARNING) &lt;&lt; &quot;CDC Poller went offline&quot;; \</a>
+<a name="ln81">    return; \</a>
+<a name="ln82">  }</a>
+<a name="ln83"> </a>
+<a name="ln84">void CDCPoller::Poll() {</a>
+<a name="ln85">  RETURN_WHEN_OFFLINE();</a>
+<a name="ln86">  WARN_NOT_OK(thread_pool_-&gt;SubmitFunc(std::bind(&amp;CDCPoller::DoPoll, this)),</a>
+<a name="ln87">              &quot;Could not submit Poll to thread pool&quot;);</a>
+<a name="ln88">}</a>
+<a name="ln89"> </a>
+<a name="ln90">void CDCPoller::DoPoll() {</a>
+<a name="ln91">  RETURN_WHEN_OFFLINE();</a>
+<a name="ln92"> </a>
+<a name="ln93">  std::lock_guard&lt;std::mutex&gt; l(data_mutex_);</a>
+<a name="ln94"> </a>
+<a name="ln95">  // determine if we should delay our upcoming poll</a>
+<a name="ln96">  if (FLAGS_async_replication_polling_delay_ms &gt; 0 || poll_failures_ &gt; 0) {</a>
+<a name="ln97">    int64_t delay = max(FLAGS_async_replication_polling_delay_ms, // user setting</a>
+<a name="ln98">                        (1 &lt;&lt; poll_failures_) -1); // failure backoff</a>
+<a name="ln99">    SleepFor(MonoDelta::FromMilliseconds(delay));</a>
+<a name="ln100">  }</a>
+<a name="ln101"> </a>
+<a name="ln102">  cdc::GetChangesRequestPB req;</a>
+<a name="ln103">  req.set_stream_id(producer_tablet_info_.stream_id);</a>
+<a name="ln104">  req.set_tablet_id(producer_tablet_info_.tablet_id);</a>
+<a name="ln105">  req.set_serve_as_proxy(FLAGS_cdc_consumer_use_proxy_forwarding);</a>
+<a name="ln106"> </a>
+<a name="ln107">  cdc::CDCCheckpointPB checkpoint;</a>
+<a name="ln108">  *checkpoint.mutable_op_id() = op_id_;</a>
+<a name="ln109">  if (checkpoint.op_id().index() &gt; 0 || checkpoint.op_id().term() &gt; 0) {</a>
+<a name="ln110">    // Only send non-zero checkpoints in request.</a>
+<a name="ln111">    // If we don't know the latest checkpoint, then CDC producer can use the checkpoint from</a>
+<a name="ln112">    // cdc_state table.</a>
+<a name="ln113">    // This is useful in scenarios where a new tablet peer becomes replication leader for a</a>
+<a name="ln114">    // producer tablet and is not aware of the last checkpoint.</a>
+<a name="ln115">    *req.mutable_from_checkpoint() = checkpoint;</a>
+<a name="ln116">  }</a>
+<a name="ln117"> </a>
+<a name="ln118">  auto rpcs = producer_client_-&gt;rpcs;</a>
+<a name="ln119">  auto read_rpc_handle = rpcs-&gt;Prepare();</a>
+<a name="ln120">  if (read_rpc_handle != rpcs-&gt;InvalidHandle()) {</a>
+<a name="ln121">    *read_rpc_handle = CreateGetChangesCDCRpc(</a>
+<a name="ln122">        CoarseMonoClock::now() + MonoDelta::FromMilliseconds(FLAGS_cdc_read_rpc_timeout_ms),</a>
+<a name="ln123">        nullptr, /* RemoteTablet: will get this from 'req' */</a>
+<a name="ln124">        producer_client_-&gt;client.get(),</a>
+<a name="ln125">        &amp;req,</a>
+<a name="ln126">        [=](const Status &amp;status, cdc::GetChangesResponsePB &amp;&amp;new_resp) {</a>
+<a name="ln127">          auto retained = rpcs-&gt;Unregister(read_rpc_handle);</a>
+<a name="ln128">          auto resp = std::make_shared&lt;cdc::GetChangesResponsePB&gt;(std::move(new_resp));</a>
+<a name="ln129">          WARN_NOT_OK(thread_pool_-&gt;SubmitFunc(std::bind(&amp;CDCPoller::HandlePoll, this,</a>
+<a name="ln130">                                                         status, resp)),</a>
+<a name="ln131">                      &quot;Could not submit HandlePoll to thread pool&quot;);</a>
+<a name="ln132">        });</a>
+<a name="ln133">    (**read_rpc_handle).SendRpc();</a>
+<a name="ln134">  } else {</a>
+<a name="ln135">    // Handle the Poll as a failure so repeated invocations will incur backoff.</a>
+<a name="ln136">    WARN_NOT_OK(thread_pool_-&gt;SubmitFunc(std::bind(&amp;CDCPoller::HandlePoll, this,</a>
+<a name="ln137">                  STATUS(Aborted, LogPrefixUnlocked() + &quot;InvalidHandle for GetChangesCDCRpc&quot;),</a>
+<a name="ln138">                  resp_)),</a>
+<a name="ln139">                &quot;Could not submit HandlePoll to thread pool&quot;);</a>
+<a name="ln140">  }</a>
+<a name="ln141">}</a>
+<a name="ln142"> </a>
+<a name="ln143">void CDCPoller::HandlePoll(yb::Status status,</a>
+<a name="ln144">                           std::shared_ptr&lt;cdc::GetChangesResponsePB&gt; resp) {</a>
+<a name="ln145">  RETURN_WHEN_OFFLINE();</a>
+<a name="ln146">  if (!should_continue_polling_()) {</a>
+<a name="ln147">    return remove_self_from_pollers_map_();</a>
+<a name="ln148">  }</a>
+<a name="ln149"> </a>
+<a name="ln150">  std::lock_guard&lt;std::mutex&gt; l(data_mutex_);</a>
+<a name="ln151"> </a>
+<a name="ln152">  status_ = status;</a>
+<a name="ln153">  resp_ = resp;</a>
+<a name="ln154"> </a>
+<a name="ln155">  bool failed = false;</a>
+<a name="ln156">  if (!status_.ok()) {</a>
+<a name="ln157">    LOG_WITH_PREFIX_UNLOCKED(INFO) &lt;&lt; &quot;CDCPoller failure: &quot; &lt;&lt; status_.ToString();</a>
+<a name="ln158">    failed = true;</a>
+<a name="ln159">  } else if (resp_-&gt;has_error()) {</a>
+<a name="ln160">    LOG_WITH_PREFIX_UNLOCKED(WARNING) &lt;&lt; &quot;CDCPoller failure response: code=&quot;</a>
+<a name="ln161">                                      &lt;&lt; resp_-&gt;error().code()</a>
+<a name="ln162">                                      &lt;&lt; &quot;, status=&quot; &lt;&lt; resp-&gt;error().status().DebugString();</a>
+<a name="ln163">    failed = true;</a>
+<a name="ln164">  } else if (!resp_-&gt;has_checkpoint()) {</a>
+<a name="ln165">    LOG_WITH_PREFIX_UNLOCKED(ERROR) &lt;&lt; &quot;CDCPoller failure: no checkpoint&quot;;</a>
+<a name="ln166">    failed = true;</a>
+<a name="ln167">  }</a>
+<a name="ln168">  if (failed) {</a>
+<a name="ln169">    // In case of errors, try polling again with backoff</a>
+<a name="ln170">    poll_failures_ = min(poll_failures_ + 1, FLAGS_replication_failure_delay_exponent);</a>
+<a name="ln171">    return Poll();</a>
+<a name="ln172">  }</a>
+<a name="ln173">  poll_failures_ = max(poll_failures_ - 2, 0); // otherwise, recover slowly if we're congested</a>
+<a name="ln174"> </a>
+<a name="ln175">  // Success Case: ApplyChanges() from Poll</a>
+<a name="ln176">  WARN_NOT_OK(output_client_-&gt;ApplyChanges(resp_.get()), &quot;Could not ApplyChanges&quot;);</a>
+<a name="ln177">}</a>
+<a name="ln178"> </a>
+<a name="ln179">void CDCPoller::HandleApplyChanges(cdc::OutputClientResponse response) {</a>
+<a name="ln180">  RETURN_WHEN_OFFLINE();</a>
+<a name="ln181"> </a>
+<a name="ln182">  WARN_NOT_OK(thread_pool_-&gt;SubmitFunc(std::bind(&amp;CDCPoller::DoHandleApplyChanges, this, response)),</a>
+<a name="ln183">              &quot;Could not submit HandleApplyChanges to thread pool&quot;);</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186">void CDCPoller::DoHandleApplyChanges(cdc::OutputClientResponse response) {</a>
+<a name="ln187">  RETURN_WHEN_OFFLINE();</a>
+<a name="ln188">  if (!should_continue_polling_()) {</a>
+<a name="ln189">    return remove_self_from_pollers_map_();</a>
+<a name="ln190">  }</a>
+<a name="ln191"> </a>
+<a name="ln192">  std::lock_guard&lt;std::mutex&gt; l(data_mutex_);</a>
+<a name="ln193"> </a>
+<a name="ln194">  if (!response.status.ok()) {</a>
+<a name="ln195">    LOG_WITH_PREFIX_UNLOCKED(WARNING) &lt;&lt; &quot;ApplyChanges failure: &quot; &lt;&lt; response.status;</a>
+<a name="ln196">    // Repeat the ApplyChanges step, with exponential backoff</a>
+<a name="ln197">    apply_failures_ = min(apply_failures_ + 1, FLAGS_replication_failure_delay_exponent);</a>
+<a name="ln198">    int64_t delay = (1 &lt;&lt; apply_failures_) -1;</a>
+<a name="ln199">    SleepFor(MonoDelta::FromMilliseconds(delay));</a>
+<a name="ln200">    WARN_NOT_OK(output_client_-&gt;ApplyChanges(resp_.get()), &quot;Could not ApplyChanges&quot;);</a>
+<a name="ln201">    return;</a>
+<a name="ln202">  }</a>
+<a name="ln203">  apply_failures_ = max(apply_failures_ - 2, 0); // recover slowly if we've gotten congested</a>
+<a name="ln204"> </a>
+<a name="ln205">  op_id_ = response.last_applied_op_id;</a>
+<a name="ln206"> </a>
+<a name="ln207">  Poll();</a>
+<a name="ln208">}</a>
+<a name="ln209">#undef RETURN_WHEN_OFFLINE</a>
+<a name="ln210"> </a>
+<a name="ln211">} // namespace enterprise</a>
+<a name="ln212">} // namespace tserver</a>
+<a name="ln213">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="198"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v629/" target="_blank">V629</a> Consider inspecting the '1 << apply_failures_' expression. Bit shifting of the 32-bit value with a subsequent expansion to the 64-bit type.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

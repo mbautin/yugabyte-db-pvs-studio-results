@@ -1,0 +1,1242 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>partition.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/common/partition.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;algorithm&gt;</a>
+<a name="ln36">#include &lt;set&gt;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &quot;yb/common/crc16.h&quot;</a>
+<a name="ln39">#include &quot;yb/common/partial_row.h&quot;</a>
+<a name="ln40">#include &quot;yb/common/row_key-util.h&quot;</a>
+<a name="ln41">#include &quot;yb/common/wire_protocol.pb.h&quot;</a>
+<a name="ln42">#include &quot;yb/docdb/doc_key.h&quot;</a>
+<a name="ln43">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln44">#include &quot;yb/gutil/hash/hash.h&quot;</a>
+<a name="ln45">#include &quot;yb/gutil/strings/join.h&quot;</a>
+<a name="ln46">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln47">#include &quot;yb/yql/redis/redisserver/redis_constants.h&quot;</a>
+<a name="ln48">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln49"> </a>
+<a name="ln50">namespace yb {</a>
+<a name="ln51"> </a>
+<a name="ln52">using std::set;</a>
+<a name="ln53">using std::string;</a>
+<a name="ln54">using std::vector;</a>
+<a name="ln55"> </a>
+<a name="ln56">using google::protobuf::RepeatedPtrField;</a>
+<a name="ln57">using strings::Substitute;</a>
+<a name="ln58"> </a>
+<a name="ln59">// The encoded size of a hash bucket in a partition key.</a>
+<a name="ln60">static const size_t kEncodedBucketSize = sizeof(uint32_t);</a>
+<a name="ln61"> </a>
+<a name="ln62">Slice Partition::range_key_start() const {</a>
+<a name="ln63">  return range_key(partition_key_start());</a>
+<a name="ln64">}</a>
+<a name="ln65"> </a>
+<a name="ln66">Slice Partition::range_key_end() const {</a>
+<a name="ln67">  return range_key(partition_key_end());</a>
+<a name="ln68">}</a>
+<a name="ln69"> </a>
+<a name="ln70">Slice Partition::range_key(const string&amp; partition_key) const {</a>
+<a name="ln71">  size_t hash_size = kEncodedBucketSize * hash_buckets().size();</a>
+<a name="ln72">  if (partition_key.size() &gt; hash_size) {</a>
+<a name="ln73">    Slice s = Slice(partition_key);</a>
+<a name="ln74">    s.remove_prefix(hash_size);</a>
+<a name="ln75">    return s;</a>
+<a name="ln76">  } else {</a>
+<a name="ln77">    return Slice();</a>
+<a name="ln78">  }</a>
+<a name="ln79">}</a>
+<a name="ln80"> </a>
+<a name="ln81">void Partition::ToPB(PartitionPB* pb) const {</a>
+<a name="ln82">  pb-&gt;Clear();</a>
+<a name="ln83">  pb-&gt;mutable_hash_buckets()-&gt;Reserve(hash_buckets_.size());</a>
+<a name="ln84">  for (int32_t bucket : hash_buckets()) {</a>
+<a name="ln85">    pb-&gt;add_hash_buckets(bucket);</a>
+<a name="ln86">  }</a>
+<a name="ln87">  pb-&gt;set_partition_key_start(partition_key_start());</a>
+<a name="ln88">  pb-&gt;set_partition_key_end(partition_key_end());</a>
+<a name="ln89">}</a>
+<a name="ln90"> </a>
+<a name="ln91">void Partition::FromPB(const PartitionPB&amp; pb, Partition* partition) {</a>
+<a name="ln92">  partition-&gt;hash_buckets_.clear();</a>
+<a name="ln93">  partition-&gt;hash_buckets_.reserve(pb.hash_buckets_size());</a>
+<a name="ln94">  for (int32_t hash_bucket : pb.hash_buckets()) {</a>
+<a name="ln95">    partition-&gt;hash_buckets_.push_back(hash_bucket);</a>
+<a name="ln96">  }</a>
+<a name="ln97"> </a>
+<a name="ln98">  partition-&gt;partition_key_start_ = pb.partition_key_start();</a>
+<a name="ln99">  partition-&gt;partition_key_end_ = pb.partition_key_end();</a>
+<a name="ln100">}</a>
+<a name="ln101"> </a>
+<a name="ln102">namespace {</a>
+<a name="ln103">// Extracts the column IDs from a protobuf repeated field of column identifiers.</a>
+<a name="ln104">Status ExtractColumnIds(const RepeatedPtrField&lt;PartitionSchemaPB_ColumnIdentifierPB&gt;&amp; identifiers,</a>
+<a name="ln105">                        const Schema&amp; schema,</a>
+<a name="ln106">                        vector&lt;ColumnId&gt;* column_ids) {</a>
+<a name="ln107">    column_ids-&gt;reserve(identifiers.size());</a>
+<a name="ln108">    for (PartitionSchemaPB_ColumnIdentifierPB identifier : identifiers) {</a>
+<a name="ln109">      switch (identifier.identifier_case()) {</a>
+<a name="ln110">        case PartitionSchemaPB_ColumnIdentifierPB::kId: {</a>
+<a name="ln111">          ColumnId column_id(identifier.id());</a>
+<a name="ln112">          if (schema.find_column_by_id(column_id) == Schema::kColumnNotFound) {</a>
+<a name="ln113">            return STATUS(InvalidArgument, &quot;unknown column id&quot;, identifier.DebugString());</a>
+<a name="ln114">          }</a>
+<a name="ln115">          column_ids-&gt;push_back(column_id);</a>
+<a name="ln116">          continue;</a>
+<a name="ln117">        }</a>
+<a name="ln118">        case PartitionSchemaPB_ColumnIdentifierPB::kName: {</a>
+<a name="ln119">          int32_t column_idx = schema.find_column(identifier.name());</a>
+<a name="ln120">          if (column_idx == Schema::kColumnNotFound) {</a>
+<a name="ln121">            return STATUS(InvalidArgument, &quot;unknown column&quot;, identifier.DebugString());</a>
+<a name="ln122">          }</a>
+<a name="ln123">          column_ids-&gt;push_back(schema.column_id(column_idx));</a>
+<a name="ln124">          continue;</a>
+<a name="ln125">        }</a>
+<a name="ln126">        default: return STATUS(InvalidArgument, &quot;unknown column&quot;, identifier.DebugString());</a>
+<a name="ln127">      }</a>
+<a name="ln128">    }</a>
+<a name="ln129">    return Status::OK();</a>
+<a name="ln130">}</a>
+<a name="ln131">// Sets a repeated field of column identifiers to the provided column IDs.</a>
+<a name="ln132">void SetColumnIdentifiers(const vector&lt;ColumnId&gt;&amp; column_ids,</a>
+<a name="ln133">                          RepeatedPtrField&lt;PartitionSchemaPB_ColumnIdentifierPB&gt;* identifiers) {</a>
+<a name="ln134">    identifiers-&gt;Reserve(column_ids.size());</a>
+<a name="ln135">    for (ColumnId column_id : column_ids) {</a>
+<a name="ln136">      identifiers-&gt;Add()-&gt;set_id(column_id);</a>
+<a name="ln137">    }</a>
+<a name="ln138">}</a>
+<a name="ln139"> </a>
+<a name="ln140">} // namespace</a>
+<a name="ln141"> </a>
+<a name="ln142">Status PartitionSchema::FromPB(const PartitionSchemaPB&amp; pb,</a>
+<a name="ln143">                               const Schema&amp; schema,</a>
+<a name="ln144">                               PartitionSchema* partition_schema) {</a>
+<a name="ln145">  partition_schema-&gt;Clear();</a>
+<a name="ln146"> </a>
+<a name="ln147">  if (pb.has_hash_schema()) {</a>
+<a name="ln148">    switch (pb.hash_schema()) {</a>
+<a name="ln149">      case PartitionSchemaPB::MULTI_COLUMN_HASH_SCHEMA:</a>
+<a name="ln150">        VLOG(3) &lt;&lt; &quot;Using multi-column hash value for partitioning&quot;;</a>
+<a name="ln151">        partition_schema-&gt;hash_schema_ = YBHashSchema::kMultiColumnHash;</a>
+<a name="ln152">        return Status::OK();</a>
+<a name="ln153"> </a>
+<a name="ln154">      case PartitionSchemaPB::REDIS_HASH_SCHEMA:</a>
+<a name="ln155">        VLOG(3) &lt;&lt; &quot;Using redis hash schema for partitioning&quot;;</a>
+<a name="ln156">        partition_schema-&gt;hash_schema_ = YBHashSchema::kRedisHash;</a>
+<a name="ln157">        return Status::OK();</a>
+<a name="ln158"> </a>
+<a name="ln159">      case PartitionSchemaPB::PGSQL_HASH_SCHEMA:</a>
+<a name="ln160">        VLOG(3) &lt;&lt; &quot;Using pgsql hash schema for partitioning&quot;;</a>
+<a name="ln161">        partition_schema-&gt;hash_schema_ = YBHashSchema::kPgsqlHash;</a>
+<a name="ln162">        return Status::OK();</a>
+<a name="ln163">    }</a>
+<a name="ln164">  }</a>
+<a name="ln165"> </a>
+<a name="ln166">  for (const PartitionSchemaPB_HashBucketSchemaPB&amp; hash_bucket_pb : pb.hash_bucket_schemas()) {</a>
+<a name="ln167">    HashBucketSchema hash_bucket;</a>
+<a name="ln168">    RETURN_NOT_OK(ExtractColumnIds(hash_bucket_pb.columns(), schema, &amp;hash_bucket.column_ids));</a>
+<a name="ln169"> </a>
+<a name="ln170">    // Hashing is column-order dependent, so sort the column_ids to ensure that</a>
+<a name="ln171">    // hash components with the same columns hash consistently. This is</a>
+<a name="ln172">    // important when deserializing a user-supplied partition schema during</a>
+<a name="ln173">    // table creation; after that the columns should remain in sorted order.</a>
+<a name="ln174">    std::sort(hash_bucket.column_ids.begin(), hash_bucket.column_ids.end());</a>
+<a name="ln175"> </a>
+<a name="ln176">    hash_bucket.seed = hash_bucket_pb.seed();</a>
+<a name="ln177">    hash_bucket.num_buckets = hash_bucket_pb.num_buckets();</a>
+<a name="ln178">    partition_schema-&gt;hash_bucket_schemas_.push_back(hash_bucket);</a>
+<a name="ln179">  }</a>
+<a name="ln180"> </a>
+<a name="ln181">  if (pb.has_range_schema()) {</a>
+<a name="ln182">    const PartitionSchemaPB_RangeSchemaPB&amp; range_pb = pb.range_schema();</a>
+<a name="ln183">    RETURN_NOT_OK(ExtractColumnIds(range_pb.columns(), schema,</a>
+<a name="ln184">                                   &amp;partition_schema-&gt;range_schema_.column_ids));</a>
+<a name="ln185">  } else {</a>
+<a name="ln186">    // Fill in the default range partition (PK columns).</a>
+<a name="ln187">    // like the sorting above, this should only happen during table creation</a>
+<a name="ln188">    // while deserializing the user-provided partition schema.</a>
+<a name="ln189">    for (int32_t column_idx = 0; column_idx &lt; schema.num_key_columns(); column_idx++) {</a>
+<a name="ln190">      partition_schema-&gt;range_schema_.column_ids.push_back(schema.column_id(column_idx));</a>
+<a name="ln191">    }</a>
+<a name="ln192">  }</a>
+<a name="ln193"> </a>
+<a name="ln194">  return partition_schema-&gt;Validate(schema);</a>
+<a name="ln195">}</a>
+<a name="ln196"> </a>
+<a name="ln197">void PartitionSchema::ToPB(PartitionSchemaPB* pb) const {</a>
+<a name="ln198">  pb-&gt;Clear();</a>
+<a name="ln199"> </a>
+<a name="ln200">  if (hash_schema_) {</a>
+<a name="ln201">    switch (*hash_schema_) {</a>
+<a name="ln202">      case YBHashSchema::kMultiColumnHash:</a>
+<a name="ln203">        pb-&gt;set_hash_schema(PartitionSchemaPB::MULTI_COLUMN_HASH_SCHEMA);</a>
+<a name="ln204">        break;</a>
+<a name="ln205">      case YBHashSchema::kRedisHash:</a>
+<a name="ln206">        pb-&gt;set_hash_schema(PartitionSchemaPB::REDIS_HASH_SCHEMA);</a>
+<a name="ln207">        break;</a>
+<a name="ln208">      case YBHashSchema::kPgsqlHash:</a>
+<a name="ln209">        pb-&gt;set_hash_schema(PartitionSchemaPB::PGSQL_HASH_SCHEMA);</a>
+<a name="ln210">        break;</a>
+<a name="ln211">    }</a>
+<a name="ln212">  }</a>
+<a name="ln213"> </a>
+<a name="ln214">  pb-&gt;mutable_hash_bucket_schemas()-&gt;Reserve(hash_bucket_schemas_.size());</a>
+<a name="ln215">  for (const HashBucketSchema&amp; hash_bucket : hash_bucket_schemas_) {</a>
+<a name="ln216">    PartitionSchemaPB_HashBucketSchemaPB* hash_bucket_pb = pb-&gt;add_hash_bucket_schemas();</a>
+<a name="ln217">    SetColumnIdentifiers(hash_bucket.column_ids, hash_bucket_pb-&gt;mutable_columns());</a>
+<a name="ln218">    hash_bucket_pb-&gt;set_num_buckets(hash_bucket.num_buckets);</a>
+<a name="ln219">    hash_bucket_pb-&gt;set_seed(hash_bucket.seed);</a>
+<a name="ln220">  }</a>
+<a name="ln221"> </a>
+<a name="ln222">  SetColumnIdentifiers(range_schema_.column_ids, pb-&gt;mutable_range_schema()-&gt;mutable_columns());</a>
+<a name="ln223">}</a>
+<a name="ln224"> </a>
+<a name="ln225">Status PartitionSchema::EncodeRedisKey(const YBPartialRow&amp; row, string* buf) const {</a>
+<a name="ln226">  CHECK_EQ(row.schema()-&gt;num_hash_key_columns(), 1);</a>
+<a name="ln227">  ConstContiguousRow cont_row(row.schema(), row.row_data_);</a>
+<a name="ln228">  return EncodeRedisKey(cont_row, buf);</a>
+<a name="ln229">}</a>
+<a name="ln230"> </a>
+<a name="ln231">Status PartitionSchema::EncodeRedisKey(const ConstContiguousRow&amp; row, string* buf) const {</a>
+<a name="ln232">  auto slice = reinterpret_cast&lt;const Slice*&gt;(row.cell_ptr(0));</a>
+<a name="ln233">  return EncodeRedisKey(*slice, buf);</a>
+<a name="ln234">}</a>
+<a name="ln235"> </a>
+<a name="ln236">Status PartitionSchema::EncodeRedisKey(const Slice&amp; slice, string* buf) const {</a>
+<a name="ln237">  size_t i = 0;</a>
+<a name="ln238">  for (i = 0; i &lt; slice.size(); i++) {</a>
+<a name="ln239">    if (slice.data()[i] == '{') break;</a>
+<a name="ln240">  }</a>
+<a name="ln241"> </a>
+<a name="ln242">  for (size_t j = i + 1; j &lt; slice.size(); j++) {</a>
+<a name="ln243">    if (slice.data()[j] == '}') {</a>
+<a name="ln244">      if (j - i &gt; 1) {</a>
+<a name="ln245">        *buf = EncodeMultiColumnHashValue(</a>
+<a name="ln246">            crc16(&amp;slice.data()[i + 1], j - i - 1) % kRedisClusterSlots);</a>
+<a name="ln247">        return Status::OK();</a>
+<a name="ln248">      }</a>
+<a name="ln249">      // We only search up to the first '}' character following the first '{' character.</a>
+<a name="ln250">      break;</a>
+<a name="ln251">    }</a>
+<a name="ln252">  }</a>
+<a name="ln253"> </a>
+<a name="ln254">  *buf = EncodeMultiColumnHashValue(crc16(slice.data(), slice.size()) % kRedisClusterSlots);</a>
+<a name="ln255">  return Status::OK();</a>
+<a name="ln256">}</a>
+<a name="ln257"> </a>
+<a name="ln258">Status PartitionSchema::EncodeKey(const RepeatedPtrField&lt;QLExpressionPB&gt;&amp; hash_col_values,</a>
+<a name="ln259">                                  string* buf) const {</a>
+<a name="ln260">  if (!hash_schema_) {</a>
+<a name="ln261">    return Status::OK();</a>
+<a name="ln262">  }</a>
+<a name="ln263"> </a>
+<a name="ln264">  switch (*hash_schema_) {</a>
+<a name="ln265">    case YBHashSchema::kMultiColumnHash: {</a>
+<a name="ln266">      string tmp;</a>
+<a name="ln267">      for (const auto &amp;col_expr_pb : hash_col_values) {</a>
+<a name="ln268">        AppendToKey(col_expr_pb.value(), &amp;tmp);</a>
+<a name="ln269">      }</a>
+<a name="ln270">      const uint16_t hash_value = YBPartition::HashColumnCompoundValue(tmp);</a>
+<a name="ln271">      *buf = EncodeMultiColumnHashValue(hash_value);</a>
+<a name="ln272">      return Status::OK();</a>
+<a name="ln273">    }</a>
+<a name="ln274">    case YBHashSchema::kPgsqlHash:</a>
+<a name="ln275">      DLOG(FATAL) &lt;&lt; &quot;Illegal code path. PGSQL hash cannot be computed from CQL expression&quot;;</a>
+<a name="ln276">      break;</a>
+<a name="ln277">    case YBHashSchema::kRedisHash:</a>
+<a name="ln278">      DLOG(FATAL) &lt;&lt; &quot;Illegal code path. REDIS hash cannot be computed from CQL expression&quot;;</a>
+<a name="ln279">      break;</a>
+<a name="ln280">  }</a>
+<a name="ln281"> </a>
+<a name="ln282">  return STATUS(InvalidArgument, &quot;Unsupported Partition Schema Type.&quot;);</a>
+<a name="ln283">}</a>
+<a name="ln284"> </a>
+<a name="ln285">Status PartitionSchema::EncodeKey(const RepeatedPtrField&lt;PgsqlExpressionPB&gt;&amp; hash_col_values,</a>
+<a name="ln286">                                  string* buf) const {</a>
+<a name="ln287">  if (!hash_schema_) {</a>
+<a name="ln288">    return Status::OK();</a>
+<a name="ln289">  }</a>
+<a name="ln290"> </a>
+<a name="ln291">  switch (*hash_schema_) {</a>
+<a name="ln292">    case YBHashSchema::kPgsqlHash: {</a>
+<a name="ln293">      // TODO(neil) Discussion is needed. PGSQL hash should be done appropriately.</a>
+<a name="ln294">      // For now, let's not doing anything. Just borrow code from multi column hashing style.</a>
+<a name="ln295">      string tmp;</a>
+<a name="ln296">      for (const auto &amp;col_expr_pb : hash_col_values) {</a>
+<a name="ln297">        AppendToKey(col_expr_pb.value(), &amp;tmp);</a>
+<a name="ln298">      }</a>
+<a name="ln299">      const uint16_t hash_value = YBPartition::HashColumnCompoundValue(tmp);</a>
+<a name="ln300">      *buf = EncodeMultiColumnHashValue(hash_value);</a>
+<a name="ln301">      return Status::OK();</a>
+<a name="ln302">    }</a>
+<a name="ln303"> </a>
+<a name="ln304">    case YBHashSchema::kMultiColumnHash:</a>
+<a name="ln305">      DLOG(FATAL) &lt;&lt; &quot;Illegal code path. CQL hash cannot be computed from PGSQL expression&quot;;</a>
+<a name="ln306">      break;</a>
+<a name="ln307"> </a>
+<a name="ln308">    case YBHashSchema::kRedisHash:</a>
+<a name="ln309">      DLOG(FATAL) &lt;&lt; &quot;Illegal code path. REDIS hash cannot be computed from PGSQL expression&quot;;</a>
+<a name="ln310">      break;</a>
+<a name="ln311">  }</a>
+<a name="ln312"> </a>
+<a name="ln313">  return STATUS(InvalidArgument, &quot;Unsupported Partition Schema Type.&quot;);</a>
+<a name="ln314">}</a>
+<a name="ln315"> </a>
+<a name="ln316">Status PartitionSchema::EncodeKey(const YBPartialRow&amp; row, string* buf) const {</a>
+<a name="ln317"> </a>
+<a name="ln318">  if (hash_schema_) {</a>
+<a name="ln319">    switch (*hash_schema_) {</a>
+<a name="ln320">      case YBHashSchema::kPgsqlHash:</a>
+<a name="ln321">        // TODO(neil) Discussion is needed. PGSQL hash should be done appropriately.</a>
+<a name="ln322">        // For now, let's not doing anything. Just borrow code from multi column hashing style.</a>
+<a name="ln323">        FALLTHROUGH_INTENDED;</a>
+<a name="ln324">      case YBHashSchema::kMultiColumnHash:</a>
+<a name="ln325">        return EncodeColumns(row, buf);</a>
+<a name="ln326">      case YBHashSchema::kRedisHash:</a>
+<a name="ln327">        return EncodeRedisKey(row, buf);</a>
+<a name="ln328">    }</a>
+<a name="ln329">  }</a>
+<a name="ln330"> </a>
+<a name="ln331">  const KeyEncoder&lt;string&gt;&amp; hash_encoder = GetKeyEncoder&lt;string&gt;(GetTypeInfo(UINT32));</a>
+<a name="ln332"> </a>
+<a name="ln333">  for (const HashBucketSchema&amp; hash_bucket_schema : hash_bucket_schemas_) {</a>
+<a name="ln334">    int32_t bucket;</a>
+<a name="ln335">    RETURN_NOT_OK(BucketForRow(row, hash_bucket_schema, &amp;bucket));</a>
+<a name="ln336">    hash_encoder.Encode(&amp;bucket, buf);</a>
+<a name="ln337">  }</a>
+<a name="ln338"> </a>
+<a name="ln339">  return EncodeColumns(row, range_schema_.column_ids, buf);</a>
+<a name="ln340">}</a>
+<a name="ln341"> </a>
+<a name="ln342">Status PartitionSchema::EncodeKey(const ConstContiguousRow&amp; row, string* buf) const {</a>
+<a name="ln343">  if (hash_schema_) {</a>
+<a name="ln344">    switch (*hash_schema_) {</a>
+<a name="ln345">      case YBHashSchema::kRedisHash:</a>
+<a name="ln346">        LOG(FATAL) &lt;&lt; &quot;Invalid hash schema kRedisHash passed to EncodeKey&quot;;</a>
+<a name="ln347">      case YBHashSchema::kPgsqlHash:</a>
+<a name="ln348">        // TODO(neil) Discussion is needed. PGSQL hash should be done appropriately.</a>
+<a name="ln349">        // For now, let's not doing anything. Just borrow code from multi column hashing style.</a>
+<a name="ln350">        FALLTHROUGH_INTENDED;</a>
+<a name="ln351">      case YBHashSchema::kMultiColumnHash:</a>
+<a name="ln352">        return EncodeColumns(row, buf);</a>
+<a name="ln353">    }</a>
+<a name="ln354">  }</a>
+<a name="ln355"> </a>
+<a name="ln356">  const KeyEncoder&lt;string&gt;&amp; hash_encoder = GetKeyEncoder&lt;string&gt;(GetTypeInfo(UINT32));</a>
+<a name="ln357">  for (const HashBucketSchema&amp; hash_bucket_schema : hash_bucket_schemas_) {</a>
+<a name="ln358">    int32_t bucket;</a>
+<a name="ln359">    RETURN_NOT_OK(BucketForRow(row, hash_bucket_schema, &amp;bucket));</a>
+<a name="ln360">    hash_encoder.Encode(&amp;bucket, buf);</a>
+<a name="ln361">  }</a>
+<a name="ln362"> </a>
+<a name="ln363">  return EncodeColumns(row, range_schema_.column_ids, buf);</a>
+<a name="ln364">}</a>
+<a name="ln365"> </a>
+<a name="ln366">string PartitionSchema::EncodeMultiColumnHashValue(uint16_t hash_value) {</a>
+<a name="ln367">  char value_bytes[kPartitionKeySize];</a>
+<a name="ln368">  value_bytes[0] = hash_value &gt;&gt; 8;</a>
+<a name="ln369">  value_bytes[1] = hash_value &amp; 0xff;</a>
+<a name="ln370">  return string(value_bytes, kPartitionKeySize);</a>
+<a name="ln371">}</a>
+<a name="ln372"> </a>
+<a name="ln373">uint16_t PartitionSchema::DecodeMultiColumnHashValue(const string&amp; partition_key) {</a>
+<a name="ln374">  DCHECK_EQ(partition_key.size(), kPartitionKeySize);</a>
+<a name="ln375">  const uint8_t *bytes = reinterpret_cast&lt;const uint8_t *&gt;(partition_key.data());</a>
+<a name="ln376">  return (bytes[0] &lt;&lt; 8) | bytes[1];</a>
+<a name="ln377">}</a>
+<a name="ln378"> </a>
+<a name="ln379">Status PartitionSchema::CreatePartitions(int32_t num_tablets,</a>
+<a name="ln380">                                         vector&lt;Partition&gt; *partitions,</a>
+<a name="ln381">                                         int32_t max_partition_key) const {</a>
+<a name="ln382">  DCHECK_GT(max_partition_key, 0);</a>
+<a name="ln383">  DCHECK_LE(max_partition_key, kMaxPartitionKey);</a>
+<a name="ln384"> </a>
+<a name="ln385">  if (max_partition_key &lt;= 0 || max_partition_key &gt; kMaxPartitionKey) {</a>
+<a name="ln386">    return STATUS_SUBSTITUTE(InvalidArgument, &quot;max_partition_key $0 should be in ($1, $2].&quot;,</a>
+<a name="ln387">                             0, kMaxPartitionKey);</a>
+<a name="ln388">  }</a>
+<a name="ln389"> </a>
+<a name="ln390">  LOG(INFO) &lt;&lt; &quot;Creating partitions with num_tablets: &quot; &lt;&lt; num_tablets;</a>
+<a name="ln391"> </a>
+<a name="ln392">  // May be also add an upper bound? TODO.</a>
+<a name="ln393">  if (num_tablets &lt;= 0) {</a>
+<a name="ln394">    return STATUS_SUBSTITUTE(InvalidArgument, &quot;num_tablets should be greater than 0. Client &quot;</a>
+<a name="ln395">                             &quot;would need to wait for master leader get heartbeats from tserver.&quot;);</a>
+<a name="ln396">  }</a>
+<a name="ln397"> </a>
+<a name="ln398">  // Allocate the partitions.</a>
+<a name="ln399">  partitions-&gt;resize(num_tablets);</a>
+<a name="ln400">  const uint16_t partition_interval = max_partition_key / num_tablets;</a>
+<a name="ln401"> </a>
+<a name="ln402">  uint16_t pstart;</a>
+<a name="ln403">  uint16_t pend = 0;</a>
+<a name="ln404">  for (int partition_index = 0; partition_index &lt; num_tablets; partition_index++) {</a>
+<a name="ln405">    pstart = pend;</a>
+<a name="ln406">    pend = (partition_index + 1) * partition_interval;</a>
+<a name="ln407"> </a>
+<a name="ln408">    // For the first tablet, start key is open-ended:</a>
+<a name="ln409">    if (partition_index != 0) {</a>
+<a name="ln410">      (*partitions)[partition_index].partition_key_start_ = EncodeMultiColumnHashValue(pstart);</a>
+<a name="ln411">    }</a>
+<a name="ln412"> </a>
+<a name="ln413">    if (partition_index &lt; num_tablets - 1) {</a>
+<a name="ln414">      (*partitions)[partition_index].partition_key_end_ = EncodeMultiColumnHashValue(pend);</a>
+<a name="ln415">    }</a>
+<a name="ln416">  }</a>
+<a name="ln417"> </a>
+<a name="ln418">  return Status::OK();</a>
+<a name="ln419">}</a>
+<a name="ln420"> </a>
+<a name="ln421">Status PartitionSchema::CreatePartitions(const vector&lt;YBPartialRow&gt;&amp; split_rows,</a>
+<a name="ln422">                                         const Schema&amp; schema,</a>
+<a name="ln423">                                         vector&lt;Partition&gt;* partitions) const {</a>
+<a name="ln424">  const KeyEncoder&lt;string&gt;&amp; hash_encoder = GetKeyEncoder&lt;string&gt;(GetTypeInfo(UINT32));</a>
+<a name="ln425"> </a>
+<a name="ln426">  // Create a partition per hash bucket combination.</a>
+<a name="ln427">  *partitions = vector&lt;Partition&gt;(1);</a>
+<a name="ln428">  for (const HashBucketSchema&amp; bucket_schema : hash_bucket_schemas_) {</a>
+<a name="ln429">    vector&lt;Partition&gt; new_partitions;</a>
+<a name="ln430">    // For each of the partitions created so far, replicate it</a>
+<a name="ln431">    // by the number of buckets in the next hash bucketing component</a>
+<a name="ln432">    for (const Partition&amp; base_partition : *partitions) {</a>
+<a name="ln433">      for (int32_t bucket = 0; bucket &lt; bucket_schema.num_buckets; bucket++) {</a>
+<a name="ln434">        Partition partition = base_partition;</a>
+<a name="ln435">        partition.hash_buckets_.push_back(bucket);</a>
+<a name="ln436">        hash_encoder.Encode(&amp;bucket, &amp;partition.partition_key_start_);</a>
+<a name="ln437">        hash_encoder.Encode(&amp;bucket, &amp;partition.partition_key_end_);</a>
+<a name="ln438">        new_partitions.push_back(partition);</a>
+<a name="ln439">      }</a>
+<a name="ln440">    }</a>
+<a name="ln441">    partitions-&gt;swap(new_partitions);</a>
+<a name="ln442">  }</a>
+<a name="ln443"> </a>
+<a name="ln444">  unordered_set&lt;int&gt; range_column_idxs;</a>
+<a name="ln445">  for (ColumnId column_id : range_schema_.column_ids) {</a>
+<a name="ln446">    int column_idx = schema.find_column_by_id(column_id);</a>
+<a name="ln447">    if (column_idx == Schema::kColumnNotFound) {</a>
+<a name="ln448">      return STATUS(InvalidArgument, Substitute(&quot;Range partition column ID $0 &quot;</a>
+<a name="ln449">                                                &quot;not found in table schema.&quot;, column_id));</a>
+<a name="ln450">    }</a>
+<a name="ln451">    if (!InsertIfNotPresent(&amp;range_column_idxs, column_idx)) {</a>
+<a name="ln452">      return STATUS(InvalidArgument, &quot;Duplicate column in range partition&quot;,</a>
+<a name="ln453">                                     schema.column(column_idx).name());</a>
+<a name="ln454">    }</a>
+<a name="ln455">  }</a>
+<a name="ln456"> </a>
+<a name="ln457">  // Create the start range keys.</a>
+<a name="ln458">  set&lt;string&gt; start_keys;</a>
+<a name="ln459">  string start_key;</a>
+<a name="ln460">  for (const YBPartialRow&amp; row : split_rows) {</a>
+<a name="ln461">    int column_count = 0;</a>
+<a name="ln462">    for (int column_idx = 0; column_idx &lt; schema.num_columns(); column_idx++) {</a>
+<a name="ln463">      const ColumnSchema&amp; column = schema.column(column_idx);</a>
+<a name="ln464">      if (row.IsColumnSet(column_idx)) {</a>
+<a name="ln465">        if (ContainsKey(range_column_idxs, column_idx)) {</a>
+<a name="ln466">          column_count++;</a>
+<a name="ln467">        } else {</a>
+<a name="ln468">          return STATUS(InvalidArgument, &quot;Split rows may only contain values for &quot;</a>
+<a name="ln469">                                         &quot;range partitioned columns&quot;, column.name());</a>
+<a name="ln470">        }</a>
+<a name="ln471">      }</a>
+<a name="ln472">    }</a>
+<a name="ln473"> </a>
+<a name="ln474">    // Check for an empty split row.</a>
+<a name="ln475">    if (column_count == 0) {</a>
+<a name="ln476">    return STATUS(InvalidArgument, &quot;Split rows must contain a value for at &quot;</a>
+<a name="ln477">                                   &quot;least one range partition column&quot;);</a>
+<a name="ln478">    }</a>
+<a name="ln479"> </a>
+<a name="ln480">    start_key.clear();</a>
+<a name="ln481">    RETURN_NOT_OK(EncodeColumns(row, range_schema_.column_ids, &amp;start_key));</a>
+<a name="ln482"> </a>
+<a name="ln483">    // Check for a duplicate split row.</a>
+<a name="ln484">    if (!InsertIfNotPresent(&amp;start_keys, start_key)) {</a>
+<a name="ln485">      return STATUS(InvalidArgument, &quot;Duplicate split row&quot;, row.ToString());</a>
+<a name="ln486">    }</a>
+<a name="ln487">  }</a>
+<a name="ln488"> </a>
+<a name="ln489">  // Create a partition per range and hash bucket combination.</a>
+<a name="ln490">  vector&lt;Partition&gt; new_partitions;</a>
+<a name="ln491">  for (const Partition&amp; base_partition : *partitions) {</a>
+<a name="ln492">    start_key.clear();</a>
+<a name="ln493"> </a>
+<a name="ln494">    for (const string&amp; end_key : start_keys) {</a>
+<a name="ln495">      Partition partition = base_partition;</a>
+<a name="ln496">      partition.partition_key_start_.append(start_key);</a>
+<a name="ln497">      partition.partition_key_end_.append(end_key);</a>
+<a name="ln498">      new_partitions.push_back(partition);</a>
+<a name="ln499">      start_key = end_key;</a>
+<a name="ln500">    }</a>
+<a name="ln501"> </a>
+<a name="ln502">    // Add the final range.</a>
+<a name="ln503">    Partition partition = base_partition;</a>
+<a name="ln504">    partition.partition_key_start_.append(start_key);</a>
+<a name="ln505">    new_partitions.push_back(partition);</a>
+<a name="ln506">  }</a>
+<a name="ln507">  partitions-&gt;swap(new_partitions);</a>
+<a name="ln508"> </a>
+<a name="ln509">  // Note: the following discussion and logic only takes effect when the table's</a>
+<a name="ln510">  // partition schema includes at least one hash bucket component.</a>
+<a name="ln511">  //</a>
+<a name="ln512">  // At this point, we have the full set of partitions built up, but each</a>
+<a name="ln513">  // partition only covers a finite slice of the partition key-space. Some</a>
+<a name="ln514">  // operations involving partitions are easier (pruning, client meta cache) if</a>
+<a name="ln515">  // it can be assumed that the partition keyspace does not have holes.</a>
+<a name="ln516">  //</a>
+<a name="ln517">  // In order to 'fill in' the partition key space, the absolute first and last</a>
+<a name="ln518">  // partitions are extended to cover the rest of the lower and upper partition</a>
+<a name="ln519">  // range by clearing the start and end partition key, respectively.</a>
+<a name="ln520">  //</a>
+<a name="ln521">  // When the table has two or more hash components, there will be gaps in</a>
+<a name="ln522">  // between partitions at the boundaries of the component ranges. Similar to</a>
+<a name="ln523">  // the absolute start and end case, these holes are filled by clearing the</a>
+<a name="ln524">  // partition key beginning at the hash component. For a concrete example,</a>
+<a name="ln525">  // see PartitionTest::TestCreatePartitions.</a>
+<a name="ln526">  for (Partition&amp; partition : *partitions) {</a>
+<a name="ln527">    if (partition.range_key_start().empty()) {</a>
+<a name="ln528">      for (int i = partition.hash_buckets().size() - 1; i &gt;= 0; i--) {</a>
+<a name="ln529">        if (partition.hash_buckets()[i] != 0) {</a>
+<a name="ln530">          break;</a>
+<a name="ln531">        }</a>
+<a name="ln532">        partition.partition_key_start_.erase(kEncodedBucketSize * i);</a>
+<a name="ln533">      }</a>
+<a name="ln534">    }</a>
+<a name="ln535">    if (partition.range_key_end().empty()) {</a>
+<a name="ln536">      for (int i = partition.hash_buckets().size() - 1; i &gt;= 0; i--) {</a>
+<a name="ln537">        partition.partition_key_end_.erase(kEncodedBucketSize * i);</a>
+<a name="ln538">        int32_t hash_bucket = partition.hash_buckets()[i] + 1;</a>
+<a name="ln539">        if (hash_bucket != hash_bucket_schemas_[i].num_buckets) {</a>
+<a name="ln540">          hash_encoder.Encode(&amp;hash_bucket, &amp;partition.partition_key_end_);</a>
+<a name="ln541">          break;</a>
+<a name="ln542">        }</a>
+<a name="ln543">      }</a>
+<a name="ln544">    }</a>
+<a name="ln545">  }</a>
+<a name="ln546"> </a>
+<a name="ln547">  return Status::OK();</a>
+<a name="ln548">}</a>
+<a name="ln549"> </a>
+<a name="ln550">Status PartitionSchema::CreatePartitions(</a>
+<a name="ln551">    const std::vector&lt;std::string&gt;&amp; split_rows,</a>
+<a name="ln552">    const Schema&amp; schema, std::vector&lt;Partition&gt;* partitions) const {</a>
+<a name="ln553">  DSCHECK(!schema.num_hash_key_columns(), IllegalState,</a>
+<a name="ln554">      &quot;Cannot create partitions using split rows for hash partitioned tables&quot;);</a>
+<a name="ln555">  *partitions = vector&lt;Partition&gt;();</a>
+<a name="ln556"> </a>
+<a name="ln557">  unordered_set&lt;int&gt; range_column_idxs;</a>
+<a name="ln558">  for (ColumnId column_id : range_schema_.column_ids) {</a>
+<a name="ln559">    int column_idx = schema.find_column_by_id(column_id);</a>
+<a name="ln560">    if (column_idx == Schema::kColumnNotFound) {</a>
+<a name="ln561">      return STATUS(InvalidArgument, Substitute(&quot;Range partition column ID $0 &quot;</a>
+<a name="ln562">                                                &quot;not found in table schema.&quot;, column_id));</a>
+<a name="ln563">    }</a>
+<a name="ln564">    if (!InsertIfNotPresent(&amp;range_column_idxs, column_idx)) {</a>
+<a name="ln565">      return STATUS(InvalidArgument, &quot;Duplicate column in range partition&quot;,</a>
+<a name="ln566">                    schema.column(column_idx).name());</a>
+<a name="ln567">    }</a>
+<a name="ln568">  }</a>
+<a name="ln569"> </a>
+<a name="ln570">  // Create the start range keys.</a>
+<a name="ln571">  set&lt;string&gt; start_keys;</a>
+<a name="ln572">  string start_key;</a>
+<a name="ln573">  for (const auto&amp; row : split_rows) {</a>
+<a name="ln574">    // Check for a duplicate split row.</a>
+<a name="ln575">    if (!InsertIfNotPresent(&amp;start_keys, row)) {</a>
+<a name="ln576">      return STATUS(InvalidArgument, &quot;Duplicate split row&quot;, row);</a>
+<a name="ln577">    }</a>
+<a name="ln578"> </a>
+<a name="ln579">    Partition partition;</a>
+<a name="ln580">    partition.partition_key_start_.append(start_key);</a>
+<a name="ln581">    partition.partition_key_end_.append(row);</a>
+<a name="ln582">    partitions-&gt;push_back(partition);</a>
+<a name="ln583">    start_key = row;</a>
+<a name="ln584">  }</a>
+<a name="ln585"> </a>
+<a name="ln586">  // Add the final partition</a>
+<a name="ln587">  Partition partition;</a>
+<a name="ln588">  partition.partition_key_start_.append(start_key);</a>
+<a name="ln589">  partitions-&gt;push_back(partition);</a>
+<a name="ln590">  return Status::OK();</a>
+<a name="ln591">}</a>
+<a name="ln592"> </a>
+<a name="ln593">template&lt;typename Row&gt;</a>
+<a name="ln594">Status PartitionSchema::PartitionContainsRowImpl(const Partition&amp; partition,</a>
+<a name="ln595">                                                 const Row&amp; row,</a>
+<a name="ln596">                                                 bool* contains) const {</a>
+<a name="ln597">  CHECK_EQ(partition.hash_buckets().size(), hash_bucket_schemas_.size());</a>
+<a name="ln598">  for (int i = 0; i &lt; hash_bucket_schemas_.size(); i++) {</a>
+<a name="ln599">    const HashBucketSchema&amp; hash_bucket_schema = hash_bucket_schemas_[i];</a>
+<a name="ln600">    int32_t bucket;</a>
+<a name="ln601">    RETURN_NOT_OK(BucketForRow(row, hash_bucket_schema, &amp;bucket));</a>
+<a name="ln602"> </a>
+<a name="ln603">    if (bucket != partition.hash_buckets()[i]) {</a>
+<a name="ln604">      *contains = false;</a>
+<a name="ln605">      return Status::OK();</a>
+<a name="ln606">    }</a>
+<a name="ln607">  }</a>
+<a name="ln608"> </a>
+<a name="ln609">  string partition_key;</a>
+<a name="ln610">  if (hash_schema_) {</a>
+<a name="ln611">    switch (*hash_schema_) {</a>
+<a name="ln612">      case YBHashSchema::kPgsqlHash:</a>
+<a name="ln613">        // TODO(neil) Discussion is needed. PGSQL hash should be done appropriately.</a>
+<a name="ln614">        // For now, let's not doing anything. Just borrow code from multi column hashing style.</a>
+<a name="ln615">        FALLTHROUGH_INTENDED;</a>
+<a name="ln616">      case YBHashSchema::kMultiColumnHash:</a>
+<a name="ln617">        RETURN_NOT_OK(EncodeColumns(row, &amp;partition_key));</a>
+<a name="ln618">        break;</a>
+<a name="ln619">      case YBHashSchema::kRedisHash:</a>
+<a name="ln620">        RETURN_NOT_OK(EncodeRedisKey(row, &amp;partition_key));</a>
+<a name="ln621">        break;</a>
+<a name="ln622">    }</a>
+<a name="ln623">  }</a>
+<a name="ln624"> </a>
+<a name="ln625">  // If all of the hash buckets match, then the row is contained in the</a>
+<a name="ln626">  // partition if the row is gte the lower bound; and if there is no upper</a>
+<a name="ln627">  // bound, or the row is lt the upper bound.</a>
+<a name="ln628">  *contains = (Slice(partition_key).compare(partition.range_key_start()) &gt;= 0)</a>
+<a name="ln629">           &amp;&amp; (partition.range_key_end().empty()</a>
+<a name="ln630">                || Slice(partition_key).compare(partition.range_key_end()) &lt; 0);</a>
+<a name="ln631"> </a>
+<a name="ln632">  return Status::OK();</a>
+<a name="ln633">}</a>
+<a name="ln634"> </a>
+<a name="ln635">Status PartitionSchema::PartitionContainsRow(const Partition&amp; partition,</a>
+<a name="ln636">                                             const YBPartialRow&amp; row,</a>
+<a name="ln637">                                             bool* contains) const {</a>
+<a name="ln638">  return PartitionContainsRowImpl(partition, row, contains);</a>
+<a name="ln639">}</a>
+<a name="ln640"> </a>
+<a name="ln641">Status PartitionSchema::PartitionContainsRow(const Partition&amp; partition,</a>
+<a name="ln642">                                             const ConstContiguousRow&amp; row,</a>
+<a name="ln643">                                             bool* contains) const {</a>
+<a name="ln644">  return PartitionContainsRowImpl(partition, row, contains);</a>
+<a name="ln645">}</a>
+<a name="ln646"> </a>
+<a name="ln647">Status PartitionSchema::DecodeRangeKey(Slice* encoded_key,</a>
+<a name="ln648">                                       YBPartialRow* row,</a>
+<a name="ln649">                                       Arena* arena) const {</a>
+<a name="ln650">  ContiguousRow cont_row(row-&gt;schema(), row-&gt;row_data_);</a>
+<a name="ln651">  for (int i = 0; i &lt; range_schema_.column_ids.size(); i++) {</a>
+<a name="ln652"> </a>
+<a name="ln653">    if (encoded_key-&gt;empty()) {</a>
+<a name="ln654">      // This can happen when decoding partition start and end keys, since they</a>
+<a name="ln655">      // are truncated to simulate absolute upper and lower bounds.</a>
+<a name="ln656">      continue;</a>
+<a name="ln657">    }</a>
+<a name="ln658"> </a>
+<a name="ln659">    int32_t column_idx = row-&gt;schema()-&gt;find_column_by_id(range_schema_.column_ids[i]);</a>
+<a name="ln660">    const ColumnSchema&amp; column = row-&gt;schema()-&gt;column(column_idx);</a>
+<a name="ln661">    const KeyEncoder&lt;faststring&gt;&amp; key_encoder = GetKeyEncoder&lt;faststring&gt;(column.type_info());</a>
+<a name="ln662">    bool is_last = i == (range_schema_.column_ids.size() - 1);</a>
+<a name="ln663"> </a>
+<a name="ln664">    // Decode the column.</a>
+<a name="ln665">    RETURN_NOT_OK_PREPEND(key_encoder.Decode(encoded_key,</a>
+<a name="ln666">                                             is_last,</a>
+<a name="ln667">                                             arena,</a>
+<a name="ln668">                                             cont_row.mutable_cell_ptr(column_idx)),</a>
+<a name="ln669">                          Substitute(&quot;Error decoding partition key range component '$0'&quot;,</a>
+<a name="ln670">                                     column.name()));</a>
+<a name="ln671">    // Mark the column as set.</a>
+<a name="ln672">    BitmapSet(row-&gt;isset_bitmap_, column_idx);</a>
+<a name="ln673">  }</a>
+<a name="ln674">  if (!encoded_key-&gt;empty()) {</a>
+<a name="ln675">    return STATUS(InvalidArgument, &quot;unable to fully decode partition key range components&quot;);</a>
+<a name="ln676">  }</a>
+<a name="ln677">  return Status::OK();</a>
+<a name="ln678">}</a>
+<a name="ln679"> </a>
+<a name="ln680">// Decodes a slice of a partition key into the buckets. The slice is modified to</a>
+<a name="ln681">// remove the hash components.</a>
+<a name="ln682">Status PartitionSchema::DecodeHashBuckets(Slice* encoded_key,</a>
+<a name="ln683">                                          vector&lt;int32_t&gt;* buckets) const {</a>
+<a name="ln684">  size_t hash_components_size = kEncodedBucketSize * hash_bucket_schemas_.size();</a>
+<a name="ln685">  if (encoded_key-&gt;size() &lt; hash_components_size) {</a>
+<a name="ln686">    return STATUS(InvalidArgument,</a>
+<a name="ln687">        Substitute(&quot;expected encoded hash key to be at least $0 bytes (only found $1)&quot;,</a>
+<a name="ln688">                   hash_components_size, encoded_key-&gt;size()));</a>
+<a name="ln689">  }</a>
+<a name="ln690">  for (const auto&amp; schema : hash_bucket_schemas_) {</a>
+<a name="ln691">    (void) schema; // quiet unused variable warning</a>
+<a name="ln692">    uint32_t big_endian;</a>
+<a name="ln693">    memcpy(&amp;big_endian, encoded_key-&gt;data(), sizeof(uint32_t));</a>
+<a name="ln694">    buckets-&gt;push_back(BigEndian::ToHost32(big_endian));</a>
+<a name="ln695">    encoded_key-&gt;remove_prefix(sizeof(uint32_t));</a>
+<a name="ln696">  }</a>
+<a name="ln697"> </a>
+<a name="ln698">  return Status::OK();</a>
+<a name="ln699">}</a>
+<a name="ln700"> </a>
+<a name="ln701">string PartitionSchema::RangePartitionDebugString(const Partition&amp; partition,</a>
+<a name="ln702">                                                  const Schema&amp; schema) const {</a>
+<a name="ln703">  CHECK(!schema.num_hash_key_columns());</a>
+<a name="ln704">  std::string s;</a>
+<a name="ln705">  s.append(&quot;range: [(&quot;);</a>
+<a name="ln706">  if (partition.partition_key_start().empty()) {</a>
+<a name="ln707">    s.append(&quot;&lt;start&gt;&quot;);</a>
+<a name="ln708">  } else {</a>
+<a name="ln709">    s.append(docdb::DocKey::DebugSliceToString(partition.partition_key_start()));</a>
+<a name="ln710">  }</a>
+<a name="ln711">  s.append(&quot;, &quot;);</a>
+<a name="ln712">  if (partition.partition_key_end().empty()) {</a>
+<a name="ln713">    s.append(&quot;&lt;end&gt;&quot;);</a>
+<a name="ln714">  } else {</a>
+<a name="ln715">    s.append(docdb::DocKey::DebugSliceToString(partition.partition_key_end()));</a>
+<a name="ln716">  }</a>
+<a name="ln717">  s.append(&quot;))&quot;);</a>
+<a name="ln718">  return s;</a>
+<a name="ln719">}</a>
+<a name="ln720"> </a>
+<a name="ln721">string PartitionSchema::PartitionDebugString(const Partition&amp; partition,</a>
+<a name="ln722">                                             const Schema&amp; schema) const {</a>
+<a name="ln723"> </a>
+<a name="ln724">  if (schema.num_hash_key_columns() == 0) {</a>
+<a name="ln725">    return RangePartitionDebugString(partition, schema);</a>
+<a name="ln726">  }</a>
+<a name="ln727"> </a>
+<a name="ln728">  string s;</a>
+<a name="ln729">  if (hash_schema_) {</a>
+<a name="ln730">    switch (*hash_schema_) {</a>
+<a name="ln731">      case YBHashSchema::kRedisHash: FALLTHROUGH_INTENDED;</a>
+<a name="ln732">      case YBHashSchema::kMultiColumnHash: {</a>
+<a name="ln733">        const string&amp; pstart = partition.partition_key_start();</a>
+<a name="ln734">        uint16_t hash_start = !pstart.empty() ? DecodeMultiColumnHashValue(pstart) : 0;</a>
+<a name="ln735">        const string&amp; pend = partition.partition_key_end();</a>
+<a name="ln736">        if (!pend.empty()) {</a>
+<a name="ln737">          uint16 hash_end = DecodeMultiColumnHashValue(pend);</a>
+<a name="ln738">          if (pstart.empty()) {</a>
+<a name="ln739">            s.append(Substitute(&quot;hash_split: [&lt;start&gt;, $1)&quot;, hash_start, hash_end));</a>
+<a name="ln740">          } else {</a>
+<a name="ln741">            s.append(Substitute(&quot;hash_split: [$0, $1)&quot;, hash_start, hash_end));</a>
+<a name="ln742">          }</a>
+<a name="ln743">        } else {</a>
+<a name="ln744">          if (pstart.empty()) {</a>
+<a name="ln745">            s.append(Substitute(&quot;hash_split: [&lt;start&gt;, &lt;end&gt;)&quot;));</a>
+<a name="ln746">          } else {</a>
+<a name="ln747">            s.append(Substitute(&quot;hash_split: [$0, &lt;end&gt;)&quot;, hash_start));</a>
+<a name="ln748">          }</a>
+<a name="ln749">        }</a>
+<a name="ln750">        return s;</a>
+<a name="ln751">      }</a>
+<a name="ln752">      case YBHashSchema::kPgsqlHash:</a>
+<a name="ln753">        return &quot;Pgsql Hash&quot;;</a>
+<a name="ln754">    }</a>
+<a name="ln755">  }</a>
+<a name="ln756"> </a>
+<a name="ln757">  if (!partition.hash_buckets().empty()) {</a>
+<a name="ln758">    vector&lt;string&gt; components;</a>
+<a name="ln759">    for (int32_t bucket : partition.hash_buckets()) {</a>
+<a name="ln760">      components.push_back(Substitute(&quot;$0&quot;, bucket));</a>
+<a name="ln761">    }</a>
+<a name="ln762">    s.append(&quot;hash buckets: (&quot;);</a>
+<a name="ln763">    s.append(JoinStrings(components, &quot;, &quot;));</a>
+<a name="ln764">    if (!range_schema_.column_ids.empty()) {</a>
+<a name="ln765">      s.append(&quot;), &quot;);</a>
+<a name="ln766">    } else {</a>
+<a name="ln767">      s.append(&quot;)&quot;);</a>
+<a name="ln768">    }</a>
+<a name="ln769">  }</a>
+<a name="ln770"> </a>
+<a name="ln771">  if (!range_schema_.column_ids.empty()) {</a>
+<a name="ln772">    Arena arena(1024, 128 * 1024);</a>
+<a name="ln773">    YBPartialRow start_row(&amp;schema);</a>
+<a name="ln774">    YBPartialRow end_row(&amp;schema);</a>
+<a name="ln775"> </a>
+<a name="ln776">    s.append(&quot;range: [(&quot;);</a>
+<a name="ln777"> </a>
+<a name="ln778">    vector&lt;string&gt; start_components;</a>
+<a name="ln779">    Slice encoded_range_key_start = partition.range_key_start();</a>
+<a name="ln780">    Status status;</a>
+<a name="ln781">    status = DecodeRangeKey(&amp;encoded_range_key_start, &amp;start_row, &amp;arena);</a>
+<a name="ln782">    if (status.ok()) {</a>
+<a name="ln783">      AppendRangeDebugStringComponentsOrString(start_row, &quot;&lt;start&gt;&quot;, &amp;start_components);</a>
+<a name="ln784">      s.append(JoinStrings(start_components, &quot;, &quot;));</a>
+<a name="ln785">    } else {</a>
+<a name="ln786">      s.append(Substitute(&quot;&lt;decode-error: $0&gt;&quot;, status.ToString()));</a>
+<a name="ln787">    }</a>
+<a name="ln788">    s.append(&quot;), (&quot;);</a>
+<a name="ln789"> </a>
+<a name="ln790">    vector&lt;string&gt; end_components;</a>
+<a name="ln791">    Slice encoded_range_key_end = partition.range_key_end();</a>
+<a name="ln792">    status = DecodeRangeKey(&amp;encoded_range_key_end, &amp;end_row, &amp;arena);</a>
+<a name="ln793">    if (status.ok()) {</a>
+<a name="ln794">      AppendRangeDebugStringComponentsOrString(end_row, &quot;&lt;end&gt;&quot;, &amp;end_components);</a>
+<a name="ln795">      s.append(JoinStrings(end_components, &quot;, &quot;));</a>
+<a name="ln796">    } else {</a>
+<a name="ln797">      s.append(Substitute(&quot;&lt;decode-error: $0&gt;&quot;, status.ToString()));</a>
+<a name="ln798">    }</a>
+<a name="ln799">    s.append(&quot;))&quot;);</a>
+<a name="ln800">  }</a>
+<a name="ln801"> </a>
+<a name="ln802">  return s;</a>
+<a name="ln803">}</a>
+<a name="ln804"> </a>
+<a name="ln805">void PartitionSchema::AppendRangeDebugStringComponentsOrString(const YBPartialRow&amp; row,</a>
+<a name="ln806">                                                               const GStringPiece default_string,</a>
+<a name="ln807">                                                               vector&lt;string&gt;* components) const {</a>
+<a name="ln808">  ConstContiguousRow const_row(row.schema(), row.row_data_);</a>
+<a name="ln809"> </a>
+<a name="ln810">  for (ColumnId column_id : range_schema_.column_ids) {</a>
+<a name="ln811">    string column;</a>
+<a name="ln812">    int32_t column_idx = row.schema()-&gt;find_column_by_id(column_id);</a>
+<a name="ln813">    if (column_idx == Schema::kColumnNotFound) {</a>
+<a name="ln814">      components-&gt;push_back(&quot;&lt;unknown-column&gt;&quot;);</a>
+<a name="ln815">      continue;</a>
+<a name="ln816">    }</a>
+<a name="ln817">    const ColumnSchema&amp; column_schema = row.schema()-&gt;column(column_idx);</a>
+<a name="ln818"> </a>
+<a name="ln819">    if (!row.IsColumnSet(column_idx)) {</a>
+<a name="ln820">      components-&gt;push_back(default_string.as_string());</a>
+<a name="ln821">      break;</a>
+<a name="ln822">    } else {</a>
+<a name="ln823">      column_schema.DebugCellAppend(const_row.cell(column_idx), &amp;column);</a>
+<a name="ln824">    }</a>
+<a name="ln825"> </a>
+<a name="ln826">    components-&gt;push_back(column);</a>
+<a name="ln827">  }</a>
+<a name="ln828">}</a>
+<a name="ln829"> </a>
+<a name="ln830">void PartitionSchema::AppendRangeDebugStringComponentsOrMin(const YBPartialRow&amp; row,</a>
+<a name="ln831">                                                            vector&lt;string&gt;* components) const {</a>
+<a name="ln832">  ConstContiguousRow const_row(row.schema(), row.row_data_);</a>
+<a name="ln833"> </a>
+<a name="ln834">  for (ColumnId column_id : range_schema_.column_ids) {</a>
+<a name="ln835">    string column;</a>
+<a name="ln836">    int32_t column_idx = row.schema()-&gt;find_column_by_id(column_id);</a>
+<a name="ln837">    if (column_idx == Schema::kColumnNotFound) {</a>
+<a name="ln838">      components-&gt;push_back(&quot;&lt;unknown-column&gt;&quot;);</a>
+<a name="ln839">      continue;</a>
+<a name="ln840">    }</a>
+<a name="ln841">    const ColumnSchema&amp; column_schema = row.schema()-&gt;column(column_idx);</a>
+<a name="ln842"> </a>
+<a name="ln843">    if (!row.IsColumnSet(column_idx)) {</a>
+<a name="ln844">      uint8_t min_value[kLargestTypeSize];</a>
+<a name="ln845">      column_schema.type_info()-&gt;CopyMinValue(&amp;min_value);</a>
+<a name="ln846">      SimpleConstCell cell(&amp;column_schema, &amp;min_value);</a>
+<a name="ln847">      column_schema.DebugCellAppend(cell, &amp;column);</a>
+<a name="ln848">    } else {</a>
+<a name="ln849">      column_schema.DebugCellAppend(const_row.cell(column_idx), &amp;column);</a>
+<a name="ln850">    }</a>
+<a name="ln851"> </a>
+<a name="ln852">    components-&gt;push_back(column);</a>
+<a name="ln853">  }</a>
+<a name="ln854">}</a>
+<a name="ln855"> </a>
+<a name="ln856">string PartitionSchema::RowDebugString(const ConstContiguousRow&amp; row) const {</a>
+<a name="ln857">  vector&lt;string&gt; components;</a>
+<a name="ln858"> </a>
+<a name="ln859">  for (const HashBucketSchema&amp; hash_bucket_schema : hash_bucket_schemas_) {</a>
+<a name="ln860">    int32_t bucket;</a>
+<a name="ln861">    Status s = BucketForRow(row, hash_bucket_schema, &amp;bucket);</a>
+<a name="ln862">    if (s.ok()) {</a>
+<a name="ln863">      components.push_back(Substitute(&quot;bucket=$0&quot;, bucket));</a>
+<a name="ln864">    } else {</a>
+<a name="ln865">      components.push_back(Substitute(&quot;&lt;bucket-error: $0&gt;&quot;, s.ToString()));</a>
+<a name="ln866">    }</a>
+<a name="ln867">  }</a>
+<a name="ln868"> </a>
+<a name="ln869">  for (ColumnId column_id : range_schema_.column_ids) {</a>
+<a name="ln870">    string column;</a>
+<a name="ln871">    int32_t column_idx = row.schema()-&gt;find_column_by_id(column_id);</a>
+<a name="ln872">    if (column_idx == Schema::kColumnNotFound) {</a>
+<a name="ln873">      components.push_back(&quot;&lt;unknown-column&gt;&quot;);</a>
+<a name="ln874">      break;</a>
+<a name="ln875">    }</a>
+<a name="ln876">    row.schema()-&gt;column(column_idx).DebugCellAppend(row.cell(column_idx), &amp;column);</a>
+<a name="ln877">    components.push_back(column);</a>
+<a name="ln878">  }</a>
+<a name="ln879"> </a>
+<a name="ln880">  return JoinStrings(components, &quot;, &quot;);</a>
+<a name="ln881">}</a>
+<a name="ln882"> </a>
+<a name="ln883">string PartitionSchema::RowDebugString(const YBPartialRow&amp; row) const {</a>
+<a name="ln884">  vector&lt;string&gt; components;</a>
+<a name="ln885"> </a>
+<a name="ln886">  for (const HashBucketSchema&amp; hash_bucket_schema : hash_bucket_schemas_) {</a>
+<a name="ln887">    int32_t bucket;</a>
+<a name="ln888">    Status s = BucketForRow(row, hash_bucket_schema, &amp;bucket);</a>
+<a name="ln889">    if (s.ok()) {</a>
+<a name="ln890">      components.push_back(Substitute(&quot;bucket=$0&quot;, bucket));</a>
+<a name="ln891">    } else {</a>
+<a name="ln892">      components.push_back(Substitute(&quot;&lt;bucket-error: $0&gt;&quot;, s.ToString()));</a>
+<a name="ln893">    }</a>
+<a name="ln894">  }</a>
+<a name="ln895"> </a>
+<a name="ln896">  AppendRangeDebugStringComponentsOrMin(row, &amp;components);</a>
+<a name="ln897"> </a>
+<a name="ln898">  return JoinStrings(components, &quot;, &quot;);</a>
+<a name="ln899">}</a>
+<a name="ln900"> </a>
+<a name="ln901">string PartitionSchema::PartitionKeyDebugString(const string&amp; key, const Schema&amp; schema) const {</a>
+<a name="ln902">  Slice encoded_key = key;</a>
+<a name="ln903"> </a>
+<a name="ln904">  vector&lt;string&gt; components;</a>
+<a name="ln905"> </a>
+<a name="ln906">  if (hash_schema_) {</a>
+<a name="ln907">    switch (*hash_schema_) {</a>
+<a name="ln908">      case YBHashSchema::kRedisHash: FALLTHROUGH_INTENDED;</a>
+<a name="ln909">      case YBHashSchema::kMultiColumnHash:</a>
+<a name="ln910">        if (key.empty()) {</a>
+<a name="ln911">          return &quot;hash_code: NaN&quot;;</a>
+<a name="ln912">        } else {</a>
+<a name="ln913">          return Substitute(&quot;hash_code: $0&quot;, DecodeMultiColumnHashValue(key));</a>
+<a name="ln914">        }</a>
+<a name="ln915">      case YBHashSchema::kPgsqlHash:</a>
+<a name="ln916">        return &quot;Pgsql Hash&quot;;</a>
+<a name="ln917">    }</a>
+<a name="ln918">  }</a>
+<a name="ln919"> </a>
+<a name="ln920">  if (!hash_bucket_schemas_.empty()) {</a>
+<a name="ln921">    vector&lt;int32_t&gt; buckets;</a>
+<a name="ln922">    Status s = DecodeHashBuckets(&amp;encoded_key, &amp;buckets);</a>
+<a name="ln923">    if (!s.ok()) {</a>
+<a name="ln924">      return Substitute(&quot;&lt;hash-decode-error: $0&gt;&quot;, s.ToString());</a>
+<a name="ln925">    }</a>
+<a name="ln926">    for (int32_t bucket : buckets) {</a>
+<a name="ln927">      components.push_back(Substitute(&quot;bucket=$0&quot;, bucket));</a>
+<a name="ln928">    }</a>
+<a name="ln929">  }</a>
+<a name="ln930"> </a>
+<a name="ln931">  if (!range_schema_.column_ids.empty()) {</a>
+<a name="ln932">    Arena arena(1024, 128 * 1024);</a>
+<a name="ln933">    YBPartialRow row(&amp;schema);</a>
+<a name="ln934"> </a>
+<a name="ln935">    Status s = DecodeRangeKey(&amp;encoded_key, &amp;row, &amp;arena);</a>
+<a name="ln936">    if (!s.ok()) {</a>
+<a name="ln937">      return Substitute(&quot;&lt;range-decode-error: $0&gt;&quot;, s.ToString());</a>
+<a name="ln938">    }</a>
+<a name="ln939"> </a>
+<a name="ln940">    AppendRangeDebugStringComponentsOrMin(row, &amp;components);</a>
+<a name="ln941">  }</a>
+<a name="ln942"> </a>
+<a name="ln943">  return JoinStrings(components, &quot;, &quot;);</a>
+<a name="ln944">}</a>
+<a name="ln945"> </a>
+<a name="ln946">namespace {</a>
+<a name="ln947">// Converts a list of column IDs to a string with the column names seperated by</a>
+<a name="ln948">// a comma character.</a>
+<a name="ln949">string ColumnIdsToColumnNames(const Schema&amp; schema,</a>
+<a name="ln950">                              const vector&lt;ColumnId&gt; column_ids) {</a>
+<a name="ln951">  vector&lt;string&gt; names;</a>
+<a name="ln952">  for (ColumnId column_id : column_ids) {</a>
+<a name="ln953">    names.push_back(schema.column(schema.find_column_by_id(column_id)).name());</a>
+<a name="ln954">  }</a>
+<a name="ln955"> </a>
+<a name="ln956">  return JoinStrings(names, &quot;, &quot;);</a>
+<a name="ln957">}</a>
+<a name="ln958">} // namespace</a>
+<a name="ln959"> </a>
+<a name="ln960">string PartitionSchema::DebugString(const Schema&amp; schema) const {</a>
+<a name="ln961">  vector&lt;string&gt; component_types;</a>
+<a name="ln962"> </a>
+<a name="ln963">  if (hash_schema_) {</a>
+<a name="ln964">    switch (*hash_schema_) {</a>
+<a name="ln965">      case YBHashSchema::kRedisHash:</a>
+<a name="ln966">        return &quot;Redis Hash Partition&quot;;</a>
+<a name="ln967">      case YBHashSchema::kMultiColumnHash: {</a>
+<a name="ln968">        string component = &quot;Multi Column Hash Partition. Partition columns: &quot;;</a>
+<a name="ln969">        const std::vector&lt;ColumnSchema&gt;&amp; cols = schema.columns();</a>
+<a name="ln970">        for (int idx = 0; idx &lt; schema.num_hash_key_columns(); idx++) {</a>
+<a name="ln971">          component.append(Substitute(&quot;$0($1)  &quot;, cols[idx].name(), cols[idx].type_info()-&gt;name()));</a>
+<a name="ln972">        }</a>
+<a name="ln973">        component_types.push_back(component);</a>
+<a name="ln974">        break;</a>
+<a name="ln975">      }</a>
+<a name="ln976">      case YBHashSchema::kPgsqlHash:</a>
+<a name="ln977">        return &quot;Pgsql Hash Partition&quot;;</a>
+<a name="ln978">    }</a>
+<a name="ln979">  }</a>
+<a name="ln980"> </a>
+<a name="ln981">  if (!hash_bucket_schemas_.empty()) {</a>
+<a name="ln982">    vector&lt;string&gt; hash_components;</a>
+<a name="ln983">    for (const HashBucketSchema&amp; hash_bucket_schema : hash_bucket_schemas_) {</a>
+<a name="ln984">      string component;</a>
+<a name="ln985">      component.append(Substitute(&quot;(bucket count: $0&quot;, hash_bucket_schema.num_buckets));</a>
+<a name="ln986">      if (hash_bucket_schema.seed != 0) {</a>
+<a name="ln987">        component.append(Substitute(&quot;, seed: $0&quot;, hash_bucket_schema.seed));</a>
+<a name="ln988">      }</a>
+<a name="ln989">      component.append(Substitute(&quot;, columns: [$0])&quot;,</a>
+<a name="ln990">                                  ColumnIdsToColumnNames(schema, hash_bucket_schema.column_ids)));</a>
+<a name="ln991">      hash_components.push_back(component);</a>
+<a name="ln992">    }</a>
+<a name="ln993">    component_types.push_back(Substitute(&quot;hash bucket components: [$0]&quot;,</a>
+<a name="ln994">                                         JoinStrings(hash_components, &quot;, &quot;)));</a>
+<a name="ln995">  }</a>
+<a name="ln996"> </a>
+<a name="ln997">  if (!range_schema_.column_ids.empty()) {</a>
+<a name="ln998">    component_types.push_back(Substitute(&quot;range columns: [$0]&quot;,</a>
+<a name="ln999">                                         ColumnIdsToColumnNames(schema, range_schema_.column_ids)));</a>
+<a name="ln1000">  }</a>
+<a name="ln1001">  return JoinStrings(component_types, &quot;, &quot;);</a>
+<a name="ln1002">}</a>
+<a name="ln1003"> </a>
+<a name="ln1004">bool PartitionSchema::Equals(const PartitionSchema&amp; other) const {</a>
+<a name="ln1005">  if (this == &amp;other) return true;</a>
+<a name="ln1006"> </a>
+<a name="ln1007">  // Compare if both partitions schema are using a hash based scheme.</a>
+<a name="ln1008">  if ((hash_schema_ != other.hash_schema_) ||</a>
+<a name="ln1009">      (hash_schema_ &amp;&amp; other.hash_schema_ &amp;&amp; *hash_schema_ != *other.hash_schema_)) {</a>
+<a name="ln1010">    return false;</a>
+<a name="ln1011">  }</a>
+<a name="ln1012"> </a>
+<a name="ln1013">  // Compare range component.</a>
+<a name="ln1014">  if (range_schema_.column_ids != other.range_schema_.column_ids) return false;</a>
+<a name="ln1015"> </a>
+<a name="ln1016">  // Compare hash bucket components.</a>
+<a name="ln1017">  if (hash_bucket_schemas_.size() != other.hash_bucket_schemas_.size()) return false;</a>
+<a name="ln1018">  for (int i = 0; i &lt; hash_bucket_schemas_.size(); i++) {</a>
+<a name="ln1019">    if (hash_bucket_schemas_[i].seed != other.hash_bucket_schemas_[i].seed) return false;</a>
+<a name="ln1020">    if (hash_bucket_schemas_[i].num_buckets</a>
+<a name="ln1021">        != other.hash_bucket_schemas_[i].num_buckets) return false;</a>
+<a name="ln1022">    if (hash_bucket_schemas_[i].column_ids</a>
+<a name="ln1023">        != other.hash_bucket_schemas_[i].column_ids) return false;</a>
+<a name="ln1024">  }</a>
+<a name="ln1025"> </a>
+<a name="ln1026">  return true;</a>
+<a name="ln1027">}</a>
+<a name="ln1028"> </a>
+<a name="ln1029">// Encodes the specified primary key columns of the supplied row into the buffer.</a>
+<a name="ln1030">Status PartitionSchema::EncodeColumns(const ConstContiguousRow&amp; row,</a>
+<a name="ln1031">                                      const vector&lt;ColumnId&gt;&amp; column_ids,</a>
+<a name="ln1032">                                      string* buf) {</a>
+<a name="ln1033">  for (int i = 0; i &lt; column_ids.size(); i++) {</a>
+<a name="ln1034">    ColumnId column_id = column_ids[i];</a>
+<a name="ln1035">    int32_t column_idx = row.schema()-&gt;find_column_by_id(column_id);</a>
+<a name="ln1036">    const TypeInfo* type = row.schema()-&gt;column(column_idx).type_info();</a>
+<a name="ln1037">    GetKeyEncoder&lt;string&gt;(type).Encode(row.cell_ptr(column_idx), i + 1 == column_ids.size(), buf);</a>
+<a name="ln1038">  }</a>
+<a name="ln1039">  return Status::OK();</a>
+<a name="ln1040">}</a>
+<a name="ln1041"> </a>
+<a name="ln1042">// Encodes the specified primary key columns of the supplied row into the buffer.</a>
+<a name="ln1043">Status PartitionSchema::EncodeColumns(const YBPartialRow&amp; row,</a>
+<a name="ln1044">                                      const vector&lt;ColumnId&gt;&amp; column_ids,</a>
+<a name="ln1045">                                      string* buf) {</a>
+<a name="ln1046">  for (int i = 0; i &lt; column_ids.size(); i++) {</a>
+<a name="ln1047">    int32_t column_idx = row.schema()-&gt;find_column_by_id(column_ids[i]);</a>
+<a name="ln1048">    CHECK(column_idx != Schema::kColumnNotFound);</a>
+<a name="ln1049">    const TypeInfo* type_info = row.schema()-&gt;column(column_idx).type_info();</a>
+<a name="ln1050">    const KeyEncoder&lt;string&gt;&amp; encoder = GetKeyEncoder&lt;string&gt;(type_info);</a>
+<a name="ln1051"> </a>
+<a name="ln1052">    if (PREDICT_FALSE(!row.IsColumnSet(column_idx))) {</a>
+<a name="ln1053">      uint8_t min_value[kLargestTypeSize];</a>
+<a name="ln1054">      type_info-&gt;CopyMinValue(min_value);</a>
+<a name="ln1055">      encoder.Encode(min_value, i + 1 == column_ids.size(), buf);</a>
+<a name="ln1056">    } else {</a>
+<a name="ln1057">      ContiguousRow cont_row(row.schema(), row.row_data_);</a>
+<a name="ln1058">      encoder.Encode(cont_row.cell_ptr(column_idx), i + 1 == column_ids.size(), buf);</a>
+<a name="ln1059">    }</a>
+<a name="ln1060">  }</a>
+<a name="ln1061">  return Status::OK();</a>
+<a name="ln1062">}</a>
+<a name="ln1063"> </a>
+<a name="ln1064">uint16_t PartitionSchema::HashColumnCompoundValue(const string&amp; compound) {</a>
+<a name="ln1065">  // In the future, if you wish to change the hashing behavior, you must introduce a new hashing</a>
+<a name="ln1066">  // method for your newly-created tables.  Existing tables must continue to use their hashing</a>
+<a name="ln1067">  // methods that was define by their PartitionSchema.</a>
+<a name="ln1068"> </a>
+<a name="ln1069">  // At the moment, Jenkins' hash is the only method we are using. In the future, we'll keep this</a>
+<a name="ln1070">  // as the default hashing behavior. Constant 'kseed&quot; cannot be changed as it'd yield a different</a>
+<a name="ln1071">  // hashing result.</a>
+<a name="ln1072">  static const int kseed = 97;</a>
+<a name="ln1073">  const uint64_t hash_value = Hash64StringWithSeed(compound, kseed);</a>
+<a name="ln1074"> </a>
+<a name="ln1075">  // Convert the 64-bit hash value to 16 bit integer.</a>
+<a name="ln1076">  const uint64_t h1 = hash_value &gt;&gt; 48;</a>
+<a name="ln1077">  const uint64_t h2 = 3 * (hash_value &gt;&gt; 32);</a>
+<a name="ln1078">  const uint64_t h3 = 5 * (hash_value &gt;&gt; 16);</a>
+<a name="ln1079">  const uint64_t h4 = 7 * (hash_value &amp; 0xffff);</a>
+<a name="ln1080"> </a>
+<a name="ln1081">  return (h1 ^ h2 ^ h3 ^ h4) &amp; 0xffff;</a>
+<a name="ln1082">}</a>
+<a name="ln1083"> </a>
+<a name="ln1084">// Encodes the hash columns of the supplied row into a 2-byte partition key.</a>
+<a name="ln1085">Status PartitionSchema::EncodeColumns(const ConstContiguousRow&amp; row, string* buf) {</a>
+<a name="ln1086">  string tmp;</a>
+<a name="ln1087">  int num_cols = row.schema()-&gt;num_hash_key_columns();</a>
+<a name="ln1088">  for (int col_idx = 0; col_idx &lt; num_cols; col_idx++) {</a>
+<a name="ln1089">    const TypeInfo* type = row.schema()-&gt;column(col_idx).type_info();</a>
+<a name="ln1090">    GetKeyEncoder&lt;string&gt;(type).Encode(row.cell_ptr(col_idx), col_idx + 1 == num_cols, &amp;tmp);</a>
+<a name="ln1091">  }</a>
+<a name="ln1092"> </a>
+<a name="ln1093">  uint16_t hash_value = HashColumnCompoundValue(tmp);</a>
+<a name="ln1094">  *buf = EncodeMultiColumnHashValue(hash_value);</a>
+<a name="ln1095">  return Status::OK();</a>
+<a name="ln1096">}</a>
+<a name="ln1097"> </a>
+<a name="ln1098">// Encodes the hash columns of the supplied row into a 2-byte partition key.</a>
+<a name="ln1099">Status PartitionSchema::EncodeColumns(const YBPartialRow&amp; row, string* buf) {</a>
+<a name="ln1100">  string tmp;</a>
+<a name="ln1101">  int num_cols = row.schema()-&gt;num_hash_key_columns();</a>
+<a name="ln1102">  for (int col_idx = 0; col_idx &lt; num_cols; col_idx++) {</a>
+<a name="ln1103">    const TypeInfo* type_info = row.schema()-&gt;column(col_idx).type_info();</a>
+<a name="ln1104">    const KeyEncoder&lt;string&gt;&amp; encoder = GetKeyEncoder&lt;string&gt;(type_info);</a>
+<a name="ln1105"> </a>
+<a name="ln1106">    if (PREDICT_FALSE(!row.IsColumnSet(col_idx))) {</a>
+<a name="ln1107">      LOG(FATAL) &lt;&lt; &quot;Hash column must be specified: &quot; &lt;&lt; col_idx;</a>
+<a name="ln1108">    } else {</a>
+<a name="ln1109">      ContiguousRow cont_row(row.schema(), row.row_data_);</a>
+<a name="ln1110">      encoder.Encode(cont_row.cell_ptr(col_idx), col_idx + 1 == num_cols, &amp;tmp);</a>
+<a name="ln1111">    }</a>
+<a name="ln1112">  }</a>
+<a name="ln1113"> </a>
+<a name="ln1114">  uint16_t hash_value = HashColumnCompoundValue(tmp);</a>
+<a name="ln1115">  *buf = EncodeMultiColumnHashValue(hash_value);</a>
+<a name="ln1116">  return Status::OK();</a>
+<a name="ln1117">}</a>
+<a name="ln1118"> </a>
+<a name="ln1119">template&lt;typename Row&gt;</a>
+<a name="ln1120">Status PartitionSchema::BucketForRow(const Row&amp; row,</a>
+<a name="ln1121">                                     const HashBucketSchema&amp; hash_bucket_schema,</a>
+<a name="ln1122">                                     int32_t* bucket) {</a>
+<a name="ln1123">  string buf;</a>
+<a name="ln1124">  RETURN_NOT_OK(EncodeColumns(row, hash_bucket_schema.column_ids, &amp;buf));</a>
+<a name="ln1125">  uint16_t hash_value = HashColumnCompoundValue(buf);</a>
+<a name="ln1126">  *bucket = hash_value % static_cast&lt;uint64_t&gt;(hash_bucket_schema.num_buckets);</a>
+<a name="ln1127">  return Status::OK();</a>
+<a name="ln1128">}</a>
+<a name="ln1129"> </a>
+<a name="ln1130">//------------------------------------------------------------</a>
+<a name="ln1131">// Template instantiations: We instantiate all possible templates to avoid linker issues.</a>
+<a name="ln1132">// see: https://isocpp.org/wiki/faq/templates#separate-template-fn-defn-from-decl</a>
+<a name="ln1133">//------------------------------------------------------------</a>
+<a name="ln1134"> </a>
+<a name="ln1135">template</a>
+<a name="ln1136">Status PartitionSchema::BucketForRow(const YBPartialRow&amp; row,</a>
+<a name="ln1137">                                     const HashBucketSchema&amp; hash_bucket_schema,</a>
+<a name="ln1138">                                     int32_t* bucket);</a>
+<a name="ln1139"> </a>
+<a name="ln1140">template</a>
+<a name="ln1141">Status PartitionSchema::BucketForRow(const ConstContiguousRow&amp; row,</a>
+<a name="ln1142">                                     const HashBucketSchema&amp; hash_bucket_schema,</a>
+<a name="ln1143">                                     int32_t* bucket);</a>
+<a name="ln1144"> </a>
+<a name="ln1145">void PartitionSchema::Clear() {</a>
+<a name="ln1146">  hash_bucket_schemas_.clear();</a>
+<a name="ln1147">  range_schema_.column_ids.clear();</a>
+<a name="ln1148">  hash_schema_ = boost::none;</a>
+<a name="ln1149">}</a>
+<a name="ln1150"> </a>
+<a name="ln1151">Status PartitionSchema::Validate(const Schema&amp; schema) const {</a>
+<a name="ln1152">  set&lt;ColumnId&gt; hash_columns;</a>
+<a name="ln1153">  for (const PartitionSchema::HashBucketSchema&amp; hash_schema : hash_bucket_schemas_) {</a>
+<a name="ln1154">    if (hash_schema.num_buckets &lt; 2) {</a>
+<a name="ln1155">      return STATUS(InvalidArgument, &quot;must have at least two hash buckets&quot;);</a>
+<a name="ln1156">    }</a>
+<a name="ln1157"> </a>
+<a name="ln1158">    if (hash_schema.column_ids.size() &lt; 1) {</a>
+<a name="ln1159">      return STATUS(InvalidArgument, &quot;must have at least one hash column&quot;);</a>
+<a name="ln1160">    }</a>
+<a name="ln1161"> </a>
+<a name="ln1162">    for (ColumnId hash_column : hash_schema.column_ids) {</a>
+<a name="ln1163">      if (!hash_columns.insert(hash_column).second) {</a>
+<a name="ln1164">        return STATUS(InvalidArgument, &quot;hash bucket schema components must not &quot;</a>
+<a name="ln1165">                                       &quot;contain columns in common&quot;);</a>
+<a name="ln1166">      }</a>
+<a name="ln1167">      int32_t column_idx = schema.find_column_by_id(hash_column);</a>
+<a name="ln1168">      if (column_idx == Schema::kColumnNotFound) {</a>
+<a name="ln1169">        return STATUS(InvalidArgument, &quot;must specify existing columns for hash &quot;</a>
+<a name="ln1170">                                       &quot;bucket partition components&quot;);</a>
+<a name="ln1171">      } else if (column_idx &gt;= schema.num_key_columns()) {</a>
+<a name="ln1172">        return STATUS(InvalidArgument, &quot;must specify only primary key columns for &quot;</a>
+<a name="ln1173">                                       &quot;hash bucket partition components&quot;);</a>
+<a name="ln1174">      }</a>
+<a name="ln1175">    }</a>
+<a name="ln1176">  }</a>
+<a name="ln1177"> </a>
+<a name="ln1178">  for (ColumnId column_id : range_schema_.column_ids) {</a>
+<a name="ln1179">    int32_t column_idx = schema.find_column_by_id(column_id);</a>
+<a name="ln1180">    if (column_idx == Schema::kColumnNotFound) {</a>
+<a name="ln1181">      return STATUS(InvalidArgument, &quot;must specify existing columns for range &quot;</a>
+<a name="ln1182">                                     &quot;partition component&quot;);</a>
+<a name="ln1183">    } else if (column_idx &gt;= schema.num_key_columns()) {</a>
+<a name="ln1184">      return STATUS(InvalidArgument, &quot;must specify only primary key columns for &quot;</a>
+<a name="ln1185">                                     &quot;range partition component&quot;);</a>
+<a name="ln1186">    }</a>
+<a name="ln1187">  }</a>
+<a name="ln1188"> </a>
+<a name="ln1189">  return Status::OK();</a>
+<a name="ln1190">}</a>
+<a name="ln1191"> </a>
+<a name="ln1192">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="150"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="155"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="160"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="703"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1048"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,292 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>taskstream.h</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#ifndef YB_UTIL_TASKSTREAM_H</a>
+<a name="ln15">#define YB_UTIL_TASKSTREAM_H</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;atomic&gt;</a>
+<a name="ln18">#include &lt;condition_variable&gt;</a>
+<a name="ln19">#include &lt;memory&gt;</a>
+<a name="ln20">#include &lt;mutex&gt;</a>
+<a name="ln21">#include &lt;thread&gt;</a>
+<a name="ln22">#include &lt;vector&gt;</a>
+<a name="ln23">#include &lt;chrono&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;yb/util/blocking_queue.h&quot;</a>
+<a name="ln28">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln29">#include &quot;yb/util/scope_exit.h&quot;</a>
+<a name="ln30">#include &quot;yb/util/status.h&quot;</a>
+<a name="ln31">#include &quot;yb/util/taskstream.h&quot;</a>
+<a name="ln32">#include &quot;yb/util/threadpool.h&quot;</a>
+<a name="ln33"> </a>
+<a name="ln34">using namespace std::chrono_literals;</a>
+<a name="ln35"> </a>
+<a name="ln36">using std::vector;</a>
+<a name="ln37"> </a>
+<a name="ln38">namespace yb {</a>
+<a name="ln39">class ThreadPool;</a>
+<a name="ln40">class ThreadPoolToken;</a>
+<a name="ln41"> </a>
+<a name="ln42">template &lt;typename T&gt;</a>
+<a name="ln43">class TaskStreamImpl;</a>
+<a name="ln44"> </a>
+<a name="ln45">YB_DEFINE_ENUM(TaskStreamRunState, (kIdle)(kSubmit)(kDrain)(kProcess)(kComplete)(kFinish));</a>
+<a name="ln46"> </a>
+<a name="ln47">template &lt;typename T&gt;</a>
+<a name="ln48">// TaskStream has a thread pool token in the given thread pool.</a>
+<a name="ln49">// TaskStream does not manage a thread but only submits to the token in the thread pool.</a>
+<a name="ln50">// When we submit tasks to the taskstream, it adds tasks to the queue to be processed.</a>
+<a name="ln51">// The internal Run function will call the user-provided function,</a>
+<a name="ln52">// for each element in the queue in a loop.</a>
+<a name="ln53">// When the queue is empty, it calls the user-provided function with no parameter,</a>
+<a name="ln54">// to indicate it needs to process the end of the group of tasks processed.</a>
+<a name="ln55">// This feature is used for the preparer and appender functionality.</a>
+<a name="ln56">class TaskStream {</a>
+<a name="ln57"> public:</a>
+<a name="ln58">  explicit TaskStream(std::function&lt;void(T*)&gt; process_item,</a>
+<a name="ln59">                      ThreadPool* thread_pool,</a>
+<a name="ln60">                      int32_t queue_max_size,</a>
+<a name="ln61">                      const MonoDelta&amp; queue_max_wait);</a>
+<a name="ln62">  ~TaskStream();</a>
+<a name="ln63"> </a>
+<a name="ln64">  CHECKED_STATUS Start();</a>
+<a name="ln65">  void Stop();</a>
+<a name="ln66"> </a>
+<a name="ln67">  CHECKED_STATUS Submit(T* item);</a>
+<a name="ln68"> </a>
+<a name="ln69">  CHECKED_STATUS TEST_SubmitFunc(const std::function&lt;void()&gt;&amp; func);</a>
+<a name="ln70"> </a>
+<a name="ln71">  std::string GetRunThreadStack() {</a>
+<a name="ln72">    auto result = ThreadStack(run_tid_);</a>
+<a name="ln73">    if (!result.ok()) {</a>
+<a name="ln74">      return result.status().ToString();</a>
+<a name="ln75">    }</a>
+<a name="ln76">    return (*result).Symbolize();</a>
+<a name="ln77">  }</a>
+<a name="ln78"> </a>
+<a name="ln79">  std::string ToString() const {</a>
+<a name="ln80">    return YB_CLASS_TO_STRING(queue, run_state, stopped, stop_requested);</a>
+<a name="ln81">  }</a>
+<a name="ln82"> </a>
+<a name="ln83"> private:</a>
+<a name="ln84">  using RunState = TaskStreamRunState;</a>
+<a name="ln85"> </a>
+<a name="ln86">  void ChangeRunState(RunState expected_old_state, RunState new_state) {</a>
+<a name="ln87">    auto old_state = run_state_.exchange(new_state, std::memory_order_acq_rel);</a>
+<a name="ln88">    LOG_IF(DFATAL, old_state != expected_old_state)</a>
+<a name="ln89">        &lt;&lt; &quot;Task stream was in wrong state &quot; &lt;&lt; old_state &lt;&lt; &quot; while &quot;</a>
+<a name="ln90">        &lt;&lt; expected_old_state &lt;&lt; &quot; was expected&quot;;</a>
+<a name="ln91">  }</a>
+<a name="ln92"> </a>
+<a name="ln93">  // We set this to true to tell the Run function to return. No new tasks will be accepted, but</a>
+<a name="ln94">  // existing tasks will still be processed.</a>
+<a name="ln95">  std::atomic&lt;bool&gt; stop_requested_{false};</a>
+<a name="ln96"> </a>
+<a name="ln97">  std::atomic&lt;RunState&gt; run_state_{RunState::kIdle};</a>
+<a name="ln98"> </a>
+<a name="ln99">  // This is set to true immediately before the thread exits.</a>
+<a name="ln100">  std::atomic&lt;bool&gt; stopped_{false};</a>
+<a name="ln101"> </a>
+<a name="ln102">  // The objects in the queue are owned by the queue and ownership gets tranferred to ProcessItem.</a>
+<a name="ln103">  BlockingQueue&lt;T*&gt; queue_;</a>
+<a name="ln104"> </a>
+<a name="ln105">  // This mutex/condition combination is used in Stop() in case multiple threads are calling that</a>
+<a name="ln106">  // function concurrently. One of them will ask the taskstream thread to stop and wait for it, and</a>
+<a name="ln107">  // then will notify other threads that have called Stop().</a>
+<a name="ln108">  std::mutex stop_mtx_;</a>
+<a name="ln109">  std::condition_variable stop_cond_;</a>
+<a name="ln110"> </a>
+<a name="ln111">  std::unique_ptr&lt;ThreadPoolToken&gt; taskstream_pool_token_;</a>
+<a name="ln112">  std::function&lt;void(T*)&gt; process_item_;</a>
+<a name="ln113">  ThreadIdForStack run_tid_ = 0;</a>
+<a name="ln114"> </a>
+<a name="ln115">  // Maximum time to wait for the queue to become non-empty.</a>
+<a name="ln116">  const MonoDelta queue_max_wait_;</a>
+<a name="ln117"> </a>
+<a name="ln118">  void Run();</a>
+<a name="ln119">  void ProcessItem(T* item);</a>
+<a name="ln120">};</a>
+<a name="ln121"> </a>
+<a name="ln122">template &lt;typename T&gt;</a>
+<a name="ln123">TaskStream&lt;T&gt;::TaskStream(std::function&lt;void(T*)&gt; process_item,</a>
+<a name="ln124">                          ThreadPool* thread_pool,</a>
+<a name="ln125">                          int32_t queue_max_size,</a>
+<a name="ln126">                          const MonoDelta&amp; queue_max_wait)</a>
+<a name="ln127">    : queue_(queue_max_size),</a>
+<a name="ln128">      // run_state_ is responsible for serial execution, so we use concurrent here to avoid</a>
+<a name="ln129">      // unnecessary checks in thread pool.</a>
+<a name="ln130">      taskstream_pool_token_(thread_pool-&gt;NewToken(ThreadPool::ExecutionMode::CONCURRENT)),</a>
+<a name="ln131">      process_item_(process_item),</a>
+<a name="ln132">      queue_max_wait_(queue_max_wait) {</a>
+<a name="ln133">}</a>
+<a name="ln134"> </a>
+<a name="ln135">template &lt;typename T&gt;</a>
+<a name="ln136">TaskStream&lt;T&gt;::~TaskStream() {</a>
+<a name="ln137">  Stop();</a>
+<a name="ln138">}</a>
+<a name="ln139"> </a>
+<a name="ln140">template &lt;typename T&gt;</a>
+<a name="ln141">Status TaskStream&lt;T&gt;::Start() {</a>
+<a name="ln142">  VLOG(1) &lt;&lt; &quot;Starting the TaskStream&quot;;</a>
+<a name="ln143">  return Status::OK();</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146">template &lt;typename T&gt;</a>
+<a name="ln147">void TaskStream&lt;T&gt;::Stop() {</a>
+<a name="ln148">  VLOG(1) &lt;&lt; &quot;Stopping the TaskStream&quot;;</a>
+<a name="ln149">  auto scope_exit = ScopeExit([] {</a>
+<a name="ln150">    VLOG(1) &lt;&lt; &quot;The TaskStream has stopped&quot;;</a>
+<a name="ln151">  });</a>
+<a name="ln152">  queue_.Shutdown();</a>
+<a name="ln153">  if (stopped_.load(std::memory_order_acquire)) {</a>
+<a name="ln154">    return;</a>
+<a name="ln155">  }</a>
+<a name="ln156">  stop_requested_ = true;</a>
+<a name="ln157">  {</a>
+<a name="ln158">    std::unique_lock&lt;std::mutex&gt; stop_lock(stop_mtx_);</a>
+<a name="ln159">    stop_cond_.wait(stop_lock, [this] {</a>
+<a name="ln160">      return (run_state_.load(std::memory_order_acquire) == RunState::kIdle &amp;&amp; queue_.empty());</a>
+<a name="ln161">    });</a>
+<a name="ln162">  }</a>
+<a name="ln163">  stopped_.store(true, std::memory_order_release);</a>
+<a name="ln164">}</a>
+<a name="ln165"> </a>
+<a name="ln166">template &lt;typename T&gt;</a>
+<a name="ln167">Status TaskStream&lt;T&gt;::Submit(T *task) {</a>
+<a name="ln168">  if (stop_requested_.load(std::memory_order_acquire)) {</a>
+<a name="ln169">    return STATUS(IllegalState, &quot;Tablet is shutting down&quot;);</a>
+<a name="ln170">  }</a>
+<a name="ln171">  if (!queue_.BlockingPut(task)) {</a>
+<a name="ln172">    return STATUS_FORMAT(ServiceUnavailable,</a>
+<a name="ln173">                         &quot;TaskStream queue is full (max capacity $0)&quot;,</a>
+<a name="ln174">                         queue_.max_size());</a>
+<a name="ln175">  }</a>
+<a name="ln176"> </a>
+<a name="ln177">  RunState expected = RunState::kIdle;</a>
+<a name="ln178">  if (!run_state_.compare_exchange_strong(</a>
+<a name="ln179">          expected, RunState::kSubmit, std::memory_order_acq_rel)) {</a>
+<a name="ln180">    // run_state_ was not idle, so we are not creating a task to process operations.</a>
+<a name="ln181">    return Status::OK();</a>
+<a name="ln182">  }</a>
+<a name="ln183">  return taskstream_pool_token_-&gt;SubmitFunc(std::bind(&amp;TaskStream::Run, this));</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186">template &lt;typename T&gt;</a>
+<a name="ln187">Status TaskStream&lt;T&gt;::TEST_SubmitFunc(const std::function&lt;void()&gt;&amp; func) {</a>
+<a name="ln188">  return taskstream_pool_token_-&gt;SubmitFunc(func);</a>
+<a name="ln189">}</a>
+<a name="ln190"> </a>
+<a name="ln191">template &lt;typename T&gt;</a>
+<a name="ln192">void TaskStream&lt;T&gt;::Run() {</a>
+<a name="ln193">  VLOG(1) &lt;&lt; &quot;Starting taskstream task:&quot; &lt;&lt; this;</a>
+<a name="ln194">  ChangeRunState(RunState::kSubmit, RunState::kDrain);</a>
+<a name="ln195">  run_tid_ = Thread::CurrentThreadIdForStack();</a>
+<a name="ln196">  for (;;) {</a>
+<a name="ln197">    MonoTime wait_timeout_deadline = MonoTime::Now() + queue_max_wait_;</a>
+<a name="ln198">    std::vector&lt;T *&gt; group;</a>
+<a name="ln199">    queue_.BlockingDrainTo(&amp;group, wait_timeout_deadline);</a>
+<a name="ln200">    if (!group.empty()) {</a>
+<a name="ln201">      ChangeRunState(RunState::kDrain, RunState::kProcess);</a>
+<a name="ln202">      for (T* item : group) {</a>
+<a name="ln203">        ProcessItem(item);</a>
+<a name="ln204">      }</a>
+<a name="ln205">      ChangeRunState(RunState::kProcess, RunState::kComplete);</a>
+<a name="ln206">      ProcessItem(nullptr);</a>
+<a name="ln207">      group.clear();</a>
+<a name="ln208">      ChangeRunState(RunState::kComplete, RunState::kDrain);</a>
+<a name="ln209">      continue;</a>
+<a name="ln210">    }</a>
+<a name="ln211">    ChangeRunState(RunState::kDrain, RunState::kFinish);</a>
+<a name="ln212">    // Not processing and queue empty, return from task.</a>
+<a name="ln213">    std::unique_lock&lt;std::mutex&gt; stop_lock(stop_mtx_);</a>
+<a name="ln214">    ChangeRunState(RunState::kFinish, RunState::kIdle);</a>
+<a name="ln215">    if (!queue_.empty()) {</a>
+<a name="ln216">      // Got more operations, try stay in the loop.</a>
+<a name="ln217">      RunState expected = RunState::kIdle;</a>
+<a name="ln218">      if (run_state_.compare_exchange_strong(</a>
+<a name="ln219">              expected, RunState::kDrain, std::memory_order_acq_rel)) {</a>
+<a name="ln220">        continue;</a>
+<a name="ln221">      }</a>
+<a name="ln222">    }</a>
+<a name="ln223">    if (stop_requested_.load(std::memory_order_acquire)) {</a>
+<a name="ln224">      VLOG(1) &lt;&lt; &quot;TaskStream task's Run() function is returning because stop is requested.&quot;;</a>
+<a name="ln225">      stop_cond_.notify_all();</a>
+<a name="ln226">      return;</a>
+<a name="ln227">    }</a>
+<a name="ln228">    VLOG(1) &lt;&lt; &quot;Returning from TaskStream task after inactivity:&quot; &lt;&lt; this;</a>
+<a name="ln229">    return;</a>
+<a name="ln230">  }</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233">template &lt;typename T&gt;</a>
+<a name="ln234">void TaskStream&lt;T&gt;::ProcessItem(T* item) {</a>
+<a name="ln235">  process_item_(item);</a>
+<a name="ln236">}</a>
+<a name="ln237"> </a>
+<a name="ln238">}  // namespace yb</a>
+<a name="ln239"> </a>
+<a name="ln240">#endif  // YB_UTIL_TASKSTREAM_H</a>
+
+</code></pre>
+<div class="balloon" rel="88"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="142"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="148"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="150"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="193"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="224"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="228"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

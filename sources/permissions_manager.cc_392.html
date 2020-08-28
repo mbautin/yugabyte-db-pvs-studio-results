@@ -1,0 +1,1117 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>permissions_manager.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;mutex&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/util/crypt.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/master/catalog_manager.h&quot;</a>
+<a name="ln21">#include &quot;yb/master/catalog_manager-internal.h&quot;</a>
+<a name="ln22">#include &quot;yb/master/master_util.h&quot;</a>
+<a name="ln23">#include &quot;yb/master/permissions_manager.h&quot;</a>
+<a name="ln24">#include &quot;yb/master/sys_catalog.h&quot;</a>
+<a name="ln25">#include &quot;yb/master/sys_catalog_constants.h&quot;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;yb/util/shared_lock.h&quot;</a>
+<a name="ln28"> </a>
+<a name="ln29">using std::shared_ptr;</a>
+<a name="ln30"> </a>
+<a name="ln31">using yb::util::kBcryptHashSize;</a>
+<a name="ln32">using yb::util::bcrypt_hashpw;</a>
+<a name="ln33">using strings::Substitute;</a>
+<a name="ln34"> </a>
+<a name="ln35">// TODO: remove direct references to member fields in CatalogManager from here.</a>
+<a name="ln36"> </a>
+<a name="ln37">namespace yb {</a>
+<a name="ln38">namespace master {</a>
+<a name="ln39"> </a>
+<a name="ln40">namespace {</a>
+<a name="ln41"> </a>
+<a name="ln42">// Helper class to abort mutations at the end of a scope.</a>
+<a name="ln43">template&lt;class PersistentDataEntryPB&gt;</a>
+<a name="ln44">class ScopedMutation {</a>
+<a name="ln45"> public:</a>
+<a name="ln46">  explicit ScopedMutation(PersistentDataEntryPB* cow_object)</a>
+<a name="ln47">      : cow_object_(DCHECK_NOTNULL(cow_object)) {</a>
+<a name="ln48">    cow_object-&gt;mutable_metadata()-&gt;StartMutation();</a>
+<a name="ln49">  }</a>
+<a name="ln50"> </a>
+<a name="ln51">  void Commit() {</a>
+<a name="ln52">    cow_object_-&gt;mutable_metadata()-&gt;CommitMutation();</a>
+<a name="ln53">    committed_ = true;</a>
+<a name="ln54">  }</a>
+<a name="ln55"> </a>
+<a name="ln56">  // Abort the mutation if it wasn't committed.</a>
+<a name="ln57">  ~ScopedMutation() {</a>
+<a name="ln58">    if (PREDICT_FALSE(!committed_)) {</a>
+<a name="ln59">      cow_object_-&gt;mutable_metadata()-&gt;AbortMutation();</a>
+<a name="ln60">    }</a>
+<a name="ln61">}</a>
+<a name="ln62"> </a>
+<a name="ln63"> private:</a>
+<a name="ln64">  PersistentDataEntryPB* cow_object_;</a>
+<a name="ln65">  bool committed_ = false;</a>
+<a name="ln66">};</a>
+<a name="ln67"> </a>
+<a name="ln68">}  // anonymous namespace</a>
+<a name="ln69"> </a>
+<a name="ln70"> </a>
+<a name="ln71">PermissionsManager::PermissionsManager(CatalogManager* catalog_manager)</a>
+<a name="ln72">    : catalog_manager_(catalog_manager) {</a>
+<a name="ln73">  CHECK_NOTNULL(catalog_manager);</a>
+<a name="ln74">}</a>
+<a name="ln75"> </a>
+<a name="ln76">Status PermissionsManager::PrepareDefaultRoles(int64_t term) {</a>
+<a name="ln77">  // Verify we have the catalog manager lock.</a>
+<a name="ln78">  if (!catalog_manager_-&gt;lock_.is_locked()) {</a>
+<a name="ln79">    return STATUS(IllegalState, &quot;We don't have the catalog manager lock!&quot;);</a>
+<a name="ln80">  }</a>
+<a name="ln81"> </a>
+<a name="ln82">  if (FindPtrOrNull(roles_map_, kDefaultCassandraUsername) != nullptr) {</a>
+<a name="ln83">    LOG(INFO) &lt;&lt; &quot;Role &quot; &lt;&lt; kDefaultCassandraUsername</a>
+<a name="ln84">              &lt;&lt; &quot; already created, skipping initialization&quot;;</a>
+<a name="ln85">    return Status::OK();</a>
+<a name="ln86">  }</a>
+<a name="ln87"> </a>
+<a name="ln88">  char hash[kBcryptHashSize];</a>
+<a name="ln89">  // TODO: refactor interface to be more c++ like...</a>
+<a name="ln90">  int ret = bcrypt_hashpw(kDefaultCassandraPassword, hash);</a>
+<a name="ln91">  if (ret != 0) {</a>
+<a name="ln92">    return STATUS_SUBSTITUTE(IllegalState, &quot;Could not hash password, reason: $0&quot;, ret);</a>
+<a name="ln93">  }</a>
+<a name="ln94"> </a>
+<a name="ln95">  // Create in memory object.</a>
+<a name="ln96">  Status s = CreateRoleUnlocked(kDefaultCassandraUsername, std::string(hash, kBcryptHashSize),</a>
+<a name="ln97">                                true, true, term, false /* Don't increment the roles version */);</a>
+<a name="ln98">  if (PREDICT_TRUE(s.ok())) {</a>
+<a name="ln99">    LOG(INFO) &lt;&lt; &quot;Created role: &quot; &lt;&lt; kDefaultCassandraUsername;</a>
+<a name="ln100">  }</a>
+<a name="ln101"> </a>
+<a name="ln102">  return s;</a>
+<a name="ln103">}</a>
+<a name="ln104"> </a>
+<a name="ln105">template&lt;class RespClass&gt;</a>
+<a name="ln106">Status PermissionsManager::GrantPermissions(</a>
+<a name="ln107">    const RoleName&amp; role_name,</a>
+<a name="ln108">    const std::string&amp; canonical_resource,</a>
+<a name="ln109">    const std::string&amp; resource_name,</a>
+<a name="ln110">    const NamespaceName&amp; keyspace,</a>
+<a name="ln111">    const std::vector&lt;PermissionType&gt;&amp; permissions,</a>
+<a name="ln112">    const ResourceType resource_type,</a>
+<a name="ln113">    RespClass* resp) {</a>
+<a name="ln114">  std::lock_guard&lt;decltype(catalog_manager_-&gt;lock_)&gt; l(catalog_manager_-&gt;lock_);</a>
+<a name="ln115"> </a>
+<a name="ln116">  scoped_refptr&lt;RoleInfo&gt; rp;</a>
+<a name="ln117">  rp = FindPtrOrNull(roles_map_, role_name);</a>
+<a name="ln118">  if (rp == nullptr) {</a>
+<a name="ln119">    const Status s = STATUS_SUBSTITUTE(NotFound, &quot;Role $0 was not found&quot;, role_name);</a>
+<a name="ln120">    return SetupError(resp-&gt;mutable_error(), MasterErrorPB::ROLE_NOT_FOUND, s);</a>
+<a name="ln121">  }</a>
+<a name="ln122"> </a>
+<a name="ln123">  RETURN_NOT_OK(IncrementRolesVersionUnlocked());</a>
+<a name="ln124"> </a>
+<a name="ln125">  {</a>
+<a name="ln126">    SysRoleEntryPB* metadata;</a>
+<a name="ln127">    ScopedMutation &lt;RoleInfo&gt; role_info_mutation(rp.get());</a>
+<a name="ln128">    metadata = &amp;rp-&gt;mutable_metadata()-&gt;mutable_dirty()-&gt;pb;</a>
+<a name="ln129"> </a>
+<a name="ln130">    ResourcePermissionsPB* current_resource = metadata-&gt;add_resources();</a>
+<a name="ln131"> </a>
+<a name="ln132">    current_resource-&gt;set_canonical_resource(canonical_resource);</a>
+<a name="ln133">    current_resource-&gt;set_resource_type(resource_type);</a>
+<a name="ln134">    current_resource-&gt;set_resource_name(resource_name);</a>
+<a name="ln135">    current_resource-&gt;set_namespace_name(keyspace);</a>
+<a name="ln136"> </a>
+<a name="ln137">    for (const auto&amp; permission : permissions) {</a>
+<a name="ln138">      if (permission == PermissionType::DESCRIBE_PERMISSION &amp;&amp;</a>
+<a name="ln139">          resource_type != ResourceType::ROLE &amp;&amp;</a>
+<a name="ln140">          resource_type != ResourceType::ALL_ROLES) {</a>
+<a name="ln141">        // Describe permission should only be granted to the role resource.</a>
+<a name="ln142">        continue;</a>
+<a name="ln143">      }</a>
+<a name="ln144">      current_resource-&gt;add_permissions(permission);</a>
+<a name="ln145">    }</a>
+<a name="ln146">    Status s = catalog_manager_-&gt;sys_catalog_-&gt;UpdateItem(rp.get(),</a>
+<a name="ln147">        catalog_manager_-&gt;leader_ready_term());</a>
+<a name="ln148">    if (!s.ok()) {</a>
+<a name="ln149">      s = s.CloneAndPrepend(Substitute(</a>
+<a name="ln150">          &quot;An error occurred while updating permissions in sys-catalog: $0&quot;, s.ToString()));</a>
+<a name="ln151">      LOG(WARNING) &lt;&lt; s;</a>
+<a name="ln152">      return CheckIfNoLongerLeaderAndSetupError(s, resp);</a>
+<a name="ln153">    }</a>
+<a name="ln154">    TRACE(&quot;Wrote Permission to sys-catalog&quot;);</a>
+<a name="ln155">    role_info_mutation.Commit();</a>
+<a name="ln156"> </a>
+<a name="ln157">    BuildResourcePermissionsUnlocked();</a>
+<a name="ln158">  }</a>
+<a name="ln159">  return Status::OK();</a>
+<a name="ln160">}</a>
+<a name="ln161"> </a>
+<a name="ln162">// TODO: get rid of explicit instantiations.</a>
+<a name="ln163">template Status PermissionsManager::GrantPermissions&lt;CreateTableResponsePB&gt;(</a>
+<a name="ln164">    const RoleName&amp; role_name,</a>
+<a name="ln165">    const std::string&amp; canonical_resource,</a>
+<a name="ln166">    const std::string&amp; resource_name,</a>
+<a name="ln167">    const NamespaceName&amp; keyspace,</a>
+<a name="ln168">    const std::vector&lt;PermissionType&gt;&amp; permissions,</a>
+<a name="ln169">    const ResourceType resource_type,</a>
+<a name="ln170">    CreateTableResponsePB* resp);</a>
+<a name="ln171"> </a>
+<a name="ln172">template Status PermissionsManager::GrantPermissions&lt;CreateNamespaceResponsePB&gt;(</a>
+<a name="ln173">    const RoleName&amp; role_name,</a>
+<a name="ln174">    const std::string&amp; canonical_resource,</a>
+<a name="ln175">    const std::string&amp; resource_name,</a>
+<a name="ln176">    const NamespaceName&amp; keyspace,</a>
+<a name="ln177">    const std::vector&lt;PermissionType&gt;&amp; permissions,</a>
+<a name="ln178">    const ResourceType resource_type,</a>
+<a name="ln179">    CreateNamespaceResponsePB* resp);</a>
+<a name="ln180"> </a>
+<a name="ln181">// Create a SysVersionInfo object to track the roles versions.</a>
+<a name="ln182">Status PermissionsManager::IncrementRolesVersionUnlocked() {</a>
+<a name="ln183">  DCHECK(catalog_manager_-&gt;lock_.is_locked()) &lt;&lt; &quot;We don't have the catalog manager lock!&quot;;</a>
+<a name="ln184"> </a>
+<a name="ln185">  // Prepare write.</a>
+<a name="ln186">  auto l = CHECK_NOTNULL(security_config_.get())-&gt;LockForWrite();</a>
+<a name="ln187">  const uint64_t roles_version = l-&gt;mutable_data()-&gt;pb.security_config().roles_version();</a>
+<a name="ln188">  if (roles_version == std::numeric_limits&lt;uint64_t&gt;::max()) {</a>
+<a name="ln189">    DFATAL_OR_RETURN_NOT_OK(</a>
+<a name="ln190">        STATUS_SUBSTITUTE(IllegalState,</a>
+<a name="ln191">                          &quot;Roles version reached max allowable integer: $0&quot;, roles_version));</a>
+<a name="ln192">  }</a>
+<a name="ln193">  l-&gt;mutable_data()-&gt;pb.mutable_security_config()-&gt;set_roles_version(roles_version + 1);</a>
+<a name="ln194"> </a>
+<a name="ln195">  TRACE(&quot;Set CatalogManager's roles version&quot;);</a>
+<a name="ln196"> </a>
+<a name="ln197">  // Write to sys_catalog and in memory.</a>
+<a name="ln198">  RETURN_NOT_OK(catalog_manager_-&gt;sys_catalog_-&gt;UpdateItem(</a>
+<a name="ln199">      security_config_.get(), catalog_manager_-&gt;leader_ready_term()));</a>
+<a name="ln200"> </a>
+<a name="ln201">  l-&gt;Commit();</a>
+<a name="ln202">  return Status::OK();</a>
+<a name="ln203">}</a>
+<a name="ln204"> </a>
+<a name="ln205">template&lt;class RespClass&gt;</a>
+<a name="ln206">Status PermissionsManager::RemoveAllPermissionsForResourceUnlocked(</a>
+<a name="ln207">    const std::string&amp; canonical_resource,</a>
+<a name="ln208">    RespClass* resp) {</a>
+<a name="ln209"> </a>
+<a name="ln210">  DCHECK(catalog_manager_-&gt;lock_.is_locked()) &lt;&lt; &quot;We don't have the catalog manager lock!&quot;;</a>
+<a name="ln211"> </a>
+<a name="ln212">  bool permissions_modified = false;</a>
+<a name="ln213">  for (const auto&amp; e : roles_map_) {</a>
+<a name="ln214">    scoped_refptr&lt;RoleInfo&gt; rp = e.second;</a>
+<a name="ln215">    ScopedMutation&lt;RoleInfo&gt; role_info_mutation(rp.get());</a>
+<a name="ln216">    auto* resources = rp-&gt;mutable_metadata()-&gt;mutable_dirty()-&gt;pb.mutable_resources();</a>
+<a name="ln217">    for (auto itr = resources-&gt;begin(); itr != resources-&gt;end(); itr++) {</a>
+<a name="ln218">      if (itr-&gt;canonical_resource() == canonical_resource) {</a>
+<a name="ln219">        resources-&gt;erase(itr);</a>
+<a name="ln220">        role_info_mutation.Commit();</a>
+<a name="ln221">        permissions_modified = true;</a>
+<a name="ln222">        break;</a>
+<a name="ln223">      }</a>
+<a name="ln224">    }</a>
+<a name="ln225">  }</a>
+<a name="ln226"> </a>
+<a name="ln227">  // Increment the roles version and update the cache only if there was a modification to the</a>
+<a name="ln228">  // permissions.</a>
+<a name="ln229">  if (permissions_modified) {</a>
+<a name="ln230">    const Status s = IncrementRolesVersionUnlocked();</a>
+<a name="ln231">    if (!s.ok()) {</a>
+<a name="ln232">      return CheckIfNoLongerLeaderAndSetupError(s, resp);</a>
+<a name="ln233">    }</a>
+<a name="ln234"> </a>
+<a name="ln235">    BuildResourcePermissionsUnlocked();</a>
+<a name="ln236">  }</a>
+<a name="ln237"> </a>
+<a name="ln238">  return Status::OK();</a>
+<a name="ln239">}</a>
+<a name="ln240"> </a>
+<a name="ln241">template&lt;class RespClass&gt;</a>
+<a name="ln242">Status PermissionsManager::RemoveAllPermissionsForResource(</a>
+<a name="ln243">    const std::string&amp; canonical_resource,</a>
+<a name="ln244">    RespClass* resp) {</a>
+<a name="ln245">  std::lock_guard&lt;decltype(catalog_manager_-&gt;lock_)&gt; l_big(catalog_manager_-&gt;lock_);</a>
+<a name="ln246">  return RemoveAllPermissionsForResourceUnlocked(canonical_resource, resp);</a>
+<a name="ln247">}</a>
+<a name="ln248"> </a>
+<a name="ln249">// TODO: get rid of the need for explicit instantations.</a>
+<a name="ln250">template</a>
+<a name="ln251">Status PermissionsManager::RemoveAllPermissionsForResource&lt;DeleteTableResponsePB&gt;(</a>
+<a name="ln252">    const std::string&amp; canonical_resource,</a>
+<a name="ln253">    DeleteTableResponsePB* resp);</a>
+<a name="ln254"> </a>
+<a name="ln255">template</a>
+<a name="ln256">Status PermissionsManager::RemoveAllPermissionsForResource&lt;DeleteNamespaceResponsePB&gt;(</a>
+<a name="ln257">    const std::string&amp; canonical_resource,</a>
+<a name="ln258">    DeleteNamespaceResponsePB* resp);</a>
+<a name="ln259"> </a>
+<a name="ln260">Status PermissionsManager::CreateRoleUnlocked(</a>
+<a name="ln261">    const std::string&amp; role_name,</a>
+<a name="ln262">    const std::string&amp; salted_hash,</a>
+<a name="ln263">    const bool login,</a>
+<a name="ln264">    const bool superuser,</a>
+<a name="ln265">    int64_t term,</a>
+<a name="ln266">    const bool increment_roles_version) {</a>
+<a name="ln267">  if (!catalog_manager_-&gt;lock_.is_locked()) {</a>
+<a name="ln268">    return STATUS(IllegalState, &quot;We don't have the catalog manager lock!&quot;);</a>
+<a name="ln269">  }</a>
+<a name="ln270">  // Create Entry.</a>
+<a name="ln271">  SysRoleEntryPB role_entry;</a>
+<a name="ln272">  role_entry.set_role(role_name);</a>
+<a name="ln273">  role_entry.set_can_login(login);</a>
+<a name="ln274">  role_entry.set_is_superuser(superuser);</a>
+<a name="ln275">  if (salted_hash.size() != 0) {</a>
+<a name="ln276">    role_entry.set_salted_hash(salted_hash);</a>
+<a name="ln277">  }</a>
+<a name="ln278"> </a>
+<a name="ln279">  if (increment_roles_version) {</a>
+<a name="ln280">    // Increment roles version.</a>
+<a name="ln281">    RETURN_NOT_OK(IncrementRolesVersionUnlocked());</a>
+<a name="ln282">  }</a>
+<a name="ln283"> </a>
+<a name="ln284">  // Create in memory object.</a>
+<a name="ln285">  scoped_refptr&lt;RoleInfo&gt; role = new RoleInfo(role_name);</a>
+<a name="ln286"> </a>
+<a name="ln287">  // Prepare write.</a>
+<a name="ln288">  auto l = role-&gt;LockForWrite();</a>
+<a name="ln289">  l-&gt;mutable_data()-&gt;pb = std::move(role_entry);</a>
+<a name="ln290"> </a>
+<a name="ln291">  roles_map_[role_name] = role;</a>
+<a name="ln292">  TRACE(&quot;Inserted new role info into CatalogManager maps&quot;);</a>
+<a name="ln293"> </a>
+<a name="ln294">  // Write to sys_catalog and in memory.</a>
+<a name="ln295">  RETURN_NOT_OK(catalog_manager_-&gt;sys_catalog_-&gt;AddItem(role.get(), term));</a>
+<a name="ln296"> </a>
+<a name="ln297">  l-&gt;Commit();</a>
+<a name="ln298">  BuildRecursiveRolesUnlocked();</a>
+<a name="ln299">  return Status::OK();</a>
+<a name="ln300">}</a>
+<a name="ln301"> </a>
+<a name="ln302">Status PermissionsManager::CreateRole(</a>
+<a name="ln303">    const CreateRoleRequestPB* req,</a>
+<a name="ln304">    CreateRoleResponsePB* resp,</a>
+<a name="ln305">    rpc::RpcContext* rpc) {</a>
+<a name="ln306"> </a>
+<a name="ln307">  LOG(INFO) &lt;&lt; &quot;CreateRole from &quot; &lt;&lt; RequestorString(rpc) &lt;&lt; &quot;: &quot; &lt;&lt; req-&gt;DebugString();</a>
+<a name="ln308"> </a>
+<a name="ln309">  RETURN_NOT_OK(catalog_manager_-&gt;CheckOnline());</a>
+<a name="ln310">  Status s;</a>
+<a name="ln311">  {</a>
+<a name="ln312">    TRACE(&quot;Acquired catalog manager lock&quot;);</a>
+<a name="ln313">    std::lock_guard&lt;decltype(catalog_manager_-&gt;lock_)&gt; l_big(catalog_manager_-&gt;lock_);</a>
+<a name="ln314">    // Only a SUPERUSER role can create another SUPERUSER role. In Apache Cassandra this gets</a>
+<a name="ln315">    // checked before the existence of the new role.</a>
+<a name="ln316">    if (req-&gt;superuser()) {</a>
+<a name="ln317">      scoped_refptr&lt;RoleInfo&gt; creator_role = FindPtrOrNull(roles_map_, req-&gt;creator_role_name());</a>
+<a name="ln318">      if (creator_role == nullptr) {</a>
+<a name="ln319">        s = STATUS_SUBSTITUTE(NotFound, &quot;role $0 does not exist&quot;, req-&gt;creator_role_name());</a>
+<a name="ln320">        return SetupError(resp-&gt;mutable_error(), MasterErrorPB::ROLE_NOT_FOUND, s);</a>
+<a name="ln321">      }</a>
+<a name="ln322"> </a>
+<a name="ln323">      auto clr = creator_role-&gt;LockForRead();</a>
+<a name="ln324">      if (!clr-&gt;data().pb.is_superuser()) {</a>
+<a name="ln325">        s = STATUS(NotAuthorized, &quot;Only superusers can create a role with superuser status&quot;);</a>
+<a name="ln326">        return SetupError(resp-&gt;mutable_error(), MasterErrorPB::NOT_AUTHORIZED, s);</a>
+<a name="ln327">      }</a>
+<a name="ln328">    }</a>
+<a name="ln329">    if (FindPtrOrNull(roles_map_, req-&gt;name()) != nullptr) {</a>
+<a name="ln330">      s = STATUS_SUBSTITUTE(AlreadyPresent, &quot;Role $0 already exists&quot;, req-&gt;name());</a>
+<a name="ln331">      return SetupError(resp-&gt;mutable_error(), MasterErrorPB::ROLE_ALREADY_PRESENT, s);</a>
+<a name="ln332">    }</a>
+<a name="ln333">    s = CreateRoleUnlocked(</a>
+<a name="ln334">        req-&gt;name(), req-&gt;salted_hash(), req-&gt;login(), req-&gt;superuser(),</a>
+<a name="ln335">        catalog_manager_-&gt;leader_ready_term());</a>
+<a name="ln336">  }</a>
+<a name="ln337">  if (PREDICT_TRUE(s.ok())) {</a>
+<a name="ln338">    LOG(INFO) &lt;&lt; &quot;Created role: &quot; &lt;&lt; req-&gt;name();</a>
+<a name="ln339">    if (req-&gt;has_creator_role_name()) {</a>
+<a name="ln340">      RETURN_NOT_OK(GrantPermissions(req-&gt;creator_role_name(),</a>
+<a name="ln341">                                     get_canonical_role(req-&gt;name()),</a>
+<a name="ln342">                                     req-&gt;name() /* resource name */,</a>
+<a name="ln343">                                     &quot;&quot; /* keyspace name */,</a>
+<a name="ln344">                                     all_permissions_for_resource(ResourceType::ROLE),</a>
+<a name="ln345">                                     ResourceType::ROLE,</a>
+<a name="ln346">                                     resp));</a>
+<a name="ln347">    }</a>
+<a name="ln348">  }</a>
+<a name="ln349">  return s;</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352">Status PermissionsManager::AlterRole(</a>
+<a name="ln353">    const AlterRoleRequestPB* req,</a>
+<a name="ln354">    AlterRoleResponsePB* resp,</a>
+<a name="ln355">    rpc::RpcContext* rpc) {</a>
+<a name="ln356"> </a>
+<a name="ln357">  VLOG(1) &lt;&lt; &quot;AlterRole from &quot; &lt;&lt; RequestorString(rpc) &lt;&lt; &quot;: &quot; &lt;&lt; req-&gt;DebugString();</a>
+<a name="ln358"> </a>
+<a name="ln359">  RETURN_NOT_OK(catalog_manager_-&gt;CheckOnline());</a>
+<a name="ln360">  Status s;</a>
+<a name="ln361"> </a>
+<a name="ln362">  TRACE(&quot;Acquired catalog manager lock&quot;);</a>
+<a name="ln363">  std::lock_guard&lt;decltype(catalog_manager_-&gt;lock_)&gt; l_big(catalog_manager_-&gt;lock_);</a>
+<a name="ln364"> </a>
+<a name="ln365">  auto role = FindPtrOrNull(roles_map_, req-&gt;name());</a>
+<a name="ln366">  if (role == nullptr) {</a>
+<a name="ln367">    s = STATUS_SUBSTITUTE(NotFound, &quot;Role $0 does not exist&quot;, req-&gt;name());</a>
+<a name="ln368">    return SetupError(resp-&gt;mutable_error(), MasterErrorPB::ROLE_NOT_FOUND, s);</a>
+<a name="ln369">  }</a>
+<a name="ln370"> </a>
+<a name="ln371">  // Increment roles version.</a>
+<a name="ln372">  RETURN_NOT_OK(IncrementRolesVersionUnlocked());</a>
+<a name="ln373"> </a>
+<a name="ln374">  // Modify the role.</a>
+<a name="ln375">  auto l = role-&gt;LockForWrite();</a>
+<a name="ln376"> </a>
+<a name="ln377">  // If the role we are trying to alter is a SUPERUSER, and the request is trying to alter the</a>
+<a name="ln378">  // SUPERUSER field for that role, the role requesting the alter operation must be a SUPERUSER</a>
+<a name="ln379">  // too.</a>
+<a name="ln380">  if (req-&gt;has_superuser()) {</a>
+<a name="ln381">    auto current_role = FindPtrOrNull(roles_map_, req-&gt;current_role());</a>
+<a name="ln382">    if (current_role == nullptr) {</a>
+<a name="ln383">      s = STATUS_SUBSTITUTE(NotFound, &quot;Internal error: role $0 does not exist&quot;,</a>
+<a name="ln384">                            req-&gt;current_role());</a>
+<a name="ln385">      return SetupError(resp-&gt;mutable_error(), MasterErrorPB::ROLE_NOT_FOUND, s);</a>
+<a name="ln386">    }</a>
+<a name="ln387"> </a>
+<a name="ln388">    // Fix for https://github.com/yugabyte/yugabyte-db/issues/2505.</a>
+<a name="ln389">    // A role cannot modify its own superuser status, nor the superuser status of any role granted</a>
+<a name="ln390">    // to it directly or through inheritance. This check should happen before the next check that</a>
+<a name="ln391">    // verifies that the role requesting the modification is a superuser.</a>
+<a name="ln392">    if (l-&gt;data().pb.role() == req-&gt;current_role() ||</a>
+<a name="ln393">        IsMemberOf(l-&gt;data().pb.role(), req-&gt;current_role())) {</a>
+<a name="ln394">      s = STATUS(NotAuthorized,</a>
+<a name="ln395">          &quot;You aren't allowed to alter your own superuser status or that of a role granted to you&quot;);</a>
+<a name="ln396">      return SetupError(resp-&gt;mutable_error(), MasterErrorPB::NOT_AUTHORIZED, s);</a>
+<a name="ln397">    }</a>
+<a name="ln398"> </a>
+<a name="ln399">    // Don't allow a non-superuser role to modify the superuser status of another role.</a>
+<a name="ln400">    auto clr = current_role-&gt;LockForRead();</a>
+<a name="ln401">    if (!clr-&gt;data().pb.is_superuser()) {</a>
+<a name="ln402">      s = STATUS(NotAuthorized, &quot;Only superusers are allowed to alter superuser status&quot;);</a>
+<a name="ln403">      return SetupError(resp-&gt;mutable_error(), MasterErrorPB::NOT_AUTHORIZED, s);</a>
+<a name="ln404">    }</a>
+<a name="ln405">  }</a>
+<a name="ln406"> </a>
+<a name="ln407">  if (req-&gt;has_login()) {</a>
+<a name="ln408">    l-&gt;mutable_data()-&gt;pb.set_can_login(req-&gt;login());</a>
+<a name="ln409">  }</a>
+<a name="ln410">  if (req-&gt;has_superuser()) {</a>
+<a name="ln411">    l-&gt;mutable_data()-&gt;pb.set_is_superuser(req-&gt;superuser());</a>
+<a name="ln412">  }</a>
+<a name="ln413">  if (req-&gt;has_salted_hash()) {</a>
+<a name="ln414">    l-&gt;mutable_data()-&gt;pb.set_salted_hash(req-&gt;salted_hash());</a>
+<a name="ln415">  }</a>
+<a name="ln416"> </a>
+<a name="ln417">  s = catalog_manager_-&gt;sys_catalog_-&gt;UpdateItem(role.get(),</a>
+<a name="ln418">                                                 catalog_manager_-&gt;leader_ready_term());</a>
+<a name="ln419">  if (!s.ok()) {</a>
+<a name="ln420">    LOG(ERROR) &lt;&lt; &quot;Unable to alter role &quot; &lt;&lt; req-&gt;name() &lt;&lt; &quot;: &quot; &lt;&lt; s;</a>
+<a name="ln421">    return s;</a>
+<a name="ln422">  }</a>
+<a name="ln423">  l-&gt;Commit();</a>
+<a name="ln424">  VLOG(1) &lt;&lt; &quot;Altered role with request: &quot; &lt;&lt; req-&gt;ShortDebugString();</a>
+<a name="ln425">  if (req-&gt;has_superuser()) {</a>
+<a name="ln426">    BuildResourcePermissionsUnlocked();</a>
+<a name="ln427">  }</a>
+<a name="ln428">  return Status::OK();</a>
+<a name="ln429">}</a>
+<a name="ln430"> </a>
+<a name="ln431">Status PermissionsManager::DeleteRole(</a>
+<a name="ln432">    const DeleteRoleRequestPB* req,</a>
+<a name="ln433">    DeleteRoleResponsePB* resp,</a>
+<a name="ln434">    rpc::RpcContext* rpc) {</a>
+<a name="ln435"> </a>
+<a name="ln436">  LOG(INFO) &lt;&lt; &quot;Servicing DeleteRole request from &quot; &lt;&lt; RequestorString(rpc)</a>
+<a name="ln437">            &lt;&lt; &quot;: &quot; &lt;&lt; req-&gt;ShortDebugString();</a>
+<a name="ln438">  RETURN_NOT_OK(catalog_manager_-&gt;CheckOnline());</a>
+<a name="ln439">  Status s;</a>
+<a name="ln440"> </a>
+<a name="ln441">  if (!req-&gt;has_name()) {</a>
+<a name="ln442">    s = STATUS(InvalidArgument, &quot;No role name given&quot;, req-&gt;DebugString());</a>
+<a name="ln443">    return SetupError(resp-&gt;mutable_error(), MasterErrorPB::ROLE_NOT_FOUND, s);</a>
+<a name="ln444">  }</a>
+<a name="ln445"> </a>
+<a name="ln446">  TRACE(&quot;Acquired catalog manager lock&quot;);</a>
+<a name="ln447">  std::lock_guard&lt;decltype(catalog_manager_-&gt;lock_)&gt; l_big(catalog_manager_-&gt;lock_);</a>
+<a name="ln448"> </a>
+<a name="ln449">  auto role = FindPtrOrNull(roles_map_, req-&gt;name());</a>
+<a name="ln450">  if (role == nullptr) {</a>
+<a name="ln451">    s = STATUS_SUBSTITUTE(NotFound, &quot;Role $0 does not exist&quot;, req-&gt;name());</a>
+<a name="ln452">    return SetupError(resp-&gt;mutable_error(), MasterErrorPB::ROLE_NOT_FOUND, s);</a>
+<a name="ln453">  }</a>
+<a name="ln454"> </a>
+<a name="ln455">  // Increment roles version.</a>
+<a name="ln456">  RETURN_NOT_OK(IncrementRolesVersionUnlocked());</a>
+<a name="ln457"> </a>
+<a name="ln458">  // Find all the roles where req-&gt;name() is part of the member_of list since we will need to remove</a>
+<a name="ln459">  // the role we are deleting from those lists.</a>
+<a name="ln460">  auto direct_member_of = DirectMemberOf(req-&gt;name());</a>
+<a name="ln461">  for (const auto&amp; role_name : direct_member_of) {</a>
+<a name="ln462">    auto role = FindPtrOrNull(roles_map_, role_name);</a>
+<a name="ln463">    if (role == nullptr) {</a>
+<a name="ln464">      continue;</a>
+<a name="ln465">    }</a>
+<a name="ln466">    role-&gt;mutable_metadata()-&gt;StartMutation();</a>
+<a name="ln467">    auto metadata = &amp;role-&gt;mutable_metadata()-&gt;mutable_dirty()-&gt;pb;</a>
+<a name="ln468"> </a>
+<a name="ln469">    // Create a new list that contains all the original roles in member_of with the exception of</a>
+<a name="ln470">    // the role we are deleting.</a>
+<a name="ln471">    vector&lt;string&gt; member_of_new_list;</a>
+<a name="ln472">    for (const auto&amp; member_of : metadata-&gt;member_of()) {</a>
+<a name="ln473">      if (member_of != req-&gt;name()) {</a>
+<a name="ln474">        member_of_new_list.push_back(member_of);</a>
+<a name="ln475">      }</a>
+<a name="ln476">    }</a>
+<a name="ln477"> </a>
+<a name="ln478">    // Remove the role we are deleting from the list member_of.</a>
+<a name="ln479">    metadata-&gt;clear_member_of();</a>
+<a name="ln480">    for (auto member_of : member_of_new_list) {</a>
+<a name="ln481">      metadata-&gt;add_member_of(std::move(member_of));</a>
+<a name="ln482">    }</a>
+<a name="ln483"> </a>
+<a name="ln484">    // Update sys-catalog with the new member_of list for this role.</a>
+<a name="ln485">    s = catalog_manager_-&gt;sys_catalog_-&gt;UpdateItem(role.get(),</a>
+<a name="ln486">        catalog_manager_-&gt;leader_ready_term());</a>
+<a name="ln487">    if (!s.ok()) {</a>
+<a name="ln488">      LOG(ERROR) &lt;&lt; &quot;Unable to remove role &quot; &lt;&lt; req-&gt;name()</a>
+<a name="ln489">                 &lt;&lt; &quot; from member_of list for role &quot; &lt;&lt; role_name;</a>
+<a name="ln490">      role-&gt;mutable_metadata()-&gt;AbortMutation();</a>
+<a name="ln491">    } else {</a>
+<a name="ln492">      role-&gt;mutable_metadata()-&gt;CommitMutation();</a>
+<a name="ln493">    }</a>
+<a name="ln494">  }</a>
+<a name="ln495"> </a>
+<a name="ln496">  auto l = role-&gt;LockForWrite();</a>
+<a name="ln497"> </a>
+<a name="ln498">  if (l-&gt;mutable_data()-&gt;pb.is_superuser()) {</a>
+<a name="ln499">    // If the role we are trying to remove is a SUPERUSER, the role trying to remove it has to be</a>
+<a name="ln500">    // a SUPERUSER too.</a>
+<a name="ln501">    auto current_role = FindPtrOrNull(roles_map_, req-&gt;current_role());</a>
+<a name="ln502">    if (current_role == nullptr) {</a>
+<a name="ln503">      s = STATUS_SUBSTITUTE(NotFound, &quot;Internal error: role $0 does not exist&quot;,</a>
+<a name="ln504">                            req-&gt;current_role());</a>
+<a name="ln505">      return SetupError(resp-&gt;mutable_error(), MasterErrorPB::ROLE_NOT_FOUND, s);</a>
+<a name="ln506">    }</a>
+<a name="ln507"> </a>
+<a name="ln508">    auto clr = current_role-&gt;LockForRead();</a>
+<a name="ln509">    if (!clr-&gt;data().pb.is_superuser()) {</a>
+<a name="ln510">      s = STATUS(NotAuthorized, &quot;Only superusers can drop a role with superuser status&quot;);</a>
+<a name="ln511">      return SetupError(resp-&gt;mutable_error(), MasterErrorPB::NOT_AUTHORIZED, s);</a>
+<a name="ln512">    }</a>
+<a name="ln513">  }</a>
+<a name="ln514"> </a>
+<a name="ln515">  // Write to sys_catalog and in memory.</a>
+<a name="ln516">  RETURN_NOT_OK(catalog_manager_-&gt;sys_catalog_-&gt;DeleteItem(role.get(),</a>
+<a name="ln517">      catalog_manager_-&gt;leader_ready_term()));</a>
+<a name="ln518">  // Remove it from the maps.</a>
+<a name="ln519">  if (roles_map_.erase(role-&gt;id()) &lt; 1) {</a>
+<a name="ln520">    PANIC_RPC(rpc, &quot;Could not remove role from map, role name=&quot; + role-&gt;id());</a>
+<a name="ln521">  }</a>
+<a name="ln522"> </a>
+<a name="ln523">  // Update the in-memory state.</a>
+<a name="ln524">  TRACE(&quot;Committing in-memory state&quot;);</a>
+<a name="ln525">  l-&gt;Commit();</a>
+<a name="ln526">  BuildRecursiveRolesUnlocked();</a>
+<a name="ln527"> </a>
+<a name="ln528">  // Remove all the permissions granted on the deleted role to any role. See DeleteTable() comment</a>
+<a name="ln529">  // for for more details.</a>
+<a name="ln530">  string canonical_resource = get_canonical_role(req-&gt;name());</a>
+<a name="ln531">  RETURN_NOT_OK(RemoveAllPermissionsForResourceUnlocked(canonical_resource, resp));</a>
+<a name="ln532"> </a>
+<a name="ln533">  LOG(INFO) &lt;&lt; &quot;Successfully deleted role &quot; &lt;&lt; role-&gt;ToString()</a>
+<a name="ln534">            &lt;&lt; &quot; per request from &quot; &lt;&lt; RequestorString(rpc);</a>
+<a name="ln535"> </a>
+<a name="ln536">  return Status::OK();</a>
+<a name="ln537">}</a>
+<a name="ln538"> </a>
+<a name="ln539">Status PermissionsManager::GrantRevokeRole(</a>
+<a name="ln540">    const GrantRevokeRoleRequestPB* req,</a>
+<a name="ln541">    GrantRevokeRoleResponsePB* resp,</a>
+<a name="ln542">    rpc::RpcContext* rpc) {</a>
+<a name="ln543"> </a>
+<a name="ln544">  LOG(INFO) &lt;&lt; &quot;Servicing &quot; &lt;&lt; (req-&gt;revoke() ? &quot;RevokeRole&quot; : &quot;GrantRole&quot;)</a>
+<a name="ln545">            &lt;&lt; &quot; request from &quot; &lt;&lt; RequestorString(rpc) &lt;&lt; &quot;: &quot; &lt;&lt; req-&gt;ShortDebugString();</a>
+<a name="ln546">  RETURN_NOT_OK(catalog_manager_-&gt;CheckOnline());</a>
+<a name="ln547"> </a>
+<a name="ln548">  // Cannot grant or revoke itself.</a>
+<a name="ln549">  if (req-&gt;granted_role() == req-&gt;recipient_role()) {</a>
+<a name="ln550">    if (req-&gt;revoke()) {</a>
+<a name="ln551">      // Ignore the request. This is what Apache Cassandra does.</a>
+<a name="ln552">      return Status::OK();</a>
+<a name="ln553">    }</a>
+<a name="ln554">    auto s = STATUS_SUBSTITUTE(InvalidArgument,</a>
+<a name="ln555">        &quot;$0 is a member of $1&quot;, req-&gt;recipient_role(), req-&gt;granted_role());</a>
+<a name="ln556">    return SetupError(resp-&gt;mutable_error(), MasterErrorPB::INVALID_REQUEST, s);</a>
+<a name="ln557">  }</a>
+<a name="ln558"> </a>
+<a name="ln559">  Status s;</a>
+<a name="ln560">  // If the request is revoke, we need to create a new list of the roles req-&gt;recipient_role()</a>
+<a name="ln561">  // is member of in which we exclude req-&gt;granted_role().</a>
+<a name="ln562">  if (!req-&gt;has_granted_role() || !req-&gt;has_recipient_role()) {</a>
+<a name="ln563">    s = STATUS(InvalidArgument, &quot;No role name given&quot;, req-&gt;DebugString());</a>
+<a name="ln564">    return SetupError(resp-&gt;mutable_error(), MasterErrorPB::ROLE_NOT_FOUND, s);</a>
+<a name="ln565">  }</a>
+<a name="ln566"> </a>
+<a name="ln567">  {</a>
+<a name="ln568">    constexpr char role_not_found_msg_str[] = &quot;$0 doesn't exist&quot;;</a>
+<a name="ln569">    TRACE(&quot;Acquired catalog manager lock&quot;);</a>
+<a name="ln570">    std::lock_guard&lt;decltype(catalog_manager_-&gt;lock_)&gt; l_big(catalog_manager_-&gt;lock_);</a>
+<a name="ln571"> </a>
+<a name="ln572">    scoped_refptr&lt;RoleInfo&gt; granted_role;</a>
+<a name="ln573">    granted_role = FindPtrOrNull(roles_map_, req-&gt;granted_role());</a>
+<a name="ln574">    if (granted_role == nullptr) {</a>
+<a name="ln575">      s = STATUS_SUBSTITUTE(NotFound, role_not_found_msg_str, req-&gt;granted_role());</a>
+<a name="ln576">      return SetupError(resp-&gt;mutable_error(), MasterErrorPB::ROLE_NOT_FOUND, s);</a>
+<a name="ln577">    }</a>
+<a name="ln578"> </a>
+<a name="ln579">    scoped_refptr&lt;RoleInfo&gt; recipient_role;</a>
+<a name="ln580">    recipient_role = FindPtrOrNull(roles_map_, req-&gt;recipient_role());</a>
+<a name="ln581">    if (recipient_role == nullptr) {</a>
+<a name="ln582">      s = STATUS_SUBSTITUTE(NotFound, role_not_found_msg_str, req-&gt;recipient_role());</a>
+<a name="ln583">      return SetupError(resp-&gt;mutable_error(), MasterErrorPB::ROLE_NOT_FOUND, s);</a>
+<a name="ln584">    }</a>
+<a name="ln585"> </a>
+<a name="ln586">    // Both roles are present.</a>
+<a name="ln587">    SysRoleEntryPB* metadata;</a>
+<a name="ln588">    {</a>
+<a name="ln589">      ScopedMutation&lt;RoleInfo&gt; role_info_mutation(recipient_role.get());</a>
+<a name="ln590">      metadata = &amp;recipient_role-&gt;mutable_metadata()-&gt;mutable_dirty()-&gt;pb;</a>
+<a name="ln591"> </a>
+<a name="ln592">      // When revoking a role, the granted role has to be a direct member of the recipient role,</a>
+<a name="ln593">      // but when granting a role, if the recipient role has been granted to the granted role either</a>
+<a name="ln594">      // directly or through inheritance, we will return an error.</a>
+<a name="ln595">      if (req-&gt;revoke()) {</a>
+<a name="ln596">        bool direct_member = false;</a>
+<a name="ln597">        vector&lt;string&gt; member_of_new_list;</a>
+<a name="ln598">        for (const auto&amp; member_of : metadata-&gt;member_of()) {</a>
+<a name="ln599">          if (member_of == req-&gt;granted_role()) {</a>
+<a name="ln600">            direct_member = true;</a>
+<a name="ln601">          } else if (req-&gt;revoke()) {</a>
+<a name="ln602">            member_of_new_list.push_back(member_of);</a>
+<a name="ln603">          }</a>
+<a name="ln604">        }</a>
+<a name="ln605"> </a>
+<a name="ln606">        if (!direct_member) {</a>
+<a name="ln607">          s = STATUS_SUBSTITUTE(InvalidArgument, &quot;$0 is not a member of $1&quot;,</a>
+<a name="ln608">                                req-&gt;recipient_role(), req-&gt;granted_role());</a>
+<a name="ln609">          return SetupError(resp-&gt;mutable_error(), MasterErrorPB::INVALID_REQUEST, s);</a>
+<a name="ln610">        }</a>
+<a name="ln611"> </a>
+<a name="ln612">        metadata-&gt;clear_member_of();</a>
+<a name="ln613">        for (auto member_of : member_of_new_list) {</a>
+<a name="ln614">          metadata-&gt;add_member_of(std::move(member_of));</a>
+<a name="ln615">        }</a>
+<a name="ln616">        s = catalog_manager_-&gt;sys_catalog_-&gt;UpdateItem(recipient_role.get(),</a>
+<a name="ln617">            catalog_manager_-&gt;leader_ready_term());</a>
+<a name="ln618">      } else {</a>
+<a name="ln619">        // Let's make sure that we don't have circular dependencies.</a>
+<a name="ln620">        if (IsMemberOf(req-&gt;granted_role(), req-&gt;recipient_role()) ||</a>
+<a name="ln621">            IsMemberOf(req-&gt;recipient_role(), req-&gt;granted_role()) ||</a>
+<a name="ln622">            req-&gt;granted_role() == req-&gt;recipient_role()) {</a>
+<a name="ln623">          s = STATUS_SUBSTITUTE(InvalidArgument, &quot;$0 is a member of $1&quot;,</a>
+<a name="ln624">                                req-&gt;recipient_role(), req-&gt;granted_role());</a>
+<a name="ln625">          return SetupError(resp-&gt;mutable_error(), MasterErrorPB::INVALID_REQUEST, s);</a>
+<a name="ln626">        }</a>
+<a name="ln627">        metadata-&gt;add_member_of(req-&gt;granted_role());</a>
+<a name="ln628">        s = catalog_manager_-&gt;sys_catalog_-&gt;UpdateItem(recipient_role.get(),</a>
+<a name="ln629">            catalog_manager_-&gt;leader_ready_term());</a>
+<a name="ln630">      }</a>
+<a name="ln631">      if (!s.ok()) {</a>
+<a name="ln632">        s = s.CloneAndPrepend(Substitute(</a>
+<a name="ln633">            &quot;An error occurred while updating roles in sys-catalog: $0&quot;, s.ToString()));</a>
+<a name="ln634">        LOG(WARNING) &lt;&lt; s.ToString();</a>
+<a name="ln635">        return CheckIfNoLongerLeaderAndSetupError(s, resp);</a>
+<a name="ln636">      }</a>
+<a name="ln637"> </a>
+<a name="ln638">      LOG(INFO) &lt;&lt; &quot;Modified 'member of' field of role &quot; &lt;&lt; recipient_role-&gt;id();</a>
+<a name="ln639"> </a>
+<a name="ln640">      // Increment roles version before commiting the mutation.</a>
+<a name="ln641">      RETURN_NOT_OK(IncrementRolesVersionUnlocked());</a>
+<a name="ln642"> </a>
+<a name="ln643">      role_info_mutation.Commit();</a>
+<a name="ln644">      BuildRecursiveRolesUnlocked();</a>
+<a name="ln645">    }</a>
+<a name="ln646">    TRACE(&quot;Wrote grant/revoke role to sys-catalog&quot;);</a>
+<a name="ln647">  }</a>
+<a name="ln648"> </a>
+<a name="ln649">  return Status::OK();</a>
+<a name="ln650">}</a>
+<a name="ln651"> </a>
+<a name="ln652">// Depth first search. We assume that there are no cycles in the graph of dependencies.</a>
+<a name="ln653">void PermissionsManager::BuildRecursiveRolesUnlocked() {</a>
+<a name="ln654">  recursive_granted_roles_.clear();</a>
+<a name="ln655"> </a>
+<a name="ln656">  // Build the first level member of map and find all the roles that have at least one member in its</a>
+<a name="ln657">  // member_of field.</a>
+<a name="ln658">  for (const auto&amp; e : roles_map_) {</a>
+<a name="ln659">    const auto&amp; role_name = e.first;</a>
+<a name="ln660">    if (recursive_granted_roles_.find(role_name) == recursive_granted_roles_.end()) {</a>
+<a name="ln661">      TraverseRole(role_name, nullptr);</a>
+<a name="ln662">    }</a>
+<a name="ln663">  }</a>
+<a name="ln664"> </a>
+<a name="ln665">  BuildResourcePermissionsUnlocked();</a>
+<a name="ln666">}</a>
+<a name="ln667"> </a>
+<a name="ln668">void PermissionsManager::BuildResourcePermissionsUnlocked() {</a>
+<a name="ln669">  shared_ptr&lt;GetPermissionsResponsePB&gt; response = std::make_shared&lt;GetPermissionsResponsePB&gt;();</a>
+<a name="ln670"> </a>
+<a name="ln671">  for (const auto&amp; e : recursive_granted_roles_) {</a>
+<a name="ln672">    const auto&amp; role_name = e.first;</a>
+<a name="ln673">    // Get a copy of this set.</a>
+<a name="ln674">    auto granted_roles = e.second;</a>
+<a name="ln675">    granted_roles.insert(role_name);</a>
+<a name="ln676">    auto* role_permissions = response-&gt;add_role_permissions();</a>
+<a name="ln677">    role_permissions-&gt;set_role(role_name);</a>
+<a name="ln678"> </a>
+<a name="ln679">    // No permissions on ALL ROLES and ALL KEYSPACES by default.</a>
+<a name="ln680">    role_permissions-&gt;set_all_keyspaces_permissions(0);</a>
+<a name="ln681">    role_permissions-&gt;set_all_roles_permissions(0);</a>
+<a name="ln682"> </a>
+<a name="ln683">    for (const auto&amp; granted_role : granted_roles) {</a>
+<a name="ln684">      const auto&amp; role_info = roles_map_[granted_role];</a>
+<a name="ln685">      auto l = role_info-&gt;LockForRead();</a>
+<a name="ln686">      const auto&amp; pb = l-&gt;data().pb;</a>
+<a name="ln687"> </a>
+<a name="ln688">      Permissions all_roles_permissions_bitset(role_permissions-&gt;all_roles_permissions());</a>
+<a name="ln689">      Permissions all_keyspaces_permissions_bitset(role_permissions-&gt;all_keyspaces_permissions());</a>
+<a name="ln690"> </a>
+<a name="ln691">      for (const auto&amp; resource : pb.resources()) {</a>
+<a name="ln692">        Permissions resource_permissions_bitset;</a>
+<a name="ln693"> </a>
+<a name="ln694">        for (const auto&amp; permission : resource.permissions()) {</a>
+<a name="ln695">          if (resource.canonical_resource() == kRolesRoleResource) {</a>
+<a name="ln696">            all_roles_permissions_bitset.set(permission);</a>
+<a name="ln697">          } else if (resource.canonical_resource() == kRolesDataResource) {</a>
+<a name="ln698">            all_keyspaces_permissions_bitset.set(permission);</a>
+<a name="ln699">          } else {</a>
+<a name="ln700">            resource_permissions_bitset.set(permission);</a>
+<a name="ln701">          }</a>
+<a name="ln702">        }</a>
+<a name="ln703"> </a>
+<a name="ln704">        if (resource.canonical_resource() != kRolesDataResource &amp;&amp;</a>
+<a name="ln705">            resource.canonical_resource() != kRolesRoleResource) {</a>
+<a name="ln706">          auto* resource_permissions = role_permissions-&gt;add_resource_permissions();</a>
+<a name="ln707">          resource_permissions-&gt;set_canonical_resource(resource.canonical_resource());</a>
+<a name="ln708">          resource_permissions-&gt;set_permissions(resource_permissions_bitset.to_ullong());</a>
+<a name="ln709">          recursive_granted_permissions_[role_name][resource.canonical_resource()] =</a>
+<a name="ln710">              resource_permissions_bitset.to_ullong();</a>
+<a name="ln711">        }</a>
+<a name="ln712">      }</a>
+<a name="ln713"> </a>
+<a name="ln714">      role_permissions-&gt;set_all_keyspaces_permissions(all_keyspaces_permissions_bitset.to_ullong());</a>
+<a name="ln715">      VLOG(2) &lt;&lt; &quot;Setting all_keyspaces_permissions to &quot;</a>
+<a name="ln716">              &lt;&lt; role_permissions-&gt;all_keyspaces_permissions()</a>
+<a name="ln717">              &lt;&lt; &quot; for role &quot; &lt;&lt; role_name;</a>
+<a name="ln718"> </a>
+<a name="ln719">      role_permissions-&gt;set_all_roles_permissions(all_roles_permissions_bitset.to_ullong());</a>
+<a name="ln720">      VLOG(2) &lt;&lt; &quot;Setting all_roles_permissions to &quot;</a>
+<a name="ln721">              &lt;&lt; role_permissions-&gt;all_roles_permissions()</a>
+<a name="ln722">              &lt;&lt; &quot; for role &quot; &lt;&lt; role_name;</a>
+<a name="ln723"> </a>
+<a name="ln724">      // TODO: since this gets checked first when enforcing permissions, there is no point in</a>
+<a name="ln725">      // populating the rest of the permissions. Furthermore, we should remove any specific</a>
+<a name="ln726">      // permissions in the map.</a>
+<a name="ln727">      // In other words, if all-roles_all_keyspaces_permissions is equal to superuser_permissions,</a>
+<a name="ln728">      // it should be the only field sent to the clients for that specific role.</a>
+<a name="ln729">      if (pb.is_superuser()) {</a>
+<a name="ln730">        Permissions superuser_bitset;</a>
+<a name="ln731">        // Set all the bits to 1.</a>
+<a name="ln732">        superuser_bitset.set();</a>
+<a name="ln733"> </a>
+<a name="ln734">        role_permissions-&gt;set_all_keyspaces_permissions(superuser_bitset.to_ullong());</a>
+<a name="ln735">        role_permissions-&gt;set_all_roles_permissions(superuser_bitset.to_ullong());</a>
+<a name="ln736">      }</a>
+<a name="ln737">    }</a>
+<a name="ln738">  }</a>
+<a name="ln739"> </a>
+<a name="ln740">  auto config = CHECK_NOTNULL(security_config_.get())-&gt;LockForRead();</a>
+<a name="ln741">  response-&gt;set_version(config-&gt;data().pb.security_config().roles_version());</a>
+<a name="ln742">  permissions_cache_ = std::move(response);</a>
+<a name="ln743">}</a>
+<a name="ln744"> </a>
+<a name="ln745">// Get all the permissions granted to resources.</a>
+<a name="ln746">Status PermissionsManager::GetPermissions(</a>
+<a name="ln747">    const GetPermissionsRequestPB* req,</a>
+<a name="ln748">    GetPermissionsResponsePB* resp,</a>
+<a name="ln749">    rpc::RpcContext* rpc) {</a>
+<a name="ln750">  std::shared_ptr&lt;GetPermissionsResponsePB&gt; permissions_cache;</a>
+<a name="ln751">  {</a>
+<a name="ln752">    std::lock_guard&lt;decltype(catalog_manager_-&gt;lock_)&gt; l_big(catalog_manager_-&gt;lock_);</a>
+<a name="ln753">    if (!permissions_cache_) {</a>
+<a name="ln754">      BuildRecursiveRolesUnlocked();</a>
+<a name="ln755">      if (!permissions_cache_) {</a>
+<a name="ln756">        DFATAL_OR_RETURN_NOT_OK(STATUS(IllegalState, &quot;Unable to build permissions cache&quot;));</a>
+<a name="ln757">      }</a>
+<a name="ln758">    }</a>
+<a name="ln759">    // Create another reference so that the cache doesn't go away while we are using it.</a>
+<a name="ln760">    permissions_cache = permissions_cache_;</a>
+<a name="ln761">  }</a>
+<a name="ln762"> </a>
+<a name="ln763">  boost::optional&lt;uint64_t&gt; request_version;</a>
+<a name="ln764">  if (req-&gt;has_if_version_greater_than()) {</a>
+<a name="ln765">    request_version = req-&gt;if_version_greater_than();</a>
+<a name="ln766">  }</a>
+<a name="ln767"> </a>
+<a name="ln768">  if (request_version &amp;&amp; permissions_cache-&gt;version() == *request_version) {</a>
+<a name="ln769">    resp-&gt;set_version(permissions_cache-&gt;version());</a>
+<a name="ln770">    return Status::OK();</a>
+<a name="ln771">  } else if (request_version &amp;&amp; permissions_cache-&gt;version() &lt; *request_version) {</a>
+<a name="ln772">    LOG(WARNING) &lt;&lt; &quot;GetPermissionsRequestPB version is greater than master's version&quot;;</a>
+<a name="ln773">    Status s = STATUS_SUBSTITUTE(IllegalState,</a>
+<a name="ln774">        &quot;GetPermissionsRequestPB version $0 is greater than master's version $1. &quot;</a>
+<a name="ln775">        &quot;Should call GetPermissions again&quot;,  *request_version,</a>
+<a name="ln776">        permissions_cache-&gt;version());</a>
+<a name="ln777">    return SetupError(resp-&gt;mutable_error(), MasterErrorPB::CONFIG_VERSION_MISMATCH, s);</a>
+<a name="ln778">  }</a>
+<a name="ln779"> </a>
+<a name="ln780">  // permisions_cache_-&gt;version() &gt; req-&gt;if_version_greater_than() or</a>
+<a name="ln781">  // req-&gt;if_version_greather_than() is not set.</a>
+<a name="ln782">  resp-&gt;CopyFrom(*permissions_cache);</a>
+<a name="ln783">  return Status::OK();</a>
+<a name="ln784">}</a>
+<a name="ln785"> </a>
+<a name="ln786">bool PermissionsManager::IsMemberOf(const RoleName&amp; granted_role, const RoleName&amp; role) {</a>
+<a name="ln787">  const auto&amp; iter = recursive_granted_roles_.find(role);</a>
+<a name="ln788">  if (iter == recursive_granted_roles_.end()) {</a>
+<a name="ln789">    // No roles have been granted to role.</a>
+<a name="ln790">    return false;</a>
+<a name="ln791">  }</a>
+<a name="ln792"> </a>
+<a name="ln793">  const auto&amp; granted_roles = iter-&gt;second;</a>
+<a name="ln794">  if (granted_roles.find(granted_role) == granted_roles.end()) {</a>
+<a name="ln795">    // granted_role has not been granted directly or through inheritance to role.</a>
+<a name="ln796">    return false;</a>
+<a name="ln797">  }</a>
+<a name="ln798"> </a>
+<a name="ln799">  return true;</a>
+<a name="ln800">}</a>
+<a name="ln801"> </a>
+<a name="ln802">Status PermissionsManager::GrantRevokePermission(</a>
+<a name="ln803">    const GrantRevokePermissionRequestPB* req,</a>
+<a name="ln804">    GrantRevokePermissionResponsePB* resp,</a>
+<a name="ln805">    rpc::RpcContext* rpc) {</a>
+<a name="ln806">  LOG(INFO) &lt;&lt; (req-&gt;revoke() ? &quot;Revoke&quot; : &quot;Grant&quot;) &lt;&lt; &quot; permission &quot;</a>
+<a name="ln807">            &lt;&lt; RequestorString(rpc) &lt;&lt; &quot;: &quot; &lt;&lt; req-&gt;ShortDebugString();</a>
+<a name="ln808">  RETURN_NOT_OK(catalog_manager_-&gt;CheckOnline());</a>
+<a name="ln809"> </a>
+<a name="ln810">  std::lock_guard&lt;decltype(catalog_manager_-&gt;lock_)&gt; l_big(catalog_manager_-&gt;lock_);</a>
+<a name="ln811">  TRACE(&quot;Acquired catalog manager lock&quot;);</a>
+<a name="ln812">  Status s;</a>
+<a name="ln813">  scoped_refptr&lt;NamespaceInfo&gt; ns;</a>
+<a name="ln814">  scoped_refptr&lt;TableInfo&gt; table;</a>
+<a name="ln815"> </a>
+<a name="ln816">  // Checking if resources exist.</a>
+<a name="ln817">  if (req-&gt;resource_type() == ResourceType::TABLE ||</a>
+<a name="ln818">      req-&gt;resource_type() == ResourceType::KEYSPACE) {</a>
+<a name="ln819">    // We can't match Apache Cassandra's error because when a namespace is not provided, the error</a>
+<a name="ln820">    // is detected by the semantic analysis in PTQualifiedName::AnalyzeName.</a>
+<a name="ln821">    DCHECK(req-&gt;has_namespace_());</a>
+<a name="ln822">    const auto&amp; namespace_info = req-&gt;namespace_();</a>
+<a name="ln823">    s = catalog_manager_-&gt;FindNamespaceUnlocked(namespace_info, &amp;ns);</a>
+<a name="ln824"> </a>
+<a name="ln825">    if (req-&gt;resource_type() == ResourceType::KEYSPACE) {</a>
+<a name="ln826">      if (ns == nullptr) {</a>
+<a name="ln827">        // Matches Apache Cassandra's error.</a>
+<a name="ln828">        s = STATUS_SUBSTITUTE(</a>
+<a name="ln829">            NotFound, &quot;Resource &lt;keyspace $0&gt; doesn't exist&quot;, namespace_info.name());</a>
+<a name="ln830">        return SetupError(resp-&gt;mutable_error(), MasterErrorPB::NAMESPACE_NOT_FOUND, s);</a>
+<a name="ln831">      }</a>
+<a name="ln832">    } else {</a>
+<a name="ln833">      if (ns) {</a>
+<a name="ln834">        table = FindPtrOrNull(catalog_manager_-&gt;table_names_map_, {ns-&gt;id(), req-&gt;resource_name()});</a>
+<a name="ln835">      }</a>
+<a name="ln836">      if (table == nullptr) {</a>
+<a name="ln837">        // Matches Apache Cassandra's error.</a>
+<a name="ln838">        s = STATUS_SUBSTITUTE(</a>
+<a name="ln839">            NotFound, &quot;Resource &lt;object '$0.$1'&gt; doesn't exist&quot;,</a>
+<a name="ln840">            namespace_info.name(), req-&gt;resource_name());</a>
+<a name="ln841">        return SetupError(resp-&gt;mutable_error(), MasterErrorPB::OBJECT_NOT_FOUND, s);</a>
+<a name="ln842">      }</a>
+<a name="ln843">    }</a>
+<a name="ln844">  }</a>
+<a name="ln845"> </a>
+<a name="ln846">  if (req-&gt;resource_type() == ResourceType::ROLE) {</a>
+<a name="ln847">    scoped_refptr&lt;RoleInfo&gt; role;</a>
+<a name="ln848">    role = FindPtrOrNull(roles_map_, req-&gt;resource_name());</a>
+<a name="ln849">    if (role == nullptr) {</a>
+<a name="ln850">      s = STATUS_SUBSTITUTE(NotFound, &quot;Resource &lt;role $0&gt; does not exist&quot;, req-&gt;role_name());</a>
+<a name="ln851">      return SetupError(resp-&gt;mutable_error(), MasterErrorPB::ROLE_NOT_FOUND, s);</a>
+<a name="ln852">    }</a>
+<a name="ln853">  }</a>
+<a name="ln854"> </a>
+<a name="ln855">  scoped_refptr&lt;RoleInfo&gt; rp;</a>
+<a name="ln856">  rp = FindPtrOrNull(roles_map_, req-&gt;role_name());</a>
+<a name="ln857">  if (rp == nullptr) {</a>
+<a name="ln858">    s = STATUS_SUBSTITUTE(InvalidArgument, &quot;Role $0 doesn't exist&quot;, req-&gt;role_name());</a>
+<a name="ln859">    return SetupError(resp-&gt;mutable_error(), MasterErrorPB::ROLE_NOT_FOUND, s);</a>
+<a name="ln860">  }</a>
+<a name="ln861"> </a>
+<a name="ln862">  // Increment roles version.</a>
+<a name="ln863">  RETURN_NOT_OK(IncrementRolesVersionUnlocked());</a>
+<a name="ln864"> </a>
+<a name="ln865">  SysRoleEntryPB* metadata;</a>
+<a name="ln866">  {</a>
+<a name="ln867">    ScopedMutation&lt;RoleInfo&gt; role_info_mutation(rp.get());</a>
+<a name="ln868">    metadata = &amp;rp-&gt;mutable_metadata()-&gt;mutable_dirty()-&gt;pb;</a>
+<a name="ln869"> </a>
+<a name="ln870">    ResourcePermissionsPB* current_resource = nullptr;</a>
+<a name="ln871">    auto current_resource_iter = metadata-&gt;mutable_resources()-&gt;end();</a>
+<a name="ln872">    for (current_resource_iter = metadata-&gt;mutable_resources()-&gt;begin();</a>
+<a name="ln873">         current_resource_iter != metadata-&gt;mutable_resources()-&gt;end(); current_resource_iter++) {</a>
+<a name="ln874">      if (current_resource_iter-&gt;canonical_resource() == req-&gt;canonical_resource()) {</a>
+<a name="ln875">        break;</a>
+<a name="ln876">      }</a>
+<a name="ln877">    }</a>
+<a name="ln878"> </a>
+<a name="ln879">    if (current_resource_iter != metadata-&gt;mutable_resources()-&gt;end()) {</a>
+<a name="ln880">      current_resource = &amp;(*current_resource_iter);</a>
+<a name="ln881">    }</a>
+<a name="ln882"> </a>
+<a name="ln883">    if (current_resource == nullptr) {</a>
+<a name="ln884">      if (req-&gt;revoke()) {</a>
+<a name="ln885">        return Status::OK();</a>
+<a name="ln886">      }</a>
+<a name="ln887"> </a>
+<a name="ln888">      current_resource = metadata-&gt;add_resources();</a>
+<a name="ln889">      current_resource_iter = std::prev(metadata-&gt;mutable_resources()-&gt;end());</a>
+<a name="ln890"> </a>
+<a name="ln891">      current_resource-&gt;set_canonical_resource(req-&gt;canonical_resource());</a>
+<a name="ln892">      current_resource-&gt;set_resource_type(req-&gt;resource_type());</a>
+<a name="ln893">      if (req-&gt;has_resource_name()) {</a>
+<a name="ln894">        current_resource-&gt;set_resource_name(req-&gt;resource_name());</a>
+<a name="ln895">      }</a>
+<a name="ln896">      if (req-&gt;has_namespace_()) {</a>
+<a name="ln897">        current_resource-&gt;set_namespace_name(req-&gt;namespace_().name());</a>
+<a name="ln898">      }</a>
+<a name="ln899">    }</a>
+<a name="ln900"> </a>
+<a name="ln901">    if (req-&gt;permission() != PermissionType::ALL_PERMISSION) {</a>
+<a name="ln902">      auto permission_iter = current_resource-&gt;permissions().end();</a>
+<a name="ln903">      for (permission_iter = current_resource-&gt;permissions().begin();</a>
+<a name="ln904">           permission_iter != current_resource-&gt;permissions().end(); permission_iter++) {</a>
+<a name="ln905">        if (*permission_iter == req-&gt;permission()) {</a>
+<a name="ln906">          break;</a>
+<a name="ln907">        }</a>
+<a name="ln908">      }</a>
+<a name="ln909"> </a>
+<a name="ln910">      // Resource doesn't have the permission, and we got a GRANT request.</a>
+<a name="ln911">      if (permission_iter == current_resource-&gt;permissions().end() &amp;&amp; !req-&gt;revoke()) {</a>
+<a name="ln912">        // Verify that the permission is supported by the resource.</a>
+<a name="ln913">        if (!valid_permission_for_resource(req-&gt;permission(), req-&gt;resource_type())) {</a>
+<a name="ln914">          s = STATUS_SUBSTITUTE(InvalidArgument, &quot;Invalid permission $0 for resource type $1&quot;,</a>
+<a name="ln915">              req-&gt;permission(), ResourceType_Name(req-&gt;resource_type()));</a>
+<a name="ln916">          // This should never happen because invalid permissions get rejected in the analysis part.</a>
+<a name="ln917">          // So crash the process if in debug mode.</a>
+<a name="ln918">          DFATAL_OR_RETURN_NOT_OK(s);</a>
+<a name="ln919">          return SetupError(resp-&gt;mutable_error(), MasterErrorPB::INVALID_REQUEST, s);</a>
+<a name="ln920">        }</a>
+<a name="ln921">        current_resource-&gt;add_permissions(req-&gt;permission());</a>
+<a name="ln922">      } else if (permission_iter != current_resource-&gt;permissions().end() &amp;&amp; req-&gt;revoke()) {</a>
+<a name="ln923">        current_resource-&gt;mutable_permissions()-&gt;erase(permission_iter);</a>
+<a name="ln924">      }</a>
+<a name="ln925">    } else {</a>
+<a name="ln926">      // ALL permissions.</a>
+<a name="ln927">      // TODO (Bristy) : Add different permissions for different resources based on role names.</a>
+<a name="ln928">      // For REVOKE ALL we clear all the permissions and do nothing else.</a>
+<a name="ln929">      current_resource-&gt;clear_permissions();</a>
+<a name="ln930"> </a>
+<a name="ln931">      if (!req-&gt;revoke()) {</a>
+<a name="ln932">        for (const auto&amp; permission : all_permissions_for_resource(req-&gt;resource_type())) {</a>
+<a name="ln933">          current_resource-&gt;add_permissions(permission);</a>
+<a name="ln934">        }</a>
+<a name="ln935">      }</a>
+<a name="ln936">    }</a>
+<a name="ln937"> </a>
+<a name="ln938">    // If this resource doesn't have any more permissions, remove it.</a>
+<a name="ln939">    if (current_resource-&gt;permissions().empty()) {</a>
+<a name="ln940">      metadata-&gt;mutable_resources()-&gt;erase(current_resource_iter);</a>
+<a name="ln941">    }</a>
+<a name="ln942"> </a>
+<a name="ln943">    s = catalog_manager_-&gt;sys_catalog_-&gt;UpdateItem(rp.get(),</a>
+<a name="ln944">        catalog_manager_-&gt;leader_ready_term());</a>
+<a name="ln945">    if (!s.ok()) {</a>
+<a name="ln946">      s = s.CloneAndPrepend(Substitute(</a>
+<a name="ln947">          &quot;An error occurred while updating permissions in sys-catalog: $0&quot;, s.ToString()));</a>
+<a name="ln948">      LOG(WARNING) &lt;&lt; s.ToString();</a>
+<a name="ln949">      return CheckIfNoLongerLeaderAndSetupError(s, resp);</a>
+<a name="ln950">    }</a>
+<a name="ln951">    TRACE(&quot;Wrote Permission to sys-catalog&quot;);</a>
+<a name="ln952"> </a>
+<a name="ln953">    role_info_mutation.Commit();</a>
+<a name="ln954">  }</a>
+<a name="ln955">  LOG(INFO) &lt;&lt; &quot;Modified Permission for role &quot; &lt;&lt; rp-&gt;id();</a>
+<a name="ln956">  BuildResourcePermissionsUnlocked();</a>
+<a name="ln957">  return Status::OK();</a>
+<a name="ln958">}</a>
+<a name="ln959"> </a>
+<a name="ln960">void PermissionsManager::GetAllRoles(std::vector&lt;scoped_refptr&lt;RoleInfo&gt;&gt;* roles) {</a>
+<a name="ln961">  roles-&gt;clear();</a>
+<a name="ln962">  SharedLock&lt;decltype(catalog_manager_-&gt;lock_)&gt; l(catalog_manager_-&gt;lock_);</a>
+<a name="ln963">  for (const RoleInfoMap::value_type&amp; e : roles_map_) {</a>
+<a name="ln964">    roles-&gt;push_back(e.second);</a>
+<a name="ln965">  }</a>
+<a name="ln966">}</a>
+<a name="ln967"> </a>
+<a name="ln968">vector&lt;string&gt; PermissionsManager::DirectMemberOf(const RoleName&amp; role) {</a>
+<a name="ln969">  vector&lt;string&gt; roles;</a>
+<a name="ln970">  for (const auto&amp; e : roles_map_) {</a>
+<a name="ln971">    auto l = e.second-&gt;LockForRead();</a>
+<a name="ln972">    const auto&amp; pb = l-&gt;data().pb;</a>
+<a name="ln973">    for (const auto&amp; member_of : pb.member_of()) {</a>
+<a name="ln974">      if (member_of == role) {</a>
+<a name="ln975">        roles.push_back(pb.role());</a>
+<a name="ln976">        // No need to keep checking the rest of the members.</a>
+<a name="ln977">        break;</a>
+<a name="ln978">      }</a>
+<a name="ln979">    }</a>
+<a name="ln980">  }</a>
+<a name="ln981">  return roles;</a>
+<a name="ln982">}</a>
+<a name="ln983"> </a>
+<a name="ln984">void PermissionsManager::BuildRecursiveRoles() {</a>
+<a name="ln985">  TRACE(&quot;Acquired catalog manager lock&quot;);</a>
+<a name="ln986">  std::lock_guard&lt;decltype(catalog_manager_-&gt;lock_)&gt; l_big(catalog_manager_-&gt;lock_);</a>
+<a name="ln987">  BuildRecursiveRolesUnlocked();</a>
+<a name="ln988">}</a>
+<a name="ln989"> </a>
+<a name="ln990">void PermissionsManager::TraverseRole(</a>
+<a name="ln991">    const string&amp; role_name, unordered_set&lt;RoleName&gt;* granted_roles) {</a>
+<a name="ln992">  auto iter = recursive_granted_roles_.find(role_name);</a>
+<a name="ln993">  // This node has already been visited. So just add all the granted (directly or through</a>
+<a name="ln994">  // inheritance) roles to granted_roles.</a>
+<a name="ln995">  if (iter != recursive_granted_roles_.end()) {</a>
+<a name="ln996">    if (granted_roles) {</a>
+<a name="ln997">      const auto&amp; set = iter-&gt;second;</a>
+<a name="ln998">      granted_roles-&gt;insert(set.begin(), set.end());</a>
+<a name="ln999">    }</a>
+<a name="ln1000">    return;</a>
+<a name="ln1001">  }</a>
+<a name="ln1002"> </a>
+<a name="ln1003">  const auto&amp; role_info = roles_map_[role_name];</a>
+<a name="ln1004">  auto l = role_info-&gt;LockForRead();</a>
+<a name="ln1005">  const auto&amp; pb = l-&gt;data().pb;</a>
+<a name="ln1006">  if (pb.member_of().size() == 0) {</a>
+<a name="ln1007">    recursive_granted_roles_.insert({role_name, {}});</a>
+<a name="ln1008">  } else {</a>
+<a name="ln1009">    for (const auto&amp; direct_granted_role : pb.member_of()) {</a>
+<a name="ln1010">      recursive_granted_roles_[role_name].insert(direct_granted_role);</a>
+<a name="ln1011">      TraverseRole(direct_granted_role, &amp;recursive_granted_roles_[role_name]);</a>
+<a name="ln1012">    }</a>
+<a name="ln1013">    if (granted_roles) {</a>
+<a name="ln1014">      const auto&amp; set = recursive_granted_roles_[role_name];</a>
+<a name="ln1015">      granted_roles-&gt;insert(set.begin(), set.end());</a>
+<a name="ln1016">    }</a>
+<a name="ln1017">  }</a>
+<a name="ln1018">}</a>
+<a name="ln1019"> </a>
+<a name="ln1020">void PermissionsManager::AddRoleUnlocked(</a>
+<a name="ln1021">    const RoleName&amp; role_name,</a>
+<a name="ln1022">    scoped_refptr&lt;RoleInfo&gt; role_info) {</a>
+<a name="ln1023">  roles_map_[role_name] = std::move(role_info);</a>
+<a name="ln1024">}</a>
+<a name="ln1025"> </a>
+<a name="ln1026">bool PermissionsManager::DoesRoleExistUnlocked(const RoleName&amp; role_name) {</a>
+<a name="ln1027">  return roles_map_.count(role_name);</a>
+<a name="ln1028">}</a>
+<a name="ln1029"> </a>
+<a name="ln1030">void PermissionsManager::ClearRolesUnlocked() {</a>
+<a name="ln1031">  roles_map_.clear();</a>
+<a name="ln1032">}</a>
+<a name="ln1033"> </a>
+<a name="ln1034">Status PermissionsManager::PrepareDefaultSecurityConfigUnlocked(int64_t term) {</a>
+<a name="ln1035">  // Set up default security config if not already present.</a>
+<a name="ln1036">  if (!security_config_) {</a>
+<a name="ln1037">    SysSecurityConfigEntryPB security_config;</a>
+<a name="ln1038">    security_config.set_roles_version(0);</a>
+<a name="ln1039"> </a>
+<a name="ln1040">    // Create in memory object.</a>
+<a name="ln1041">    security_config_ = new SysConfigInfo(kSecurityConfigType);</a>
+<a name="ln1042"> </a>
+<a name="ln1043">    // Prepare write.</a>
+<a name="ln1044">    auto l = security_config_-&gt;LockForWrite();</a>
+<a name="ln1045">    *l-&gt;mutable_data()-&gt;pb.mutable_security_config() = std::move(security_config);</a>
+<a name="ln1046"> </a>
+<a name="ln1047">    // Write to sys_catalog and in memory.</a>
+<a name="ln1048">    RETURN_NOT_OK(catalog_manager_-&gt;sys_catalog_-&gt;AddItem(security_config_.get(), term));</a>
+<a name="ln1049">    l-&gt;Commit();</a>
+<a name="ln1050">  }</a>
+<a name="ln1051">  return Status::OK();</a>
+<a name="ln1052">}</a>
+<a name="ln1053"> </a>
+<a name="ln1054">void PermissionsManager::SetSecurityConfigOnLoadUnlocked(SysConfigInfo* security_config) {</a>
+<a name="ln1055">  LOG_IF(WARNING, security_config_ != nullptr)</a>
+<a name="ln1056">      &lt;&lt; &quot;Multiple security configs found when loading sys catalog&quot;;</a>
+<a name="ln1057">  security_config_ = security_config;</a>
+<a name="ln1058">}</a>
+<a name="ln1059"> </a>
+<a name="ln1060">}  // namespace master</a>
+<a name="ln1061">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="183"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="189"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="210"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="357"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="424"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="715"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="720"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="756"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="821"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="918"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1055"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

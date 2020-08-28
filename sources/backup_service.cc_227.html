@@ -1,0 +1,160 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>backup_service.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &quot;yb/tserver/backup_service.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &quot;yb/util/debug/trace_event.h&quot;</a>
+<a name="ln16">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/tablet/tablet.h&quot;</a>
+<a name="ln19">#include &quot;yb/tablet/tablet_retention_policy.h&quot;</a>
+<a name="ln20">#include &quot;yb/tablet/operations/snapshot_operation.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/tserver/service_util.h&quot;</a>
+<a name="ln23">#include &quot;yb/tserver/tablet_server.h&quot;</a>
+<a name="ln24">#include &quot;yb/tserver/ts_tablet_manager.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">namespace yb {</a>
+<a name="ln27">namespace tserver {</a>
+<a name="ln28"> </a>
+<a name="ln29">using rpc::RpcContext;</a>
+<a name="ln30">using tablet::SnapshotOperationState;</a>
+<a name="ln31">using tablet::OperationCompletionCallback;</a>
+<a name="ln32">using tablet::Tablet;</a>
+<a name="ln33"> </a>
+<a name="ln34">TabletServiceBackupImpl::TabletServiceBackupImpl(TSTabletManager* tablet_manager,</a>
+<a name="ln35">                                                 const scoped_refptr&lt;MetricEntity&gt;&amp; metric_entity)</a>
+<a name="ln36">    : TabletServerBackupServiceIf(metric_entity),</a>
+<a name="ln37">      tablet_manager_(tablet_manager) {</a>
+<a name="ln38">}</a>
+<a name="ln39"> </a>
+<a name="ln40">void TabletServiceBackupImpl::TabletSnapshotOp(const TabletSnapshotOpRequestPB* req,</a>
+<a name="ln41">                                               TabletSnapshotOpResponsePB* resp,</a>
+<a name="ln42">                                               RpcContext context) {</a>
+<a name="ln43">  if (!CheckUuidMatchOrRespond(tablet_manager_, &quot;TabletSnapshotOp&quot;, req, resp, &amp;context)) {</a>
+<a name="ln44">    return;</a>
+<a name="ln45">  }</a>
+<a name="ln46"> </a>
+<a name="ln47">  if (req-&gt;tablet_id_size() != 1) {</a>
+<a name="ln48">    auto status = STATUS_FORMAT(</a>
+<a name="ln49">        InvalidArgument, &quot;Wrong number of tablets: expected one, but found $0&quot;,</a>
+<a name="ln50">        req-&gt;tablet_id_size());</a>
+<a name="ln51">    SetupErrorAndRespond(resp-&gt;mutable_error(), status, &amp;context);</a>
+<a name="ln52">    return;</a>
+<a name="ln53">  }</a>
+<a name="ln54"> </a>
+<a name="ln55">  server::UpdateClock(*req, tablet_manager_-&gt;server()-&gt;Clock());</a>
+<a name="ln56"> </a>
+<a name="ln57">  const auto&amp; tablet_id = req-&gt;tablet_id(0);</a>
+<a name="ln58"> </a>
+<a name="ln59">  TRACE_EVENT1(&quot;tserver&quot;, &quot;TabletSnapshotOp&quot;, &quot;tablet_id: &quot;, tablet_id);</a>
+<a name="ln60"> </a>
+<a name="ln61">  LOG(INFO) &lt;&lt; &quot;Processing TabletSnapshotOp for tablet &quot; &lt;&lt; tablet_id &lt;&lt; &quot; from &quot;</a>
+<a name="ln62">            &lt;&lt; context.requestor_string() &lt;&lt; &quot;: &quot; &lt;&lt; req-&gt;operation();</a>
+<a name="ln63">  VLOG(1) &lt;&lt; &quot;Full request: &quot; &lt;&lt; req-&gt;DebugString();</a>
+<a name="ln64"> </a>
+<a name="ln65">  auto tablet = LookupLeaderTabletOrRespond(tablet_manager_, tablet_id, resp, &amp;context);</a>
+<a name="ln66">  if (!tablet) {</a>
+<a name="ln67">    return;</a>
+<a name="ln68">  }</a>
+<a name="ln69"> </a>
+<a name="ln70">  auto snapshot_hybrid_time = HybridTime::FromPB(req-&gt;snapshot_hybrid_time());</a>
+<a name="ln71">  tablet::ScopedReadOperation read_operation;</a>
+<a name="ln72">  // Transaction aware snapshot</a>
+<a name="ln73">  if (snapshot_hybrid_time) {</a>
+<a name="ln74">    // We need to ensure that the state of the tablet's data at the snapshot hybrid time is not</a>
+<a name="ln75">    // garbage-collected away only while performing submit.</a>
+<a name="ln76">    // Since history cutoff is propagated using Raft, it will use the same queue as the</a>
+<a name="ln77">    // &quot;create snapshot&quot; operation.</a>
+<a name="ln78">    // So history cutoff could be updated only after the &quot;create snapshot&quot; operation is applied.</a>
+<a name="ln79">    auto temp_read_operation_result = tablet::ScopedReadOperation::Create(</a>
+<a name="ln80">        tablet.peer-&gt;tablet(), tablet::RequireLease::kTrue,</a>
+<a name="ln81">        ReadHybridTime::SingleTime(snapshot_hybrid_time));</a>
+<a name="ln82">    Status status;</a>
+<a name="ln83">    if (temp_read_operation_result.ok()) {</a>
+<a name="ln84">      read_operation = std::move(*temp_read_operation_result);</a>
+<a name="ln85">      if (tablet.peer-&gt;tablet()-&gt;transaction_participant()) {</a>
+<a name="ln86">        status = tablet.peer-&gt;tablet()-&gt;transaction_participant()-&gt;ResolveIntents(</a>
+<a name="ln87">            snapshot_hybrid_time, context.GetClientDeadline());</a>
+<a name="ln88">      }</a>
+<a name="ln89">    } else {</a>
+<a name="ln90">      status = temp_read_operation_result.status();</a>
+<a name="ln91">    }</a>
+<a name="ln92">    if (!status.ok()) {</a>
+<a name="ln93">      return SetupErrorAndRespond(resp-&gt;mutable_error(), status, &amp;context);</a>
+<a name="ln94">    }</a>
+<a name="ln95">  }</a>
+<a name="ln96"> </a>
+<a name="ln97">  auto tx_state = std::make_unique&lt;SnapshotOperationState&gt;(tablet.peer-&gt;tablet(), req);</a>
+<a name="ln98"> </a>
+<a name="ln99">  auto clock = tablet_manager_-&gt;server()-&gt;Clock();</a>
+<a name="ln100">  tx_state-&gt;set_completion_callback(</a>
+<a name="ln101">      MakeRpcOperationCompletionCallback(std::move(context), resp, clock));</a>
+<a name="ln102"> </a>
+<a name="ln103">  if (!tx_state-&gt;CheckOperationRequirements()) {</a>
+<a name="ln104">    return;</a>
+<a name="ln105">  }</a>
+<a name="ln106"> </a>
+<a name="ln107">  // TODO(txn_snapshot) Avoid duplicate snapshots.</a>
+<a name="ln108">  // Submit the create snapshot op. The RPC will be responded to asynchronously.</a>
+<a name="ln109">  tablet.peer-&gt;Submit(</a>
+<a name="ln110">      std::make_unique&lt;tablet::SnapshotOperation&gt;(std::move(tx_state)), tablet.leader_term);</a>
+<a name="ln111">}</a>
+<a name="ln112"> </a>
+<a name="ln113">}  // namespace tserver</a>
+<a name="ln114">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="63"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

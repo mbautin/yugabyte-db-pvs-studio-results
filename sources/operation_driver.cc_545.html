@@ -1,0 +1,567 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>operation_driver.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/tablet/operations/operation_driver.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;mutex&gt;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln38">#include &quot;yb/consensus/consensus.h&quot;</a>
+<a name="ln39">#include &quot;yb/gutil/strings/strcat.h&quot;</a>
+<a name="ln40">#include &quot;yb/master/sys_catalog_constants.h&quot;</a>
+<a name="ln41">#include &quot;yb/tablet/tablet.h&quot;</a>
+<a name="ln42">#include &quot;yb/tablet/tablet_peer.h&quot;</a>
+<a name="ln43">#include &quot;yb/tablet/operations/operation_tracker.h&quot;</a>
+<a name="ln44">#include &quot;yb/util/debug-util.h&quot;</a>
+<a name="ln45">#include &quot;yb/util/debug/trace_event.h&quot;</a>
+<a name="ln46">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln47">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln48">#include &quot;yb/util/threadpool.h&quot;</a>
+<a name="ln49">#include &quot;yb/util/thread_restrictions.h&quot;</a>
+<a name="ln50">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln51"> </a>
+<a name="ln52">using namespace std::literals;</a>
+<a name="ln53"> </a>
+<a name="ln54">DEFINE_test_flag(int32, delay_execute_async_ms, 0,</a>
+<a name="ln55">                 &quot;Delay execution of ExecuteAsync for specified amount of milliseconds during &quot;</a>
+<a name="ln56">                     &quot;tests&quot;);</a>
+<a name="ln57"> </a>
+<a name="ln58">namespace yb {</a>
+<a name="ln59">namespace tablet {</a>
+<a name="ln60"> </a>
+<a name="ln61">using namespace std::placeholders;</a>
+<a name="ln62">using std::shared_ptr;</a>
+<a name="ln63"> </a>
+<a name="ln64">using consensus::Consensus;</a>
+<a name="ln65">using consensus::ConsensusRound;</a>
+<a name="ln66">using consensus::ReplicateMsg;</a>
+<a name="ln67">using consensus::DriverType;</a>
+<a name="ln68">using log::Log;</a>
+<a name="ln69">using server::Clock;</a>
+<a name="ln70"> </a>
+<a name="ln71">////////////////////////////////////////////////////////////</a>
+<a name="ln72">// OperationDriver</a>
+<a name="ln73">////////////////////////////////////////////////////////////</a>
+<a name="ln74"> </a>
+<a name="ln75">OperationDriver::OperationDriver(OperationTracker *operation_tracker,</a>
+<a name="ln76">                                 Consensus* consensus,</a>
+<a name="ln77">                                 Log* log,</a>
+<a name="ln78">                                 Preparer* preparer,</a>
+<a name="ln79">                                 OperationOrderVerifier* order_verifier,</a>
+<a name="ln80">                                 TableType table_type)</a>
+<a name="ln81">    : operation_tracker_(operation_tracker),</a>
+<a name="ln82">      consensus_(consensus),</a>
+<a name="ln83">      log_(log),</a>
+<a name="ln84">      preparer_(preparer),</a>
+<a name="ln85">      order_verifier_(order_verifier),</a>
+<a name="ln86">      trace_(new Trace()),</a>
+<a name="ln87">      start_time_(MonoTime::Now()),</a>
+<a name="ln88">      replication_state_(NOT_REPLICATING),</a>
+<a name="ln89">      prepare_state_(NOT_PREPARED),</a>
+<a name="ln90">      table_type_(table_type) {</a>
+<a name="ln91">  if (Trace::CurrentTrace()) {</a>
+<a name="ln92">    Trace::CurrentTrace()-&gt;AddChildTrace(trace_.get());</a>
+<a name="ln93">  }</a>
+<a name="ln94">  DCHECK(op_id_copy_.is_lock_free());</a>
+<a name="ln95">}</a>
+<a name="ln96"> </a>
+<a name="ln97">Status OperationDriver::Init(std::unique_ptr&lt;Operation&gt;* operation, int64_t term) {</a>
+<a name="ln98">  if (operation) {</a>
+<a name="ln99">    operation_ = std::move(*operation);</a>
+<a name="ln100">  }</a>
+<a name="ln101"> </a>
+<a name="ln102">  if (term == OpId::kUnknownTerm) {</a>
+<a name="ln103">    if (operation_) {</a>
+<a name="ln104">      op_id_copy_.store(yb::OpId::FromPB(operation_-&gt;state()-&gt;op_id()),</a>
+<a name="ln105">                                         boost::memory_order_release);</a>
+<a name="ln106">    }</a>
+<a name="ln107">    replication_state_ = REPLICATING;</a>
+<a name="ln108">  } else {</a>
+<a name="ln109">    if (consensus_) {  // sometimes NULL in tests</a>
+<a name="ln110">      // Unretained is required to avoid a refcount cycle.</a>
+<a name="ln111">      consensus::ReplicateMsgPtr replicate_msg = operation_-&gt;NewReplicateMsg();</a>
+<a name="ln112">      mutable_state()-&gt;set_consensus_round(</a>
+<a name="ln113">        consensus_-&gt;NewRound(std::move(replicate_msg),</a>
+<a name="ln114">                             std::bind(&amp;OperationDriver::ReplicationFinished, this, _1, _2, _3)));</a>
+<a name="ln115">      mutable_state()-&gt;consensus_round()-&gt;BindToTerm(term);</a>
+<a name="ln116">      mutable_state()-&gt;consensus_round()-&gt;SetAppendCallback(this);</a>
+<a name="ln117">    }</a>
+<a name="ln118">  }</a>
+<a name="ln119"> </a>
+<a name="ln120">  auto result = operation_tracker_-&gt;Add(this);</a>
+<a name="ln121">  if (!result.ok() &amp;&amp; operation) {</a>
+<a name="ln122">    *operation = std::move(operation_);</a>
+<a name="ln123">  }</a>
+<a name="ln124"> </a>
+<a name="ln125">  return result;</a>
+<a name="ln126">}</a>
+<a name="ln127"> </a>
+<a name="ln128">yb::OpId OperationDriver::GetOpId() {</a>
+<a name="ln129">  return op_id_copy_.load(boost::memory_order_acquire);</a>
+<a name="ln130">}</a>
+<a name="ln131"> </a>
+<a name="ln132">const OperationState* OperationDriver::state() const {</a>
+<a name="ln133">  return operation_ != nullptr ? operation_-&gt;state() : nullptr;</a>
+<a name="ln134">}</a>
+<a name="ln135"> </a>
+<a name="ln136">OperationState* OperationDriver::mutable_state() {</a>
+<a name="ln137">  return operation_ != nullptr ? operation_-&gt;state() : nullptr;</a>
+<a name="ln138">}</a>
+<a name="ln139"> </a>
+<a name="ln140">OperationType OperationDriver::operation_type() const {</a>
+<a name="ln141">  return operation_ ? operation_-&gt;operation_type() : OperationType::kEmpty;</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144">string OperationDriver::ToString() const {</a>
+<a name="ln145">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln146">  return ToStringUnlocked();</a>
+<a name="ln147">}</a>
+<a name="ln148"> </a>
+<a name="ln149">string OperationDriver::ToStringUnlocked() const {</a>
+<a name="ln150">  string ret = StateString(replication_state_, prepare_state_);</a>
+<a name="ln151">  if (operation_ != nullptr) {</a>
+<a name="ln152">    ret += &quot; &quot; + operation_-&gt;ToString();</a>
+<a name="ln153">  } else {</a>
+<a name="ln154">    ret += &quot;[unknown operation]&quot;;</a>
+<a name="ln155">  }</a>
+<a name="ln156">  return ret;</a>
+<a name="ln157">}</a>
+<a name="ln158"> </a>
+<a name="ln159"> </a>
+<a name="ln160">void OperationDriver::ExecuteAsync() {</a>
+<a name="ln161">  VLOG_WITH_PREFIX(4) &lt;&lt; &quot;ExecuteAsync()&quot;;</a>
+<a name="ln162">  TRACE_EVENT_FLOW_BEGIN0(&quot;operation&quot;, &quot;ExecuteAsync&quot;, this);</a>
+<a name="ln163">  ADOPT_TRACE(trace());</a>
+<a name="ln164"> </a>
+<a name="ln165">  auto delay = GetAtomicFlag(&amp;FLAGS_TEST_delay_execute_async_ms);</a>
+<a name="ln166">  if (delay != 0 &amp;&amp;</a>
+<a name="ln167">      operation_type() == OperationType::kWrite &amp;&amp;</a>
+<a name="ln168">      operation_-&gt;state()-&gt;tablet()-&gt;tablet_id() != master::kSysCatalogTabletId) {</a>
+<a name="ln169">    LOG(INFO) &lt;&lt; &quot;T &quot; &lt;&lt; operation_-&gt;state()-&gt;tablet()-&gt;tablet_id()</a>
+<a name="ln170">              &lt;&lt; &quot; Debug sleep for: &quot; &lt;&lt; MonoDelta(1ms * delay) &lt;&lt; &quot;\n&quot; &lt;&lt; GetStackTrace();</a>
+<a name="ln171">    std::this_thread::sleep_for(1ms * delay);</a>
+<a name="ln172">  }</a>
+<a name="ln173"> </a>
+<a name="ln174">  auto s = preparer_-&gt;Submit(this);</a>
+<a name="ln175"> </a>
+<a name="ln176">  if (operation_) {</a>
+<a name="ln177">    operation_-&gt;SubmittedToPreparer();</a>
+<a name="ln178">  }</a>
+<a name="ln179"> </a>
+<a name="ln180">  if (!s.ok()) {</a>
+<a name="ln181">    HandleFailure(s);</a>
+<a name="ln182">  }</a>
+<a name="ln183">}</a>
+<a name="ln184"> </a>
+<a name="ln185">void OperationDriver::HandleConsensusAppend(</a>
+<a name="ln186">    const yb::OpId&amp; op_id, const yb::OpId&amp; committed_op_id) {</a>
+<a name="ln187">  ADOPT_TRACE(trace());</a>
+<a name="ln188">  if (!StartOperation()) {</a>
+<a name="ln189">    return;</a>
+<a name="ln190">  }</a>
+<a name="ln191">  operation_-&gt;state()-&gt;LeaderInit(op_id, committed_op_id);</a>
+<a name="ln192">}</a>
+<a name="ln193"> </a>
+<a name="ln194">void OperationDriver::PrepareAndStartTask() {</a>
+<a name="ln195">  TRACE_EVENT_FLOW_END0(&quot;operation&quot;, &quot;PrepareAndStartTask&quot;, this);</a>
+<a name="ln196">  Status prepare_status = PrepareAndStart();</a>
+<a name="ln197">  if (PREDICT_FALSE(!prepare_status.ok())) {</a>
+<a name="ln198">    HandleFailure(prepare_status);</a>
+<a name="ln199">  }</a>
+<a name="ln200">}</a>
+<a name="ln201"> </a>
+<a name="ln202">bool OperationDriver::StartOperation() {</a>
+<a name="ln203">  if (operation_) {</a>
+<a name="ln204">    operation_-&gt;Start();</a>
+<a name="ln205">    std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln206">    op_id_copy_.store(yb::OpId::FromPB(operation_-&gt;state()-&gt;op_id()), boost::memory_order_release);</a>
+<a name="ln207">  }</a>
+<a name="ln208">  if (propagated_safe_time_) {</a>
+<a name="ln209">    mvcc_-&gt;SetPropagatedSafeTimeOnFollower(propagated_safe_time_);</a>
+<a name="ln210">  }</a>
+<a name="ln211">  if (!operation_) {</a>
+<a name="ln212">    operation_tracker_-&gt;Release(this, nullptr /* applied_op_ids */);</a>
+<a name="ln213">    return false;</a>
+<a name="ln214">  }</a>
+<a name="ln215">  return true;</a>
+<a name="ln216">}</a>
+<a name="ln217"> </a>
+<a name="ln218">Status OperationDriver::PrepareAndStart() {</a>
+<a name="ln219">  ADOPT_TRACE(trace());</a>
+<a name="ln220">  TRACE_EVENT1(&quot;operation&quot;, &quot;PrepareAndStart&quot;, &quot;operation&quot;, this);</a>
+<a name="ln221">  VLOG_WITH_PREFIX(4) &lt;&lt; &quot;PrepareAndStart()&quot;;</a>
+<a name="ln222">  // Actually prepare and start the operation.</a>
+<a name="ln223">  prepare_physical_hybrid_time_ = GetMonoTimeMicros();</a>
+<a name="ln224">  if (operation_) {</a>
+<a name="ln225">    RETURN_NOT_OK(operation_-&gt;Prepare());</a>
+<a name="ln226">  }</a>
+<a name="ln227"> </a>
+<a name="ln228">  // Only take the lock long enough to take a local copy of the</a>
+<a name="ln229">  // replication state and set our prepare state. This ensures that</a>
+<a name="ln230">  // exactly one of Replicate/Prepare callbacks will trigger the apply</a>
+<a name="ln231">  // phase.</a>
+<a name="ln232">  ReplicationState repl_state_copy;</a>
+<a name="ln233">  {</a>
+<a name="ln234">    std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln235">    CHECK_EQ(prepare_state_, NOT_PREPARED);</a>
+<a name="ln236">    repl_state_copy = replication_state_;</a>
+<a name="ln237">  }</a>
+<a name="ln238"> </a>
+<a name="ln239">  if (repl_state_copy != NOT_REPLICATING) {</a>
+<a name="ln240">    // We want to call Start() as soon as possible, because the operation already has the</a>
+<a name="ln241">    // hybrid_time assigned.</a>
+<a name="ln242">    if (!StartOperation()) {</a>
+<a name="ln243">      return Status::OK();</a>
+<a name="ln244">    }</a>
+<a name="ln245">  }</a>
+<a name="ln246"> </a>
+<a name="ln247">  {</a>
+<a name="ln248">    std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln249">    // No one should have modified prepare_state_ since we've read it under the lock a few lines</a>
+<a name="ln250">    // above, because PrepareAndStart should only run once per operation.</a>
+<a name="ln251">    CHECK_EQ(prepare_state_, NOT_PREPARED);</a>
+<a name="ln252">    // After this update, the ReplicationFinished callback will be able to apply this operation.</a>
+<a name="ln253">    // We can only do this after we've called Start()</a>
+<a name="ln254">    prepare_state_ = PREPARED;</a>
+<a name="ln255"> </a>
+<a name="ln256">    if (replication_state_ == NOT_REPLICATING) {</a>
+<a name="ln257">      replication_state_ = REPLICATING;</a>
+<a name="ln258">    }</a>
+<a name="ln259">  }</a>
+<a name="ln260"> </a>
+<a name="ln261">  return Status::OK();</a>
+<a name="ln262">}</a>
+<a name="ln263"> </a>
+<a name="ln264">OperationDriver::~OperationDriver() {</a>
+<a name="ln265">}</a>
+<a name="ln266"> </a>
+<a name="ln267">void OperationDriver::ReplicationFailed(const Status&amp; replication_status) {</a>
+<a name="ln268">  {</a>
+<a name="ln269">    std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln270">    if (replication_state_ == REPLICATION_FAILED) {</a>
+<a name="ln271">      return;</a>
+<a name="ln272">    }</a>
+<a name="ln273">    CHECK_EQ(replication_state_, REPLICATING);</a>
+<a name="ln274">    operation_status_ = replication_status;</a>
+<a name="ln275">    replication_state_ = REPLICATION_FAILED;</a>
+<a name="ln276">  }</a>
+<a name="ln277">  HandleFailure();</a>
+<a name="ln278">}</a>
+<a name="ln279"> </a>
+<a name="ln280">void OperationDriver::HandleFailure(Status status) {</a>
+<a name="ln281">  ReplicationState repl_state_copy;</a>
+<a name="ln282"> </a>
+<a name="ln283">  {</a>
+<a name="ln284">    std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln285">    if (!status.ok()) {</a>
+<a name="ln286">      if (!operation_status_.ok()) {</a>
+<a name="ln287">        LOG(DFATAL) &lt;&lt; &quot;Operation already failed with: &quot; &lt;&lt; operation_status_ &lt;&lt; &quot;, new status: &quot;</a>
+<a name="ln288">                    &lt;&lt; status &lt;&lt; &quot;, state: &quot; &lt;&lt; replication_state_;</a>
+<a name="ln289">      }</a>
+<a name="ln290">      operation_status_ = status;</a>
+<a name="ln291">    } else {</a>
+<a name="ln292">      status = operation_status_;</a>
+<a name="ln293">    }</a>
+<a name="ln294">    repl_state_copy = replication_state_;</a>
+<a name="ln295">  }</a>
+<a name="ln296"> </a>
+<a name="ln297">  VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Failed operation: &quot; &lt;&lt; status;</a>
+<a name="ln298">  CHECK(!status.ok());</a>
+<a name="ln299">  ADOPT_TRACE(trace());</a>
+<a name="ln300">  TRACE(&quot;HandleFailure($0)&quot;, status.ToString());</a>
+<a name="ln301"> </a>
+<a name="ln302">  switch (repl_state_copy) {</a>
+<a name="ln303">    case NOT_REPLICATING:</a>
+<a name="ln304">    case REPLICATION_FAILED:</a>
+<a name="ln305">    {</a>
+<a name="ln306">      VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Operation &quot; &lt;&lt; ToString() &lt;&lt; &quot; failed prior to &quot;</a>
+<a name="ln307">          &quot;replication success: &quot; &lt;&lt; status;</a>
+<a name="ln308">      operation_-&gt;Aborted(status);</a>
+<a name="ln309">      operation_tracker_-&gt;Release(this, nullptr /* applied_op_ids */);</a>
+<a name="ln310">      return;</a>
+<a name="ln311">    }</a>
+<a name="ln312"> </a>
+<a name="ln313">    case REPLICATING:</a>
+<a name="ln314">    case REPLICATED:</a>
+<a name="ln315">    {</a>
+<a name="ln316">      LOG_WITH_PREFIX(FATAL) &lt;&lt; &quot;Cannot cancel operations that have already replicated&quot;</a>
+<a name="ln317">                             &lt;&lt; &quot;: &quot; &lt;&lt; status &lt;&lt; &quot; operation: &quot; &lt;&lt; ToString();</a>
+<a name="ln318">    }</a>
+<a name="ln319">  }</a>
+<a name="ln320">}</a>
+<a name="ln321"> </a>
+<a name="ln322">void OperationDriver::ReplicationFinished(</a>
+<a name="ln323">    const Status&amp; status, int64_t leader_term, OpIds* applied_op_ids) {</a>
+<a name="ln324">  auto op_id_local = DCHECK_NOTNULL(mutable_state()-&gt;consensus_round())-&gt;id();</a>
+<a name="ln325">  DCHECK(!status.ok() || op_id_local.IsInitialized());</a>
+<a name="ln326">  op_id_copy_.store(yb::OpId::FromPB(op_id_local), boost::memory_order_release);</a>
+<a name="ln327"> </a>
+<a name="ln328">  PrepareState prepare_state_copy;</a>
+<a name="ln329">  {</a>
+<a name="ln330">    std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln331">    mutable_state()-&gt;mutable_op_id()-&gt;CopyFrom(op_id_local);</a>
+<a name="ln332">    CHECK_EQ(replication_state_, REPLICATING);</a>
+<a name="ln333">    if (status.ok()) {</a>
+<a name="ln334">      replication_state_ = REPLICATED;</a>
+<a name="ln335">    } else {</a>
+<a name="ln336">      replication_state_ = REPLICATION_FAILED;</a>
+<a name="ln337">      operation_status_ = status;</a>
+<a name="ln338">    }</a>
+<a name="ln339">    prepare_state_copy = prepare_state_;</a>
+<a name="ln340">  }</a>
+<a name="ln341"> </a>
+<a name="ln342">  // If we have prepared and replicated, we're ready to move ahead and apply this operation.</a>
+<a name="ln343">  // Note that if we set the state to REPLICATION_FAILED above, ApplyOperation() will actually abort</a>
+<a name="ln344">  // the operation, i.e. ApplyTask() will never be called and the operation will never be applied to</a>
+<a name="ln345">  // the tablet.</a>
+<a name="ln346">  if (prepare_state_copy != PrepareState::PREPARED) {</a>
+<a name="ln347">    LOG(DFATAL) &lt;&lt; &quot;Replicating an operation that has not been prepared: &quot; &lt;&lt; AsString(this);</a>
+<a name="ln348"> </a>
+<a name="ln349">    LOG(ERROR) &lt;&lt; &quot;Attempting to wait for the operation to be prepared&quot;;</a>
+<a name="ln350"> </a>
+<a name="ln351">    // This case should never happen, but if it happens we are trying to survive.</a>
+<a name="ln352">    for (;;) {</a>
+<a name="ln353">      std::this_thread::sleep_for(1ms);</a>
+<a name="ln354">      PrepareState prepare_state;</a>
+<a name="ln355">      {</a>
+<a name="ln356">        std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln357">        prepare_state = prepare_state_;</a>
+<a name="ln358">        if (prepare_state == PrepareState::PREPARED) {</a>
+<a name="ln359">          break;</a>
+<a name="ln360">        }</a>
+<a name="ln361">      }</a>
+<a name="ln362">      YB_LOG_EVERY_N_SECS(WARNING, 1)</a>
+<a name="ln363">          &lt;&lt; &quot;Waiting for the operation to be prepared, current state: &quot; &lt;&lt; prepare_state;</a>
+<a name="ln364">    }</a>
+<a name="ln365">  }</a>
+<a name="ln366"> </a>
+<a name="ln367">  // We likely need to do cleanup if this fails so for now just</a>
+<a name="ln368">  // CHECK_OK</a>
+<a name="ln369">  CHECK_OK(ApplyOperation(leader_term, applied_op_ids));</a>
+<a name="ln370">}</a>
+<a name="ln371"> </a>
+<a name="ln372">void OperationDriver::Abort(const Status&amp; status) {</a>
+<a name="ln373">  CHECK(!status.ok());</a>
+<a name="ln374"> </a>
+<a name="ln375">  ReplicationState repl_state_copy;</a>
+<a name="ln376">  {</a>
+<a name="ln377">    std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln378">    repl_state_copy = replication_state_;</a>
+<a name="ln379">    operation_status_ = status;</a>
+<a name="ln380">  }</a>
+<a name="ln381"> </a>
+<a name="ln382">  // If the state is not NOT_REPLICATING we abort immediately and the operation</a>
+<a name="ln383">  // will never be replicated.</a>
+<a name="ln384">  // In any other state we just set the operation status, if the operation's</a>
+<a name="ln385">  // Apply hasn't started yet this prevents it from starting, but if it has then</a>
+<a name="ln386">  // the operation runs to completion.</a>
+<a name="ln387">  if (repl_state_copy == NOT_REPLICATING) {</a>
+<a name="ln388">    HandleFailure();</a>
+<a name="ln389">  }</a>
+<a name="ln390">}</a>
+<a name="ln391"> </a>
+<a name="ln392">Status OperationDriver::ApplyOperation(</a>
+<a name="ln393">    int64_t leader_term, OpIds* applied_op_ids) {</a>
+<a name="ln394">  {</a>
+<a name="ln395">    std::unique_lock&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln396">    DCHECK_EQ(prepare_state_, PREPARED);</a>
+<a name="ln397">    if (operation_status_.ok()) {</a>
+<a name="ln398">      DCHECK_EQ(replication_state_, REPLICATED);</a>
+<a name="ln399">      order_verifier_-&gt;CheckApply(op_id_copy_.load(boost::memory_order_relaxed).index,</a>
+<a name="ln400">                                  prepare_physical_hybrid_time_);</a>
+<a name="ln401">    } else {</a>
+<a name="ln402">      DCHECK_EQ(replication_state_, REPLICATION_FAILED);</a>
+<a name="ln403">      DCHECK(!operation_status_.ok());</a>
+<a name="ln404">      lock.unlock();</a>
+<a name="ln405">      HandleFailure();</a>
+<a name="ln406">      return Status::OK();</a>
+<a name="ln407">    }</a>
+<a name="ln408">  }</a>
+<a name="ln409"> </a>
+<a name="ln410">  TRACE_EVENT_FLOW_BEGIN0(&quot;operation&quot;, &quot;ApplyTask&quot;, this);</a>
+<a name="ln411"> </a>
+<a name="ln412">  // RocksDB-backed tables require that we apply changes in the same order they appear in the Raft</a>
+<a name="ln413">  // log.</a>
+<a name="ln414">  ApplyTask(leader_term, applied_op_ids);</a>
+<a name="ln415">  return Status::OK();</a>
+<a name="ln416">}</a>
+<a name="ln417"> </a>
+<a name="ln418">void OperationDriver::ApplyTask(int64_t leader_term, OpIds* applied_op_ids) {</a>
+<a name="ln419">  TRACE_EVENT_FLOW_END0(&quot;operation&quot;, &quot;ApplyTask&quot;, this);</a>
+<a name="ln420">  ADOPT_TRACE(trace());</a>
+<a name="ln421"> </a>
+<a name="ln422">#ifndef NDEBUG</a>
+<a name="ln423">  {</a>
+<a name="ln424">    std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln425">    DCHECK_EQ(replication_state_, REPLICATED);</a>
+<a name="ln426">    DCHECK_EQ(prepare_state_, PREPARED);</a>
+<a name="ln427">  }</a>
+<a name="ln428">#endif</a>
+<a name="ln429"> </a>
+<a name="ln430">  // We need to ref-count ourself, since Commit() may run very quickly</a>
+<a name="ln431">  // and end up calling Finalize() while we're still in this code.</a>
+<a name="ln432">  scoped_refptr&lt;OperationDriver&gt; ref(this);</a>
+<a name="ln433"> </a>
+<a name="ln434">  {</a>
+<a name="ln435">    auto status = operation_-&gt;Replicated(leader_term);</a>
+<a name="ln436">    LOG_IF_WITH_PREFIX(FATAL, !status.ok()) &lt;&lt; &quot;Apply failed: &quot; &lt;&lt; status;</a>
+<a name="ln437">    operation_tracker_-&gt;Release(this, applied_op_ids);</a>
+<a name="ln438">  }</a>
+<a name="ln439">}</a>
+<a name="ln440"> </a>
+<a name="ln441">std::string OperationDriver::StateString(ReplicationState repl_state,</a>
+<a name="ln442">                                           PrepareState prep_state) {</a>
+<a name="ln443">  string state_str;</a>
+<a name="ln444">  switch (repl_state) {</a>
+<a name="ln445">    case NOT_REPLICATING:</a>
+<a name="ln446">      StrAppend(&amp;state_str, &quot;NR-&quot;);  // For Not Replicating</a>
+<a name="ln447">      break;</a>
+<a name="ln448">    case REPLICATING:</a>
+<a name="ln449">      StrAppend(&amp;state_str, &quot;R-&quot;);  // For Replicating</a>
+<a name="ln450">      break;</a>
+<a name="ln451">    case REPLICATION_FAILED:</a>
+<a name="ln452">      StrAppend(&amp;state_str, &quot;RF-&quot;);  // For Replication Failed</a>
+<a name="ln453">      break;</a>
+<a name="ln454">    case REPLICATED:</a>
+<a name="ln455">      StrAppend(&amp;state_str, &quot;RD-&quot;);  // For Replication Done</a>
+<a name="ln456">      break;</a>
+<a name="ln457">    default:</a>
+<a name="ln458">      LOG(DFATAL) &lt;&lt; &quot;Unexpected replication state: &quot; &lt;&lt; repl_state;</a>
+<a name="ln459">  }</a>
+<a name="ln460">  switch (prep_state) {</a>
+<a name="ln461">    case PREPARED:</a>
+<a name="ln462">      StrAppend(&amp;state_str, &quot;P&quot;);</a>
+<a name="ln463">      break;</a>
+<a name="ln464">    case NOT_PREPARED:</a>
+<a name="ln465">      StrAppend(&amp;state_str, &quot;NP&quot;);</a>
+<a name="ln466">      break;</a>
+<a name="ln467">    default:</a>
+<a name="ln468">      LOG(DFATAL) &lt;&lt; &quot;Unexpected prepare state: &quot; &lt;&lt; prep_state;</a>
+<a name="ln469">  }</a>
+<a name="ln470">  return state_str;</a>
+<a name="ln471">}</a>
+<a name="ln472"> </a>
+<a name="ln473">std::string OperationDriver::LogPrefix() const {</a>
+<a name="ln474">  ReplicationState repl_state_copy;</a>
+<a name="ln475">  PrepareState prep_state_copy;</a>
+<a name="ln476">  std::string ts_string;</a>
+<a name="ln477">  OperationType operation_type;</a>
+<a name="ln478"> </a>
+<a name="ln479">  {</a>
+<a name="ln480">    std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln481">    repl_state_copy = replication_state_;</a>
+<a name="ln482">    prep_state_copy = prepare_state_;</a>
+<a name="ln483">    ts_string = state() &amp;&amp; state()-&gt;has_hybrid_time()</a>
+<a name="ln484">        ? state()-&gt;hybrid_time().ToString() : &quot;No hybrid_time&quot;;</a>
+<a name="ln485">    operation_type = this-&gt;operation_type();</a>
+<a name="ln486">  }</a>
+<a name="ln487"> </a>
+<a name="ln488">  string state_str = StateString(repl_state_copy, prep_state_copy);</a>
+<a name="ln489">  // We use the tablet and the peer (T, P) to identify ts and tablet and the hybrid_time (Ts) to</a>
+<a name="ln490">  // (help) identify the operation. The state string (S) describes the state of the operation.</a>
+<a name="ln491">  return Format(&quot;T $0 P $1 S $2 Ts $3 $4: &quot;,</a>
+<a name="ln492">                // consensus_ is NULL in some unit tests.</a>
+<a name="ln493">                PREDICT_TRUE(consensus_) ? consensus_-&gt;tablet_id() : &quot;(unknown)&quot;,</a>
+<a name="ln494">                PREDICT_TRUE(consensus_) ? consensus_-&gt;peer_uuid() : &quot;(unknown)&quot;,</a>
+<a name="ln495">                state_str, ts_string, operation_type);</a>
+<a name="ln496">}</a>
+<a name="ln497"> </a>
+<a name="ln498">int64_t OperationDriver::SpaceUsed() {</a>
+<a name="ln499">  if (!operation_) {</a>
+<a name="ln500">    return 0;</a>
+<a name="ln501">  }</a>
+<a name="ln502">  auto consensus_round = operation_-&gt;state()-&gt;consensus_round();</a>
+<a name="ln503">  if (consensus_round) {</a>
+<a name="ln504">    return consensus_round-&gt;replicate_msg()-&gt;SpaceUsedLong();</a>
+<a name="ln505">  }</a>
+<a name="ln506">  return state()-&gt;request()-&gt;SpaceUsedLong();</a>
+<a name="ln507">}</a>
+<a name="ln508"> </a>
+<a name="ln509">}  // namespace tablet</a>
+<a name="ln510">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="94"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="161"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="221"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="297"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="298"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="306"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="325"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="369"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="373"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="403"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="436"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="75"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> It is possible that not all members of a class are initialized inside the constructor. Consider inspecting: prepare_physical_hybrid_time_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,637 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>transaction_base.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">// This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">// LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">// of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20"> </a>
+<a name="ln21">#ifndef ROCKSDB_LITE</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/rocksdb/utilities/transactions/transaction_base.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;yb/rocksdb/db/db_impl.h&quot;</a>
+<a name="ln26">#include &quot;yb/rocksdb/db/column_family.h&quot;</a>
+<a name="ln27">#include &quot;yb/rocksdb/comparator.h&quot;</a>
+<a name="ln28">#include &quot;yb/rocksdb/db.h&quot;</a>
+<a name="ln29">#include &quot;yb/rocksdb/status.h&quot;</a>
+<a name="ln30">#include &quot;yb/util/string_util.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32">namespace rocksdb {</a>
+<a name="ln33"> </a>
+<a name="ln34">TransactionBaseImpl::TransactionBaseImpl(DB* db,</a>
+<a name="ln35">                                         const WriteOptions&amp; write_options)</a>
+<a name="ln36">    : db_(db),</a>
+<a name="ln37">      write_options_(write_options),</a>
+<a name="ln38">      cmp_(GetColumnFamilyUserComparator(db-&gt;DefaultColumnFamily())),</a>
+<a name="ln39">      start_time_(db_-&gt;GetEnv()-&gt;NowMicros()),</a>
+<a name="ln40">      write_batch_(cmp_, 0, true),</a>
+<a name="ln41">      indexing_enabled_(true) {}</a>
+<a name="ln42"> </a>
+<a name="ln43">TransactionBaseImpl::~TransactionBaseImpl() {</a>
+<a name="ln44">  // Release snapshot if snapshot is set</a>
+<a name="ln45">  SetSnapshotInternal(nullptr);</a>
+<a name="ln46">}</a>
+<a name="ln47"> </a>
+<a name="ln48">void TransactionBaseImpl::Clear() {</a>
+<a name="ln49">  save_points_.reset(nullptr);</a>
+<a name="ln50">  write_batch_.Clear();</a>
+<a name="ln51">  tracked_keys_.clear();</a>
+<a name="ln52">  num_puts_ = 0;</a>
+<a name="ln53">  num_deletes_ = 0;</a>
+<a name="ln54">  num_merges_ = 0;</a>
+<a name="ln55">}</a>
+<a name="ln56"> </a>
+<a name="ln57">void TransactionBaseImpl::Reinitialize(DB* db,</a>
+<a name="ln58">                                       const WriteOptions&amp; write_options) {</a>
+<a name="ln59">  Clear();</a>
+<a name="ln60">  ClearSnapshot();</a>
+<a name="ln61">  db_ = db;</a>
+<a name="ln62">  write_options_ = write_options;</a>
+<a name="ln63">  start_time_ = db_-&gt;GetEnv()-&gt;NowMicros();</a>
+<a name="ln64">  indexing_enabled_ = true;</a>
+<a name="ln65">  cmp_ = GetColumnFamilyUserComparator(db_-&gt;DefaultColumnFamily());</a>
+<a name="ln66">}</a>
+<a name="ln67"> </a>
+<a name="ln68">void TransactionBaseImpl::SetSnapshot() {</a>
+<a name="ln69">  assert(dynamic_cast&lt;DBImpl*&gt;(db_) != nullptr);</a>
+<a name="ln70">  auto db_impl = reinterpret_cast&lt;DBImpl*&gt;(db_);</a>
+<a name="ln71"> </a>
+<a name="ln72">  const Snapshot* snapshot = db_impl-&gt;GetSnapshotForWriteConflictBoundary();</a>
+<a name="ln73"> </a>
+<a name="ln74">  SetSnapshotInternal(snapshot);</a>
+<a name="ln75">}</a>
+<a name="ln76"> </a>
+<a name="ln77">void TransactionBaseImpl::SetSnapshotInternal(const Snapshot* snapshot) {</a>
+<a name="ln78">  // Set a custom deleter for the snapshot_ SharedPtr as the snapshot needs to</a>
+<a name="ln79">  // be released, not deleted when it is no longer referenced.</a>
+<a name="ln80">  snapshot_.reset(snapshot, std::bind(&amp;TransactionBaseImpl::ReleaseSnapshot,</a>
+<a name="ln81">                                      this, std::placeholders::_1, db_));</a>
+<a name="ln82">  snapshot_needed_ = false;</a>
+<a name="ln83">  snapshot_notifier_ = nullptr;</a>
+<a name="ln84">}</a>
+<a name="ln85"> </a>
+<a name="ln86">void TransactionBaseImpl::SetSnapshotOnNextOperation(</a>
+<a name="ln87">    std::shared_ptr&lt;TransactionNotifier&gt; notifier) {</a>
+<a name="ln88">  snapshot_needed_ = true;</a>
+<a name="ln89">  snapshot_notifier_ = notifier;</a>
+<a name="ln90">}</a>
+<a name="ln91"> </a>
+<a name="ln92">void TransactionBaseImpl::SetSnapshotIfNeeded() {</a>
+<a name="ln93">  if (snapshot_needed_) {</a>
+<a name="ln94">    std::shared_ptr&lt;TransactionNotifier&gt; notifier = snapshot_notifier_;</a>
+<a name="ln95">    SetSnapshot();</a>
+<a name="ln96">    if (notifier != nullptr) {</a>
+<a name="ln97">      notifier-&gt;SnapshotCreated(GetSnapshot());</a>
+<a name="ln98">    }</a>
+<a name="ln99">  }</a>
+<a name="ln100">}</a>
+<a name="ln101"> </a>
+<a name="ln102">Status TransactionBaseImpl::TryLock(ColumnFamilyHandle* column_family,</a>
+<a name="ln103">                                    const SliceParts&amp; key, bool read_only,</a>
+<a name="ln104">                                    bool untracked) {</a>
+<a name="ln105">  size_t key_size = 0;</a>
+<a name="ln106">  for (int i = 0; i &lt; key.num_parts; ++i) {</a>
+<a name="ln107">    key_size += key.parts[i].size();</a>
+<a name="ln108">  }</a>
+<a name="ln109"> </a>
+<a name="ln110">  std::string str;</a>
+<a name="ln111">  str.reserve(key_size);</a>
+<a name="ln112"> </a>
+<a name="ln113">  for (int i = 0; i &lt; key.num_parts; ++i) {</a>
+<a name="ln114">    str.append(key.parts[i].cdata(), key.parts[i].size());</a>
+<a name="ln115">  }</a>
+<a name="ln116"> </a>
+<a name="ln117">  return TryLock(column_family, str, read_only, untracked);</a>
+<a name="ln118">}</a>
+<a name="ln119"> </a>
+<a name="ln120">void TransactionBaseImpl::SetSavePoint() {</a>
+<a name="ln121">  if (save_points_ == nullptr) {</a>
+<a name="ln122">    save_points_.reset(new std::stack&lt;TransactionBaseImpl::SavePoint&gt;());</a>
+<a name="ln123">  }</a>
+<a name="ln124">  save_points_-&gt;emplace(snapshot_, snapshot_needed_, snapshot_notifier_,</a>
+<a name="ln125">                        num_puts_, num_deletes_, num_merges_);</a>
+<a name="ln126">  write_batch_.SetSavePoint();</a>
+<a name="ln127">}</a>
+<a name="ln128"> </a>
+<a name="ln129">Status TransactionBaseImpl::RollbackToSavePoint() {</a>
+<a name="ln130">  if (save_points_ != nullptr &amp;&amp; save_points_-&gt;size() &gt; 0) {</a>
+<a name="ln131">    // Restore saved SavePoint</a>
+<a name="ln132">    TransactionBaseImpl::SavePoint&amp; save_point = save_points_-&gt;top();</a>
+<a name="ln133">    snapshot_ = save_point.snapshot_;</a>
+<a name="ln134">    snapshot_needed_ = save_point.snapshot_needed_;</a>
+<a name="ln135">    snapshot_notifier_ = save_point.snapshot_notifier_;</a>
+<a name="ln136">    num_puts_ = save_point.num_puts_;</a>
+<a name="ln137">    num_deletes_ = save_point.num_deletes_;</a>
+<a name="ln138">    num_merges_ = save_point.num_merges_;</a>
+<a name="ln139"> </a>
+<a name="ln140">    // Rollback batch</a>
+<a name="ln141">    Status s = write_batch_.RollbackToSavePoint();</a>
+<a name="ln142">    assert(s.ok());</a>
+<a name="ln143"> </a>
+<a name="ln144">    // Rollback any keys that were tracked since the last savepoint</a>
+<a name="ln145">    const TransactionKeyMap&amp; key_map = save_point.new_keys_;</a>
+<a name="ln146">    for (const auto&amp; key_map_iter : key_map) {</a>
+<a name="ln147">      uint32_t column_family_id = key_map_iter.first;</a>
+<a name="ln148">      auto&amp; keys = key_map_iter.second;</a>
+<a name="ln149"> </a>
+<a name="ln150">      auto&amp; cf_tracked_keys = tracked_keys_[column_family_id];</a>
+<a name="ln151"> </a>
+<a name="ln152">      for (const auto&amp; key_iter : keys) {</a>
+<a name="ln153">        const std::string&amp; key = key_iter.first;</a>
+<a name="ln154">        uint32_t num_reads = key_iter.second.num_reads;</a>
+<a name="ln155">        uint32_t num_writes = key_iter.second.num_writes;</a>
+<a name="ln156"> </a>
+<a name="ln157">        auto tracked_keys_iter = cf_tracked_keys.find(key);</a>
+<a name="ln158">        assert(tracked_keys_iter != cf_tracked_keys.end());</a>
+<a name="ln159"> </a>
+<a name="ln160">        // Decrement the total reads/writes of this key by the number of</a>
+<a name="ln161">        // reads/writes done since the last SavePoint.</a>
+<a name="ln162">        if (num_reads &gt; 0) {</a>
+<a name="ln163">          assert(tracked_keys_iter-&gt;second.num_reads &gt;= num_reads);</a>
+<a name="ln164">          tracked_keys_iter-&gt;second.num_reads -= num_reads;</a>
+<a name="ln165">        }</a>
+<a name="ln166">        if (num_writes &gt; 0) {</a>
+<a name="ln167">          assert(tracked_keys_iter-&gt;second.num_writes &gt;= num_writes);</a>
+<a name="ln168">          tracked_keys_iter-&gt;second.num_writes -= num_writes;</a>
+<a name="ln169">        }</a>
+<a name="ln170">        if (tracked_keys_iter-&gt;second.num_reads == 0 &amp;&amp;</a>
+<a name="ln171">            tracked_keys_iter-&gt;second.num_writes == 0) {</a>
+<a name="ln172">          tracked_keys_[column_family_id].erase(tracked_keys_iter);</a>
+<a name="ln173">        }</a>
+<a name="ln174">      }</a>
+<a name="ln175">    }</a>
+<a name="ln176"> </a>
+<a name="ln177">    save_points_-&gt;pop();</a>
+<a name="ln178"> </a>
+<a name="ln179">    return s;</a>
+<a name="ln180">  } else {</a>
+<a name="ln181">    assert(write_batch_.RollbackToSavePoint().IsNotFound());</a>
+<a name="ln182">    return STATUS(NotFound, &quot;&quot;);</a>
+<a name="ln183">  }</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186">Status TransactionBaseImpl::Get(const ReadOptions&amp; read_options,</a>
+<a name="ln187">                                ColumnFamilyHandle* column_family,</a>
+<a name="ln188">                                const Slice&amp; key, std::string* value) {</a>
+<a name="ln189">  return write_batch_.GetFromBatchAndDB(db_, read_options, column_family, key,</a>
+<a name="ln190">                                        value);</a>
+<a name="ln191">}</a>
+<a name="ln192"> </a>
+<a name="ln193">Status TransactionBaseImpl::GetForUpdate(const ReadOptions&amp; read_options,</a>
+<a name="ln194">                                         ColumnFamilyHandle* column_family,</a>
+<a name="ln195">                                         const Slice&amp; key, std::string* value) {</a>
+<a name="ln196">  Status s = TryLock(column_family, key, true /* read_only */);</a>
+<a name="ln197"> </a>
+<a name="ln198">  if (s.ok() &amp;&amp; value != nullptr) {</a>
+<a name="ln199">    s = Get(read_options, column_family, key, value);</a>
+<a name="ln200">  }</a>
+<a name="ln201">  return s;</a>
+<a name="ln202">}</a>
+<a name="ln203"> </a>
+<a name="ln204">std::vector&lt;Status&gt; TransactionBaseImpl::MultiGet(</a>
+<a name="ln205">    const ReadOptions&amp; read_options,</a>
+<a name="ln206">    const std::vector&lt;ColumnFamilyHandle*&gt;&amp; column_family,</a>
+<a name="ln207">    const std::vector&lt;Slice&gt;&amp; keys, std::vector&lt;std::string&gt;* values) {</a>
+<a name="ln208">  size_t num_keys = keys.size();</a>
+<a name="ln209">  values-&gt;resize(num_keys);</a>
+<a name="ln210"> </a>
+<a name="ln211">  std::vector&lt;Status&gt; stat_list(num_keys);</a>
+<a name="ln212">  for (size_t i = 0; i &lt; num_keys; ++i) {</a>
+<a name="ln213">    std::string* value = values ? &amp;(*values)[i] : nullptr;</a>
+<a name="ln214">    stat_list[i] = Get(read_options, column_family[i], keys[i], value);</a>
+<a name="ln215">  }</a>
+<a name="ln216"> </a>
+<a name="ln217">  return stat_list;</a>
+<a name="ln218">}</a>
+<a name="ln219"> </a>
+<a name="ln220">std::vector&lt;Status&gt; TransactionBaseImpl::MultiGetForUpdate(</a>
+<a name="ln221">    const ReadOptions&amp; read_options,</a>
+<a name="ln222">    const std::vector&lt;ColumnFamilyHandle*&gt;&amp; column_family,</a>
+<a name="ln223">    const std::vector&lt;Slice&gt;&amp; keys, std::vector&lt;std::string&gt;* values) {</a>
+<a name="ln224">  // Regardless of whether the MultiGet succeeded, track these keys.</a>
+<a name="ln225">  size_t num_keys = keys.size();</a>
+<a name="ln226">  values-&gt;resize(num_keys);</a>
+<a name="ln227"> </a>
+<a name="ln228">  // Lock all keys</a>
+<a name="ln229">  for (size_t i = 0; i &lt; num_keys; ++i) {</a>
+<a name="ln230">    Status s = TryLock(column_family[i], keys[i], true /* read_only */);</a>
+<a name="ln231">    if (!s.ok()) {</a>
+<a name="ln232">      // Fail entire multiget if we cannot lock all keys</a>
+<a name="ln233">      return std::vector&lt;Status&gt;(num_keys, s);</a>
+<a name="ln234">    }</a>
+<a name="ln235">  }</a>
+<a name="ln236"> </a>
+<a name="ln237">  // TODO(agiardullo): optimize multiget?</a>
+<a name="ln238">  std::vector&lt;Status&gt; stat_list(num_keys);</a>
+<a name="ln239">  for (size_t i = 0; i &lt; num_keys; ++i) {</a>
+<a name="ln240">    std::string* value = values ? &amp;(*values)[i] : nullptr;</a>
+<a name="ln241">    stat_list[i] = Get(read_options, column_family[i], keys[i], value);</a>
+<a name="ln242">  }</a>
+<a name="ln243"> </a>
+<a name="ln244">  return stat_list;</a>
+<a name="ln245">}</a>
+<a name="ln246"> </a>
+<a name="ln247">Iterator* TransactionBaseImpl::GetIterator(const ReadOptions&amp; read_options) {</a>
+<a name="ln248">  Iterator* db_iter = db_-&gt;NewIterator(read_options);</a>
+<a name="ln249">  assert(db_iter);</a>
+<a name="ln250"> </a>
+<a name="ln251">  return write_batch_.NewIteratorWithBase(db_iter);</a>
+<a name="ln252">}</a>
+<a name="ln253"> </a>
+<a name="ln254">Iterator* TransactionBaseImpl::GetIterator(const ReadOptions&amp; read_options,</a>
+<a name="ln255">                                           ColumnFamilyHandle* column_family) {</a>
+<a name="ln256">  Iterator* db_iter = db_-&gt;NewIterator(read_options, column_family);</a>
+<a name="ln257">  assert(db_iter);</a>
+<a name="ln258"> </a>
+<a name="ln259">  return write_batch_.NewIteratorWithBase(column_family, db_iter);</a>
+<a name="ln260">}</a>
+<a name="ln261"> </a>
+<a name="ln262">Status TransactionBaseImpl::Put(ColumnFamilyHandle* column_family,</a>
+<a name="ln263">                                const Slice&amp; key, const Slice&amp; value) {</a>
+<a name="ln264">  Status s = TryLock(column_family, key, false /* read_only */);</a>
+<a name="ln265"> </a>
+<a name="ln266">  if (s.ok()) {</a>
+<a name="ln267">    GetBatchForWrite()-&gt;Put(column_family, key, value);</a>
+<a name="ln268">    num_puts_++;</a>
+<a name="ln269">  }</a>
+<a name="ln270"> </a>
+<a name="ln271">  return s;</a>
+<a name="ln272">}</a>
+<a name="ln273"> </a>
+<a name="ln274">Status TransactionBaseImpl::Put(ColumnFamilyHandle* column_family,</a>
+<a name="ln275">                                const SliceParts&amp; key,</a>
+<a name="ln276">                                const SliceParts&amp; value) {</a>
+<a name="ln277">  Status s = TryLock(column_family, key, false /* read_only */);</a>
+<a name="ln278"> </a>
+<a name="ln279">  if (s.ok()) {</a>
+<a name="ln280">    GetBatchForWrite()-&gt;Put(column_family, key, value);</a>
+<a name="ln281">    num_puts_++;</a>
+<a name="ln282">  }</a>
+<a name="ln283"> </a>
+<a name="ln284">  return s;</a>
+<a name="ln285">}</a>
+<a name="ln286"> </a>
+<a name="ln287">Status TransactionBaseImpl::Merge(ColumnFamilyHandle* column_family,</a>
+<a name="ln288">                                  const Slice&amp; key, const Slice&amp; value) {</a>
+<a name="ln289">  Status s = TryLock(column_family, key, false /* read_only */);</a>
+<a name="ln290"> </a>
+<a name="ln291">  if (s.ok()) {</a>
+<a name="ln292">    GetBatchForWrite()-&gt;Merge(column_family, key, value);</a>
+<a name="ln293">    num_merges_++;</a>
+<a name="ln294">  }</a>
+<a name="ln295"> </a>
+<a name="ln296">  return s;</a>
+<a name="ln297">}</a>
+<a name="ln298"> </a>
+<a name="ln299">Status TransactionBaseImpl::Delete(ColumnFamilyHandle* column_family,</a>
+<a name="ln300">                                   const Slice&amp; key) {</a>
+<a name="ln301">  Status s = TryLock(column_family, key, false /* read_only */);</a>
+<a name="ln302"> </a>
+<a name="ln303">  if (s.ok()) {</a>
+<a name="ln304">    GetBatchForWrite()-&gt;Delete(column_family, key);</a>
+<a name="ln305">    num_deletes_++;</a>
+<a name="ln306">  }</a>
+<a name="ln307"> </a>
+<a name="ln308">  return s;</a>
+<a name="ln309">}</a>
+<a name="ln310"> </a>
+<a name="ln311">Status TransactionBaseImpl::Delete(ColumnFamilyHandle* column_family,</a>
+<a name="ln312">                                   const SliceParts&amp; key) {</a>
+<a name="ln313">  Status s = TryLock(column_family, key, false /* read_only */);</a>
+<a name="ln314"> </a>
+<a name="ln315">  if (s.ok()) {</a>
+<a name="ln316">    GetBatchForWrite()-&gt;Delete(column_family, key);</a>
+<a name="ln317">    num_deletes_++;</a>
+<a name="ln318">  }</a>
+<a name="ln319"> </a>
+<a name="ln320">  return s;</a>
+<a name="ln321">}</a>
+<a name="ln322"> </a>
+<a name="ln323">Status TransactionBaseImpl::SingleDelete(ColumnFamilyHandle* column_family,</a>
+<a name="ln324">                                         const Slice&amp; key) {</a>
+<a name="ln325">  Status s = TryLock(column_family, key, false /* read_only */);</a>
+<a name="ln326"> </a>
+<a name="ln327">  if (s.ok()) {</a>
+<a name="ln328">    GetBatchForWrite()-&gt;SingleDelete(column_family, key);</a>
+<a name="ln329">    num_deletes_++;</a>
+<a name="ln330">  }</a>
+<a name="ln331"> </a>
+<a name="ln332">  return s;</a>
+<a name="ln333">}</a>
+<a name="ln334"> </a>
+<a name="ln335">Status TransactionBaseImpl::SingleDelete(ColumnFamilyHandle* column_family,</a>
+<a name="ln336">                                         const SliceParts&amp; key) {</a>
+<a name="ln337">  Status s = TryLock(column_family, key, false /* read_only */);</a>
+<a name="ln338"> </a>
+<a name="ln339">  if (s.ok()) {</a>
+<a name="ln340">    GetBatchForWrite()-&gt;SingleDelete(column_family, key);</a>
+<a name="ln341">    num_deletes_++;</a>
+<a name="ln342">  }</a>
+<a name="ln343"> </a>
+<a name="ln344">  return s;</a>
+<a name="ln345">}</a>
+<a name="ln346"> </a>
+<a name="ln347">Status TransactionBaseImpl::PutUntracked(ColumnFamilyHandle* column_family,</a>
+<a name="ln348">                                         const Slice&amp; key, const Slice&amp; value) {</a>
+<a name="ln349">  Status s =</a>
+<a name="ln350">      TryLock(column_family, key, false /* read_only */, true /* untracked */);</a>
+<a name="ln351"> </a>
+<a name="ln352">  if (s.ok()) {</a>
+<a name="ln353">    GetBatchForWrite()-&gt;Put(column_family, key, value);</a>
+<a name="ln354">    num_puts_++;</a>
+<a name="ln355">  }</a>
+<a name="ln356"> </a>
+<a name="ln357">  return s;</a>
+<a name="ln358">}</a>
+<a name="ln359"> </a>
+<a name="ln360">Status TransactionBaseImpl::PutUntracked(ColumnFamilyHandle* column_family,</a>
+<a name="ln361">                                         const SliceParts&amp; key,</a>
+<a name="ln362">                                         const SliceParts&amp; value) {</a>
+<a name="ln363">  Status s =</a>
+<a name="ln364">      TryLock(column_family, key, false /* read_only */, true /* untracked */);</a>
+<a name="ln365"> </a>
+<a name="ln366">  if (s.ok()) {</a>
+<a name="ln367">    GetBatchForWrite()-&gt;Put(column_family, key, value);</a>
+<a name="ln368">    num_puts_++;</a>
+<a name="ln369">  }</a>
+<a name="ln370"> </a>
+<a name="ln371">  return s;</a>
+<a name="ln372">}</a>
+<a name="ln373"> </a>
+<a name="ln374">Status TransactionBaseImpl::MergeUntracked(ColumnFamilyHandle* column_family,</a>
+<a name="ln375">                                           const Slice&amp; key,</a>
+<a name="ln376">                                           const Slice&amp; value) {</a>
+<a name="ln377">  Status s =</a>
+<a name="ln378">      TryLock(column_family, key, false /* read_only */, true /* untracked */);</a>
+<a name="ln379"> </a>
+<a name="ln380">  if (s.ok()) {</a>
+<a name="ln381">    GetBatchForWrite()-&gt;Merge(column_family, key, value);</a>
+<a name="ln382">    num_merges_++;</a>
+<a name="ln383">  }</a>
+<a name="ln384"> </a>
+<a name="ln385">  return s;</a>
+<a name="ln386">}</a>
+<a name="ln387"> </a>
+<a name="ln388">Status TransactionBaseImpl::DeleteUntracked(ColumnFamilyHandle* column_family,</a>
+<a name="ln389">                                            const Slice&amp; key) {</a>
+<a name="ln390">  Status s =</a>
+<a name="ln391">      TryLock(column_family, key, false /* read_only */, true /* untracked */);</a>
+<a name="ln392"> </a>
+<a name="ln393">  if (s.ok()) {</a>
+<a name="ln394">    GetBatchForWrite()-&gt;Delete(column_family, key);</a>
+<a name="ln395">    num_deletes_++;</a>
+<a name="ln396">  }</a>
+<a name="ln397"> </a>
+<a name="ln398">  return s;</a>
+<a name="ln399">}</a>
+<a name="ln400"> </a>
+<a name="ln401">Status TransactionBaseImpl::DeleteUntracked(ColumnFamilyHandle* column_family,</a>
+<a name="ln402">                                            const SliceParts&amp; key) {</a>
+<a name="ln403">  Status s =</a>
+<a name="ln404">      TryLock(column_family, key, false /* read_only */, true /* untracked */);</a>
+<a name="ln405"> </a>
+<a name="ln406">  if (s.ok()) {</a>
+<a name="ln407">    GetBatchForWrite()-&gt;Delete(column_family, key);</a>
+<a name="ln408">    num_deletes_++;</a>
+<a name="ln409">  }</a>
+<a name="ln410"> </a>
+<a name="ln411">  return s;</a>
+<a name="ln412">}</a>
+<a name="ln413"> </a>
+<a name="ln414">void TransactionBaseImpl::PutLogData(const Slice&amp; blob) {</a>
+<a name="ln415">  write_batch_.PutLogData(blob);</a>
+<a name="ln416">}</a>
+<a name="ln417"> </a>
+<a name="ln418">WriteBatchWithIndex* TransactionBaseImpl::GetWriteBatch() {</a>
+<a name="ln419">  return &amp;write_batch_;</a>
+<a name="ln420">}</a>
+<a name="ln421"> </a>
+<a name="ln422">uint64_t TransactionBaseImpl::GetElapsedTime() const {</a>
+<a name="ln423">  return (db_-&gt;GetEnv()-&gt;NowMicros() - start_time_) / 1000;</a>
+<a name="ln424">}</a>
+<a name="ln425"> </a>
+<a name="ln426">uint64_t TransactionBaseImpl::GetNumPuts() const { return num_puts_; }</a>
+<a name="ln427"> </a>
+<a name="ln428">uint64_t TransactionBaseImpl::GetNumDeletes() const { return num_deletes_; }</a>
+<a name="ln429"> </a>
+<a name="ln430">uint64_t TransactionBaseImpl::GetNumMerges() const { return num_merges_; }</a>
+<a name="ln431"> </a>
+<a name="ln432">uint64_t TransactionBaseImpl::GetNumKeys() const {</a>
+<a name="ln433">  uint64_t count = 0;</a>
+<a name="ln434"> </a>
+<a name="ln435">  // sum up locked keys in all column families</a>
+<a name="ln436">  for (const auto&amp; key_map_iter : tracked_keys_) {</a>
+<a name="ln437">    const auto&amp; keys = key_map_iter.second;</a>
+<a name="ln438">    count += keys.size();</a>
+<a name="ln439">  }</a>
+<a name="ln440"> </a>
+<a name="ln441">  return count;</a>
+<a name="ln442">}</a>
+<a name="ln443"> </a>
+<a name="ln444">void TransactionBaseImpl::TrackKey(uint32_t cfh_id, const std::string&amp; key,</a>
+<a name="ln445">                                   SequenceNumber seq, bool read_only) {</a>
+<a name="ln446">  // Update map of all tracked keys for this transaction</a>
+<a name="ln447">  TrackKey(&amp;tracked_keys_, cfh_id, key, seq, read_only);</a>
+<a name="ln448"> </a>
+<a name="ln449">  if (save_points_ != nullptr &amp;&amp; !save_points_-&gt;empty()) {</a>
+<a name="ln450">    // Update map of tracked keys in this SavePoint</a>
+<a name="ln451">    TrackKey(&amp;save_points_-&gt;top().new_keys_, cfh_id, key, seq, read_only);</a>
+<a name="ln452">  }</a>
+<a name="ln453">}</a>
+<a name="ln454"> </a>
+<a name="ln455">// Add a key to the given TransactionKeyMap</a>
+<a name="ln456">void TransactionBaseImpl::TrackKey(TransactionKeyMap* key_map, uint32_t cfh_id,</a>
+<a name="ln457">                                   const std::string&amp; key, SequenceNumber seq,</a>
+<a name="ln458">                                   bool read_only) {</a>
+<a name="ln459">  auto&amp; cf_key_map = (*key_map)[cfh_id];</a>
+<a name="ln460">  auto iter = cf_key_map.find(key);</a>
+<a name="ln461">  if (iter == cf_key_map.end()) {</a>
+<a name="ln462">    auto result = cf_key_map.insert({key, TransactionKeyMapInfo(seq)});</a>
+<a name="ln463">    iter = result.first;</a>
+<a name="ln464">  } else if (seq &lt; iter-&gt;second.seq) {</a>
+<a name="ln465">    // Now tracking this key with an earlier sequence number</a>
+<a name="ln466">    iter-&gt;second.seq = seq;</a>
+<a name="ln467">  }</a>
+<a name="ln468"> </a>
+<a name="ln469">  if (read_only) {</a>
+<a name="ln470">    iter-&gt;second.num_reads++;</a>
+<a name="ln471">  } else {</a>
+<a name="ln472">    iter-&gt;second.num_writes++;</a>
+<a name="ln473">  }</a>
+<a name="ln474">}</a>
+<a name="ln475"> </a>
+<a name="ln476">std::unique_ptr&lt;TransactionKeyMap&gt;</a>
+<a name="ln477">TransactionBaseImpl::GetTrackedKeysSinceSavePoint() {</a>
+<a name="ln478">  if (save_points_ != nullptr &amp;&amp; !save_points_-&gt;empty()) {</a>
+<a name="ln479">    // Examine the number of reads/writes performed on all keys written</a>
+<a name="ln480">    // since the last SavePoint and compare to the total number of reads/writes</a>
+<a name="ln481">    // for each key.</a>
+<a name="ln482">    TransactionKeyMap* result = new TransactionKeyMap();</a>
+<a name="ln483">    for (const auto&amp; key_map_iter : save_points_-&gt;top().new_keys_) {</a>
+<a name="ln484">      uint32_t column_family_id = key_map_iter.first;</a>
+<a name="ln485">      auto&amp; keys = key_map_iter.second;</a>
+<a name="ln486"> </a>
+<a name="ln487">      auto&amp; cf_tracked_keys = tracked_keys_[column_family_id];</a>
+<a name="ln488"> </a>
+<a name="ln489">      for (const auto&amp; key_iter : keys) {</a>
+<a name="ln490">        const std::string&amp; key = key_iter.first;</a>
+<a name="ln491">        uint32_t num_reads = key_iter.second.num_reads;</a>
+<a name="ln492">        uint32_t num_writes = key_iter.second.num_writes;</a>
+<a name="ln493"> </a>
+<a name="ln494">        auto total_key_info = cf_tracked_keys.find(key);</a>
+<a name="ln495">        assert(total_key_info != cf_tracked_keys.end());</a>
+<a name="ln496">        assert(total_key_info-&gt;second.num_reads &gt;= num_reads);</a>
+<a name="ln497">        assert(total_key_info-&gt;second.num_writes &gt;= num_writes);</a>
+<a name="ln498"> </a>
+<a name="ln499">        if (total_key_info-&gt;second.num_reads == num_reads &amp;&amp;</a>
+<a name="ln500">            total_key_info-&gt;second.num_writes == num_writes) {</a>
+<a name="ln501">          // All the reads/writes to this key were done in the last savepoint.</a>
+<a name="ln502">          bool read_only = (num_writes == 0);</a>
+<a name="ln503">          TrackKey(result, column_family_id, key, key_iter.second.seq,</a>
+<a name="ln504">                   read_only);</a>
+<a name="ln505">        }</a>
+<a name="ln506">      }</a>
+<a name="ln507">    }</a>
+<a name="ln508">    return std::unique_ptr&lt;TransactionKeyMap&gt;(result);</a>
+<a name="ln509">  }</a>
+<a name="ln510"> </a>
+<a name="ln511">  // No SavePoint</a>
+<a name="ln512">  return nullptr;</a>
+<a name="ln513">}</a>
+<a name="ln514"> </a>
+<a name="ln515">// Gets the write batch that should be used for Put/Merge/Deletes.</a>
+<a name="ln516">//</a>
+<a name="ln517">// Returns either a WriteBatch or WriteBatchWithIndex depending on whether</a>
+<a name="ln518">// DisableIndexing() has been called.</a>
+<a name="ln519">WriteBatchBase* TransactionBaseImpl::GetBatchForWrite() {</a>
+<a name="ln520">  if (indexing_enabled_) {</a>
+<a name="ln521">    // Use WriteBatchWithIndex</a>
+<a name="ln522">    return &amp;write_batch_;</a>
+<a name="ln523">  } else {</a>
+<a name="ln524">    // Don't use WriteBatchWithIndex. Return base WriteBatch.</a>
+<a name="ln525">    return write_batch_.GetWriteBatch();</a>
+<a name="ln526">  }</a>
+<a name="ln527">}</a>
+<a name="ln528"> </a>
+<a name="ln529">void TransactionBaseImpl::ReleaseSnapshot(const Snapshot* snapshot, DB* db) {</a>
+<a name="ln530">  if (snapshot != nullptr) {</a>
+<a name="ln531">    db-&gt;ReleaseSnapshot(snapshot);</a>
+<a name="ln532">  }</a>
+<a name="ln533">}</a>
+<a name="ln534"> </a>
+<a name="ln535">void TransactionBaseImpl::UndoGetForUpdate(ColumnFamilyHandle* column_family,</a>
+<a name="ln536">                                           const Slice&amp; key) {</a>
+<a name="ln537">  uint32_t column_family_id = GetColumnFamilyID(column_family);</a>
+<a name="ln538">  auto&amp; cf_tracked_keys = tracked_keys_[column_family_id];</a>
+<a name="ln539">  std::string key_str = key.ToString();</a>
+<a name="ln540">  bool can_decrement = false;</a>
+<a name="ln541">  bool can_unlock __attribute__((unused)) = false;</a>
+<a name="ln542"> </a>
+<a name="ln543">  if (save_points_ != nullptr &amp;&amp; !save_points_-&gt;empty()) {</a>
+<a name="ln544">    // Check if this key was fetched ForUpdate in this SavePoint</a>
+<a name="ln545">    auto&amp; cf_savepoint_keys = save_points_-&gt;top().new_keys_[column_family_id];</a>
+<a name="ln546"> </a>
+<a name="ln547">    auto savepoint_iter = cf_savepoint_keys.find(key_str);</a>
+<a name="ln548">    if (savepoint_iter != cf_savepoint_keys.end()) {</a>
+<a name="ln549">      if (savepoint_iter-&gt;second.num_reads &gt; 0) {</a>
+<a name="ln550">        savepoint_iter-&gt;second.num_reads--;</a>
+<a name="ln551">        can_decrement = true;</a>
+<a name="ln552"> </a>
+<a name="ln553">        if (savepoint_iter-&gt;second.num_reads == 0 &amp;&amp;</a>
+<a name="ln554">            savepoint_iter-&gt;second.num_writes == 0) {</a>
+<a name="ln555">          // No other GetForUpdates or write on this key in this SavePoint</a>
+<a name="ln556">          cf_savepoint_keys.erase(savepoint_iter);</a>
+<a name="ln557">          can_unlock = true;</a>
+<a name="ln558">        }</a>
+<a name="ln559">      }</a>
+<a name="ln560">    }</a>
+<a name="ln561">  } else {</a>
+<a name="ln562">    // No SavePoint set</a>
+<a name="ln563">    can_decrement = true;</a>
+<a name="ln564">    can_unlock = true;</a>
+<a name="ln565">  }</a>
+<a name="ln566"> </a>
+<a name="ln567">  // We can only decrement the read count for this key if we were able to</a>
+<a name="ln568">  // decrement the read count in the current SavePoint, OR if there is no</a>
+<a name="ln569">  // SavePoint set.</a>
+<a name="ln570">  if (can_decrement) {</a>
+<a name="ln571">    auto key_iter = cf_tracked_keys.find(key_str);</a>
+<a name="ln572"> </a>
+<a name="ln573">    if (key_iter != cf_tracked_keys.end()) {</a>
+<a name="ln574">      if (key_iter-&gt;second.num_reads &gt; 0) {</a>
+<a name="ln575">        key_iter-&gt;second.num_reads--;</a>
+<a name="ln576"> </a>
+<a name="ln577">        if (key_iter-&gt;second.num_reads == 0 &amp;&amp;</a>
+<a name="ln578">            key_iter-&gt;second.num_writes == 0) {</a>
+<a name="ln579">          // No other GetForUpdates or writes on this key</a>
+<a name="ln580">          assert(can_unlock);</a>
+<a name="ln581">          cf_tracked_keys.erase(key_iter);</a>
+<a name="ln582">          UnlockGetForUpdate(column_family, key);</a>
+<a name="ln583">        }</a>
+<a name="ln584">      }</a>
+<a name="ln585">    }</a>
+<a name="ln586">  }</a>
+<a name="ln587">}</a>
+<a name="ln588"> </a>
+<a name="ln589">}  // namespace rocksdb</a>
+<a name="ln590"> </a>
+<a name="ln591">#endif  // ROCKSDB_LITE</a>
+
+</code></pre>
+<div class="balloon" rel="209"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v595/" target="_blank">V595</a> The 'values' pointer was utilized before it was verified against nullptr. Check lines: 209, 213.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

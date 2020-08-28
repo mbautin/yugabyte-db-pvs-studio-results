@@ -1,0 +1,2428 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>executor.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/yql/cql/ql/util/errcodes.h&quot;</a>
+<a name="ln17">#include &quot;yb/yql/cql/ql/exec/executor.h&quot;</a>
+<a name="ln18">#include &quot;yb/yql/cql/ql/ql_processor.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/client/callbacks.h&quot;</a>
+<a name="ln21">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln22">#include &quot;yb/client/error.h&quot;</a>
+<a name="ln23">#include &quot;yb/client/rejection_score_source.h&quot;</a>
+<a name="ln24">#include &quot;yb/client/table.h&quot;</a>
+<a name="ln25">#include &quot;yb/client/table_alterer.h&quot;</a>
+<a name="ln26">#include &quot;yb/client/table_creator.h&quot;</a>
+<a name="ln27">#include &quot;yb/client/yb_op.h&quot;</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &quot;yb/common/common.pb.h&quot;</a>
+<a name="ln30">#include &quot;yb/common/ql_protocol_util.h&quot;</a>
+<a name="ln31">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln32">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln33"> </a>
+<a name="ln34">#include &quot;yb/rpc/thread_pool.h&quot;</a>
+<a name="ln35">#include &quot;yb/util/decimal.h&quot;</a>
+<a name="ln36">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln37">#include &quot;yb/util/random_util.h&quot;</a>
+<a name="ln38">#include &quot;yb/util/thread_restrictions.h&quot;</a>
+<a name="ln39">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41">namespace yb {</a>
+<a name="ln42">namespace ql {</a>
+<a name="ln43"> </a>
+<a name="ln44">using std::string;</a>
+<a name="ln45">using std::shared_ptr;</a>
+<a name="ln46">using namespace std::placeholders;</a>
+<a name="ln47"> </a>
+<a name="ln48">using client::YBColumnSpec;</a>
+<a name="ln49">using client::YBOperation;</a>
+<a name="ln50">using client::YBqlOpPtr;</a>
+<a name="ln51">using client::YBqlReadOp;</a>
+<a name="ln52">using client::YBqlReadOpPtr;</a>
+<a name="ln53">using client::YBqlWriteOp;</a>
+<a name="ln54">using client::YBqlWriteOpPtr;</a>
+<a name="ln55">using client::YBSchema;</a>
+<a name="ln56">using client::YBSchemaBuilder;</a>
+<a name="ln57">using client::YBSessionPtr;</a>
+<a name="ln58">using client::YBTableAlterer;</a>
+<a name="ln59">using client::YBTableCreator;</a>
+<a name="ln60">using client::YBTableName;</a>
+<a name="ln61">using client::YBTableType;</a>
+<a name="ln62">using strings::Substitute;</a>
+<a name="ln63"> </a>
+<a name="ln64">#define RETURN_STMT_NOT_OK(s) do {                                         \</a>
+<a name="ln65">    auto&amp;&amp; _s = (s);                                                       \</a>
+<a name="ln66">    if (PREDICT_FALSE(!_s.ok())) return StatementExecuted(MoveStatus(_s)); \</a>
+<a name="ln67">  } while (false)</a>
+<a name="ln68"> </a>
+<a name="ln69">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln70"> </a>
+<a name="ln71">Executor::Executor(QLEnv *ql_env, Rescheduler* rescheduler, const QLMetrics* ql_metrics)</a>
+<a name="ln72">    : ql_env_(ql_env),</a>
+<a name="ln73">      rescheduler_(rescheduler),</a>
+<a name="ln74">      session_(ql_env_-&gt;NewSession()),</a>
+<a name="ln75">      ql_metrics_(ql_metrics) {</a>
+<a name="ln76">}</a>
+<a name="ln77"> </a>
+<a name="ln78">Executor::~Executor() {</a>
+<a name="ln79">}</a>
+<a name="ln80"> </a>
+<a name="ln81">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln82"> </a>
+<a name="ln83">void Executor::ExecuteAsync(const ParseTree&amp; parse_tree, const StatementParameters&amp; params,</a>
+<a name="ln84">                            StatementExecutedCallback cb) {</a>
+<a name="ln85">  DCHECK(cb_.is_null()) &lt;&lt; &quot;Another execution is in progress.&quot;;</a>
+<a name="ln86">  cb_ = std::move(cb);</a>
+<a name="ln87">  session_-&gt;SetForceConsistentRead(client::ForceConsistentRead::kFalse);</a>
+<a name="ln88">  auto read_time = params.read_time();</a>
+<a name="ln89">  if (read_time) {</a>
+<a name="ln90">    session_-&gt;SetReadPoint(read_time);</a>
+<a name="ln91">  } else {</a>
+<a name="ln92">    session_-&gt;SetReadPoint(client::Restart::kFalse);</a>
+<a name="ln93">  }</a>
+<a name="ln94">  RETURN_STMT_NOT_OK(Execute(parse_tree, params));</a>
+<a name="ln95">  FlushAsync();</a>
+<a name="ln96">}</a>
+<a name="ln97"> </a>
+<a name="ln98">void Executor::ExecuteAsync(const StatementBatch&amp; batch, StatementExecutedCallback cb) {</a>
+<a name="ln99">  DCHECK(cb_.is_null()) &lt;&lt; &quot;Another execution is in progress.&quot;;</a>
+<a name="ln100">  cb_ = std::move(cb);</a>
+<a name="ln101">  session_-&gt;SetForceConsistentRead(client::ForceConsistentRead::kFalse);</a>
+<a name="ln102">  session_-&gt;SetReadPoint(client::Restart::kFalse);</a>
+<a name="ln103"> </a>
+<a name="ln104">  // Table for DML batches, where all statements must modify the same table.</a>
+<a name="ln105">  client::YBTablePtr dml_batch_table;</a>
+<a name="ln106"> </a>
+<a name="ln107">  // Verify the statements in the batch.</a>
+<a name="ln108">  for (const auto&amp; pair : batch) {</a>
+<a name="ln109">    const ParseTree&amp; parse_tree = pair.first;</a>
+<a name="ln110">    const TreeNode* tnode = parse_tree.root().get();</a>
+<a name="ln111">    if (tnode != nullptr) {</a>
+<a name="ln112">      switch (tnode-&gt;opcode()) {</a>
+<a name="ln113">        case TreeNodeOpcode::kPTInsertStmt: FALLTHROUGH_INTENDED;</a>
+<a name="ln114">        case TreeNodeOpcode::kPTUpdateStmt: FALLTHROUGH_INTENDED;</a>
+<a name="ln115">        case TreeNodeOpcode::kPTDeleteStmt: {</a>
+<a name="ln116">          const auto *stmt = static_cast&lt;const PTDmlStmt *&gt;(tnode);</a>
+<a name="ln117">          if (stmt-&gt;if_clause() != nullptr &amp;&amp; !stmt-&gt;returns_status()) {</a>
+<a name="ln118">            return StatementExecuted(</a>
+<a name="ln119">                ErrorStatus(ErrorCode::CQL_STATEMENT_INVALID,</a>
+<a name="ln120">                            &quot;batch execution of conditional DML statement without RETURNS STATUS &quot;</a>
+<a name="ln121">                            &quot;AS ROW clause is not supported yet&quot;));</a>
+<a name="ln122">          }</a>
+<a name="ln123"> </a>
+<a name="ln124">          if (stmt-&gt;ModifiesMultipleRows()) {</a>
+<a name="ln125">            return StatementExecuted(</a>
+<a name="ln126">                ErrorStatus(ErrorCode::CQL_STATEMENT_INVALID,</a>
+<a name="ln127">                            &quot;batch execution with DML statements modifying multiple rows is not &quot;</a>
+<a name="ln128">                            &quot;supported yet&quot;));</a>
+<a name="ln129">          }</a>
+<a name="ln130"> </a>
+<a name="ln131">          if (!returns_status_batch_opt_) {</a>
+<a name="ln132">            returns_status_batch_opt_ = stmt-&gt;returns_status();</a>
+<a name="ln133">          } else if (stmt-&gt;returns_status() != *returns_status_batch_opt_) {</a>
+<a name="ln134">            return StatementExecuted(</a>
+<a name="ln135">                ErrorStatus(ErrorCode::CQL_STATEMENT_INVALID,</a>
+<a name="ln136">                            &quot;batch execution mixing statements with and without RETURNS STATUS &quot;</a>
+<a name="ln137">                            &quot;AS ROW is not supported&quot;));</a>
+<a name="ln138">          }</a>
+<a name="ln139"> </a>
+<a name="ln140">          if (*returns_status_batch_opt_) {</a>
+<a name="ln141">            if (dml_batch_table == nullptr) {</a>
+<a name="ln142">              dml_batch_table = stmt-&gt;table();</a>
+<a name="ln143">            } else if (dml_batch_table-&gt;id() != stmt-&gt;table()-&gt;id()) {</a>
+<a name="ln144">              return StatementExecuted(</a>
+<a name="ln145">                  ErrorStatus(ErrorCode::CQL_STATEMENT_INVALID,</a>
+<a name="ln146">                              &quot;batch execution with RETURNS STATUS statements cannot span multiple &quot;</a>
+<a name="ln147">                              &quot;tables&quot;));</a>
+<a name="ln148">            }</a>
+<a name="ln149">          }</a>
+<a name="ln150"> </a>
+<a name="ln151">          break;</a>
+<a name="ln152">        }</a>
+<a name="ln153">        default:</a>
+<a name="ln154">          return StatementExecuted(</a>
+<a name="ln155">              ErrorStatus(ErrorCode::CQL_STATEMENT_INVALID,</a>
+<a name="ln156">                          &quot;batch execution supports INSERT, UPDATE and DELETE statements only &quot;</a>
+<a name="ln157">                          &quot;currently&quot;));</a>
+<a name="ln158">          break;</a>
+<a name="ln159">      }</a>
+<a name="ln160">    }</a>
+<a name="ln161">  }</a>
+<a name="ln162"> </a>
+<a name="ln163">  for (const auto&amp; pair : batch) {</a>
+<a name="ln164">    const ParseTree&amp; parse_tree = pair.first;</a>
+<a name="ln165">    const StatementParameters&amp; params = pair.second;</a>
+<a name="ln166">    RETURN_STMT_NOT_OK(Execute(parse_tree, params));</a>
+<a name="ln167">  }</a>
+<a name="ln168"> </a>
+<a name="ln169">  FlushAsync();</a>
+<a name="ln170">}</a>
+<a name="ln171"> </a>
+<a name="ln172">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln173"> </a>
+<a name="ln174">Status Executor::Execute(const ParseTree&amp; parse_tree, const StatementParameters&amp; params) {</a>
+<a name="ln175">  // Prepare execution context and execute the parse tree's root node.</a>
+<a name="ln176">  exec_contexts_.emplace_back(parse_tree, params);</a>
+<a name="ln177">  exec_context_ = &amp;exec_contexts_.back();</a>
+<a name="ln178">  auto root_node = parse_tree.root().get();</a>
+<a name="ln179">  RETURN_NOT_OK(PreExecTreeNode(root_node));</a>
+<a name="ln180">  return ProcessStatementStatus(parse_tree, ExecTreeNode(root_node));</a>
+<a name="ln181">}</a>
+<a name="ln182"> </a>
+<a name="ln183">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln184"> </a>
+<a name="ln185">Status Executor::PreExecTreeNode(TreeNode *tnode) {</a>
+<a name="ln186">  if (!tnode) {</a>
+<a name="ln187">    return Status::OK();</a>
+<a name="ln188">  } else if (tnode-&gt;opcode() == TreeNodeOpcode::kPTInsertStmt) {</a>
+<a name="ln189">    return PreExecTreeNode(static_cast&lt;PTInsertStmt*&gt;(tnode));</a>
+<a name="ln190">  } else {</a>
+<a name="ln191">    return Status::OK();</a>
+<a name="ln192">  }</a>
+<a name="ln193">}</a>
+<a name="ln194"> </a>
+<a name="ln195">Status Executor::PreExecTreeNode(PTInsertStmt *tnode) {</a>
+<a name="ln196">  if (tnode-&gt;InsertingValue()-&gt;opcode() == TreeNodeOpcode::kPTInsertJsonClause) {</a>
+<a name="ln197">    // We couldn't resolve JSON clause bind variable until now</a>
+<a name="ln198">    return PreExecTreeNode(static_cast&lt;PTInsertJsonClause*&gt;(tnode-&gt;InsertingValue().get()));</a>
+<a name="ln199">  } else {</a>
+<a name="ln200">    return Status::OK();</a>
+<a name="ln201">  }</a>
+<a name="ln202">}</a>
+<a name="ln203"> </a>
+<a name="ln204">shared_ptr&lt;client::YBTable&gt; Executor::GetTableFromStatement(const TreeNode *tnode) const {</a>
+<a name="ln205">  if (tnode != nullptr) {</a>
+<a name="ln206">    switch (tnode-&gt;opcode()) {</a>
+<a name="ln207">      case TreeNodeOpcode::kPTAlterTable:</a>
+<a name="ln208">        return static_cast&lt;const PTAlterTable *&gt;(tnode)-&gt;table();</a>
+<a name="ln209"> </a>
+<a name="ln210">      case TreeNodeOpcode::kPTSelectStmt:</a>
+<a name="ln211">        return static_cast&lt;const PTSelectStmt *&gt;(tnode)-&gt;table();</a>
+<a name="ln212"> </a>
+<a name="ln213">      case TreeNodeOpcode::kPTInsertStmt:</a>
+<a name="ln214">        return static_cast&lt;const PTInsertStmt *&gt;(tnode)-&gt;table();</a>
+<a name="ln215"> </a>
+<a name="ln216">      case TreeNodeOpcode::kPTDeleteStmt:</a>
+<a name="ln217">        return static_cast&lt;const PTDeleteStmt *&gt;(tnode)-&gt;table();</a>
+<a name="ln218"> </a>
+<a name="ln219">      case TreeNodeOpcode::kPTUpdateStmt:</a>
+<a name="ln220">        return static_cast&lt;const PTUpdateStmt *&gt;(tnode)-&gt;table();</a>
+<a name="ln221"> </a>
+<a name="ln222">      case TreeNodeOpcode::kPTExplainStmt:</a>
+<a name="ln223">        return GetTableFromStatement(static_cast&lt;const PTExplainStmt *&gt;(tnode)-&gt;stmt().get());</a>
+<a name="ln224"> </a>
+<a name="ln225">      default: break;</a>
+<a name="ln226">    }</a>
+<a name="ln227">  }</a>
+<a name="ln228"> </a>
+<a name="ln229">  return nullptr;</a>
+<a name="ln230">}</a>
+<a name="ln231"> </a>
+<a name="ln232">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln233"> </a>
+<a name="ln234">Status Executor::ExecTreeNode(const TreeNode *tnode) {</a>
+<a name="ln235">  if (tnode == nullptr) {</a>
+<a name="ln236">    return Status::OK();</a>
+<a name="ln237">  }</a>
+<a name="ln238">  TnodeContext* tnode_context = nullptr;</a>
+<a name="ln239">  if (tnode-&gt;opcode() != TreeNodeOpcode::kPTListNode) {</a>
+<a name="ln240">    tnode_context = exec_context_-&gt;AddTnode(tnode);</a>
+<a name="ln241">    if (tnode-&gt;IsDml() &amp;&amp; static_cast&lt;const PTDmlStmt *&gt;(tnode)-&gt;RequiresTransaction()) {</a>
+<a name="ln242">      RETURN_NOT_OK(exec_context_-&gt;StartTransaction(SNAPSHOT_ISOLATION, ql_env_));</a>
+<a name="ln243">    }</a>
+<a name="ln244">  }</a>
+<a name="ln245">  switch (tnode-&gt;opcode()) {</a>
+<a name="ln246">    case TreeNodeOpcode::kPTListNode:</a>
+<a name="ln247">      return ExecPTNode(static_cast&lt;const PTListNode *&gt;(tnode));</a>
+<a name="ln248"> </a>
+<a name="ln249">    case TreeNodeOpcode::kPTCreateTable: FALLTHROUGH_INTENDED;</a>
+<a name="ln250">    case TreeNodeOpcode::kPTCreateIndex:</a>
+<a name="ln251">      return ExecPTNode(static_cast&lt;const PTCreateTable *&gt;(tnode));</a>
+<a name="ln252"> </a>
+<a name="ln253">    case TreeNodeOpcode::kPTAlterTable:</a>
+<a name="ln254">      return ExecPTNode(static_cast&lt;const PTAlterTable *&gt;(tnode));</a>
+<a name="ln255"> </a>
+<a name="ln256">    case TreeNodeOpcode::kPTCreateType:</a>
+<a name="ln257">      return ExecPTNode(static_cast&lt;const PTCreateType *&gt;(tnode));</a>
+<a name="ln258"> </a>
+<a name="ln259">    case TreeNodeOpcode::kPTCreateRole:</a>
+<a name="ln260">      return ExecPTNode(static_cast&lt;const PTCreateRole *&gt;(tnode));</a>
+<a name="ln261"> </a>
+<a name="ln262">    case TreeNodeOpcode::kPTAlterRole:</a>
+<a name="ln263">      return ExecPTNode(static_cast&lt;const PTAlterRole *&gt;(tnode));</a>
+<a name="ln264"> </a>
+<a name="ln265">    case TreeNodeOpcode::kPTGrantRevokeRole:</a>
+<a name="ln266">      return ExecPTNode(static_cast&lt;const PTGrantRevokeRole *&gt;(tnode));</a>
+<a name="ln267"> </a>
+<a name="ln268">    case TreeNodeOpcode::kPTDropStmt:</a>
+<a name="ln269">      return ExecPTNode(static_cast&lt;const PTDropStmt *&gt;(tnode));</a>
+<a name="ln270"> </a>
+<a name="ln271">    case TreeNodeOpcode::kPTGrantRevokePermission:</a>
+<a name="ln272">      return ExecPTNode(static_cast&lt;const PTGrantRevokePermission *&gt;(tnode));</a>
+<a name="ln273"> </a>
+<a name="ln274">    case TreeNodeOpcode::kPTSelectStmt:</a>
+<a name="ln275">      return ExecPTNode(static_cast&lt;const PTSelectStmt *&gt;(tnode), tnode_context);</a>
+<a name="ln276"> </a>
+<a name="ln277">    case TreeNodeOpcode::kPTInsertStmt:</a>
+<a name="ln278">      return ExecPTNode(static_cast&lt;const PTInsertStmt *&gt;(tnode), tnode_context);</a>
+<a name="ln279"> </a>
+<a name="ln280">    case TreeNodeOpcode::kPTDeleteStmt:</a>
+<a name="ln281">      return ExecPTNode(static_cast&lt;const PTDeleteStmt *&gt;(tnode), tnode_context);</a>
+<a name="ln282"> </a>
+<a name="ln283">    case TreeNodeOpcode::kPTUpdateStmt:</a>
+<a name="ln284">      return ExecPTNode(static_cast&lt;const PTUpdateStmt *&gt;(tnode), tnode_context);</a>
+<a name="ln285"> </a>
+<a name="ln286">    case TreeNodeOpcode::kPTStartTransaction:</a>
+<a name="ln287">      return ExecPTNode(static_cast&lt;const PTStartTransaction *&gt;(tnode));</a>
+<a name="ln288"> </a>
+<a name="ln289">    case TreeNodeOpcode::kPTCommit:</a>
+<a name="ln290">      return ExecPTNode(static_cast&lt;const PTCommit *&gt;(tnode));</a>
+<a name="ln291"> </a>
+<a name="ln292">    case TreeNodeOpcode::kPTTruncateStmt:</a>
+<a name="ln293">      return ExecPTNode(static_cast&lt;const PTTruncateStmt *&gt;(tnode));</a>
+<a name="ln294"> </a>
+<a name="ln295">    case TreeNodeOpcode::kPTCreateKeyspace:</a>
+<a name="ln296">      return ExecPTNode(static_cast&lt;const PTCreateKeyspace *&gt;(tnode));</a>
+<a name="ln297"> </a>
+<a name="ln298">    case TreeNodeOpcode::kPTUseKeyspace:</a>
+<a name="ln299">      return ExecPTNode(static_cast&lt;const PTUseKeyspace *&gt;(tnode));</a>
+<a name="ln300"> </a>
+<a name="ln301">    case TreeNodeOpcode::kPTAlterKeyspace:</a>
+<a name="ln302">      return ExecPTNode(static_cast&lt;const PTAlterKeyspace *&gt;(tnode));</a>
+<a name="ln303"> </a>
+<a name="ln304">    case TreeNodeOpcode::kPTExplainStmt:</a>
+<a name="ln305">      return ExecPTNode(static_cast&lt;const PTExplainStmt *&gt;(tnode));</a>
+<a name="ln306"> </a>
+<a name="ln307">    default:</a>
+<a name="ln308">      return exec_context_-&gt;Error(tnode, ErrorCode::FEATURE_NOT_SUPPORTED);</a>
+<a name="ln309">  }</a>
+<a name="ln310">}</a>
+<a name="ln311"> </a>
+<a name="ln312">Status Executor::ExecPTNode(const PTCreateRole *tnode) {</a>
+<a name="ln313">  const Status s = ql_env_-&gt;CreateRole(tnode-&gt;role_name(), tnode-&gt;salted_hash(), tnode-&gt;login(),</a>
+<a name="ln314">                                       tnode-&gt;superuser());</a>
+<a name="ln315">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln316">    ErrorCode error_code = ErrorCode::SERVER_ERROR;</a>
+<a name="ln317">    if (s.IsAlreadyPresent()) {</a>
+<a name="ln318">      error_code = ErrorCode::DUPLICATE_ROLE;</a>
+<a name="ln319">    } else if (s.IsNotAuthorized()) {</a>
+<a name="ln320">      error_code = ErrorCode::UNAUTHORIZED;</a>
+<a name="ln321">    }</a>
+<a name="ln322"> </a>
+<a name="ln323">    if (tnode-&gt;create_if_not_exists() &amp;&amp; error_code == ErrorCode::DUPLICATE_ROLE) {</a>
+<a name="ln324">      return Status::OK();</a>
+<a name="ln325">    }</a>
+<a name="ln326"> </a>
+<a name="ln327">    // TODO (Bristy) : Set result_ properly.</a>
+<a name="ln328">    return exec_context_-&gt;Error(tnode, s, error_code);</a>
+<a name="ln329">  }</a>
+<a name="ln330"> </a>
+<a name="ln331">  return Status::OK();</a>
+<a name="ln332">}</a>
+<a name="ln333"> </a>
+<a name="ln334">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln335"> </a>
+<a name="ln336">Status Executor::ExecPTNode(const PTAlterRole *tnode) {</a>
+<a name="ln337">  const Status s = ql_env_-&gt;AlterRole(tnode-&gt;role_name(), tnode-&gt;salted_hash(), tnode-&gt;login(),</a>
+<a name="ln338">                                      tnode-&gt;superuser());</a>
+<a name="ln339">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln340">    ErrorCode error_code = ErrorCode::ROLE_NOT_FOUND;</a>
+<a name="ln341">    if (s.IsNotAuthorized()) {</a>
+<a name="ln342">      error_code = ErrorCode::UNAUTHORIZED;</a>
+<a name="ln343">    }</a>
+<a name="ln344">    return exec_context_-&gt;Error(tnode, s, error_code);</a>
+<a name="ln345">  }</a>
+<a name="ln346"> </a>
+<a name="ln347">  return Status::OK();</a>
+<a name="ln348">}</a>
+<a name="ln349"> </a>
+<a name="ln350">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln351"> </a>
+<a name="ln352">Status Executor::ExecPTNode(const PTGrantRevokeRole* tnode) {</a>
+<a name="ln353">  const Status s = ql_env_-&gt;GrantRevokeRole(tnode-&gt;statement_type(), tnode-&gt;granted_role_name(),</a>
+<a name="ln354">                                            tnode-&gt;recipient_role_name());</a>
+<a name="ln355">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln356">    ErrorCode error_code = ErrorCode::SERVER_ERROR;</a>
+<a name="ln357">    if (s.IsInvalidArgument()) {</a>
+<a name="ln358">      error_code = ErrorCode::INVALID_REQUEST;</a>
+<a name="ln359">    } else if (s.IsNotFound()) {</a>
+<a name="ln360">      error_code = ErrorCode::ROLE_NOT_FOUND;</a>
+<a name="ln361">    }</a>
+<a name="ln362">    // TODO (Bristy) : Set result_ properly.</a>
+<a name="ln363">    return exec_context_-&gt;Error(tnode, s, error_code);</a>
+<a name="ln364">  }</a>
+<a name="ln365">  return Status::OK();</a>
+<a name="ln366">}</a>
+<a name="ln367"> </a>
+<a name="ln368">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln369"> </a>
+<a name="ln370">Status Executor::ExecPTNode(const PTListNode *tnode) {</a>
+<a name="ln371">  for (TreeNode::SharedPtr dml : tnode-&gt;node_list()) {</a>
+<a name="ln372">    RETURN_NOT_OK(ExecTreeNode(dml.get()));</a>
+<a name="ln373">  }</a>
+<a name="ln374">  return Status::OK();</a>
+<a name="ln375">}</a>
+<a name="ln376"> </a>
+<a name="ln377">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln378"> </a>
+<a name="ln379">Status Executor::ExecPTNode(const PTCreateType *tnode) {</a>
+<a name="ln380">  YBTableName yb_name = tnode-&gt;yb_type_name();</a>
+<a name="ln381"> </a>
+<a name="ln382">  const std::string&amp; type_name = yb_name.table_name();</a>
+<a name="ln383">  std::string keyspace_name = yb_name.namespace_name();</a>
+<a name="ln384"> </a>
+<a name="ln385">  std::vector&lt;std::string&gt; field_names;</a>
+<a name="ln386">  std::vector&lt;std::shared_ptr&lt;QLType&gt;&gt; field_types;</a>
+<a name="ln387"> </a>
+<a name="ln388">  for (const PTTypeField::SharedPtr&amp; field : tnode-&gt;fields()-&gt;node_list()) {</a>
+<a name="ln389">    field_names.emplace_back(field-&gt;yb_name());</a>
+<a name="ln390">    field_types.push_back(field-&gt;ql_type());</a>
+<a name="ln391">  }</a>
+<a name="ln392"> </a>
+<a name="ln393">  Status s = ql_env_-&gt;CreateUDType(keyspace_name, type_name, field_names, field_types);</a>
+<a name="ln394">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln395">    ErrorCode error_code = ErrorCode::SERVER_ERROR;</a>
+<a name="ln396">    if (s.IsAlreadyPresent()) {</a>
+<a name="ln397">      error_code = ErrorCode::DUPLICATE_TYPE;</a>
+<a name="ln398">    } else if (s.IsNotFound()) {</a>
+<a name="ln399">      error_code = ErrorCode::KEYSPACE_NOT_FOUND;</a>
+<a name="ln400">    } else if (s.IsInvalidArgument()) {</a>
+<a name="ln401">      error_code = ErrorCode::INVALID_TYPE_DEFINITION;</a>
+<a name="ln402">    }</a>
+<a name="ln403"> </a>
+<a name="ln404">    if (tnode-&gt;create_if_not_exists() &amp;&amp; error_code == ErrorCode::DUPLICATE_TYPE) {</a>
+<a name="ln405">      return Status::OK();</a>
+<a name="ln406">    }</a>
+<a name="ln407"> </a>
+<a name="ln408">    return exec_context_-&gt;Error(tnode-&gt;type_name(), s, error_code);</a>
+<a name="ln409">  }</a>
+<a name="ln410"> </a>
+<a name="ln411">  result_ = std::make_shared&lt;SchemaChangeResult&gt;(&quot;CREATED&quot;, &quot;TYPE&quot;, keyspace_name, type_name);</a>
+<a name="ln412">  return Status::OK();</a>
+<a name="ln413">}</a>
+<a name="ln414"> </a>
+<a name="ln415">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln416"> </a>
+<a name="ln417">Status Executor::ExecPTNode(const PTCreateTable *tnode) {</a>
+<a name="ln418">  YBTableName table_name = tnode-&gt;yb_table_name();</a>
+<a name="ln419"> </a>
+<a name="ln420">  if (table_name.is_system() &amp;&amp; client::FLAGS_yb_system_namespace_readonly) {</a>
+<a name="ln421">    return exec_context_-&gt;Error(tnode-&gt;table_name(), ErrorCode::SYSTEM_NAMESPACE_READONLY);</a>
+<a name="ln422">  }</a>
+<a name="ln423"> </a>
+<a name="ln424">  // Setting up columns.</a>
+<a name="ln425">  Status s;</a>
+<a name="ln426">  YBSchema schema;</a>
+<a name="ln427">  YBSchemaBuilder b;</a>
+<a name="ln428">  shared_ptr&lt;YBTableCreator&gt; table_creator(ql_env_-&gt;NewTableCreator());</a>
+<a name="ln429">  // Table properties is kept in the metadata of the IndexTable.</a>
+<a name="ln430">  TableProperties table_properties;</a>
+<a name="ln431">  // IndexInfo is kept in the metadata of the Table that is being indexed.</a>
+<a name="ln432">  IndexInfoPB *index_info = nullptr;</a>
+<a name="ln433"> </a>
+<a name="ln434">  // When creating an index, we construct IndexInfo and associated it with the data-table. Later,</a>
+<a name="ln435">  // when operating on the data-table, we can decide if updating the index-tables are needed.</a>
+<a name="ln436">  if (tnode-&gt;opcode() == TreeNodeOpcode::kPTCreateIndex) {</a>
+<a name="ln437">    const PTCreateIndex *index_node = static_cast&lt;const PTCreateIndex*&gt;(tnode);</a>
+<a name="ln438"> </a>
+<a name="ln439">    index_info = table_creator-&gt;mutable_index_info();</a>
+<a name="ln440">    index_info-&gt;set_indexed_table_id(index_node-&gt;indexed_table_id());</a>
+<a name="ln441">    index_info-&gt;set_is_local(index_node-&gt;is_local());</a>
+<a name="ln442">    index_info-&gt;set_is_unique(index_node-&gt;is_unique());</a>
+<a name="ln443">    index_info-&gt;set_hash_column_count(tnode-&gt;hash_columns().size());</a>
+<a name="ln444">    index_info-&gt;set_range_column_count(tnode-&gt;primary_columns().size());</a>
+<a name="ln445">    index_info-&gt;set_use_mangled_column_name(true);</a>
+<a name="ln446"> </a>
+<a name="ln447">    // List key columns of data-table being indexed.</a>
+<a name="ln448">    for (const auto&amp; col_desc : index_node-&gt;column_descs()) {</a>
+<a name="ln449">      if (col_desc.is_hash()) {</a>
+<a name="ln450">        index_info-&gt;add_indexed_hash_column_ids(col_desc.id());</a>
+<a name="ln451">      } else if (col_desc.is_primary()) {</a>
+<a name="ln452">        index_info-&gt;add_indexed_range_column_ids(col_desc.id());</a>
+<a name="ln453">      }</a>
+<a name="ln454">    }</a>
+<a name="ln455">  }</a>
+<a name="ln456"> </a>
+<a name="ln457">  for (const auto&amp; column : tnode-&gt;hash_columns()) {</a>
+<a name="ln458">    if (column-&gt;sorting_type() != ColumnSchema::SortingType::kNotSpecified) {</a>
+<a name="ln459">      return exec_context_-&gt;Error(tnode-&gt;columns().front(), s, ErrorCode::INVALID_TABLE_DEFINITION);</a>
+<a name="ln460">    }</a>
+<a name="ln461">    b.AddColumn(column-&gt;coldef_name().c_str())</a>
+<a name="ln462">      -&gt;Type(column-&gt;ql_type())</a>
+<a name="ln463">      -&gt;HashPrimaryKey()</a>
+<a name="ln464">      -&gt;Order(column-&gt;order());</a>
+<a name="ln465">    RETURN_NOT_OK(AddColumnToIndexInfo(index_info, column));</a>
+<a name="ln466">  }</a>
+<a name="ln467"> </a>
+<a name="ln468">  for (const auto&amp; column : tnode-&gt;primary_columns()) {</a>
+<a name="ln469">    b.AddColumn(column-&gt;coldef_name().c_str())</a>
+<a name="ln470">      -&gt;Type(column-&gt;ql_type())</a>
+<a name="ln471">      -&gt;PrimaryKey()</a>
+<a name="ln472">      -&gt;Order(column-&gt;order())</a>
+<a name="ln473">      -&gt;SetSortingType(column-&gt;sorting_type());</a>
+<a name="ln474">    RETURN_NOT_OK(AddColumnToIndexInfo(index_info, column));</a>
+<a name="ln475">  }</a>
+<a name="ln476"> </a>
+<a name="ln477">  for (const auto&amp; column : tnode-&gt;columns()) {</a>
+<a name="ln478">    if (column-&gt;sorting_type() != ColumnSchema::SortingType::kNotSpecified) {</a>
+<a name="ln479">      return exec_context_-&gt;Error(tnode-&gt;columns().front(), s, ErrorCode::INVALID_TABLE_DEFINITION);</a>
+<a name="ln480">    }</a>
+<a name="ln481">    YBColumnSpec *column_spec = b.AddColumn(column-&gt;coldef_name().c_str())</a>
+<a name="ln482">                                  -&gt;Type(column-&gt;ql_type())</a>
+<a name="ln483">                                  -&gt;Nullable()</a>
+<a name="ln484">                                  -&gt;Order(column-&gt;order());</a>
+<a name="ln485">    if (column-&gt;is_static()) {</a>
+<a name="ln486">      column_spec-&gt;StaticColumn();</a>
+<a name="ln487">    }</a>
+<a name="ln488">    if (column-&gt;is_counter()) {</a>
+<a name="ln489">      column_spec-&gt;Counter();</a>
+<a name="ln490">    }</a>
+<a name="ln491">    RETURN_NOT_OK(AddColumnToIndexInfo(index_info, column));</a>
+<a name="ln492">  }</a>
+<a name="ln493"> </a>
+<a name="ln494">  s = tnode-&gt;ToTableProperties(&amp;table_properties);</a>
+<a name="ln495">  if (!s.ok()) {</a>
+<a name="ln496">    return exec_context_-&gt;Error(tnode-&gt;columns().front(), s, ErrorCode::INVALID_TABLE_DEFINITION);</a>
+<a name="ln497">  }</a>
+<a name="ln498">  b.SetTableProperties(table_properties);</a>
+<a name="ln499"> </a>
+<a name="ln500">  s = b.Build(&amp;schema);</a>
+<a name="ln501">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln502">    return exec_context_-&gt;Error(tnode-&gt;columns().front(), s, ErrorCode::INVALID_TABLE_DEFINITION);</a>
+<a name="ln503">  }</a>
+<a name="ln504"> </a>
+<a name="ln505">  // Create table.</a>
+<a name="ln506">  table_creator-&gt;table_name(table_name)</a>
+<a name="ln507">      .table_type(YBTableType::YQL_TABLE_TYPE)</a>
+<a name="ln508">      .creator_role_name(ql_env_-&gt;CurrentRoleName())</a>
+<a name="ln509">      .schema(&amp;schema);</a>
+<a name="ln510"> </a>
+<a name="ln511">  if (tnode-&gt;opcode() == TreeNodeOpcode::kPTCreateIndex) {</a>
+<a name="ln512">    const PTCreateIndex *index_node = static_cast&lt;const PTCreateIndex*&gt;(tnode);</a>
+<a name="ln513">    table_creator-&gt;indexed_table_id(index_node-&gt;indexed_table_id());</a>
+<a name="ln514">    table_creator-&gt;is_local_index(index_node-&gt;is_local());</a>
+<a name="ln515">    table_creator-&gt;is_unique_index(index_node-&gt;is_unique());</a>
+<a name="ln516">  }</a>
+<a name="ln517"> </a>
+<a name="ln518">  // Clean-up table cache BEFORE op (the cache is used by other processor threads).</a>
+<a name="ln519">  ql_env_-&gt;RemoveCachedTableDesc(table_name);</a>
+<a name="ln520">  if (tnode-&gt;opcode() == TreeNodeOpcode::kPTCreateIndex) {</a>
+<a name="ln521">    const YBTableName indexed_table_name =</a>
+<a name="ln522">        static_cast&lt;const PTCreateIndex*&gt;(tnode)-&gt;indexed_table_name();</a>
+<a name="ln523">    ql_env_-&gt;RemoveCachedTableDesc(indexed_table_name);</a>
+<a name="ln524">  }</a>
+<a name="ln525"> </a>
+<a name="ln526">  s = table_creator-&gt;Create();</a>
+<a name="ln527">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln528">    ErrorCode error_code = ErrorCode::SERVER_ERROR;</a>
+<a name="ln529">    if (s.IsAlreadyPresent()) {</a>
+<a name="ln530">      error_code = ErrorCode::DUPLICATE_OBJECT;</a>
+<a name="ln531">    } else if (s.IsNotFound()) {</a>
+<a name="ln532">      error_code = tnode-&gt;opcode() == TreeNodeOpcode::kPTCreateIndex</a>
+<a name="ln533">                   ? ErrorCode::OBJECT_NOT_FOUND</a>
+<a name="ln534">                   : ErrorCode::KEYSPACE_NOT_FOUND;</a>
+<a name="ln535">    } else if (s.IsInvalidArgument()) {</a>
+<a name="ln536">      error_code = ErrorCode::INVALID_TABLE_DEFINITION;</a>
+<a name="ln537">    }</a>
+<a name="ln538"> </a>
+<a name="ln539">    if (tnode-&gt;create_if_not_exists() &amp;&amp; error_code == ErrorCode::DUPLICATE_OBJECT) {</a>
+<a name="ln540">      return Status::OK();</a>
+<a name="ln541">    }</a>
+<a name="ln542"> </a>
+<a name="ln543">    return exec_context_-&gt;Error(tnode-&gt;table_name(), s, error_code);</a>
+<a name="ln544">  }</a>
+<a name="ln545"> </a>
+<a name="ln546">  // Clean-up table cache AFTER op (the cache is used by other processor threads).</a>
+<a name="ln547">  ql_env_-&gt;RemoveCachedTableDesc(table_name);</a>
+<a name="ln548"> </a>
+<a name="ln549">  if (tnode-&gt;opcode() == TreeNodeOpcode::kPTCreateIndex) {</a>
+<a name="ln550">    const YBTableName indexed_table_name =</a>
+<a name="ln551">        static_cast&lt;const PTCreateIndex*&gt;(tnode)-&gt;indexed_table_name();</a>
+<a name="ln552">    // Clean-up table cache AFTER op (the cache is used by other processor threads).</a>
+<a name="ln553">    ql_env_-&gt;RemoveCachedTableDesc(indexed_table_name);</a>
+<a name="ln554"> </a>
+<a name="ln555">    result_ = std::make_shared&lt;SchemaChangeResult&gt;(</a>
+<a name="ln556">        &quot;UPDATED&quot;, &quot;TABLE&quot;, indexed_table_name.namespace_name(), indexed_table_name.table_name());</a>
+<a name="ln557">  } else {</a>
+<a name="ln558">    result_ = std::make_shared&lt;SchemaChangeResult&gt;(</a>
+<a name="ln559">        &quot;CREATED&quot;, &quot;TABLE&quot;, table_name.namespace_name(), table_name.table_name());</a>
+<a name="ln560">  }</a>
+<a name="ln561">  return Status::OK();</a>
+<a name="ln562">}</a>
+<a name="ln563"> </a>
+<a name="ln564">Status Executor::AddColumnToIndexInfo(IndexInfoPB *index_info, const PTColumnDefinition *column) {</a>
+<a name="ln565">  // Associate index-column with data-column.</a>
+<a name="ln566">  if (index_info) {</a>
+<a name="ln567">    // Note that column_id is assigned by master server, so we don't have it yet. When processing</a>
+<a name="ln568">    // create index request, server will update IndexInfo with proper column_id.</a>
+<a name="ln569">    auto *col = index_info-&gt;add_columns();</a>
+<a name="ln570">    col-&gt;set_column_name(column-&gt;coldef_name().c_str());</a>
+<a name="ln571">    col-&gt;set_indexed_column_id(column-&gt;indexed_ref());</a>
+<a name="ln572">    RETURN_NOT_OK(PTExprToPB(column-&gt;colexpr(), col-&gt;mutable_colexpr()));</a>
+<a name="ln573">  }</a>
+<a name="ln574">  return Status::OK();</a>
+<a name="ln575">}</a>
+<a name="ln576"> </a>
+<a name="ln577">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln578"> </a>
+<a name="ln579">Status Executor::ExecPTNode(const PTAlterTable *tnode) {</a>
+<a name="ln580">  YBTableName table_name = tnode-&gt;yb_table_name();</a>
+<a name="ln581"> </a>
+<a name="ln582">  shared_ptr&lt;YBTableAlterer&gt; table_alterer(ql_env_-&gt;NewTableAlterer(table_name));</a>
+<a name="ln583"> </a>
+<a name="ln584">  for (const auto&amp; mod_column : tnode-&gt;mod_columns()) {</a>
+<a name="ln585">    switch (mod_column-&gt;mod_type()) {</a>
+<a name="ln586">      case ALTER_ADD:</a>
+<a name="ln587">        table_alterer-&gt;AddColumn(mod_column-&gt;new_name()-&gt;data())</a>
+<a name="ln588">            -&gt;Type(mod_column-&gt;ql_type());</a>
+<a name="ln589">        break;</a>
+<a name="ln590">      case ALTER_DROP:</a>
+<a name="ln591">        table_alterer-&gt;DropColumn(mod_column-&gt;old_name()-&gt;last_name().data());</a>
+<a name="ln592">        break;</a>
+<a name="ln593">      case ALTER_RENAME:</a>
+<a name="ln594">        table_alterer-&gt;AlterColumn(mod_column-&gt;old_name()-&gt;last_name().data())</a>
+<a name="ln595">            -&gt;RenameTo(mod_column-&gt;new_name()-&gt;c_str());</a>
+<a name="ln596">        break;</a>
+<a name="ln597">      case ALTER_TYPE:</a>
+<a name="ln598">        // Not yet supported by AlterTableRequestPB.</a>
+<a name="ln599">        return exec_context_-&gt;Error(tnode, ErrorCode::FEATURE_NOT_YET_IMPLEMENTED);</a>
+<a name="ln600">    }</a>
+<a name="ln601">  }</a>
+<a name="ln602"> </a>
+<a name="ln603">  if (!tnode-&gt;mod_props().empty()) {</a>
+<a name="ln604">    TableProperties table_properties;</a>
+<a name="ln605">    Status s = tnode-&gt;ToTableProperties(&amp;table_properties);</a>
+<a name="ln606">    if(PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln607">      return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln608">    }</a>
+<a name="ln609"> </a>
+<a name="ln610">    table_alterer-&gt;SetTableProperties(table_properties);</a>
+<a name="ln611">  }</a>
+<a name="ln612"> </a>
+<a name="ln613">  // Clean-up table cache BEFORE op (the cache is used by other processor threads).</a>
+<a name="ln614">  ql_env_-&gt;RemoveCachedTableDesc(table_name);</a>
+<a name="ln615"> </a>
+<a name="ln616">  Status s = table_alterer-&gt;Alter();</a>
+<a name="ln617">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln618">    return exec_context_-&gt;Error(tnode, s, ErrorCode::EXEC_ERROR);</a>
+<a name="ln619">  }</a>
+<a name="ln620"> </a>
+<a name="ln621">  result_ = std::make_shared&lt;SchemaChangeResult&gt;(</a>
+<a name="ln622">      &quot;UPDATED&quot;, &quot;TABLE&quot;, table_name.namespace_name(), table_name.table_name());</a>
+<a name="ln623"> </a>
+<a name="ln624">  // Clean-up table cache AFTER op (the cache is used by other processor threads).</a>
+<a name="ln625">  ql_env_-&gt;RemoveCachedTableDesc(table_name);</a>
+<a name="ln626">  return Status::OK();</a>
+<a name="ln627">}</a>
+<a name="ln628"> </a>
+<a name="ln629">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln630"> </a>
+<a name="ln631">Status Executor::ExecPTNode(const PTDropStmt *tnode) {</a>
+<a name="ln632">  Status s;</a>
+<a name="ln633">  ErrorCode error_not_found = ErrorCode::SERVER_ERROR;</a>
+<a name="ln634"> </a>
+<a name="ln635">  switch (tnode-&gt;drop_type()) {</a>
+<a name="ln636">    case OBJECT_TABLE: {</a>
+<a name="ln637">      // Drop the table.</a>
+<a name="ln638">      const YBTableName table_name = tnode-&gt;yb_table_name();</a>
+<a name="ln639">      // Clean-up table cache BEFORE op (the cache is used by other processor threads).</a>
+<a name="ln640">      ql_env_-&gt;RemoveCachedTableDesc(table_name);</a>
+<a name="ln641"> </a>
+<a name="ln642">      s = ql_env_-&gt;DeleteTable(table_name);</a>
+<a name="ln643">      error_not_found = ErrorCode::OBJECT_NOT_FOUND;</a>
+<a name="ln644">      result_ = std::make_shared&lt;SchemaChangeResult&gt;(</a>
+<a name="ln645">          &quot;DROPPED&quot;, &quot;TABLE&quot;, table_name.namespace_name(), table_name.table_name());</a>
+<a name="ln646"> </a>
+<a name="ln647">      // Clean-up table cache AFTER op (the cache is used by other processor threads).</a>
+<a name="ln648">      ql_env_-&gt;RemoveCachedTableDesc(table_name);</a>
+<a name="ln649">      break;</a>
+<a name="ln650">    }</a>
+<a name="ln651"> </a>
+<a name="ln652">    case OBJECT_INDEX: {</a>
+<a name="ln653">      // Drop the index.</a>
+<a name="ln654">      const YBTableName table_name = tnode-&gt;yb_table_name();</a>
+<a name="ln655">      // Clean-up table cache BEFORE op (the cache is used by other processor threads).</a>
+<a name="ln656">      ql_env_-&gt;RemoveCachedTableDesc(table_name);</a>
+<a name="ln657"> </a>
+<a name="ln658">      YBTableName indexed_table_name;</a>
+<a name="ln659">      s = ql_env_-&gt;DeleteIndexTable(table_name, &amp;indexed_table_name);</a>
+<a name="ln660">      error_not_found = ErrorCode::OBJECT_NOT_FOUND;</a>
+<a name="ln661">      result_ = std::make_shared&lt;SchemaChangeResult&gt;(</a>
+<a name="ln662">          &quot;UPDATED&quot;, &quot;TABLE&quot;, indexed_table_name.namespace_name(), indexed_table_name.table_name());</a>
+<a name="ln663"> </a>
+<a name="ln664">      // Clean-up table cache AFTER op (the cache is used by other processor threads).</a>
+<a name="ln665">      ql_env_-&gt;RemoveCachedTableDesc(table_name);</a>
+<a name="ln666">      ql_env_-&gt;RemoveCachedTableDesc(indexed_table_name);</a>
+<a name="ln667">      break;</a>
+<a name="ln668">    }</a>
+<a name="ln669"> </a>
+<a name="ln670">    case OBJECT_SCHEMA: {</a>
+<a name="ln671">      // Drop the keyspace.</a>
+<a name="ln672">      const string keyspace_name(tnode-&gt;name()-&gt;last_name().c_str());</a>
+<a name="ln673">      s = ql_env_-&gt;DeleteKeyspace(keyspace_name);</a>
+<a name="ln674">      error_not_found = ErrorCode::KEYSPACE_NOT_FOUND;</a>
+<a name="ln675">      result_ = std::make_shared&lt;SchemaChangeResult&gt;(&quot;DROPPED&quot;, &quot;KEYSPACE&quot;, keyspace_name);</a>
+<a name="ln676">      break;</a>
+<a name="ln677">    }</a>
+<a name="ln678"> </a>
+<a name="ln679">    case OBJECT_TYPE: {</a>
+<a name="ln680">      // Drop the type.</a>
+<a name="ln681">      const string type_name(tnode-&gt;name()-&gt;last_name().c_str());</a>
+<a name="ln682">      const string namespace_name(tnode-&gt;name()-&gt;first_name().c_str());</a>
+<a name="ln683">      s = ql_env_-&gt;DeleteUDType(namespace_name, type_name);</a>
+<a name="ln684">      error_not_found = ErrorCode::TYPE_NOT_FOUND;</a>
+<a name="ln685">      result_ = std::make_shared&lt;SchemaChangeResult&gt;(&quot;DROPPED&quot;, &quot;TYPE&quot;, namespace_name, type_name);</a>
+<a name="ln686">      ql_env_-&gt;RemoveCachedUDType(namespace_name, type_name);</a>
+<a name="ln687">      break;</a>
+<a name="ln688">    }</a>
+<a name="ln689"> </a>
+<a name="ln690">    case OBJECT_ROLE: {</a>
+<a name="ln691">      // Drop the role.</a>
+<a name="ln692">      const string role_name(tnode-&gt;name()-&gt;QLName());</a>
+<a name="ln693">      s = ql_env_-&gt;DeleteRole(role_name);</a>
+<a name="ln694">      error_not_found = ErrorCode::ROLE_NOT_FOUND;</a>
+<a name="ln695">      // TODO (Bristy) : Set result_ properly.</a>
+<a name="ln696">      break;</a>
+<a name="ln697">    }</a>
+<a name="ln698"> </a>
+<a name="ln699">    default:</a>
+<a name="ln700">      return exec_context_-&gt;Error(tnode-&gt;name(), ErrorCode::FEATURE_NOT_SUPPORTED);</a>
+<a name="ln701">  }</a>
+<a name="ln702"> </a>
+<a name="ln703">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln704">    ErrorCode error_code = ErrorCode::SERVER_ERROR;</a>
+<a name="ln705"> </a>
+<a name="ln706">    if (s.IsNotFound()) {</a>
+<a name="ln707">      // Ignore not found error for a DROP IF EXISTS statement.</a>
+<a name="ln708">      if (tnode-&gt;drop_if_exists()) {</a>
+<a name="ln709">        return Status::OK();</a>
+<a name="ln710">      }</a>
+<a name="ln711"> </a>
+<a name="ln712">      error_code = error_not_found;</a>
+<a name="ln713">    } else if (s.IsNotAuthorized()) {</a>
+<a name="ln714">      error_code = ErrorCode::UNAUTHORIZED;</a>
+<a name="ln715">    } else if(s.IsQLError()) {</a>
+<a name="ln716">      error_code = ErrorCode::INVALID_REQUEST;</a>
+<a name="ln717">    }</a>
+<a name="ln718"> </a>
+<a name="ln719">    return exec_context_-&gt;Error(tnode-&gt;name(), s, error_code);</a>
+<a name="ln720">  }</a>
+<a name="ln721"> </a>
+<a name="ln722">  return Status::OK();</a>
+<a name="ln723">}</a>
+<a name="ln724"> </a>
+<a name="ln725">Status Executor::ExecPTNode(const PTGrantRevokePermission* tnode) {</a>
+<a name="ln726">  const string role_name = tnode-&gt;role_name()-&gt;QLName();</a>
+<a name="ln727">  const string canonical_resource = tnode-&gt;canonical_resource();</a>
+<a name="ln728">  const char* resource_name = tnode-&gt;resource_name();</a>
+<a name="ln729">  const char* namespace_name = tnode-&gt;namespace_name();</a>
+<a name="ln730">  ResourceType resource_type = tnode-&gt;resource_type();</a>
+<a name="ln731">  PermissionType permission = tnode-&gt;permission();</a>
+<a name="ln732">  const auto statement_type = tnode-&gt;statement_type();</a>
+<a name="ln733"> </a>
+<a name="ln734">  Status s = ql_env_-&gt;GrantRevokePermission(statement_type, permission, resource_type,</a>
+<a name="ln735">                                            canonical_resource, resource_name, namespace_name,</a>
+<a name="ln736">                                            role_name);</a>
+<a name="ln737"> </a>
+<a name="ln738">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln739">    ErrorCode error_code = ErrorCode::SERVER_ERROR;</a>
+<a name="ln740">    if (s.IsInvalidArgument()) {</a>
+<a name="ln741">      error_code = ErrorCode::INVALID_ARGUMENTS;</a>
+<a name="ln742">    }</a>
+<a name="ln743">    if (s.IsNotFound()) {</a>
+<a name="ln744">      error_code = ErrorCode::RESOURCE_NOT_FOUND;</a>
+<a name="ln745">    }</a>
+<a name="ln746">    return exec_context_-&gt;Error(tnode, s, error_code);</a>
+<a name="ln747">  }</a>
+<a name="ln748">  // TODO (Bristy) : Return proper result.</a>
+<a name="ln749">  return Status::OK();</a>
+<a name="ln750">}</a>
+<a name="ln751"> </a>
+<a name="ln752">Status Executor::GetOffsetOrLimit(</a>
+<a name="ln753">    const PTSelectStmt* tnode,</a>
+<a name="ln754">    const std::function&lt;PTExpr::SharedPtr(const PTSelectStmt* tnode)&gt;&amp; get_val,</a>
+<a name="ln755">    const string&amp; clause_type,</a>
+<a name="ln756">    int32_t* value) {</a>
+<a name="ln757">  QLExpressionPB expr_pb;</a>
+<a name="ln758">  Status s = (PTExprToPB(get_val(tnode), &amp;expr_pb));</a>
+<a name="ln759">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln760">    return exec_context_-&gt;Error(get_val(tnode), s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln761">  }</a>
+<a name="ln762"> </a>
+<a name="ln763">  if (expr_pb.has_value() &amp;&amp; IsNull(expr_pb.value())) {</a>
+<a name="ln764">    return exec_context_-&gt;Error(get_val(tnode),</a>
+<a name="ln765">                                Substitute(&quot;$0 value cannot be null.&quot;, clause_type).c_str(),</a>
+<a name="ln766">                                ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln767">  }</a>
+<a name="ln768"> </a>
+<a name="ln769">  // This should be ensured by checks before getting here.</a>
+<a name="ln770">  DCHECK(expr_pb.has_value() &amp;&amp; expr_pb.value().has_int32_value())</a>
+<a name="ln771">      &lt;&lt; &quot;Integer constant expected for &quot; + clause_type + &quot; clause&quot;;</a>
+<a name="ln772"> </a>
+<a name="ln773">  if (expr_pb.value().int32_value() &lt; 0) {</a>
+<a name="ln774">    return exec_context_-&gt;Error(get_val(tnode),</a>
+<a name="ln775">                                Substitute(&quot;$0 value cannot be negative.&quot;, clause_type).c_str(),</a>
+<a name="ln776">                                ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln777">  }</a>
+<a name="ln778">  *value = expr_pb.value().int32_value();</a>
+<a name="ln779">  return Status::OK();</a>
+<a name="ln780">}</a>
+<a name="ln781"> </a>
+<a name="ln782">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln783"> </a>
+<a name="ln784">Status Executor::ExecPTNode(const PTSelectStmt *tnode, TnodeContext* tnode_context) {</a>
+<a name="ln785">  const shared_ptr&lt;client::YBTable&gt;&amp; table = tnode-&gt;table();</a>
+<a name="ln786">  if (table == nullptr) {</a>
+<a name="ln787">    // If this is a request for 'system.peers_v2' table make sure that we send the appropriate error</a>
+<a name="ln788">    // so that the client driver can query the proper peers table i.e. 'system.peers' based on the</a>
+<a name="ln789">    // error.</a>
+<a name="ln790">    if (tnode-&gt;is_system() &amp;&amp;</a>
+<a name="ln791">        tnode-&gt;table_name().table_name() == &quot;peers_v2&quot; &amp;&amp;</a>
+<a name="ln792">        tnode-&gt;table_name().namespace_name() == &quot;system&quot;) {</a>
+<a name="ln793">      string error_msg = &quot;Unknown keyspace/cf pair (system.peers_v2)&quot;;</a>
+<a name="ln794">      return exec_context_-&gt;Error(tnode, error_msg, ErrorCode::SERVER_ERROR);</a>
+<a name="ln795">    }</a>
+<a name="ln796"> </a>
+<a name="ln797">    // If this is a system table but the table does not exist, it is okay. Just return OK with void</a>
+<a name="ln798">    // result.</a>
+<a name="ln799">    return tnode-&gt;is_system() ? Status::OK()</a>
+<a name="ln800">                              : exec_context_-&gt;Error(tnode, ErrorCode::OBJECT_NOT_FOUND);</a>
+<a name="ln801">  }</a>
+<a name="ln802"> </a>
+<a name="ln803">  const StatementParameters&amp; params = exec_context_-&gt;params();</a>
+<a name="ln804">  // If there is a table id in the statement parameter's paging state, this is a continuation of a</a>
+<a name="ln805">  // prior SELECT statement. Verify that the same table/index still exists and matches the table id</a>
+<a name="ln806">  // for query without index, or the index id in the leaf node (where child_select is null also).</a>
+<a name="ln807">  const bool continue_select = !tnode-&gt;child_select() &amp;&amp; !params.table_id().empty();</a>
+<a name="ln808">  if (continue_select &amp;&amp; params.table_id() != table-&gt;id()) {</a>
+<a name="ln809">    return exec_context_-&gt;Error(tnode, &quot;Object no longer exists.&quot;, ErrorCode::OBJECT_NOT_FOUND);</a>
+<a name="ln810">  }</a>
+<a name="ln811"> </a>
+<a name="ln812">  // If there is an index to select from, execute it.</a>
+<a name="ln813">  if (tnode-&gt;child_select()) {</a>
+<a name="ln814">    const PTSelectStmt* child_select = tnode-&gt;child_select().get();</a>
+<a name="ln815">    TnodeContext* child_context = tnode_context-&gt;AddChildTnode(child_select);</a>
+<a name="ln816">    RETURN_NOT_OK(ExecPTNode(child_select, child_context));</a>
+<a name="ln817">    // If the index covers the SELECT query fully, we are done. Otherwise, continue to prepare</a>
+<a name="ln818">    // the SELECT from the table using the primary key to be returned from the index select.</a>
+<a name="ln819">    if (child_select-&gt;covers_fully()) {</a>
+<a name="ln820">      return Status::OK();</a>
+<a name="ln821">    }</a>
+<a name="ln822">  }</a>
+<a name="ln823"> </a>
+<a name="ln824">  // Create the read request.</a>
+<a name="ln825">  YBqlReadOpPtr select_op(table-&gt;NewQLSelect());</a>
+<a name="ln826">  QLReadRequestPB *req = select_op-&gt;mutable_request();</a>
+<a name="ln827">  // Where clause - Hash, range, and regular columns.</a>
+<a name="ln828"> </a>
+<a name="ln829">  req-&gt;set_is_aggregate(tnode-&gt;is_aggregate());</a>
+<a name="ln830"> </a>
+<a name="ln831">  Result&lt;uint64_t&gt; max_rows_estimate = WhereClauseToPB(req, tnode-&gt;key_where_ops(),</a>
+<a name="ln832">                                                       tnode-&gt;where_ops(),</a>
+<a name="ln833">                                                       tnode-&gt;subscripted_col_where_ops(),</a>
+<a name="ln834">                                                       tnode-&gt;json_col_where_ops(),</a>
+<a name="ln835">                                                       tnode-&gt;partition_key_ops(),</a>
+<a name="ln836">                                                       tnode-&gt;func_ops(),</a>
+<a name="ln837">                                                       tnode_context);</a>
+<a name="ln838">  if (PREDICT_FALSE(!max_rows_estimate)) {</a>
+<a name="ln839">    return exec_context_-&gt;Error(tnode, max_rows_estimate.status(), ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln840">  }</a>
+<a name="ln841"> </a>
+<a name="ln842">  // If where clause restrictions guarantee no rows could match, return empty result immediately.</a>
+<a name="ln843">  if (*max_rows_estimate == 0 &amp;&amp; !tnode-&gt;is_aggregate()) {</a>
+<a name="ln844">    QLRowBlock empty_row_block(tnode-&gt;table()-&gt;InternalSchema(), {});</a>
+<a name="ln845">    faststring buffer;</a>
+<a name="ln846">    empty_row_block.Serialize(select_op-&gt;request().client(), &amp;buffer);</a>
+<a name="ln847">    *select_op-&gt;mutable_rows_data() = buffer.ToString();</a>
+<a name="ln848">    result_ = std::make_shared&lt;RowsResult&gt;(select_op.get());</a>
+<a name="ln849">    return Status::OK();</a>
+<a name="ln850">  }</a>
+<a name="ln851"> </a>
+<a name="ln852">  req-&gt;set_is_forward_scan(tnode-&gt;is_forward_scan());</a>
+<a name="ln853"> </a>
+<a name="ln854">  // Specify selected list by adding the expressions to selected_exprs in read request.</a>
+<a name="ln855">  QLRSRowDescPB *rsrow_desc_pb = req-&gt;mutable_rsrow_desc();</a>
+<a name="ln856">  for (const auto&amp; expr : tnode-&gt;selected_exprs()) {</a>
+<a name="ln857">    if (expr-&gt;opcode() == TreeNodeOpcode::kPTAllColumns) {</a>
+<a name="ln858">      const Status s = PTExprToPB(static_cast&lt;const PTAllColumns*&gt;(expr.get()), req);</a>
+<a name="ln859">      if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln860">        return exec_context_-&gt;Error(expr, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln861">      }</a>
+<a name="ln862">    } else {</a>
+<a name="ln863">      const Status s = PTExprToPB(expr, req-&gt;add_selected_exprs());</a>
+<a name="ln864">      if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln865">        return exec_context_-&gt;Error(expr, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln866">      }</a>
+<a name="ln867"> </a>
+<a name="ln868">      // Add the expression metadata (rsrow descriptor).</a>
+<a name="ln869">      QLRSColDescPB *rscol_desc_pb = rsrow_desc_pb-&gt;add_rscol_descs();</a>
+<a name="ln870">      rscol_desc_pb-&gt;set_name(expr-&gt;QLName());</a>
+<a name="ln871">      expr-&gt;rscol_type_PB(rscol_desc_pb-&gt;mutable_ql_type());</a>
+<a name="ln872">    }</a>
+<a name="ln873">  }</a>
+<a name="ln874"> </a>
+<a name="ln875">  // Setup the column values that need to be read.</a>
+<a name="ln876">  Status s = ColumnRefsToPB(tnode, req-&gt;mutable_column_refs());</a>
+<a name="ln877">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln878">    return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln879">  }</a>
+<a name="ln880"> </a>
+<a name="ln881">  // Set the IF clause.</a>
+<a name="ln882">  if (tnode-&gt;if_clause() != nullptr) {</a>
+<a name="ln883">    s = PTExprToPB(tnode-&gt;if_clause(), select_op-&gt;mutable_request()-&gt;mutable_if_expr());</a>
+<a name="ln884">    if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln885">      return exec_context_-&gt;Error(tnode-&gt;if_clause(), s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln886">    }</a>
+<a name="ln887">  }</a>
+<a name="ln888"> </a>
+<a name="ln889">  // Specify distinct columns or non.</a>
+<a name="ln890">  req-&gt;set_distinct(tnode-&gt;distinct());</a>
+<a name="ln891"> </a>
+<a name="ln892">  // Default row count limit is the page size.</a>
+<a name="ln893">  // We should return paging state when page size limit is hit.</a>
+<a name="ln894">  // For system tables, we do not support page size so do nothing.</a>
+<a name="ln895">  if (!tnode-&gt;is_system()) {</a>
+<a name="ln896">    req-&gt;set_limit(params.page_size());</a>
+<a name="ln897">    req-&gt;set_return_paging_state(true);</a>
+<a name="ln898">  }</a>
+<a name="ln899"> </a>
+<a name="ln900">  // Check if there is a limit and compute the new limit based on the number of returned rows.</a>
+<a name="ln901">  if (tnode-&gt;limit()) {</a>
+<a name="ln902">    int32_t limit;</a>
+<a name="ln903">    RETURN_NOT_OK(GetOffsetOrLimit(</a>
+<a name="ln904">        tnode,</a>
+<a name="ln905">        [](const PTSelectStmt* tnode) -&gt; PTExpr::SharedPtr { return tnode-&gt;limit(); },</a>
+<a name="ln906">        &quot;LIMIT&quot;, &amp;limit));</a>
+<a name="ln907"> </a>
+<a name="ln908">    if (limit == 0 || params.total_num_rows_read() &gt;= limit) {</a>
+<a name="ln909">      return Status::OK();</a>
+<a name="ln910">    }</a>
+<a name="ln911"> </a>
+<a name="ln912">    // If the LIMIT clause, subtracting the number of rows we have returned so far, is lower than</a>
+<a name="ln913">    // the page size limit set from above, set the lower limit and do not return paging state when</a>
+<a name="ln914">    // this limit is hit.</a>
+<a name="ln915">    limit -= params.total_num_rows_read();</a>
+<a name="ln916">    if (!req-&gt;has_limit() || limit &lt;= req-&gt;limit()) {</a>
+<a name="ln917">      req-&gt;set_limit(limit);</a>
+<a name="ln918">      req-&gt;set_return_paging_state(false);</a>
+<a name="ln919">    }</a>
+<a name="ln920">  }</a>
+<a name="ln921"> </a>
+<a name="ln922">  if (tnode-&gt;offset()) {</a>
+<a name="ln923">    int32_t offset;</a>
+<a name="ln924">    RETURN_NOT_OK(GetOffsetOrLimit(</a>
+<a name="ln925">        tnode,</a>
+<a name="ln926">        [](const PTSelectStmt *tnode) -&gt; PTExpr::SharedPtr { return tnode-&gt;offset(); },</a>
+<a name="ln927">        &quot;OFFSET&quot;, &amp;offset));</a>
+<a name="ln928">    // Update the offset with values from previous pagination.</a>
+<a name="ln929">    offset = std::max(static_cast&lt;int64_t&gt;(0), offset - params.total_rows_skipped());</a>
+<a name="ln930">    req-&gt;set_offset(offset);</a>
+<a name="ln931">    // We need the paging state to know how many rows were skipped by the offset clause.</a>
+<a name="ln932">    req-&gt;set_return_paging_state(true);</a>
+<a name="ln933">  }</a>
+<a name="ln934"> </a>
+<a name="ln935">  // If this is a continuation of a prior read, set the next partition key, row key and total number</a>
+<a name="ln936">  // of rows read in the request's paging state.</a>
+<a name="ln937">  if (continue_select) {</a>
+<a name="ln938">    QLPagingStatePB *paging_state = req-&gt;mutable_paging_state();</a>
+<a name="ln939">    paging_state-&gt;set_next_partition_key(params.next_partition_key());</a>
+<a name="ln940">    paging_state-&gt;set_next_row_key(params.next_row_key());</a>
+<a name="ln941">    paging_state-&gt;set_total_num_rows_read(params.total_num_rows_read());</a>
+<a name="ln942">    paging_state-&gt;set_total_rows_skipped(params.total_rows_skipped());</a>
+<a name="ln943">  }</a>
+<a name="ln944"> </a>
+<a name="ln945">  // Set the consistency level for the operation. Always use strong consistency for system tables.</a>
+<a name="ln946">  select_op-&gt;set_yb_consistency_level(tnode-&gt;is_system() ? YBConsistencyLevel::STRONG</a>
+<a name="ln947">                                                         : params.yb_consistency_level());</a>
+<a name="ln948"> </a>
+<a name="ln949">  // If we have several hash partitions (i.e. IN condition on hash columns) we initialize the</a>
+<a name="ln950">  // start partition here, and then iteratively scan the rest in FetchMoreRows.</a>
+<a name="ln951">  // Otherwise, the request will already have the right hashed column values set.</a>
+<a name="ln952">  if (tnode_context-&gt;UnreadPartitionsRemaining() &gt; 0) {</a>
+<a name="ln953">    tnode_context-&gt;InitializePartition(select_op-&gt;mutable_request(),</a>
+<a name="ln954">                                       continue_select ? params.next_partition_index() : 0);</a>
+<a name="ln955"> </a>
+<a name="ln956">    // We can optimize to run the ops in parallel (rather than serially) if:</a>
+<a name="ln957">    // - the estimated max number of rows is less than req limit (min of page size and CQL limit).</a>
+<a name="ln958">    // - there is no offset (which requires passing skipped rows from one request to the next).</a>
+<a name="ln959">    if (*max_rows_estimate &lt;= req-&gt;limit() &amp;&amp; !req-&gt;has_offset()) {</a>
+<a name="ln960">      RETURN_NOT_OK(AddOperation(select_op, tnode_context));</a>
+<a name="ln961">      while (tnode_context-&gt;UnreadPartitionsRemaining() &gt; 1) {</a>
+<a name="ln962">        YBqlReadOpPtr op(table-&gt;NewQLSelect());</a>
+<a name="ln963">        op-&gt;mutable_request()-&gt;CopyFrom(select_op-&gt;request());</a>
+<a name="ln964">        op-&gt;set_yb_consistency_level(select_op-&gt;yb_consistency_level());</a>
+<a name="ln965">        tnode_context-&gt;AdvanceToNextPartition(op-&gt;mutable_request());</a>
+<a name="ln966">        RETURN_NOT_OK(AddOperation(op, tnode_context));</a>
+<a name="ln967">        select_op = op; // Use new op as base for the next one, if any.</a>
+<a name="ln968">      }</a>
+<a name="ln969">      return Status::OK();</a>
+<a name="ln970">    }</a>
+<a name="ln971">  }</a>
+<a name="ln972"> </a>
+<a name="ln973">  // If this select statement uses an uncovered index underneath, save this op as a template to</a>
+<a name="ln974">  // read from the table once the primary keys are returned from the uncovered index. The paging</a>
+<a name="ln975">  // state should be used by the underlying select from the index only which decides where to</a>
+<a name="ln976">  // continue the select from the index.</a>
+<a name="ln977">  if (tnode-&gt;child_select() &amp;&amp; !tnode-&gt;child_select()-&gt;covers_fully()) {</a>
+<a name="ln978">    req-&gt;clear_return_paging_state();</a>
+<a name="ln979">    tnode_context-&gt;SetUncoveredSelectOp(select_op);</a>
+<a name="ln980">    result_ = std::make_shared&lt;RowsResult&gt;(select_op.get());</a>
+<a name="ln981">    return Status::OK();</a>
+<a name="ln982">  }</a>
+<a name="ln983"> </a>
+<a name="ln984">  // Add the operation.</a>
+<a name="ln985">  return AddOperation(select_op, tnode_context);</a>
+<a name="ln986">}</a>
+<a name="ln987"> </a>
+<a name="ln988">Result&lt;bool&gt; Executor::FetchMoreRows(const PTSelectStmt* tnode,</a>
+<a name="ln989">                                     const YBqlReadOpPtr&amp; op,</a>
+<a name="ln990">                                     TnodeContext* tnode_context,</a>
+<a name="ln991">                                     ExecContext* exec_context) {</a>
+<a name="ln992">  RowsResult::SharedPtr current_result = tnode_context-&gt;rows_result();</a>
+<a name="ln993">  if (!current_result) {</a>
+<a name="ln994">    return STATUS(InternalError, &quot;Missing result for SELECT operation&quot;);</a>
+<a name="ln995">  }</a>
+<a name="ln996"> </a>
+<a name="ln997">  // Rows read so far: in this fetch, previous fetches (for paging selects), and in total.</a>
+<a name="ln998">  const size_t current_fetch_row_count = tnode_context-&gt;row_count();</a>
+<a name="ln999">  const size_t previous_fetches_row_count = exec_context-&gt;params().total_num_rows_read();</a>
+<a name="ln1000">  const size_t total_row_count = previous_fetches_row_count + current_fetch_row_count;</a>
+<a name="ln1001"> </a>
+<a name="ln1002">  // Statement (paging) parameters.</a>
+<a name="ln1003">  StatementParameters current_params;</a>
+<a name="ln1004">  RETURN_NOT_OK(current_params.SetPagingState(current_result-&gt;paging_state()));</a>
+<a name="ln1005"> </a>
+<a name="ln1006">  const size_t total_rows_skipped = exec_context-&gt;params().total_rows_skipped() +</a>
+<a name="ln1007">                                    current_params.total_rows_skipped();</a>
+<a name="ln1008"> </a>
+<a name="ln1009">  // The limit for this select: min of page size and result limit (if set).</a>
+<a name="ln1010">  uint64_t fetch_limit = exec_context-&gt;params().page_size(); // default;</a>
+<a name="ln1011">  if (tnode-&gt;limit()) {</a>
+<a name="ln1012">    QLExpressionPB limit_pb;</a>
+<a name="ln1013">    RETURN_NOT_OK(PTExprToPB(tnode-&gt;limit(), &amp;limit_pb));</a>
+<a name="ln1014"> </a>
+<a name="ln1015">    // If the LIMIT clause has been reached, we are done.</a>
+<a name="ln1016">    if (total_row_count &gt;= limit_pb.value().int32_value()) {</a>
+<a name="ln1017">      current_result-&gt;ClearPagingState();</a>
+<a name="ln1018">      return false;</a>
+<a name="ln1019">    }</a>
+<a name="ln1020"> </a>
+<a name="ln1021">    const int64_t limit = limit_pb.value().int32_value() - previous_fetches_row_count;</a>
+<a name="ln1022">    if (limit &lt; fetch_limit) {</a>
+<a name="ln1023">      fetch_limit = limit;</a>
+<a name="ln1024">    }</a>
+<a name="ln1025">  }</a>
+<a name="ln1026"> </a>
+<a name="ln1027">  //------------------------------------------------------------------------------------------------</a>
+<a name="ln1028">  // Check if we should fetch more rows.</a>
+<a name="ln1029"> </a>
+<a name="ln1030">  // If there is no paging state the current scan has exhausted its results. The paging state</a>
+<a name="ln1031">  // might be non-empty, but just contain num_rows_skipped, in this case the</a>
+<a name="ln1032">  // 'next_partition_key' and 'next_row_key' would be empty indicating that we've finished</a>
+<a name="ln1033">  // reading the current partition.</a>
+<a name="ln1034">  const bool finished_current_read_partition = current_result-&gt;paging_state().empty() ||</a>
+<a name="ln1035">                                               (current_params.next_partition_key().empty() &amp;&amp;</a>
+<a name="ln1036">                                                current_params.next_row_key().empty());</a>
+<a name="ln1037">  if (finished_current_read_partition) {</a>
+<a name="ln1038"> </a>
+<a name="ln1039">    // If there or no other partitions to query, we are done.</a>
+<a name="ln1040">    if (tnode_context-&gt;UnreadPartitionsRemaining() &lt;= 1) {</a>
+<a name="ln1041">      // Clear the paging state, since we don't have any more data left in the table.</a>
+<a name="ln1042">      current_result-&gt;ClearPagingState();</a>
+<a name="ln1043">      return false;</a>
+<a name="ln1044">    }</a>
+<a name="ln1045"> </a>
+<a name="ln1046">    // Sanity check that if we finished a partition the next partition/row key are empty.</a>
+<a name="ln1047">    // Otherwise we could start scanning the next partition from the wrong place.</a>
+<a name="ln1048">    DCHECK(current_params.next_partition_key().empty());</a>
+<a name="ln1049">    DCHECK(current_params.next_row_key().empty());</a>
+<a name="ln1050"> </a>
+<a name="ln1051">    // Otherwise, we continue to the next partition.</a>
+<a name="ln1052">    tnode_context-&gt;AdvanceToNextPartition(op-&gt;mutable_request());</a>
+<a name="ln1053">  }</a>
+<a name="ln1054"> </a>
+<a name="ln1055">  // If we reached the fetch limit (min of paging state and limit clause) we are done.</a>
+<a name="ln1056">  if (current_fetch_row_count &gt;= fetch_limit) {</a>
+<a name="ln1057"> </a>
+<a name="ln1058">    // If we need to return a paging state to the user, we create it here so that we can resume from</a>
+<a name="ln1059">    // the exact place where we left off: partition index and primary key within that partition.</a>
+<a name="ln1060">    if (op-&gt;request().return_paging_state()) {</a>
+<a name="ln1061">      QLPagingStatePB paging_state;</a>
+<a name="ln1062">      paging_state.set_total_num_rows_read(total_row_count);</a>
+<a name="ln1063">      paging_state.set_total_rows_skipped(total_rows_skipped);</a>
+<a name="ln1064">      paging_state.set_table_id(tnode-&gt;table()-&gt;id());</a>
+<a name="ln1065"> </a>
+<a name="ln1066">      // Set the partition to resume from. Relevant for multi-partition selects, i.e. with IN</a>
+<a name="ln1067">      // condition on the partition columns.</a>
+<a name="ln1068">      paging_state.set_next_partition_index(tnode_context-&gt;current_partition_index());</a>
+<a name="ln1069"> </a>
+<a name="ln1070">      // Within a partition, set the exact primary key to resume from (if any).</a>
+<a name="ln1071">      paging_state.set_next_partition_key(current_params.next_partition_key());</a>
+<a name="ln1072">      paging_state.set_next_row_key(current_params.next_row_key());</a>
+<a name="ln1073"> </a>
+<a name="ln1074">      paging_state.set_original_request_id(exec_context_-&gt;params().request_id());</a>
+<a name="ln1075"> </a>
+<a name="ln1076">      current_result-&gt;SetPagingState(paging_state);</a>
+<a name="ln1077">    }</a>
+<a name="ln1078"> </a>
+<a name="ln1079">    return false;</a>
+<a name="ln1080">  }</a>
+<a name="ln1081"> </a>
+<a name="ln1082">  //------------------------------------------------------------------------------------------------</a>
+<a name="ln1083">  // Fetch more results.</a>
+<a name="ln1084"> </a>
+<a name="ln1085">  // Update limit, offset and paging_state information for next scan request.</a>
+<a name="ln1086">  op-&gt;mutable_request()-&gt;set_limit(fetch_limit - current_fetch_row_count);</a>
+<a name="ln1087">  if (tnode-&gt;offset()) {</a>
+<a name="ln1088">    QLExpressionPB offset_pb;</a>
+<a name="ln1089">    RETURN_NOT_OK(PTExprToPB(tnode-&gt;offset(), &amp;offset_pb));</a>
+<a name="ln1090">    // The paging state keeps a running count of the number of rows skipped so far.</a>
+<a name="ln1091">    op-&gt;mutable_request()-&gt;set_offset(</a>
+<a name="ln1092">        std::max(static_cast&lt;int64_t&gt;(0),</a>
+<a name="ln1093">                 offset_pb.value().int32_value() - static_cast&lt;int64_t&gt;(total_rows_skipped)));</a>
+<a name="ln1094">  }</a>
+<a name="ln1095"> </a>
+<a name="ln1096">  QLPagingStatePB *paging_state = op-&gt;mutable_request()-&gt;mutable_paging_state();</a>
+<a name="ln1097">  paging_state-&gt;set_next_partition_key(current_params.next_partition_key());</a>
+<a name="ln1098">  paging_state-&gt;set_next_row_key(current_params.next_row_key());</a>
+<a name="ln1099">  paging_state-&gt;set_total_num_rows_read(total_row_count);</a>
+<a name="ln1100">  paging_state-&gt;set_total_rows_skipped(total_rows_skipped);</a>
+<a name="ln1101">  return true;</a>
+<a name="ln1102">}</a>
+<a name="ln1103"> </a>
+<a name="ln1104"> </a>
+<a name="ln1105">Result&lt;bool&gt; Executor::FetchRowsByKeys(const PTSelectStmt* tnode,</a>
+<a name="ln1106">                                       const YBqlReadOpPtr&amp; select_op,</a>
+<a name="ln1107">                                       const QLRowBlock&amp; keys,</a>
+<a name="ln1108">                                       TnodeContext* tnode_context) {</a>
+<a name="ln1109">  const Schema&amp; schema = tnode-&gt;table()-&gt;InternalSchema();</a>
+<a name="ln1110">  for (const QLRow&amp; key : keys.rows()) {</a>
+<a name="ln1111">    YBqlReadOpPtr op(tnode-&gt;table()-&gt;NewQLSelect());</a>
+<a name="ln1112">    op-&gt;set_yb_consistency_level(select_op-&gt;yb_consistency_level());</a>
+<a name="ln1113">    QLReadRequestPB* req = op-&gt;mutable_request();</a>
+<a name="ln1114">    req-&gt;CopyFrom(select_op-&gt;request());</a>
+<a name="ln1115">    RETURN_NOT_OK(WhereKeyToPB(req, schema, key));</a>
+<a name="ln1116">    RETURN_NOT_OK(AddOperation(op, tnode_context));</a>
+<a name="ln1117">  }</a>
+<a name="ln1118">  return !keys.rows().empty();</a>
+<a name="ln1119">}</a>
+<a name="ln1120"> </a>
+<a name="ln1121">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln1122"> </a>
+<a name="ln1123">Status Executor::ExecPTNode(const PTInsertStmt *tnode, TnodeContext* tnode_context) {</a>
+<a name="ln1124">  // Create write request.</a>
+<a name="ln1125">  const shared_ptr&lt;client::YBTable&gt;&amp; table = tnode-&gt;table();</a>
+<a name="ln1126">  YBqlWriteOpPtr insert_op(table-&gt;NewQLInsert());</a>
+<a name="ln1127">  QLWriteRequestPB *req = insert_op-&gt;mutable_request();</a>
+<a name="ln1128"> </a>
+<a name="ln1129">  // Set the ttl.</a>
+<a name="ln1130">  Status s = TtlToPB(tnode, req);</a>
+<a name="ln1131">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1132">    return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1133">  }</a>
+<a name="ln1134"> </a>
+<a name="ln1135">  // Set the timestamp.</a>
+<a name="ln1136">  s = TimestampToPB(tnode, req);</a>
+<a name="ln1137">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1138">    return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1139">  }</a>
+<a name="ln1140"> </a>
+<a name="ln1141">  // Set the values for columns.</a>
+<a name="ln1142">  if (tnode-&gt;InsertingValue()-&gt;opcode() == TreeNodeOpcode::kPTInsertJsonClause) {</a>
+<a name="ln1143">    // Error messages are already formatted and don't need additional wrap</a>
+<a name="ln1144">    RETURN_NOT_OK(</a>
+<a name="ln1145">        InsertJsonClauseToPB(tnode,</a>
+<a name="ln1146">                             static_cast&lt;PTInsertJsonClause*&gt;(tnode-&gt;InsertingValue().get()),</a>
+<a name="ln1147">                             req));</a>
+<a name="ln1148">  } else {</a>
+<a name="ln1149">    s = ColumnArgsToPB(tnode, req);</a>
+<a name="ln1150">    if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1151">      // Note: INVALID_ARGUMENTS is retryable error code (due to mapping into STALE_METADATA),</a>
+<a name="ln1152">      //       INVALID_REQUEST - non-retryable.</a>
+<a name="ln1153">      ErrorCode error_code =</a>
+<a name="ln1154">          s.code() == Status::kNotSupported || s.code() == Status::kRuntimeError ?</a>
+<a name="ln1155">          ErrorCode::INVALID_REQUEST : ErrorCode::INVALID_ARGUMENTS;</a>
+<a name="ln1156"> </a>
+<a name="ln1157">      return exec_context_-&gt;Error(tnode, s, error_code);</a>
+<a name="ln1158">    }</a>
+<a name="ln1159">  }</a>
+<a name="ln1160"> </a>
+<a name="ln1161">  // Setup the column values that need to be read.</a>
+<a name="ln1162">  s = ColumnRefsToPB(tnode, req-&gt;mutable_column_refs());</a>
+<a name="ln1163">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1164">    return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1165">  }</a>
+<a name="ln1166"> </a>
+<a name="ln1167">  // Set the IF clause.</a>
+<a name="ln1168">  if (tnode-&gt;if_clause() != nullptr) {</a>
+<a name="ln1169">    s = PTExprToPB(tnode-&gt;if_clause(), insert_op-&gt;mutable_request()-&gt;mutable_if_expr());</a>
+<a name="ln1170">    if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1171">      return exec_context_-&gt;Error(tnode-&gt;if_clause(), s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1172">    }</a>
+<a name="ln1173">    req-&gt;set_else_error(tnode-&gt;else_error());</a>
+<a name="ln1174">  }</a>
+<a name="ln1175"> </a>
+<a name="ln1176">  // Set the RETURNS clause if set.</a>
+<a name="ln1177">  if (tnode-&gt;returns_status()) {</a>
+<a name="ln1178">    req-&gt;set_returns_status(true);</a>
+<a name="ln1179">  }</a>
+<a name="ln1180"> </a>
+<a name="ln1181">  // Set whether write op writes to the static/primary row.</a>
+<a name="ln1182">  insert_op-&gt;set_writes_static_row(tnode-&gt;ModifiesStaticRow());</a>
+<a name="ln1183">  insert_op-&gt;set_writes_primary_row(tnode-&gt;ModifiesPrimaryRow());</a>
+<a name="ln1184"> </a>
+<a name="ln1185">  // Add the operation.</a>
+<a name="ln1186">  return AddOperation(insert_op, tnode_context);</a>
+<a name="ln1187">}</a>
+<a name="ln1188"> </a>
+<a name="ln1189">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln1190"> </a>
+<a name="ln1191">Status Executor::ExecPTNode(const PTDeleteStmt *tnode, TnodeContext* tnode_context) {</a>
+<a name="ln1192">  // Create write request.</a>
+<a name="ln1193">  const shared_ptr&lt;client::YBTable&gt;&amp; table = tnode-&gt;table();</a>
+<a name="ln1194">  YBqlWriteOpPtr delete_op(table-&gt;NewQLDelete());</a>
+<a name="ln1195">  QLWriteRequestPB *req = delete_op-&gt;mutable_request();</a>
+<a name="ln1196"> </a>
+<a name="ln1197">  // Set the timestamp.</a>
+<a name="ln1198">  Status s = TimestampToPB(tnode, req);</a>
+<a name="ln1199">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1200">    return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1201">  }</a>
+<a name="ln1202"> </a>
+<a name="ln1203">  // Where clause - Hash, range, and regular columns.</a>
+<a name="ln1204">  // NOTE: Currently, where clause for write op doesn't allow regular columns.</a>
+<a name="ln1205">  s = WhereClauseToPB(req, tnode-&gt;key_where_ops(), tnode-&gt;where_ops(),</a>
+<a name="ln1206">                      tnode-&gt;subscripted_col_where_ops());</a>
+<a name="ln1207">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1208">    return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1209">  }</a>
+<a name="ln1210"> </a>
+<a name="ln1211">  // Setup the column values that need to be read.</a>
+<a name="ln1212">  s = ColumnRefsToPB(tnode, req-&gt;mutable_column_refs());</a>
+<a name="ln1213">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1214">    return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1215">  }</a>
+<a name="ln1216">  s = ColumnArgsToPB(tnode, req);</a>
+<a name="ln1217">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1218">    return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1219">  }</a>
+<a name="ln1220"> </a>
+<a name="ln1221">  // Set the IF clause.</a>
+<a name="ln1222">  if (tnode-&gt;if_clause() != nullptr) {</a>
+<a name="ln1223">    s = PTExprToPB(tnode-&gt;if_clause(), delete_op-&gt;mutable_request()-&gt;mutable_if_expr());</a>
+<a name="ln1224">    if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1225">      return exec_context_-&gt;Error(tnode-&gt;if_clause(), s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1226">    }</a>
+<a name="ln1227">    req-&gt;set_else_error(tnode-&gt;else_error());</a>
+<a name="ln1228">  }</a>
+<a name="ln1229"> </a>
+<a name="ln1230">  // Set the RETURNS clause if set.</a>
+<a name="ln1231">  if (tnode-&gt;returns_status()) {</a>
+<a name="ln1232">    req-&gt;set_returns_status(true);</a>
+<a name="ln1233">  }</a>
+<a name="ln1234"> </a>
+<a name="ln1235">  // Set whether write op writes to the static/primary row.</a>
+<a name="ln1236">  delete_op-&gt;set_writes_static_row(tnode-&gt;ModifiesStaticRow());</a>
+<a name="ln1237">  delete_op-&gt;set_writes_primary_row(tnode-&gt;ModifiesPrimaryRow());</a>
+<a name="ln1238"> </a>
+<a name="ln1239">  // Add the operation.</a>
+<a name="ln1240">  return AddOperation(delete_op, tnode_context);</a>
+<a name="ln1241">}</a>
+<a name="ln1242"> </a>
+<a name="ln1243">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln1244"> </a>
+<a name="ln1245">Status Executor::ExecPTNode(const PTUpdateStmt *tnode, TnodeContext* tnode_context) {</a>
+<a name="ln1246">  // Create write request.</a>
+<a name="ln1247">  const shared_ptr&lt;client::YBTable&gt;&amp; table = tnode-&gt;table();</a>
+<a name="ln1248">  YBqlWriteOpPtr update_op(table-&gt;NewQLUpdate());</a>
+<a name="ln1249">  QLWriteRequestPB *req = update_op-&gt;mutable_request();</a>
+<a name="ln1250"> </a>
+<a name="ln1251">  // Where clause - Hash, range, and regular columns.</a>
+<a name="ln1252">  // NOTE: Currently, where clause for write op doesn't allow regular columns.</a>
+<a name="ln1253">  Status s = WhereClauseToPB(req, tnode-&gt;key_where_ops(), tnode-&gt;where_ops(),</a>
+<a name="ln1254">                             tnode-&gt;subscripted_col_where_ops());</a>
+<a name="ln1255">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1256">    return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1257">  }</a>
+<a name="ln1258"> </a>
+<a name="ln1259">  // Set the ttl.</a>
+<a name="ln1260">  s = TtlToPB(tnode, req);</a>
+<a name="ln1261">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1262">    return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1263">  }</a>
+<a name="ln1264"> </a>
+<a name="ln1265">  // Set the timestamp.</a>
+<a name="ln1266">  s = TimestampToPB(tnode, req);</a>
+<a name="ln1267">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1268">    return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1269">  }</a>
+<a name="ln1270"> </a>
+<a name="ln1271">  // Setup the columns' new values.</a>
+<a name="ln1272">  s = ColumnArgsToPB(tnode, update_op-&gt;mutable_request());</a>
+<a name="ln1273">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1274">    return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1275">  }</a>
+<a name="ln1276"> </a>
+<a name="ln1277">  // Setup the column values that need to be read.</a>
+<a name="ln1278">  s = ColumnRefsToPB(tnode, req-&gt;mutable_column_refs());</a>
+<a name="ln1279">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1280">    return exec_context_-&gt;Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1281">  }</a>
+<a name="ln1282"> </a>
+<a name="ln1283">  // Set the IF clause.</a>
+<a name="ln1284">  if (tnode-&gt;if_clause() != nullptr) {</a>
+<a name="ln1285">    s = PTExprToPB(tnode-&gt;if_clause(), update_op-&gt;mutable_request()-&gt;mutable_if_expr());</a>
+<a name="ln1286">    if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1287">      return exec_context_-&gt;Error(tnode-&gt;if_clause(), s, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln1288">    }</a>
+<a name="ln1289">    req-&gt;set_else_error(tnode-&gt;else_error());</a>
+<a name="ln1290">  }</a>
+<a name="ln1291"> </a>
+<a name="ln1292">  // Set the RETURNS clause if set.</a>
+<a name="ln1293">  if (tnode-&gt;returns_status()) {</a>
+<a name="ln1294">    req-&gt;set_returns_status(true);</a>
+<a name="ln1295">  }</a>
+<a name="ln1296"> </a>
+<a name="ln1297">  // Set whether write op writes to the static/primary row.</a>
+<a name="ln1298">  update_op-&gt;set_writes_static_row(tnode-&gt;ModifiesStaticRow());</a>
+<a name="ln1299">  update_op-&gt;set_writes_primary_row(tnode-&gt;ModifiesPrimaryRow());</a>
+<a name="ln1300"> </a>
+<a name="ln1301">  // Add the operation.</a>
+<a name="ln1302">  return AddOperation(update_op, tnode_context);</a>
+<a name="ln1303">}</a>
+<a name="ln1304"> </a>
+<a name="ln1305">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln1306"> </a>
+<a name="ln1307">Status Executor::ExecPTNode(const PTStartTransaction *tnode) {</a>
+<a name="ln1308">  return exec_context_-&gt;StartTransaction(tnode-&gt;isolation_level(), ql_env_);</a>
+<a name="ln1309">}</a>
+<a name="ln1310"> </a>
+<a name="ln1311">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln1312"> </a>
+<a name="ln1313">Status Executor::ExecPTNode(const PTCommit *tnode) {</a>
+<a name="ln1314">  // Commit happens after the write operations have been flushed and responded.</a>
+<a name="ln1315">  return Status::OK();</a>
+<a name="ln1316">}</a>
+<a name="ln1317"> </a>
+<a name="ln1318">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln1319"> </a>
+<a name="ln1320">Status Executor::ExecPTNode(const PTTruncateStmt *tnode) {</a>
+<a name="ln1321">  return ql_env_-&gt;TruncateTable(tnode-&gt;table_id());</a>
+<a name="ln1322">}</a>
+<a name="ln1323"> </a>
+<a name="ln1324">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln1325"> </a>
+<a name="ln1326">Status Executor::ExecPTNode(const PTCreateKeyspace *tnode) {</a>
+<a name="ln1327">  Status s = ql_env_-&gt;CreateKeyspace(tnode-&gt;name());</a>
+<a name="ln1328"> </a>
+<a name="ln1329">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1330">    ErrorCode error_code = ErrorCode::SERVER_ERROR;</a>
+<a name="ln1331"> </a>
+<a name="ln1332">    if (s.IsAlreadyPresent()) {</a>
+<a name="ln1333">      if (tnode-&gt;create_if_not_exists()) {</a>
+<a name="ln1334">        // Case: CREATE KEYSPACE IF NOT EXISTS name;</a>
+<a name="ln1335">        return Status::OK();</a>
+<a name="ln1336">      }</a>
+<a name="ln1337"> </a>
+<a name="ln1338">      error_code = ErrorCode::KEYSPACE_ALREADY_EXISTS;</a>
+<a name="ln1339">    }</a>
+<a name="ln1340"> </a>
+<a name="ln1341">    return exec_context_-&gt;Error(tnode, s, error_code);</a>
+<a name="ln1342">  }</a>
+<a name="ln1343"> </a>
+<a name="ln1344">  result_ = std::make_shared&lt;SchemaChangeResult&gt;(&quot;CREATED&quot;, &quot;KEYSPACE&quot;, tnode-&gt;name());</a>
+<a name="ln1345">  return Status::OK();</a>
+<a name="ln1346">}</a>
+<a name="ln1347"> </a>
+<a name="ln1348">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln1349"> </a>
+<a name="ln1350">Status Executor::ExecPTNode(const PTUseKeyspace *tnode) {</a>
+<a name="ln1351">  const Status s = ql_env_-&gt;UseKeyspace(tnode-&gt;name());</a>
+<a name="ln1352">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1353">    ErrorCode error_code = s.IsNotFound() ? ErrorCode::KEYSPACE_NOT_FOUND : ErrorCode::SERVER_ERROR;</a>
+<a name="ln1354">    return exec_context_-&gt;Error(tnode, s, error_code);</a>
+<a name="ln1355">  }</a>
+<a name="ln1356"> </a>
+<a name="ln1357">  result_ = std::make_shared&lt;SetKeyspaceResult&gt;(tnode-&gt;name());</a>
+<a name="ln1358">  return Status::OK();</a>
+<a name="ln1359">}</a>
+<a name="ln1360"> </a>
+<a name="ln1361">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln1362"> </a>
+<a name="ln1363">Status Executor::ExecPTNode(const PTAlterKeyspace *tnode) {</a>
+<a name="ln1364">  // To get new keyspace properties use: tnode-&gt;keyspace_properties()</a>
+<a name="ln1365">  // Current implementation only check existence of this keyspace.</a>
+<a name="ln1366">  const Status s = ql_env_-&gt;AlterKeyspace(tnode-&gt;name());</a>
+<a name="ln1367"> </a>
+<a name="ln1368">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln1369">    ErrorCode error_code = s.IsNotFound() ? ErrorCode::KEYSPACE_NOT_FOUND : ErrorCode::SERVER_ERROR;</a>
+<a name="ln1370">    return exec_context_-&gt;Error(tnode, s, error_code);</a>
+<a name="ln1371">  }</a>
+<a name="ln1372"> </a>
+<a name="ln1373">  result_ = std::make_shared&lt;SchemaChangeResult&gt;(&quot;UPDATED&quot;, &quot;KEYSPACE&quot;, tnode-&gt;name());</a>
+<a name="ln1374">  return Status::OK();</a>
+<a name="ln1375">}</a>
+<a name="ln1376"> </a>
+<a name="ln1377">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln1378"> </a>
+<a name="ln1379">namespace {</a>
+<a name="ln1380"> </a>
+<a name="ln1381">void AddStringRow(const string&amp; str, QLRowBlock* row_block) {</a>
+<a name="ln1382">  row_block-&gt;Extend().mutable_column(0)-&gt;set_string_value(str);</a>
+<a name="ln1383">}</a>
+<a name="ln1384"> </a>
+<a name="ln1385">void RightPad(const int length, string *s) {</a>
+<a name="ln1386">  s-&gt;append(length - s-&gt;length(), ' ');</a>
+<a name="ln1387">}</a>
+<a name="ln1388">} // namespace</a>
+<a name="ln1389"> </a>
+<a name="ln1390">Status Executor::ExecPTNode(const PTExplainStmt *tnode) {</a>
+<a name="ln1391">  TreeNode::SharedPtr subStmt = tnode-&gt;stmt();</a>
+<a name="ln1392">  PTDmlStmt *dmlStmt = down_cast&lt;PTDmlStmt *&gt;(subStmt.get());</a>
+<a name="ln1393">  const YBTableName explainTable(YQL_DATABASE_CQL, &quot;Explain&quot;);</a>
+<a name="ln1394">  ColumnSchema explainColumn(&quot;QUERY PLAN&quot;, STRING);</a>
+<a name="ln1395">  auto explainColumns = std::make_shared&lt;std::vector&lt;ColumnSchema&gt;&gt;(</a>
+<a name="ln1396">      std::initializer_list&lt;ColumnSchema&gt;{explainColumn});</a>
+<a name="ln1397">  auto explainSchema = std::make_shared&lt;Schema&gt;(*explainColumns, 0);</a>
+<a name="ln1398">  QLRowBlock row_block(*explainSchema);</a>
+<a name="ln1399">  faststring buffer;</a>
+<a name="ln1400">  ExplainPlanPB explain_plan = dmlStmt-&gt;AnalysisResultToPB();</a>
+<a name="ln1401">  switch (explain_plan.plan_case()) {</a>
+<a name="ln1402">    case ExplainPlanPB::kSelectPlan: {</a>
+<a name="ln1403">      SelectPlanPB *select_plan = explain_plan.mutable_select_plan();</a>
+<a name="ln1404">      if (select_plan-&gt;has_aggregate()) {</a>
+<a name="ln1405">        RightPad(select_plan-&gt;output_width(), select_plan-&gt;mutable_aggregate());</a>
+<a name="ln1406">        AddStringRow(select_plan-&gt;aggregate(), &amp;row_block);</a>
+<a name="ln1407">      }</a>
+<a name="ln1408">      RightPad(select_plan-&gt;output_width(), select_plan-&gt;mutable_select_type());</a>
+<a name="ln1409">      AddStringRow(select_plan-&gt;select_type(), &amp;row_block);</a>
+<a name="ln1410">      if (select_plan-&gt;has_key_conditions()) {</a>
+<a name="ln1411">        RightPad(select_plan-&gt;output_width(), select_plan-&gt;mutable_key_conditions());</a>
+<a name="ln1412">        AddStringRow(select_plan-&gt;key_conditions(), &amp;row_block);</a>
+<a name="ln1413">      }</a>
+<a name="ln1414">      if (select_plan-&gt;has_filter()) {</a>
+<a name="ln1415">        RightPad(select_plan-&gt;output_width(), select_plan-&gt;mutable_filter());</a>
+<a name="ln1416">        AddStringRow(select_plan-&gt;filter(), &amp;row_block);</a>
+<a name="ln1417">      }</a>
+<a name="ln1418">      break;</a>
+<a name="ln1419">    }</a>
+<a name="ln1420">    case ExplainPlanPB::kInsertPlan: {</a>
+<a name="ln1421">      InsertPlanPB *insert_plan = explain_plan.mutable_insert_plan();</a>
+<a name="ln1422">      RightPad(insert_plan-&gt;output_width(), insert_plan-&gt;mutable_insert_type());</a>
+<a name="ln1423">      AddStringRow(insert_plan-&gt;insert_type(), &amp;row_block);</a>
+<a name="ln1424">      break;</a>
+<a name="ln1425">    }</a>
+<a name="ln1426">    case ExplainPlanPB::kUpdatePlan: {</a>
+<a name="ln1427">      UpdatePlanPB *update_plan = explain_plan.mutable_update_plan();</a>
+<a name="ln1428">      RightPad(update_plan-&gt;output_width(), update_plan-&gt;mutable_update_type());</a>
+<a name="ln1429">      AddStringRow(update_plan-&gt;update_type(), &amp;row_block);</a>
+<a name="ln1430">      RightPad(update_plan-&gt;output_width(), update_plan-&gt;mutable_scan_type());</a>
+<a name="ln1431">      AddStringRow(update_plan-&gt;scan_type(), &amp;row_block);</a>
+<a name="ln1432">      RightPad(update_plan-&gt;output_width(), update_plan-&gt;mutable_key_conditions());</a>
+<a name="ln1433">      AddStringRow(update_plan-&gt;key_conditions(), &amp;row_block);</a>
+<a name="ln1434">      break;</a>
+<a name="ln1435">    }</a>
+<a name="ln1436">    case ExplainPlanPB::kDeletePlan: {</a>
+<a name="ln1437">      DeletePlanPB *delete_plan = explain_plan.mutable_delete_plan();</a>
+<a name="ln1438">      RightPad(delete_plan-&gt;output_width(), delete_plan-&gt;mutable_delete_type());</a>
+<a name="ln1439">      AddStringRow(delete_plan-&gt;delete_type(), &amp;row_block);</a>
+<a name="ln1440">      RightPad(delete_plan-&gt;output_width(), delete_plan-&gt;mutable_scan_type());</a>
+<a name="ln1441">      AddStringRow(delete_plan-&gt;scan_type(), &amp;row_block);</a>
+<a name="ln1442">      RightPad(delete_plan-&gt;output_width(), delete_plan-&gt;mutable_key_conditions());</a>
+<a name="ln1443">      AddStringRow(delete_plan-&gt;key_conditions(), &amp;row_block);</a>
+<a name="ln1444">      if (delete_plan-&gt;has_filter()) {</a>
+<a name="ln1445">        RightPad(delete_plan-&gt;output_width(), delete_plan-&gt;mutable_filter());</a>
+<a name="ln1446">        AddStringRow(delete_plan-&gt;filter(), &amp;row_block);</a>
+<a name="ln1447">      }</a>
+<a name="ln1448">      break;</a>
+<a name="ln1449">    }</a>
+<a name="ln1450">    case ExplainPlanPB::PLAN_NOT_SET: {</a>
+<a name="ln1451">      return exec_context_-&gt;Error(tnode, ErrorCode::EXEC_ERROR);</a>
+<a name="ln1452">      break;</a>
+<a name="ln1453">    }</a>
+<a name="ln1454">  }</a>
+<a name="ln1455">  row_block.Serialize(YQL_CLIENT_CQL, &amp;buffer);</a>
+<a name="ln1456">  result_ = std::make_shared&lt;RowsResult&gt;(explainTable, explainColumns, buffer.ToString());</a>
+<a name="ln1457">  return Status::OK();</a>
+<a name="ln1458">}</a>
+<a name="ln1459"> </a>
+<a name="ln1460">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln1461"> </a>
+<a name="ln1462">namespace {</a>
+<a name="ln1463"> </a>
+<a name="ln1464">// When executing a DML in a transaction or a SELECT statement on a transaction-enabled table, the</a>
+<a name="ln1465">// following transient errors may happen for which the YCQL service will restart the transaction.</a>
+<a name="ln1466">// - TryAgain: when the transaction has a write conflict with another transaction or read-</a>
+<a name="ln1467">//             restart is required.</a>
+<a name="ln1468">// - Expired:  when the transaction expires due to missed heartbeat</a>
+<a name="ln1469">bool NeedsRestart(const Status&amp; s) {</a>
+<a name="ln1470">  return s.IsTryAgain() || s.IsExpired();</a>
+<a name="ln1471">}</a>
+<a name="ln1472"> </a>
+<a name="ln1473">// Process TnodeContexts and their children under an ExecContext.</a>
+<a name="ln1474">Status ProcessTnodeContexts(ExecContext* exec_context,</a>
+<a name="ln1475">                            const std::function&lt;Result&lt;bool&gt;(TnodeContext*)&gt;&amp; processor) {</a>
+<a name="ln1476">  for (TnodeContext&amp; tnode_context : exec_context-&gt;tnode_contexts()) {</a>
+<a name="ln1477">    TnodeContext* p = &amp;tnode_context;</a>
+<a name="ln1478">    while (p != nullptr) {</a>
+<a name="ln1479">      const Result&lt;bool&gt; done = processor(p);</a>
+<a name="ln1480">      RETURN_NOT_OK(done);</a>
+<a name="ln1481">      if (done.get()) {</a>
+<a name="ln1482">        return Status::OK();</a>
+<a name="ln1483">      }</a>
+<a name="ln1484">      p = p-&gt;child_context();</a>
+<a name="ln1485">    }</a>
+<a name="ln1486">  }</a>
+<a name="ln1487">  return Status::OK();</a>
+<a name="ln1488">}</a>
+<a name="ln1489"> </a>
+<a name="ln1490">} // namespace</a>
+<a name="ln1491"> </a>
+<a name="ln1492">void Executor::FlushAsync() {</a>
+<a name="ln1493">  // Buffered read/write operations are flushed in rounds. In each round, FlushAsync() is called to</a>
+<a name="ln1494">  // flush buffered operations in the non-transactional session in the Executor or the transactional</a>
+<a name="ln1495">  // session in each ExecContext if any. Also, transactions in any ExecContext ready to commit with</a>
+<a name="ln1496">  // no more pending operation are also committed. If there is no session to flush nor</a>
+<a name="ln1497">  // transaction to commit, the statement is executed.</a>
+<a name="ln1498">  //</a>
+<a name="ln1499">  // As flushes and commits happen, multiple FlushAsyncDone() and CommitDone() callbacks can be</a>
+<a name="ln1500">  // invoked concurrently. To avoid race condition among them, the async-call count before calling</a>
+<a name="ln1501">  // FlushAsync() and CommitTransaction(). This is necessary so that only the last callback will</a>
+<a name="ln1502">  // correctly detect that all async calls are done invoked before processing the async results</a>
+<a name="ln1503">  // exclusively.</a>
+<a name="ln1504">  write_batch_.Clear();</a>
+<a name="ln1505">  std::vector&lt;std::pair&lt;YBSessionPtr, ExecContext*&gt;&gt; flush_sessions;</a>
+<a name="ln1506">  std::vector&lt;ExecContext*&gt; commit_contexts;</a>
+<a name="ln1507">  if (session_-&gt;CountBufferedOperations() &gt; 0) {</a>
+<a name="ln1508">    flush_sessions.push_back({session_, nullptr});</a>
+<a name="ln1509">  }</a>
+<a name="ln1510">  for (ExecContext&amp; exec_context : exec_contexts_) {</a>
+<a name="ln1511">    if (exec_context.HasTransaction()) {</a>
+<a name="ln1512">      auto transactional_session = exec_context.transactional_session();</a>
+<a name="ln1513">      if (transactional_session-&gt;CountBufferedOperations() &gt; 0) {</a>
+<a name="ln1514">        // In case or retry we should ignore values that could be written by previous attempts</a>
+<a name="ln1515">        // of retried operation.</a>
+<a name="ln1516">        transactional_session-&gt;SetInTxnLimit(transactional_session-&gt;read_point()-&gt;Now());</a>
+<a name="ln1517">        flush_sessions.push_back({transactional_session, &amp;exec_context});</a>
+<a name="ln1518">      } else if (!exec_context.HasPendingOperations()) {</a>
+<a name="ln1519">        commit_contexts.push_back(&amp;exec_context);</a>
+<a name="ln1520">      }</a>
+<a name="ln1521">    }</a>
+<a name="ln1522">  }</a>
+<a name="ln1523"> </a>
+<a name="ln1524">  // Commit transactions first before flushing operations in case some operations are blocked by</a>
+<a name="ln1525">  // prior operations in the uncommitted transactions. num_flushes_ is updated before FlushAsync()</a>
+<a name="ln1526">  // and CommitTransaction() are called to avoid race condition of recursive FlushAsync() called</a>
+<a name="ln1527">  // from FlushAsyncDone() and CommitDone().</a>
+<a name="ln1528">  DCHECK_EQ(num_async_calls_, 0);</a>
+<a name="ln1529">  num_async_calls_ = flush_sessions.size() + commit_contexts.size();</a>
+<a name="ln1530">  num_flushes_ += flush_sessions.size();</a>
+<a name="ln1531">  async_status_ = Status::OK();</a>
+<a name="ln1532">  for (auto* exec_context : commit_contexts) {</a>
+<a name="ln1533">    exec_context-&gt;CommitTransaction([this, exec_context](const Status&amp; s) {</a>
+<a name="ln1534">        CommitDone(s, exec_context);</a>
+<a name="ln1535">      });</a>
+<a name="ln1536">  }</a>
+<a name="ln1537">  // Use the same score on each tablet. So probability of rejecting write should be related</a>
+<a name="ln1538">  // to used capacity.</a>
+<a name="ln1539">  auto rejection_score_source = std::make_shared&lt;client::RejectionScoreSource&gt;();</a>
+<a name="ln1540">  for (const auto&amp; pair : flush_sessions) {</a>
+<a name="ln1541">    auto session = pair.first;</a>
+<a name="ln1542">    auto exec_context = pair.second;</a>
+<a name="ln1543">    session-&gt;SetRejectionScoreSource(rejection_score_source);</a>
+<a name="ln1544">    TRACE(&quot;Flush Async&quot;);</a>
+<a name="ln1545">    session-&gt;FlushAsync([this, exec_context](const Status&amp; s) {</a>
+<a name="ln1546">        FlushAsyncDone(s, exec_context);</a>
+<a name="ln1547">      });</a>
+<a name="ln1548">  }</a>
+<a name="ln1549"> </a>
+<a name="ln1550">  if (flush_sessions.empty() &amp;&amp; commit_contexts.empty()) {</a>
+<a name="ln1551">    // If this is a batch returning status, append the rows in the user-given order before</a>
+<a name="ln1552">    // returning result.</a>
+<a name="ln1553">    if (IsReturnsStatusBatch()) {</a>
+<a name="ln1554">      for (ExecContext&amp; exec_context : exec_contexts_) {</a>
+<a name="ln1555">        int64_t row_count = 0;</a>
+<a name="ln1556">        RETURN_STMT_NOT_OK(ProcessTnodeContexts(</a>
+<a name="ln1557">            &amp;exec_context,</a>
+<a name="ln1558">            [this, &amp;exec_context, &amp;row_count](TnodeContext* tnode_context) -&gt; Result&lt;bool&gt; {</a>
+<a name="ln1559">              for (client::YBqlOpPtr&amp; op : tnode_context-&gt;ops()) {</a>
+<a name="ln1560">                if (!op-&gt;rows_data().empty()) {</a>
+<a name="ln1561">                  DCHECK_EQ(++row_count, 1) &lt;&lt; exec_context.stmt()</a>
+<a name="ln1562">                                            &lt;&lt; &quot; returned multiple status rows&quot;;</a>
+<a name="ln1563">                  RETURN_NOT_OK(AppendRowsResult(std::make_shared&lt;RowsResult&gt;(op.get())));</a>
+<a name="ln1564">                }</a>
+<a name="ln1565">              }</a>
+<a name="ln1566">              return false; // not done</a>
+<a name="ln1567">            }));</a>
+<a name="ln1568">      }</a>
+<a name="ln1569">    }</a>
+<a name="ln1570">    return StatementExecuted(Status::OK());</a>
+<a name="ln1571">  }</a>
+<a name="ln1572">}</a>
+<a name="ln1573"> </a>
+<a name="ln1574">// As multiple FlushAsyncDone() and CommitDone() can be invoked concurrently for different</a>
+<a name="ln1575">// ExecContexts, care must be taken so that the callbacks only update the individual ExecContexts.</a>
+<a name="ln1576">// Any update on data structures shared in Executor should either be protected by a mutex or</a>
+<a name="ln1577">// deferred to ProcessAsyncResults() that will be invoked exclusively.</a>
+<a name="ln1578">void Executor::FlushAsyncDone(Status s, ExecContext* exec_context) {</a>
+<a name="ln1579">  TRACE(&quot;Flush Async Done&quot;);</a>
+<a name="ln1580">  // Process FlushAsync status for either transactional session in an ExecContext, or the</a>
+<a name="ln1581">  // non-transactional session in the Executor for other ExecContexts with no transactional session.</a>
+<a name="ln1582">  const YBSessionPtr&amp; session = exec_context != nullptr ? GetSession(exec_context) : session_;</a>
+<a name="ln1583"> </a>
+<a name="ln1584">  // When any error occurs during the dispatching of YBOperation, YBSession saves the error and</a>
+<a name="ln1585">  // returns IOError. When it happens, retrieves the errors and discard the IOError.</a>
+<a name="ln1586">  OpErrors op_errors;</a>
+<a name="ln1587">  if (s.IsIOError()) {</a>
+<a name="ln1588">    for (const auto&amp; error : session-&gt;GetPendingErrors()) {</a>
+<a name="ln1589">      op_errors[static_cast&lt;const client::YBqlOp*&gt;(&amp;error-&gt;failed_op())] = error-&gt;status();</a>
+<a name="ln1590">    }</a>
+<a name="ln1591">    s = Status::OK();</a>
+<a name="ln1592">  }</a>
+<a name="ln1593"> </a>
+<a name="ln1594">  if (s.ok()) {</a>
+<a name="ln1595">    if (exec_context != nullptr) {</a>
+<a name="ln1596">      s = ProcessAsyncStatus(op_errors, exec_context);</a>
+<a name="ln1597">      if (!s.ok()) {</a>
+<a name="ln1598">        std::lock_guard&lt;std::mutex&gt; lock(status_mutex_);</a>
+<a name="ln1599">        async_status_ = s;</a>
+<a name="ln1600">      }</a>
+<a name="ln1601">    } else {</a>
+<a name="ln1602">      for (auto&amp; exec_context : exec_contexts_) {</a>
+<a name="ln1603">        if (!exec_context.HasTransaction()) {</a>
+<a name="ln1604">          s = ProcessAsyncStatus(op_errors, &amp;exec_context);</a>
+<a name="ln1605">          if (!s.ok()) {</a>
+<a name="ln1606">            std::lock_guard&lt;std::mutex&gt; lock(status_mutex_);</a>
+<a name="ln1607">            async_status_ = s;</a>
+<a name="ln1608">          }</a>
+<a name="ln1609">        }</a>
+<a name="ln1610">      }</a>
+<a name="ln1611">    }</a>
+<a name="ln1612">  } else {</a>
+<a name="ln1613">    std::lock_guard&lt;std::mutex&gt; lock(status_mutex_);</a>
+<a name="ln1614">    async_status_ = s;</a>
+<a name="ln1615">  }</a>
+<a name="ln1616"> </a>
+<a name="ln1617">  // Process async results exclusively if this is the last callback of the last FlushAsync() and</a>
+<a name="ln1618">  // there is no more outstanding async call.</a>
+<a name="ln1619">  if (--num_async_calls_ == 0) {</a>
+<a name="ln1620">    ProcessAsyncResults();</a>
+<a name="ln1621">  }</a>
+<a name="ln1622">}</a>
+<a name="ln1623"> </a>
+<a name="ln1624">void Executor::CommitDone(Status s, ExecContext* exec_context) {</a>
+<a name="ln1625">  TRACE(&quot;Commit Transaction Done&quot;);</a>
+<a name="ln1626"> </a>
+<a name="ln1627">  if (s.ok()) {</a>
+<a name="ln1628">    if (ql_metrics_ != nullptr) {</a>
+<a name="ln1629">      const MonoTime now = MonoTime::Now();</a>
+<a name="ln1630">      const auto delta_usec = (now - exec_context-&gt;transaction_start_time()).ToMicroseconds();</a>
+<a name="ln1631">      ql_metrics_-&gt;ql_transaction_-&gt;Increment(delta_usec);</a>
+<a name="ln1632">    }</a>
+<a name="ln1633">  } else {</a>
+<a name="ln1634">    if (NeedsRestart(s)) {</a>
+<a name="ln1635">      exec_context-&gt;Reset(client::Restart::kTrue, rescheduler_);</a>
+<a name="ln1636">    } else {</a>
+<a name="ln1637">      std::lock_guard&lt;std::mutex&gt; lock(status_mutex_);</a>
+<a name="ln1638">      async_status_ = s;</a>
+<a name="ln1639">    }</a>
+<a name="ln1640">  }</a>
+<a name="ln1641"> </a>
+<a name="ln1642">  // Process async results exclusively if this is the last callback of the last FlushAsync() and</a>
+<a name="ln1643">  // there is no more outstanding async call.</a>
+<a name="ln1644">  if (--num_async_calls_ == 0) {</a>
+<a name="ln1645">    ProcessAsyncResults();</a>
+<a name="ln1646">  }</a>
+<a name="ln1647">}</a>
+<a name="ln1648"> </a>
+<a name="ln1649">void Executor::ProcessAsyncResults(const bool rescheduled) {</a>
+<a name="ln1650">  // If the current thread is not the RPC worker thread, call the callback directly. Otherwise,</a>
+<a name="ln1651">  // reschedule the call to resume in the RPC worker thread.</a>
+<a name="ln1652">  if (!rescheduled &amp;&amp; rescheduler_-&gt;NeedReschedule()) {</a>
+<a name="ln1653">    return rescheduler_-&gt;Reschedule(&amp;process_async_results_task_.Bind(this));</a>
+<a name="ln1654">  }</a>
+<a name="ln1655"> </a>
+<a name="ln1656">  // Return error immediately when async call failed.</a>
+<a name="ln1657">  RETURN_STMT_NOT_OK(async_status_);</a>
+<a name="ln1658"> </a>
+<a name="ln1659">  // Go through each ExecContext and process async results.</a>
+<a name="ln1660">  bool has_buffered_ops = false;</a>
+<a name="ln1661">  bool has_restart = false;</a>
+<a name="ln1662">  const MonoTime now = (ql_metrics_ != nullptr) ? MonoTime::Now() : MonoTime();</a>
+<a name="ln1663">  for (auto exec_itr = exec_contexts_.begin(); exec_itr != exec_contexts_.end(); ) {</a>
+<a name="ln1664"> </a>
+<a name="ln1665">    // Set current ExecContext.</a>
+<a name="ln1666">    exec_context_ = &amp;*exec_itr;</a>
+<a name="ln1667"> </a>
+<a name="ln1668">    // Restart a statement if necessary</a>
+<a name="ln1669">    if (exec_context_-&gt;restart()) {</a>
+<a name="ln1670">      has_restart = true;</a>
+<a name="ln1671">      const TreeNode *root = exec_context_-&gt;parse_tree().root().get();</a>
+<a name="ln1672">      // Clear partial rows accumulated from the SELECT statement.</a>
+<a name="ln1673">      if (root-&gt;opcode() == TreeNodeOpcode::kPTSelectStmt) {</a>
+<a name="ln1674">        result_ = nullptr;</a>
+<a name="ln1675">      }</a>
+<a name="ln1676"> </a>
+<a name="ln1677">      // We should restart read, but read time was specified by caller.</a>
+<a name="ln1678">      // For instance it could happen in case of pagination.</a>
+<a name="ln1679">      if (exec_context_-&gt;params().read_time()) {</a>
+<a name="ln1680">        RETURN_STMT_NOT_OK(</a>
+<a name="ln1681">            STATUS(IllegalState, &quot;Restart read required, but read time specified by caller&quot;));</a>
+<a name="ln1682">      }</a>
+<a name="ln1683"> </a>
+<a name="ln1684">      YBSessionPtr session = GetSession(exec_context_);</a>
+<a name="ln1685">      session-&gt;SetReadPoint(client::Restart::kTrue);</a>
+<a name="ln1686">      RETURN_STMT_NOT_OK(ExecTreeNode(root));</a>
+<a name="ln1687">      if (session-&gt;CountBufferedOperations() &gt; 0) {</a>
+<a name="ln1688">        has_buffered_ops = true;</a>
+<a name="ln1689">      }</a>
+<a name="ln1690">      exec_itr++;</a>
+<a name="ln1691">      continue;</a>
+<a name="ln1692">    }</a>
+<a name="ln1693"> </a>
+<a name="ln1694">    // Go through each TnodeContext in an ExecContext and process async results.</a>
+<a name="ln1695">    auto&amp; tnode_contexts = exec_context_-&gt;tnode_contexts();</a>
+<a name="ln1696">    for (auto tnode_itr = tnode_contexts.begin(); tnode_itr != tnode_contexts.end(); ) {</a>
+<a name="ln1697">      TnodeContext&amp; tnode_context = *tnode_itr;</a>
+<a name="ln1698"> </a>
+<a name="ln1699">      const Result&lt;bool&gt; result = ProcessTnodeResults(&amp;tnode_context);</a>
+<a name="ln1700">      RETURN_STMT_NOT_OK(result);</a>
+<a name="ln1701">      if (*result) {</a>
+<a name="ln1702">        has_buffered_ops = true;</a>
+<a name="ln1703">      }</a>
+<a name="ln1704"> </a>
+<a name="ln1705">      // If this statement is restarted, stop traversing the rest of the statement tnodes.</a>
+<a name="ln1706">      if (exec_context_-&gt;restart()) {</a>
+<a name="ln1707">        break;</a>
+<a name="ln1708">      }</a>
+<a name="ln1709"> </a>
+<a name="ln1710">      // If there are pending ops, we are not done with this statement tnode yet.</a>
+<a name="ln1711">      if (tnode_context.HasPendingOperations()) {</a>
+<a name="ln1712">        tnode_itr++;</a>
+<a name="ln1713">        continue;</a>
+<a name="ln1714">      }</a>
+<a name="ln1715"> </a>
+<a name="ln1716">      // For SELECT statement, aggregate result sets if needed.</a>
+<a name="ln1717">      const TreeNode *tnode = tnode_context.tnode();</a>
+<a name="ln1718">      if (tnode-&gt;opcode() == TreeNodeOpcode::kPTSelectStmt) {</a>
+<a name="ln1719">        RETURN_STMT_NOT_OK(AggregateResultSets(static_cast&lt;const PTSelectStmt *&gt;(tnode),</a>
+<a name="ln1720">                                               &amp;tnode_context));</a>
+<a name="ln1721">      }</a>
+<a name="ln1722"> </a>
+<a name="ln1723">      // Update the metrics for SELECT/INSERT/UPDATE/DELETE here after the ops have been completed</a>
+<a name="ln1724">      // but exclude the time to commit the transaction if any. Report the metric only once.</a>
+<a name="ln1725">      if (ql_metrics_ != nullptr &amp;&amp; !tnode_context.end_time().Initialized()) {</a>
+<a name="ln1726">        tnode_context.set_end_time(now);</a>
+<a name="ln1727">        const auto delta_usec = tnode_context.execution_time().ToMicroseconds();</a>
+<a name="ln1728">        switch (tnode-&gt;opcode()) {</a>
+<a name="ln1729">          case TreeNodeOpcode::kPTSelectStmt:</a>
+<a name="ln1730">            ql_metrics_-&gt;ql_select_-&gt;Increment(delta_usec);</a>
+<a name="ln1731">            break;</a>
+<a name="ln1732">          case TreeNodeOpcode::kPTInsertStmt:</a>
+<a name="ln1733">            ql_metrics_-&gt;ql_insert_-&gt;Increment(delta_usec);</a>
+<a name="ln1734">            break;</a>
+<a name="ln1735">          case TreeNodeOpcode::kPTUpdateStmt:</a>
+<a name="ln1736">            ql_metrics_-&gt;ql_update_-&gt;Increment(delta_usec);</a>
+<a name="ln1737">            break;</a>
+<a name="ln1738">          case TreeNodeOpcode::kPTDeleteStmt:</a>
+<a name="ln1739">            ql_metrics_-&gt;ql_delete_-&gt;Increment(delta_usec);</a>
+<a name="ln1740">            break;</a>
+<a name="ln1741">          case TreeNodeOpcode::kPTStartTransaction:</a>
+<a name="ln1742">          case TreeNodeOpcode::kPTCommit:</a>
+<a name="ln1743">            break;</a>
+<a name="ln1744">          default:</a>
+<a name="ln1745">            LOG(FATAL) &lt;&lt; &quot;unexpected operation &quot; &lt;&lt; tnode-&gt;opcode();</a>
+<a name="ln1746">        }</a>
+<a name="ln1747">        if (tnode-&gt;IsDml()) {</a>
+<a name="ln1748">          ql_metrics_-&gt;time_to_execute_ql_query_-&gt;Increment(delta_usec);</a>
+<a name="ln1749">        }</a>
+<a name="ln1750">      }</a>
+<a name="ln1751"> </a>
+<a name="ln1752">      // If this is a batch returning status, keep the statement tnode with its ops so that we can</a>
+<a name="ln1753">      // return the row status when all statements in the batch finish.</a>
+<a name="ln1754">      if (IsReturnsStatusBatch()) {</a>
+<a name="ln1755">        tnode_itr++;</a>
+<a name="ln1756">        continue;</a>
+<a name="ln1757">      }</a>
+<a name="ln1758"> </a>
+<a name="ln1759">      // Move rows results and remove the statement tnode that has completed.</a>
+<a name="ln1760">      RETURN_STMT_NOT_OK(AppendRowsResult(std::move(tnode_context.rows_result())));</a>
+<a name="ln1761">      tnode_itr = tnode_contexts.erase(tnode_itr);</a>
+<a name="ln1762">    }</a>
+<a name="ln1763"> </a>
+<a name="ln1764">    // If the current ExecContext is restarted, process it again. Otherwise, move to the next one.</a>
+<a name="ln1765">    if (!exec_context_-&gt;restart()) {</a>
+<a name="ln1766">      exec_itr++;</a>
+<a name="ln1767">    }</a>
+<a name="ln1768">  }</a>
+<a name="ln1769"> </a>
+<a name="ln1770">  // If there are buffered ops that need flushes, the flushes need to be rescheduled if this call</a>
+<a name="ln1771">  // hasn't been rescheduled. This is necessary because in an RF1 setup, the flush is a direct</a>
+<a name="ln1772">  // local call and the recursive FlushAsync and FlushAsyncDone calls for a full table scan can</a>
+<a name="ln1773">  // recurse too deeply hitting the stack limitiation. Rescheduling can also avoid occupying the</a>
+<a name="ln1774">  // RPC worker thread for too long starving other CQL calls waiting in the queue. If there is no</a>
+<a name="ln1775">  // buffered ops to flush, just call FlushAsync() to commit the transactions if any.</a>
+<a name="ln1776">  //</a>
+<a name="ln1777">  // When restart is required we will reexecute the whole operation with new transaction.</a>
+<a name="ln1778">  // Since restart could happen multiple times, it is possible that we will do it recursively,</a>
+<a name="ln1779">  // when local call is enabled.</a>
+<a name="ln1780">  // So to avoid stack overflow we use reschedule in this case.</a>
+<a name="ln1781">  if ((has_buffered_ops || has_restart) &amp;&amp; !rescheduled) {</a>
+<a name="ln1782">    rescheduler_-&gt;Reschedule(&amp;flush_async_task_.Bind(this));</a>
+<a name="ln1783">  } else {</a>
+<a name="ln1784">    FlushAsync();</a>
+<a name="ln1785">  }</a>
+<a name="ln1786">}</a>
+<a name="ln1787"> </a>
+<a name="ln1788">Result&lt;bool&gt; Executor::ProcessTnodeResults(TnodeContext* tnode_context) {</a>
+<a name="ln1789">  bool has_buffered_ops = false;</a>
+<a name="ln1790"> </a>
+<a name="ln1791">  // Go through each op in a TnodeContext and process async results.</a>
+<a name="ln1792">  const TreeNode *tnode = tnode_context-&gt;tnode();</a>
+<a name="ln1793">  auto&amp; ops = tnode_context-&gt;ops();</a>
+<a name="ln1794">  for (auto op_itr = ops.begin(); op_itr != ops.end(); ) {</a>
+<a name="ln1795">    YBqlOpPtr&amp; op = *op_itr;</a>
+<a name="ln1796"> </a>
+<a name="ln1797">    // Apply any op that has not been applied and executed.</a>
+<a name="ln1798">    if (!op-&gt;response().has_status()) {</a>
+<a name="ln1799">      DCHECK_EQ(op-&gt;type(), YBOperation::Type::QL_WRITE);</a>
+<a name="ln1800">      if (write_batch_.Add(std::static_pointer_cast&lt;YBqlWriteOp&gt;(op))) {</a>
+<a name="ln1801">        YBSessionPtr session = GetSession(exec_context_);</a>
+<a name="ln1802">        TRACE(&quot;Apply&quot;);</a>
+<a name="ln1803">        RETURN_NOT_OK(session-&gt;Apply(op));</a>
+<a name="ln1804">        has_buffered_ops = true;</a>
+<a name="ln1805">      }</a>
+<a name="ln1806">      op_itr++;</a>
+<a name="ln1807">      continue;</a>
+<a name="ln1808">    }</a>
+<a name="ln1809"> </a>
+<a name="ln1810">    // If the statement is in a transaction, check the status of the current operation. If it</a>
+<a name="ln1811">    // failed to apply (either because of an execution error or unsatisfied IF condition), quit the</a>
+<a name="ln1812">    // execution and abort the transaction. Also, if this is a batch returning status, mark all</a>
+<a name="ln1813">    // other ops in this statement as done and clear the rows data to make sure only one status row</a>
+<a name="ln1814">    // is returned from this statement.</a>
+<a name="ln1815">    //</a>
+<a name="ln1816">    // Note: For an error response, we only get to this point if using 'RETURNS STATUS AS ROW'.</a>
+<a name="ln1817">    // Otherwise, ProcessAsyncResults() should have failed so we would have returned above already.</a>
+<a name="ln1818">    if (exec_context_-&gt;HasTransaction() &amp;&amp;</a>
+<a name="ln1819">        (op-&gt;response().status() != QLResponsePB_QLStatus_YQL_STATUS_OK ||</a>
+<a name="ln1820">         (op-&gt;response().has_applied() &amp;&amp; !op-&gt;response().applied()))) {</a>
+<a name="ln1821">      exec_context_-&gt;AbortTransaction();</a>
+<a name="ln1822">      if (IsReturnsStatusBatch()) {</a>
+<a name="ln1823">        RETURN_NOT_OK(ProcessTnodeContexts(</a>
+<a name="ln1824">            exec_context_,</a>
+<a name="ln1825">            [&amp;op](TnodeContext* tnode_context) -&gt; Result&lt;bool&gt; {</a>
+<a name="ln1826">              for (auto&amp; other : tnode_context-&gt;ops()) {</a>
+<a name="ln1827">                if (other != op) {</a>
+<a name="ln1828">                  other-&gt;mutable_response()-&gt;set_status(QLResponsePB::YQL_STATUS_OK);</a>
+<a name="ln1829">                  other-&gt;mutable_rows_data()-&gt;clear();</a>
+<a name="ln1830">                }</a>
+<a name="ln1831">              }</a>
+<a name="ln1832">              return false; // not done</a>
+<a name="ln1833">            }));</a>
+<a name="ln1834">      }</a>
+<a name="ln1835">    }</a>
+<a name="ln1836"> </a>
+<a name="ln1837">    // If the transaction is ready to commit, apply child transaction results if any.</a>
+<a name="ln1838">    if (exec_context_-&gt;HasTransaction() &amp;&amp; !exec_context_-&gt;HasPendingOperations()) {</a>
+<a name="ln1839">      const QLResponsePB&amp; response = op-&gt;response();</a>
+<a name="ln1840">      if (response.has_child_transaction_result()) {</a>
+<a name="ln1841">        const auto&amp; result = response.child_transaction_result();</a>
+<a name="ln1842">        const Status s = exec_context_-&gt;ApplyChildTransactionResult(result);</a>
+<a name="ln1843">        // If restart is needed, reset the current context and return immediately.</a>
+<a name="ln1844">        if (NeedsRestart(s)) {</a>
+<a name="ln1845">          exec_context_-&gt;Reset(client::Restart::kTrue, rescheduler_);</a>
+<a name="ln1846">          return false;</a>
+<a name="ln1847">        }</a>
+<a name="ln1848">        RETURN_NOT_OK(s);</a>
+<a name="ln1849">      }</a>
+<a name="ln1850">    }</a>
+<a name="ln1851"> </a>
+<a name="ln1852">    // If this is a batch returning status, defer appending the row because we need to return the</a>
+<a name="ln1853">    // results in the user-given order when all statements in the batch finish.</a>
+<a name="ln1854">    if (IsReturnsStatusBatch()) {</a>
+<a name="ln1855">      op_itr++;</a>
+<a name="ln1856">      continue;</a>
+<a name="ln1857">    }</a>
+<a name="ln1858"> </a>
+<a name="ln1859">    // Append the rows if present.</a>
+<a name="ln1860">    if (!op-&gt;rows_data().empty()) {</a>
+<a name="ln1861">      RETURN_NOT_OK(tnode_context-&gt;AppendRowsResult(std::make_shared&lt;RowsResult&gt;(op.get())));</a>
+<a name="ln1862">    }</a>
+<a name="ln1863"> </a>
+<a name="ln1864">    // For SELECT statement, check if there are more rows to fetch and apply the op as needed.</a>
+<a name="ln1865">    if (tnode-&gt;opcode() == TreeNodeOpcode::kPTSelectStmt) {</a>
+<a name="ln1866">      const auto* select_stmt = static_cast&lt;const PTSelectStmt *&gt;(tnode);</a>
+<a name="ln1867">      // Do this except for the parent SELECT with an index. For covered index, we will select</a>
+<a name="ln1868">      // from the index only. For uncovered index, the parent SELECT will fetch using the primary</a>
+<a name="ln1869">      // keys returned from below.</a>
+<a name="ln1870">      if (!select_stmt-&gt;child_select()) {</a>
+<a name="ln1871">        DCHECK_EQ(op-&gt;type(), YBOperation::Type::QL_READ);</a>
+<a name="ln1872">        const auto&amp; read_op = std::static_pointer_cast&lt;YBqlReadOp&gt;(op);</a>
+<a name="ln1873">        if (VERIFY_RESULT(FetchMoreRows(select_stmt, read_op, tnode_context, exec_context_))) {</a>
+<a name="ln1874">          op-&gt;mutable_response()-&gt;Clear();</a>
+<a name="ln1875">          TRACE(&quot;Apply&quot;);</a>
+<a name="ln1876">          RETURN_NOT_OK(session_-&gt;Apply(op));</a>
+<a name="ln1877">          has_buffered_ops = true;</a>
+<a name="ln1878">          op_itr++;</a>
+<a name="ln1879">          continue;</a>
+<a name="ln1880">        }</a>
+<a name="ln1881">      }</a>
+<a name="ln1882">    }</a>
+<a name="ln1883"> </a>
+<a name="ln1884">    // Remove the op that has completed.</a>
+<a name="ln1885">    op_itr = ops.erase(op_itr);</a>
+<a name="ln1886">  }</a>
+<a name="ln1887"> </a>
+<a name="ln1888">  // If there is a child context, process it.</a>
+<a name="ln1889">  TnodeContext* child_context = tnode_context-&gt;child_context();</a>
+<a name="ln1890">  if (child_context != nullptr) {</a>
+<a name="ln1891">    const TreeNode *child_tnode = child_context-&gt;tnode();</a>
+<a name="ln1892">    if (VERIFY_RESULT(ProcessTnodeResults(child_context))) {</a>
+<a name="ln1893">      has_buffered_ops = true;</a>
+<a name="ln1894">    }</a>
+<a name="ln1895"> </a>
+<a name="ln1896">    // If the child selects from an uncovered index, extract the primary keys returned and use them</a>
+<a name="ln1897">    // to select from the indexed table.</a>
+<a name="ln1898">    DCHECK_EQ(child_tnode-&gt;opcode(), TreeNodeOpcode::kPTSelectStmt);</a>
+<a name="ln1899">    DCHECK(!static_cast&lt;const PTSelectStmt *&gt;(child_tnode)-&gt;index_id().empty());</a>
+<a name="ln1900">    const bool covers_fully = static_cast&lt;const PTSelectStmt *&gt;(child_tnode)-&gt;covers_fully();</a>
+<a name="ln1901">    DCHECK_EQ(tnode-&gt;opcode(), TreeNodeOpcode::kPTSelectStmt);</a>
+<a name="ln1902">    const auto* select_stmt = static_cast&lt;const PTSelectStmt *&gt;(tnode);</a>
+<a name="ln1903">    string&amp; rows_data = child_context-&gt;rows_result()-&gt;rows_data();</a>
+<a name="ln1904">    if (!covers_fully &amp;&amp; !rows_data.empty()) {</a>
+<a name="ln1905">      QLRowBlock* keys = tnode_context-&gt;keys();</a>
+<a name="ln1906">      keys-&gt;rows().clear();</a>
+<a name="ln1907">      Slice data(rows_data);</a>
+<a name="ln1908">      RETURN_NOT_OK(keys-&gt;Deserialize(YQL_CLIENT_CQL,  &amp;data));</a>
+<a name="ln1909">      const YBqlReadOpPtr&amp; select_op = tnode_context-&gt;uncovered_select_op();</a>
+<a name="ln1910">      if (VERIFY_RESULT(FetchRowsByKeys(select_stmt, select_op, *keys, tnode_context))) {</a>
+<a name="ln1911">        has_buffered_ops = true;</a>
+<a name="ln1912">      }</a>
+<a name="ln1913">      rows_data.clear();</a>
+<a name="ln1914">    }</a>
+<a name="ln1915"> </a>
+<a name="ln1916">    // If the current statement tnode and its child are done, move the result from the child</a>
+<a name="ln1917">    // for covered query, or just the paging state for uncovered query.</a>
+<a name="ln1918">    if (!tnode_context-&gt;HasPendingOperations() &amp;&amp; !child_context-&gt;HasPendingOperations()) {</a>
+<a name="ln1919">      if (covers_fully) {</a>
+<a name="ln1920">        RETURN_NOT_OK(tnode_context-&gt;AppendRowsResult(std::move(child_context-&gt;rows_result())));</a>
+<a name="ln1921">      } else {</a>
+<a name="ln1922">        if (!tnode_context-&gt;rows_result()) {</a>
+<a name="ln1923">          RETURN_NOT_OK(tnode_context-&gt;AppendRowsResult(std::make_shared&lt;RowsResult&gt;(select_stmt)));</a>
+<a name="ln1924">        }</a>
+<a name="ln1925">        tnode_context-&gt;rows_result()-&gt;SetPagingState(std::move(*child_context-&gt;rows_result()));</a>
+<a name="ln1926">      }</a>
+<a name="ln1927">    }</a>
+<a name="ln1928">  }</a>
+<a name="ln1929"> </a>
+<a name="ln1930">  return has_buffered_ops;</a>
+<a name="ln1931">}</a>
+<a name="ln1932"> </a>
+<a name="ln1933">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln1934"> </a>
+<a name="ln1935">namespace {</a>
+<a name="ln1936"> </a>
+<a name="ln1937">// Check if index updates can be issued from CQL proxy directly when executing a DML. Only indexes</a>
+<a name="ln1938">// that index primary key columns only may be updated from CQL proxy.</a>
+<a name="ln1939">bool UpdateIndexesLocally(const PTDmlStmt *tnode, const QLWriteRequestPB&amp; req) {</a>
+<a name="ln1940">  if (req.has_if_expr() || req.returns_status()) {</a>
+<a name="ln1941">    return false;</a>
+<a name="ln1942">  }</a>
+<a name="ln1943"> </a>
+<a name="ln1944">  switch (req.type()) {</a>
+<a name="ln1945">    // For insert, the pk-only indexes can be updated from CQL proxy directly.</a>
+<a name="ln1946">    case QLWriteRequestPB::QL_STMT_INSERT:</a>
+<a name="ln1947">      return true;</a>
+<a name="ln1948"> </a>
+<a name="ln1949">    // For update, the pk-only indexes can be updated from CQL proxy directly only when not all</a>
+<a name="ln1950">    // columns are set to null. Otherwise, the row may be removed by the DML if it was created via</a>
+<a name="ln1951">    // update (i.e. no liveness column) and the remaining columns are already null.</a>
+<a name="ln1952">    case QLWriteRequestPB::QL_STMT_UPDATE: {</a>
+<a name="ln1953">      for (const auto&amp; column_value : req.column_values()) {</a>
+<a name="ln1954">        switch (column_value.expr().expr_case()) {</a>
+<a name="ln1955">          case QLExpressionPB::ExprCase::kValue:</a>
+<a name="ln1956">            if (!IsNull(column_value.expr().value())) {</a>
+<a name="ln1957">              return true;</a>
+<a name="ln1958">            }</a>
+<a name="ln1959">            break;</a>
+<a name="ln1960">          case QLExpressionPB::ExprCase::kColumnId: FALLTHROUGH_INTENDED;</a>
+<a name="ln1961">          case QLExpressionPB::ExprCase::kSubscriptedCol: FALLTHROUGH_INTENDED;</a>
+<a name="ln1962">          case QLExpressionPB::ExprCase::kJsonColumn: FALLTHROUGH_INTENDED;</a>
+<a name="ln1963">          case QLExpressionPB::ExprCase::kBfcall: FALLTHROUGH_INTENDED;</a>
+<a name="ln1964">          case QLExpressionPB::ExprCase::kTscall: FALLTHROUGH_INTENDED;</a>
+<a name="ln1965">          case QLExpressionPB::ExprCase::kCondition: FALLTHROUGH_INTENDED;</a>
+<a name="ln1966">          case QLExpressionPB::ExprCase::kBocall: FALLTHROUGH_INTENDED;</a>
+<a name="ln1967">          case QLExpressionPB::ExprCase::kBindId: FALLTHROUGH_INTENDED;</a>
+<a name="ln1968">          case QLExpressionPB::ExprCase::EXPR_NOT_SET:</a>
+<a name="ln1969">            return false;</a>
+<a name="ln1970">        }</a>
+<a name="ln1971">      }</a>
+<a name="ln1972">      return false;</a>
+<a name="ln1973">    }</a>
+<a name="ln1974">    // For delete, the pk-only indexes can be updated from CQL proxy directly only if the whole</a>
+<a name="ln1975">    // is deleted and it is not a range delete.</a>
+<a name="ln1976">    case QLWriteRequestPB::QL_STMT_DELETE: {</a>
+<a name="ln1977">      const Schema&amp; schema = tnode-&gt;table()-&gt;InternalSchema();</a>
+<a name="ln1978">      return (req.column_values().empty() &amp;&amp;</a>
+<a name="ln1979">              req.range_column_values_size() == schema.num_range_key_columns());</a>
+<a name="ln1980">    }</a>
+<a name="ln1981">  }</a>
+<a name="ln1982">  return false; // Not feasible</a>
+<a name="ln1983">}</a>
+<a name="ln1984"> </a>
+<a name="ln1985">} // namespace</a>
+<a name="ln1986"> </a>
+<a name="ln1987">Status Executor::UpdateIndexes(const PTDmlStmt *tnode,</a>
+<a name="ln1988">                               QLWriteRequestPB *req,</a>
+<a name="ln1989">                               TnodeContext* tnode_context) {</a>
+<a name="ln1990">  // DML with TTL is not allowed if indexes are present.</a>
+<a name="ln1991">  if (req-&gt;has_ttl()) {</a>
+<a name="ln1992">    return exec_context_-&gt;Error(tnode, ErrorCode::FEATURE_NOT_SUPPORTED);</a>
+<a name="ln1993">  }</a>
+<a name="ln1994"> </a>
+<a name="ln1995">  // If updates of pk-only indexes can be issued from CQL proxy directly, do it. Otherwise, add</a>
+<a name="ln1996">  // them to the list of indexes to be updated from tserver.</a>
+<a name="ln1997">  if (!tnode-&gt;pk_only_indexes().empty()) {</a>
+<a name="ln1998">    if (UpdateIndexesLocally(tnode, *req)) {</a>
+<a name="ln1999">      RETURN_NOT_OK(AddIndexWriteOps(tnode, *req, tnode_context));</a>
+<a name="ln2000">    } else {</a>
+<a name="ln2001">      for (const auto&amp; index : tnode-&gt;pk_only_indexes()) {</a>
+<a name="ln2002">        req-&gt;add_update_index_ids(index-&gt;id());</a>
+<a name="ln2003">      }</a>
+<a name="ln2004">    }</a>
+<a name="ln2005">  }</a>
+<a name="ln2006"> </a>
+<a name="ln2007">  // Add non-pk-only indexes to the list of indexes to be updated from tserver also.</a>
+<a name="ln2008">  for (const auto&amp; index_id : tnode-&gt;non_pk_only_indexes()) {</a>
+<a name="ln2009">    req-&gt;add_update_index_ids(index_id);</a>
+<a name="ln2010">  }</a>
+<a name="ln2011"> </a>
+<a name="ln2012">  // For update/delete, check if it just deletes some columns. If so, add the rest columns to be</a>
+<a name="ln2013">  // read so that tserver can check if they are all null also, in which case the row will be</a>
+<a name="ln2014">  // removed after the DML.</a>
+<a name="ln2015">  if ((req-&gt;type() == QLWriteRequestPB::QL_STMT_UPDATE ||</a>
+<a name="ln2016">       req-&gt;type() == QLWriteRequestPB::QL_STMT_DELETE) &amp;&amp;</a>
+<a name="ln2017">      !req-&gt;column_values().empty()) {</a>
+<a name="ln2018">    bool all_null = true;</a>
+<a name="ln2019">    std::set&lt;int32&gt; column_dels;</a>
+<a name="ln2020">    for (const QLColumnValuePB&amp; column_value : req-&gt;column_values()) {</a>
+<a name="ln2021">      if (column_value.has_expr() &amp;&amp;</a>
+<a name="ln2022">          column_value.expr().has_value() &amp;&amp;</a>
+<a name="ln2023">          !IsNull(column_value.expr().value())) {</a>
+<a name="ln2024">        all_null = false;</a>
+<a name="ln2025">        break;</a>
+<a name="ln2026">      }</a>
+<a name="ln2027">      column_dels.insert(column_value.column_id());</a>
+<a name="ln2028">    }</a>
+<a name="ln2029">    if (all_null) {</a>
+<a name="ln2030">      const Schema&amp; schema = tnode-&gt;table()-&gt;InternalSchema();</a>
+<a name="ln2031">      const MCSet&lt;int32&gt;&amp; column_refs = tnode-&gt;column_refs();</a>
+<a name="ln2032">      for (size_t idx = schema.num_key_columns(); idx &lt; schema.num_columns(); idx++) {</a>
+<a name="ln2033">        const int32 column_id = schema.column_id(idx);</a>
+<a name="ln2034">        if (!schema.column(idx).is_static() &amp;&amp;</a>
+<a name="ln2035">            column_refs.count(column_id) != 0 &amp;&amp;</a>
+<a name="ln2036">            column_dels.count(column_id) != 0) {</a>
+<a name="ln2037">          req-&gt;mutable_column_refs()-&gt;add_ids(column_id);</a>
+<a name="ln2038">        }</a>
+<a name="ln2039">      }</a>
+<a name="ln2040">    }</a>
+<a name="ln2041">  }</a>
+<a name="ln2042"> </a>
+<a name="ln2043">  if (!req-&gt;update_index_ids().empty() &amp;&amp; tnode-&gt;RequiresTransaction()) {</a>
+<a name="ln2044">    RETURN_NOT_OK(exec_context_-&gt;PrepareChildTransaction(req-&gt;mutable_child_transaction_data()));</a>
+<a name="ln2045">  }</a>
+<a name="ln2046">  return Status::OK();</a>
+<a name="ln2047">}</a>
+<a name="ln2048"> </a>
+<a name="ln2049">// Add the write operations to update the pk-only indexes.</a>
+<a name="ln2050">Status Executor::AddIndexWriteOps(const PTDmlStmt *tnode,</a>
+<a name="ln2051">                                  const QLWriteRequestPB&amp; req,</a>
+<a name="ln2052">                                  TnodeContext* tnode_context) {</a>
+<a name="ln2053">  const Schema&amp; schema = tnode-&gt;table()-&gt;InternalSchema();</a>
+<a name="ln2054">  const bool is_upsert = (req.type() == QLWriteRequestPB::QL_STMT_INSERT ||</a>
+<a name="ln2055">                          req.type() == QLWriteRequestPB::QL_STMT_UPDATE);</a>
+<a name="ln2056">  // Populate a column-id to value map.</a>
+<a name="ln2057">  std::unordered_map&lt;ColumnId, const QLExpressionPB&amp;&gt; values;</a>
+<a name="ln2058">  for (size_t i = 0; i &lt; schema.num_hash_key_columns(); i++) {</a>
+<a name="ln2059">    values.emplace(schema.column_id(i), req.hashed_column_values(i));</a>
+<a name="ln2060">  }</a>
+<a name="ln2061">  for (size_t i = 0; i &lt; schema.num_range_key_columns(); i++) {</a>
+<a name="ln2062">    values.emplace(schema.column_id(schema.num_hash_key_columns() + i), req.range_column_values(i));</a>
+<a name="ln2063">  }</a>
+<a name="ln2064">  if (is_upsert) {</a>
+<a name="ln2065">    for (const auto&amp; column_value : req.column_values()) {</a>
+<a name="ln2066">      values.emplace(ColumnId(column_value.column_id()), column_value.expr());</a>
+<a name="ln2067">    }</a>
+<a name="ln2068">  }</a>
+<a name="ln2069"> </a>
+<a name="ln2070">  // Create the write operation for each index and populate it using the original operation.</a>
+<a name="ln2071">  // CQL does not allow the primary key to be updated, so PK-only index rows will be either</a>
+<a name="ln2072">  // deleted when the row in the main table is deleted, or it will be inserted into the index</a>
+<a name="ln2073">  // when a row is inserted into the main table or updated (for a non-pk column).</a>
+<a name="ln2074">  for (const auto&amp; index_table : tnode-&gt;pk_only_indexes()) {</a>
+<a name="ln2075">    const IndexInfo* index =</a>
+<a name="ln2076">        VERIFY_RESULT(tnode-&gt;table()-&gt;index_map().FindIndex(index_table-&gt;id()));</a>
+<a name="ln2077">    const bool index_ready_to_accept = (is_upsert ? index-&gt;HasWritePermission()</a>
+<a name="ln2078">                                                  : index-&gt;HasDeletePermission());</a>
+<a name="ln2079">    if (!index_ready_to_accept) {</a>
+<a name="ln2080">      VLOG(2) &lt;&lt; &quot;Index not ready to apply operaton &quot; &lt;&lt; index-&gt;ToString();</a>
+<a name="ln2081">      // We are in the process of backfilling the index. It should not be updated with a</a>
+<a name="ln2082">      // write/delete yet. The backfill stage will update the index for such entries.</a>
+<a name="ln2083">      continue;</a>
+<a name="ln2084">    }</a>
+<a name="ln2085">    YBqlWriteOpPtr index_op(is_upsert ? index_table-&gt;NewQLInsert() : index_table-&gt;NewQLDelete());</a>
+<a name="ln2086">    index_op-&gt;set_writes_primary_row(true);</a>
+<a name="ln2087">    QLWriteRequestPB *index_req = index_op-&gt;mutable_request();</a>
+<a name="ln2088">    index_req-&gt;set_request_id(req.request_id());</a>
+<a name="ln2089">    index_req-&gt;set_query_id(req.query_id());</a>
+<a name="ln2090">    for (size_t i = 0; i &lt; index-&gt;columns().size(); i++) {</a>
+<a name="ln2091">      const ColumnId indexed_column_id = index-&gt;column(i).indexed_column_id;</a>
+<a name="ln2092">      if (i &lt; index-&gt;hash_column_count()) {</a>
+<a name="ln2093">        *index_req-&gt;add_hashed_column_values() = values.at(indexed_column_id);</a>
+<a name="ln2094">      } else if (i &lt; index-&gt;key_column_count()) {</a>
+<a name="ln2095">        *index_req-&gt;add_range_column_values() = values.at(indexed_column_id);</a>
+<a name="ln2096">      } else if (is_upsert) {</a>
+<a name="ln2097">        const auto itr = values.find(indexed_column_id);</a>
+<a name="ln2098">        if (itr != values.end()) {</a>
+<a name="ln2099">          QLColumnValuePB* column_value = index_req-&gt;add_column_values();</a>
+<a name="ln2100">          column_value-&gt;set_column_id(index-&gt;column(i).column_id);</a>
+<a name="ln2101">          *column_value-&gt;mutable_expr() = itr-&gt;second;</a>
+<a name="ln2102">        }</a>
+<a name="ln2103">      }</a>
+<a name="ln2104">    }</a>
+<a name="ln2105">    RETURN_NOT_OK(AddOperation(index_op, tnode_context));</a>
+<a name="ln2106">  }</a>
+<a name="ln2107"> </a>
+<a name="ln2108">  return Status::OK();</a>
+<a name="ln2109">}</a>
+<a name="ln2110"> </a>
+<a name="ln2111">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2112"> </a>
+<a name="ln2113">bool Executor::WriteBatch::Add(const YBqlWriteOpPtr&amp; op) {</a>
+<a name="ln2114">  // Checks if the write operation reads the primary/static row and if another operation that writes</a>
+<a name="ln2115">  // the primary/static row by the same primary/hash key already exists.</a>
+<a name="ln2116">  if ((op-&gt;ReadsPrimaryRow() &amp;&amp; ops_by_primary_key_.count(op) &gt; 0) ||</a>
+<a name="ln2117">      (op-&gt;ReadsStaticRow() &amp;&amp; ops_by_hash_key_.count(op) &gt; 0)) {</a>
+<a name="ln2118">    return false;</a>
+<a name="ln2119">  }</a>
+<a name="ln2120"> </a>
+<a name="ln2121">  if (op-&gt;WritesPrimaryRow()) { ops_by_primary_key_.insert(op); }</a>
+<a name="ln2122">  if (op-&gt;WritesStaticRow()) { ops_by_hash_key_.insert(op); }</a>
+<a name="ln2123">  return true;</a>
+<a name="ln2124">}</a>
+<a name="ln2125"> </a>
+<a name="ln2126">void Executor::WriteBatch::Clear() {</a>
+<a name="ln2127">  ops_by_primary_key_.clear();</a>
+<a name="ln2128">  ops_by_hash_key_.clear();</a>
+<a name="ln2129">}</a>
+<a name="ln2130"> </a>
+<a name="ln2131">bool Executor::WriteBatch::Empty() const {</a>
+<a name="ln2132">  return ops_by_primary_key_.empty() &amp;&amp;  ops_by_hash_key_.empty();</a>
+<a name="ln2133">}</a>
+<a name="ln2134"> </a>
+<a name="ln2135">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2136"> </a>
+<a name="ln2137">Status Executor::AddOperation(const YBqlReadOpPtr&amp; op, TnodeContext *tnode_context) {</a>
+<a name="ln2138">  DCHECK(write_batch_.Empty()) &lt;&lt; &quot;Concurrent read and write operations not supported yet&quot;;</a>
+<a name="ln2139"> </a>
+<a name="ln2140">  op-&gt;mutable_request()-&gt;set_request_id(exec_context_-&gt;params().request_id());</a>
+<a name="ln2141">  tnode_context-&gt;AddOperation(op);</a>
+<a name="ln2142"> </a>
+<a name="ln2143">  // We need consistent read point if statement is executed in multiple RPC commands.</a>
+<a name="ln2144">  if (tnode_context-&gt;UnreadPartitionsRemaining() &gt; 0 ||</a>
+<a name="ln2145">      op-&gt;request().hashed_column_values().empty()) {</a>
+<a name="ln2146">    session_-&gt;SetForceConsistentRead(client::ForceConsistentRead::kTrue);</a>
+<a name="ln2147">  }</a>
+<a name="ln2148"> </a>
+<a name="ln2149">  TRACE(&quot;Apply&quot;);</a>
+<a name="ln2150">  return session_-&gt;Apply(op);</a>
+<a name="ln2151">}</a>
+<a name="ln2152"> </a>
+<a name="ln2153">Status Executor::AddOperation(const YBqlWriteOpPtr&amp; op, TnodeContext *tnode_context) {</a>
+<a name="ln2154">  tnode_context-&gt;AddOperation(op);</a>
+<a name="ln2155"> </a>
+<a name="ln2156">  // Check for inter-dependency in the current write batch before applying the write operation.</a>
+<a name="ln2157">  // Apply it in the transactional session in exec_context for the current statement if there is</a>
+<a name="ln2158">  // one. Otherwise, apply to the non-transactional session in the executor.</a>
+<a name="ln2159">  if (write_batch_.Add(op)) {</a>
+<a name="ln2160">    YBSessionPtr session = GetSession(exec_context_);</a>
+<a name="ln2161">    TRACE(&quot;Apply&quot;);</a>
+<a name="ln2162">    RETURN_NOT_OK(session-&gt;Apply(op));</a>
+<a name="ln2163">  }</a>
+<a name="ln2164"> </a>
+<a name="ln2165">  // Also update secondary indexes if needed.</a>
+<a name="ln2166">  if (op-&gt;table()-&gt;index_map().empty()) {</a>
+<a name="ln2167">    return Status::OK();</a>
+<a name="ln2168">  }</a>
+<a name="ln2169">  const auto* dml_stmt = static_cast&lt;const PTDmlStmt*&gt;(tnode_context-&gt;tnode());</a>
+<a name="ln2170">  return UpdateIndexes(dml_stmt, op-&gt;mutable_request(), tnode_context);</a>
+<a name="ln2171">}</a>
+<a name="ln2172"> </a>
+<a name="ln2173">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2174"> </a>
+<a name="ln2175">Status Executor::ProcessStatementStatus(const ParseTree&amp; parse_tree, const Status&amp; s) {</a>
+<a name="ln2176">  if (PREDICT_FALSE(!s.ok() &amp;&amp; s.IsQLError() &amp;&amp; !parse_tree.reparsed())) {</a>
+<a name="ln2177">    // If execution fails because the statement was analyzed with stale metadata cache, the</a>
+<a name="ln2178">    // statement needs to be reparsed and re-analyzed. Symptoms of stale metadata are as listed</a>
+<a name="ln2179">    // below. Expand the list in future as new cases arise.</a>
+<a name="ln2180">    // - TABLET_NOT_FOUND when the tserver fails to execute the YBQLOp because the tablet is not</a>
+<a name="ln2181">    //   found (ENG-945).</a>
+<a name="ln2182">    // - WRONG_METADATA_VERSION when the schema version the tablet holds is different from the one</a>
+<a name="ln2183">    //   used by the semantic analyzer.</a>
+<a name="ln2184">    // - INVALID_TABLE_DEFINITION when a referenced user-defined type is not found.</a>
+<a name="ln2185">    // - INVALID_ARGUMENTS when the column datatype is inconsistent with the supplied value in an</a>
+<a name="ln2186">    //   INSERT or UPDATE statement.</a>
+<a name="ln2187">    const ErrorCode errcode = GetErrorCode(s);</a>
+<a name="ln2188">    if (errcode == ErrorCode::TABLET_NOT_FOUND         ||</a>
+<a name="ln2189">        errcode == ErrorCode::WRONG_METADATA_VERSION   ||</a>
+<a name="ln2190">        errcode == ErrorCode::INVALID_TABLE_DEFINITION ||</a>
+<a name="ln2191">        errcode == ErrorCode::INVALID_TYPE_DEFINITION  ||</a>
+<a name="ln2192">        errcode == ErrorCode::INVALID_ARGUMENTS        ||</a>
+<a name="ln2193">        errcode == ErrorCode::OBJECT_NOT_FOUND         ||</a>
+<a name="ln2194">        errcode == ErrorCode::TYPE_NOT_FOUND) {</a>
+<a name="ln2195"> </a>
+<a name="ln2196">      if (errcode == ErrorCode::INVALID_ARGUMENTS) {</a>
+<a name="ln2197">        // Check the table schema is up-to-date.</a>
+<a name="ln2198">        const shared_ptr&lt;client::YBTable&gt; table = GetTableFromStatement(parse_tree.root().get());</a>
+<a name="ln2199">        if (table) {</a>
+<a name="ln2200">          const uint32_t current_schema_ver = table-&gt;schema().version();</a>
+<a name="ln2201">          uint32_t updated_schema_ver = 0;</a>
+<a name="ln2202">          const Status s_get_schema = ql_env_-&gt;GetUpToDateTableSchemaVersion(</a>
+<a name="ln2203">              table-&gt;name(), &amp;updated_schema_ver);</a>
+<a name="ln2204"> </a>
+<a name="ln2205">          if (s_get_schema.ok() &amp;&amp; updated_schema_ver == current_schema_ver) {</a>
+<a name="ln2206">            return s; // Do not retry via STALE_METADATA code if the table schema is up-to-date.</a>
+<a name="ln2207">          }</a>
+<a name="ln2208">        }</a>
+<a name="ln2209">      }</a>
+<a name="ln2210"> </a>
+<a name="ln2211">      parse_tree.ClearAnalyzedTableCache(ql_env_);</a>
+<a name="ln2212">      parse_tree.ClearAnalyzedUDTypeCache(ql_env_);</a>
+<a name="ln2213">      parse_tree.set_stale();</a>
+<a name="ln2214">      return ErrorStatus(ErrorCode::STALE_METADATA);</a>
+<a name="ln2215">    }</a>
+<a name="ln2216">  }</a>
+<a name="ln2217">  return s;</a>
+<a name="ln2218">}</a>
+<a name="ln2219"> </a>
+<a name="ln2220">Status Executor::ProcessOpStatus(const PTDmlStmt* stmt,</a>
+<a name="ln2221">                                 const YBqlOpPtr&amp; op,</a>
+<a name="ln2222">                                 ExecContext* exec_context) {</a>
+<a name="ln2223">  const QLResponsePB &amp;resp = op-&gt;response();</a>
+<a name="ln2224">  // Returns if this op was deferred and has not been completed, or it has been completed okay.</a>
+<a name="ln2225">  if (!resp.has_status() || resp.status() == QLResponsePB::YQL_STATUS_OK) {</a>
+<a name="ln2226">    return Status::OK();</a>
+<a name="ln2227">  }</a>
+<a name="ln2228"> </a>
+<a name="ln2229">  if (resp.status() == QLResponsePB::YQL_STATUS_RESTART_REQUIRED_ERROR) {</a>
+<a name="ln2230">    return STATUS(TryAgain, resp.error_message());</a>
+<a name="ln2231">  }</a>
+<a name="ln2232"> </a>
+<a name="ln2233">  // If we got an error we need to manually produce a result in the op.</a>
+<a name="ln2234">  if (stmt-&gt;IsWriteOp() &amp;&amp; stmt-&gt;returns_status()) {</a>
+<a name="ln2235">    std::vector&lt;ColumnSchema&gt; columns;</a>
+<a name="ln2236">    const auto&amp; schema = stmt-&gt;table()-&gt;schema();</a>
+<a name="ln2237">    columns.reserve(stmt-&gt;table()-&gt;schema().num_columns() + 2);</a>
+<a name="ln2238">    columns.emplace_back(&quot;[applied]&quot;, DataType::BOOL);</a>
+<a name="ln2239">    columns.emplace_back(&quot;[message]&quot;, DataType::STRING);</a>
+<a name="ln2240">    columns.insert(columns.end(), schema.columns().begin(), schema.columns().end());</a>
+<a name="ln2241">    auto* column_schemas = op-&gt;mutable_response()-&gt;mutable_column_schemas();</a>
+<a name="ln2242">    column_schemas-&gt;Clear();</a>
+<a name="ln2243">    for (const auto&amp; column : columns) {</a>
+<a name="ln2244">      ColumnSchemaToPB(column, column_schemas-&gt;Add());</a>
+<a name="ln2245">    }</a>
+<a name="ln2246"> </a>
+<a name="ln2247">    QLRowBlock result_row_block(Schema(columns, 0));</a>
+<a name="ln2248">    QLRow&amp; row = result_row_block.Extend();</a>
+<a name="ln2249">    row.mutable_column(0)-&gt;set_bool_value(false);</a>
+<a name="ln2250">    row.mutable_column(1)-&gt;set_string_value(resp.error_message());</a>
+<a name="ln2251">    // Leave the rest of the columns null in this case.</a>
+<a name="ln2252"> </a>
+<a name="ln2253">    faststring row_data;</a>
+<a name="ln2254">    result_row_block.Serialize(YQL_CLIENT_CQL, &amp;row_data);</a>
+<a name="ln2255">    *op-&gt;mutable_rows_data() = row_data.ToString();</a>
+<a name="ln2256">    return Status::OK();</a>
+<a name="ln2257">  }</a>
+<a name="ln2258"> </a>
+<a name="ln2259">  const ErrorCode errcode = QLStatusToErrorCode(resp.status());</a>
+<a name="ln2260">  return exec_context-&gt;Error(stmt, resp.error_message().c_str(), errcode);</a>
+<a name="ln2261">}</a>
+<a name="ln2262"> </a>
+<a name="ln2263">Status Executor::ProcessAsyncStatus(const OpErrors&amp; op_errors, ExecContext* exec_context) {</a>
+<a name="ln2264">  return ProcessTnodeContexts(</a>
+<a name="ln2265">      exec_context,</a>
+<a name="ln2266">      [this, exec_context, &amp;op_errors](TnodeContext* tnode_context) -&gt; Result&lt;bool&gt; {</a>
+<a name="ln2267">        const TreeNode* tnode = tnode_context-&gt;tnode();</a>
+<a name="ln2268">        for (auto&amp; op : tnode_context-&gt;ops()) {</a>
+<a name="ln2269">          Status s;</a>
+<a name="ln2270">          const auto itr = op_errors.find(op.get());</a>
+<a name="ln2271">          if (itr != op_errors.end()) {</a>
+<a name="ln2272">            s = itr-&gt;second;</a>
+<a name="ln2273">          }</a>
+<a name="ln2274">          if (PREDICT_FALSE(!s.ok() &amp;&amp; !NeedsRestart(s))) {</a>
+<a name="ln2275">            // YBOperation returns not-found error when the tablet is not found.</a>
+<a name="ln2276">            const auto errcode = s.IsNotFound() ? ErrorCode::TABLET_NOT_FOUND</a>
+<a name="ln2277">                                                : ErrorCode::EXEC_ERROR;</a>
+<a name="ln2278">            s = exec_context-&gt;Error(tnode, s, errcode);</a>
+<a name="ln2279">          }</a>
+<a name="ln2280">          if (s.ok()) {</a>
+<a name="ln2281">            DCHECK(tnode-&gt;IsDml()) &lt;&lt; &quot;Only DML should issue a read/write operation&quot;;</a>
+<a name="ln2282">            s = ProcessOpStatus(static_cast&lt;const PTDmlStmt *&gt;(tnode), op, exec_context);</a>
+<a name="ln2283">          }</a>
+<a name="ln2284">          if (NeedsRestart(s)) {</a>
+<a name="ln2285">            exec_context-&gt;Reset(client::Restart::kTrue, rescheduler_);</a>
+<a name="ln2286">            return true; // done</a>
+<a name="ln2287">          }</a>
+<a name="ln2288">          RETURN_NOT_OK(ProcessStatementStatus(exec_context-&gt;parse_tree(), s));</a>
+<a name="ln2289">        }</a>
+<a name="ln2290">        return false; // not done</a>
+<a name="ln2291">      });</a>
+<a name="ln2292">}</a>
+<a name="ln2293"> </a>
+<a name="ln2294">Status Executor::AppendRowsResult(RowsResult::SharedPtr&amp;&amp; rows_result) {</a>
+<a name="ln2295">  if (!rows_result) {</a>
+<a name="ln2296">    return Status::OK();</a>
+<a name="ln2297">  }</a>
+<a name="ln2298">  if (!result_) {</a>
+<a name="ln2299">    result_ = std::move(rows_result);</a>
+<a name="ln2300">    return Status::OK();</a>
+<a name="ln2301">  }</a>
+<a name="ln2302">  CHECK(result_-&gt;type() == ExecutedResult::Type::ROWS);</a>
+<a name="ln2303">  return std::static_pointer_cast&lt;RowsResult&gt;(result_)-&gt;Append(std::move(*rows_result));</a>
+<a name="ln2304">}</a>
+<a name="ln2305"> </a>
+<a name="ln2306">void Executor::StatementExecuted(const Status&amp; s) {</a>
+<a name="ln2307">  // Update metrics for all statements executed.</a>
+<a name="ln2308">  if (s.ok() &amp;&amp; ql_metrics_ != nullptr) {</a>
+<a name="ln2309">    for (auto&amp; exec_context : exec_contexts_) {</a>
+<a name="ln2310">      for (auto&amp; tnode_context : exec_context.tnode_contexts()) {</a>
+<a name="ln2311">        const TreeNode* tnode = tnode_context.tnode();</a>
+<a name="ln2312">        if (tnode != nullptr) {</a>
+<a name="ln2313">          switch (tnode-&gt;opcode()) {</a>
+<a name="ln2314">            case TreeNodeOpcode::kPTSelectStmt: FALLTHROUGH_INTENDED;</a>
+<a name="ln2315">            case TreeNodeOpcode::kPTInsertStmt: FALLTHROUGH_INTENDED;</a>
+<a name="ln2316">            case TreeNodeOpcode::kPTUpdateStmt: FALLTHROUGH_INTENDED;</a>
+<a name="ln2317">            case TreeNodeOpcode::kPTDeleteStmt: FALLTHROUGH_INTENDED;</a>
+<a name="ln2318">            case TreeNodeOpcode::kPTListNode:   FALLTHROUGH_INTENDED;</a>
+<a name="ln2319">            case TreeNodeOpcode::kPTStartTransaction: FALLTHROUGH_INTENDED;</a>
+<a name="ln2320">            case TreeNodeOpcode::kPTCommit:</a>
+<a name="ln2321">              // The metrics for SELECT/INSERT/UPDATE/DELETE have been updated when the ops have</a>
+<a name="ln2322">              // been completed in FlushAsyncDone(). Exclude PTListNode also as we are interested</a>
+<a name="ln2323">              // in the metrics of its constituent DMLs only. Transaction metrics have been</a>
+<a name="ln2324">              // updated in CommitDone().</a>
+<a name="ln2325">              break;</a>
+<a name="ln2326">            default: {</a>
+<a name="ln2327">              const MonoTime now = MonoTime::Now();</a>
+<a name="ln2328">              const auto delta_usec = (now - tnode_context.start_time()).ToMicroseconds();</a>
+<a name="ln2329">              ql_metrics_-&gt;ql_others_-&gt;Increment(delta_usec);</a>
+<a name="ln2330">              ql_metrics_-&gt;time_to_execute_ql_query_-&gt;Increment(delta_usec);</a>
+<a name="ln2331">              break;</a>
+<a name="ln2332">            }</a>
+<a name="ln2333">          }</a>
+<a name="ln2334">        }</a>
+<a name="ln2335">      }</a>
+<a name="ln2336">      ql_metrics_-&gt;num_retries_to_execute_ql_-&gt;Increment(exec_context.num_retries());</a>
+<a name="ln2337">    }</a>
+<a name="ln2338">    ql_metrics_-&gt;num_flushes_to_execute_ql_-&gt;Increment(num_flushes_);</a>
+<a name="ln2339">  }</a>
+<a name="ln2340"> </a>
+<a name="ln2341">  // Clean up and invoke statement-executed callback.</a>
+<a name="ln2342">  ExecutedResult::SharedPtr result = s.ok() ? std::move(result_) : nullptr;</a>
+<a name="ln2343">  StatementExecutedCallback cb = std::move(cb_);</a>
+<a name="ln2344">  Reset();</a>
+<a name="ln2345">  cb.Run(s, result);</a>
+<a name="ln2346">}</a>
+<a name="ln2347"> </a>
+<a name="ln2348">void Executor::Reset() {</a>
+<a name="ln2349">  exec_context_ = nullptr;</a>
+<a name="ln2350">  exec_contexts_.clear();</a>
+<a name="ln2351">  write_batch_.Clear();</a>
+<a name="ln2352">  session_-&gt;Abort();</a>
+<a name="ln2353">  num_flushes_ = 0;</a>
+<a name="ln2354">  result_ = nullptr;</a>
+<a name="ln2355">  cb_.Reset();</a>
+<a name="ln2356">  returns_status_batch_opt_ = boost::none;</a>
+<a name="ln2357">}</a>
+<a name="ln2358"> </a>
+<a name="ln2359">QLExpressionPB* CreateQLExpression(QLWriteRequestPB *req, const ColumnDesc&amp; col_desc) {</a>
+<a name="ln2360">  if (col_desc.is_hash()) {</a>
+<a name="ln2361">    return req-&gt;add_hashed_column_values();</a>
+<a name="ln2362">  } else if (col_desc.is_primary()) {</a>
+<a name="ln2363">    return req-&gt;add_range_column_values();</a>
+<a name="ln2364">  } else {</a>
+<a name="ln2365">    QLColumnValuePB *col_pb = req-&gt;add_column_values();</a>
+<a name="ln2366">    col_pb-&gt;set_column_id(col_desc.id());</a>
+<a name="ln2367">    return col_pb-&gt;mutable_expr();</a>
+<a name="ln2368">  }</a>
+<a name="ln2369">}</a>
+<a name="ln2370"> </a>
+<a name="ln2371">}  // namespace ql</a>
+<a name="ln2372">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="85"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="99"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="770"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1048"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1049"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1892"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1051/" target="_blank">V1051</a> Consider checking for misprints. It's possible that the 'child_tnode' should be used inside 'ProcessTnodeResults' function.</p></div>
+<div class="balloon" rel="1899"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="2080"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="2138"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="2281"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="2302"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

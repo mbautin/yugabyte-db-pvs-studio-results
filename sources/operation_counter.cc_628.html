@@ -1,0 +1,282 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>operation_counter.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/util/operation_counter.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;thread&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;glog/logging.h&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/util/debug/long_operation_tracker.h&quot;</a>
+<a name="ln23">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">using namespace std::literals;</a>
+<a name="ln26"> </a>
+<a name="ln27">using strings::Substitute;</a>
+<a name="ln28"> </a>
+<a name="ln29">namespace yb {</a>
+<a name="ln30"> </a>
+<a name="ln31">OperationCounter::OperationCounter(const std::string&amp; log_prefix) : log_prefix_(log_prefix) {</a>
+<a name="ln32">}</a>
+<a name="ln33"> </a>
+<a name="ln34">void OperationCounter::Shutdown() {</a>
+<a name="ln35">  auto wait_start = CoarseMonoClock::now();</a>
+<a name="ln36">  auto last_report = wait_start;</a>
+<a name="ln37">  for (;;) {</a>
+<a name="ln38">    auto value = value_.load(std::memory_order_acquire);</a>
+<a name="ln39">    if (value == 0) {</a>
+<a name="ln40">      break;</a>
+<a name="ln41">    }</a>
+<a name="ln42">    auto now = CoarseMonoClock::now();</a>
+<a name="ln43">    if (now &gt; last_report + std::chrono::seconds(10)) {</a>
+<a name="ln44">      LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln45">          &lt;&lt; &quot;Long wait for scope counter shutdown &quot; &lt;&lt; value &lt;&lt; &quot;: &quot; &lt;&lt; AsString(now - wait_start);</a>
+<a name="ln46">      last_report = now;</a>
+<a name="ln47">    }</a>
+<a name="ln48">    std::this_thread::sleep_for(std::chrono::milliseconds(100));</a>
+<a name="ln49">  }</a>
+<a name="ln50">}</a>
+<a name="ln51"> </a>
+<a name="ln52">void OperationCounter::Release() {</a>
+<a name="ln53">  value_.fetch_sub(1, std::memory_order_acq_rel);</a>
+<a name="ln54">}</a>
+<a name="ln55"> </a>
+<a name="ln56">void OperationCounter::Acquire() {</a>
+<a name="ln57">  value_.fetch_add(1, std::memory_order_acq_rel);</a>
+<a name="ln58">}</a>
+<a name="ln59"> </a>
+<a name="ln60">ScopedOperation::ScopedOperation(OperationCounter* counter) : counter_(counter) {</a>
+<a name="ln61">  counter-&gt;Acquire();</a>
+<a name="ln62">}</a>
+<a name="ln63"> </a>
+<a name="ln64">namespace {</a>
+<a name="ln65"> </a>
+<a name="ln66">// Using upper bits of counter as special flags.</a>
+<a name="ln67">constexpr uint64_t kStopDelta = 1ull &lt;&lt; 63u;</a>
+<a name="ln68">constexpr uint64_t kDisabledDelta = 1ull &lt;&lt; 48u;</a>
+<a name="ln69">constexpr uint64_t kOpCounterMask = kDisabledDelta - 1;</a>
+<a name="ln70">constexpr uint64_t kDisabledCounterMask = ~kOpCounterMask;</a>
+<a name="ln71"> </a>
+<a name="ln72">}</a>
+<a name="ln73"> </a>
+<a name="ln74">// Return pending operations counter value only.</a>
+<a name="ln75">uint64_t RWOperationCounter::GetOpCounter() const {</a>
+<a name="ln76">  return Get() &amp; kOpCounterMask;</a>
+<a name="ln77">}</a>
+<a name="ln78"> </a>
+<a name="ln79">uint64_t RWOperationCounter::Update(uint64_t delta) {</a>
+<a name="ln80">  uint64_t result = counters_.fetch_add(delta, std::memory_order::memory_order_acq_rel) + delta;</a>
+<a name="ln81">  VLOG(2) &lt;&lt; &quot;[&quot; &lt;&lt; this &lt;&lt; &quot;] Update(&quot; &lt;&lt; static_cast&lt;int64_t&gt;(delta) &lt;&lt; &quot;), result = &quot; &lt;&lt; result;</a>
+<a name="ln82">  // Ensure that there is no underflow in either counter.</a>
+<a name="ln83">  DCHECK_EQ((result &amp; (kStopDelta &gt;&gt; 1u)), 0); // Counter of DisableAndWaitForOps() calls.</a>
+<a name="ln84">  DCHECK_EQ((result &amp; (kDisabledDelta &gt;&gt; 1u)), 0); // Counter of pending operations.</a>
+<a name="ln85">  return result;</a>
+<a name="ln86">}</a>
+<a name="ln87"> </a>
+<a name="ln88">bool RWOperationCounter::WaitMutexAndIncrement(CoarseTimePoint deadline) {</a>
+<a name="ln89">  if (deadline == CoarseTimePoint()) {</a>
+<a name="ln90">    deadline = CoarseMonoClock::now() + 10ms;</a>
+<a name="ln91">  }</a>
+<a name="ln92">  for (;;) {</a>
+<a name="ln93">    std::unique_lock&lt;decltype(disable_)&gt; lock(disable_, deadline);</a>
+<a name="ln94">    if (!lock.owns_lock()) {</a>
+<a name="ln95">      return false;</a>
+<a name="ln96">    }</a>
+<a name="ln97"> </a>
+<a name="ln98">    if (Increment()) {</a>
+<a name="ln99">      return true;</a>
+<a name="ln100">    }</a>
+<a name="ln101"> </a>
+<a name="ln102">    if (counters_.load(std::memory_order_acquire) &amp; kStopDelta) {</a>
+<a name="ln103">      return false;</a>
+<a name="ln104">    }</a>
+<a name="ln105">  }</a>
+<a name="ln106">}</a>
+<a name="ln107"> </a>
+<a name="ln108">void RWOperationCounter::Enable(Unlock unlock, Stop was_stop) {</a>
+<a name="ln109">  Update(-(was_stop ? kStopDelta : kDisabledDelta));</a>
+<a name="ln110">  if (unlock) {</a>
+<a name="ln111">    UnlockExclusiveOpMutex();</a>
+<a name="ln112">  }</a>
+<a name="ln113">}</a>
+<a name="ln114"> </a>
+<a name="ln115">bool RWOperationCounter::Increment() {</a>
+<a name="ln116">  if (Update(1) &amp; kDisabledCounterMask) {</a>
+<a name="ln117">    Update(-1);</a>
+<a name="ln118">    return false;</a>
+<a name="ln119">  }</a>
+<a name="ln120"> </a>
+<a name="ln121">  return true;</a>
+<a name="ln122">}</a>
+<a name="ln123"> </a>
+<a name="ln124">Status RWOperationCounter::DisableAndWaitForOps(const CoarseTimePoint&amp; deadline, Stop stop) {</a>
+<a name="ln125">  LongOperationTracker long_operation_tracker(__func__, 1s);</a>
+<a name="ln126"> </a>
+<a name="ln127">  const auto start_time = CoarseMonoClock::now();</a>
+<a name="ln128">  std::unique_lock&lt;decltype(disable_)&gt; lock(disable_, deadline);</a>
+<a name="ln129">  if (!lock.owns_lock()) {</a>
+<a name="ln130">    return STATUS(TimedOut, &quot;Timed out waiting to disable the resource exclusively&quot;);</a>
+<a name="ln131">  }</a>
+<a name="ln132"> </a>
+<a name="ln133">  Update(stop ? kStopDelta : kDisabledDelta);</a>
+<a name="ln134">  auto status = WaitForOpsToFinish(start_time, deadline);</a>
+<a name="ln135">  if (!status.ok()) {</a>
+<a name="ln136">    Enable(Unlock::kFalse, stop);</a>
+<a name="ln137">    return status;</a>
+<a name="ln138">  }</a>
+<a name="ln139"> </a>
+<a name="ln140">  lock.release();</a>
+<a name="ln141">  return Status::OK();</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144">// The implementation is based on OperationTracker::WaitForAllToFinish.</a>
+<a name="ln145">Status RWOperationCounter::WaitForOpsToFinish(</a>
+<a name="ln146">    const CoarseTimePoint&amp; start_time, const CoarseTimePoint&amp; deadline) {</a>
+<a name="ln147">  const auto complain_interval = 1s;</a>
+<a name="ln148">  int64_t num_pending_ops = 0;</a>
+<a name="ln149">  int num_complaints = 0;</a>
+<a name="ln150">  auto wait_time = 250us;</a>
+<a name="ln151"> </a>
+<a name="ln152">  while ((num_pending_ops = GetOpCounter()) &gt; 0) {</a>
+<a name="ln153">    auto now = CoarseMonoClock::now();</a>
+<a name="ln154">    auto waited_time = now - start_time;</a>
+<a name="ln155">    if (now &gt; deadline) {</a>
+<a name="ln156">      return STATUS_FORMAT(</a>
+<a name="ln157">          TimedOut,</a>
+<a name="ln158">          &quot;Timed out waiting for all pending operations to complete. &quot;</a>
+<a name="ln159">              &quot;$0 transactions pending. Waited for $1&quot;,</a>
+<a name="ln160">          num_pending_ops, waited_time);</a>
+<a name="ln161">    }</a>
+<a name="ln162">    if (waited_time &gt; num_complaints * complain_interval) {</a>
+<a name="ln163">      LOG(WARNING) &lt;&lt; Format(&quot;Waiting for $0 pending operations to complete now for $1&quot;,</a>
+<a name="ln164">                             num_pending_ops, waited_time);</a>
+<a name="ln165">      num_complaints++;</a>
+<a name="ln166">    }</a>
+<a name="ln167">    std::this_thread::sleep_until(std::min(deadline, now + wait_time));</a>
+<a name="ln168">    wait_time = std::min(wait_time * 5 / 4, 1000000us);</a>
+<a name="ln169">  }</a>
+<a name="ln170"> </a>
+<a name="ln171">  return Status::OK();</a>
+<a name="ln172">}</a>
+<a name="ln173"> </a>
+<a name="ln174">ScopedRWOperation::ScopedRWOperation(RWOperationCounter* counter, const CoarseTimePoint&amp; deadline)</a>
+<a name="ln175">    : data_{counter, counter ? counter-&gt;resource_name() : &quot;&quot;</a>
+<a name="ln176">#ifndef NDEBUG</a>
+<a name="ln177">            , LongOperationTracker(&quot;ScopedRWOperation&quot;, 1s)</a>
+<a name="ln178">#endif</a>
+<a name="ln179">      } {</a>
+<a name="ln180">  if (counter != nullptr) {</a>
+<a name="ln181">    // The race condition between IsReady() and Increment() is OK, because we are checking if</a>
+<a name="ln182">    // anyone has started an exclusive operation since we did the increment, and don't proceed</a>
+<a name="ln183">    // with this shared-ownership operation in that case.</a>
+<a name="ln184">    if (!counter-&gt;Increment() &amp;&amp; !counter-&gt;WaitMutexAndIncrement(deadline)) {</a>
+<a name="ln185">      data_.counter_ = nullptr;</a>
+<a name="ln186">    }</a>
+<a name="ln187">  }</a>
+<a name="ln188">}</a>
+<a name="ln189"> </a>
+<a name="ln190">ScopedRWOperation::~ScopedRWOperation() {</a>
+<a name="ln191">  Reset();</a>
+<a name="ln192">}</a>
+<a name="ln193"> </a>
+<a name="ln194">void ScopedRWOperation::Reset() {</a>
+<a name="ln195">  if (data_.counter_ != nullptr) {</a>
+<a name="ln196">    data_.counter_-&gt;Decrement();</a>
+<a name="ln197">    data_.counter_ = nullptr;</a>
+<a name="ln198">  }</a>
+<a name="ln199">  data_.resource_name_ = &quot;&quot;;</a>
+<a name="ln200">}</a>
+<a name="ln201"> </a>
+<a name="ln202">ScopedRWOperationPause::ScopedRWOperationPause(</a>
+<a name="ln203">    RWOperationCounter* counter, const CoarseTimePoint&amp; deadline, Stop stop) {</a>
+<a name="ln204">  if (counter != nullptr) {</a>
+<a name="ln205">    data_.status_ = counter-&gt;DisableAndWaitForOps(deadline, stop);</a>
+<a name="ln206">    if (data_.status_.ok()) {</a>
+<a name="ln207">      data_.counter_ = counter;</a>
+<a name="ln208">    }</a>
+<a name="ln209">  }</a>
+<a name="ln210">  data_.was_stop_ = stop;</a>
+<a name="ln211">}</a>
+<a name="ln212"> </a>
+<a name="ln213">ScopedRWOperationPause::~ScopedRWOperationPause() {</a>
+<a name="ln214">  Reset();</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217">void ScopedRWOperationPause::Reset() {</a>
+<a name="ln218">  if (data_.counter_ != nullptr) {</a>
+<a name="ln219">    data_.counter_-&gt;Enable(Unlock(data_.status_.ok()), data_.was_stop_);</a>
+<a name="ln220">    // Prevent from the destructor calling Enable again.</a>
+<a name="ln221">    data_.counter_ = nullptr;</a>
+<a name="ln222">  }</a>
+<a name="ln223">}</a>
+<a name="ln224"> </a>
+<a name="ln225">void ScopedRWOperationPause::ReleaseMutexButKeepDisabled() {</a>
+<a name="ln226">  CHECK_OK(data_.status_);</a>
+<a name="ln227">  CHECK_NOTNULL(data_.counter_);</a>
+<a name="ln228">  CHECK(data_.was_stop_);</a>
+<a name="ln229">  data_.counter_-&gt;UnlockExclusiveOpMutex();</a>
+<a name="ln230">  // Make sure the destructor has no effect when it runs.</a>
+<a name="ln231">  data_.counter_ = nullptr;</a>
+<a name="ln232">}</a>
+<a name="ln233"> </a>
+<a name="ln234">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="81"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="226"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="228"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,473 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>cdc_producer.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &quot;yb/cdc/cdc_producer.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &quot;yb/cdc/cdc_service.pb.h&quot;</a>
+<a name="ln16">#include &quot;yb/common/transaction.h&quot;</a>
+<a name="ln17">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &quot;yb/consensus/raft_consensus.h&quot;</a>
+<a name="ln20">#include &quot;yb/consensus/replicate_msgs_holder.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/docdb/docdb.pb.h&quot;</a>
+<a name="ln23">#include &quot;yb/docdb/primitive_value.h&quot;</a>
+<a name="ln24">#include &quot;yb/docdb/value_type.h&quot;</a>
+<a name="ln25">#include &quot;yb/tablet/tablet.h&quot;</a>
+<a name="ln26">#include &quot;yb/tablet/tablet_peer.h&quot;</a>
+<a name="ln27">#include &quot;yb/tablet/transaction_participant.h&quot;</a>
+<a name="ln28">#include &quot;yb/tserver/tablet_server.h&quot;</a>
+<a name="ln29">#include &quot;yb/tserver/ts_tablet_manager.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31">DEFINE_int32(cdc_transaction_timeout_ms, 0,</a>
+<a name="ln32">  &quot;Don't check for an aborted transaction unless its original write is lagging by this duration.&quot;);</a>
+<a name="ln33"> </a>
+<a name="ln34">namespace yb {</a>
+<a name="ln35">namespace cdc {</a>
+<a name="ln36"> </a>
+<a name="ln37">using consensus::ReplicateMsgPtr;</a>
+<a name="ln38">using consensus::ReplicateMsgs;</a>
+<a name="ln39">using docdb::PrimitiveValue;</a>
+<a name="ln40">using tablet::TransactionParticipant;</a>
+<a name="ln41"> </a>
+<a name="ln42">namespace {</a>
+<a name="ln43"> </a>
+<a name="ln44">// Use boost::unordered_map instead of std::unordered_map because gcc release build</a>
+<a name="ln45">// fails to compile correctly when TxnStatusMap is used with Result&lt;&gt; (due to what seems like</a>
+<a name="ln46">// a bug in gcc where it tries to incorrectly destroy Status part of Result).</a>
+<a name="ln47">typedef boost::unordered_map&lt;</a>
+<a name="ln48">    TransactionId, TransactionStatusResult, TransactionIdHash&gt; TxnStatusMap;</a>
+<a name="ln49">typedef std::pair&lt;uint64_t, size_t&gt; RecordTimeIndex;</a>
+<a name="ln50"> </a>
+<a name="ln51">void AddColumnToMap(const ColumnSchema&amp; col_schema,</a>
+<a name="ln52">                    const docdb::PrimitiveValue&amp; col,</a>
+<a name="ln53">                    cdc::KeyValuePairPB* kv_pair) {</a>
+<a name="ln54">  kv_pair-&gt;set_key(col_schema.name());</a>
+<a name="ln55">  PrimitiveValue::ToQLValuePB(col, col_schema.type(), kv_pair-&gt;mutable_value());</a>
+<a name="ln56">}</a>
+<a name="ln57"> </a>
+<a name="ln58">void AddPrimaryKey(const docdb::SubDocKey&amp; decoded_key,</a>
+<a name="ln59">                   const Schema&amp; tablet_schema,</a>
+<a name="ln60">                   CDCRecordPB* record) {</a>
+<a name="ln61">  size_t i = 0;</a>
+<a name="ln62">  for (const auto&amp; col : decoded_key.doc_key().hashed_group()) {</a>
+<a name="ln63">    AddColumnToMap(tablet_schema.column(i), col, record-&gt;add_key());</a>
+<a name="ln64">    i++;</a>
+<a name="ln65">  }</a>
+<a name="ln66">  for (const auto&amp; col : decoded_key.doc_key().range_group()) {</a>
+<a name="ln67">    AddColumnToMap(tablet_schema.column(i), col, record-&gt;add_key());</a>
+<a name="ln68">    i++;</a>
+<a name="ln69">  }</a>
+<a name="ln70">}</a>
+<a name="ln71"> </a>
+<a name="ln72">// Set committed record information including commit time for record.</a>
+<a name="ln73">// This will look at transaction status to determine commit time to be used for CDC record.</a>
+<a name="ln74">// Returns true if we need to stop processing WAL records beyond this, false otherwise.</a>
+<a name="ln75">Result&lt;bool&gt; SetCommittedRecordIndexForReplicateMsg(</a>
+<a name="ln76">    const ReplicateMsgPtr&amp; msg, size_t index, const TxnStatusMap&amp; txn_map,</a>
+<a name="ln77">    std::vector&lt;RecordTimeIndex&gt;* records) {</a>
+<a name="ln78"> </a>
+<a name="ln79">  switch (msg-&gt;op_type()) {</a>
+<a name="ln80">    case consensus::OperationType::UPDATE_TRANSACTION_OP: {</a>
+<a name="ln81">      if (msg-&gt;transaction_state().status() == TransactionStatus::APPLYING) {</a>
+<a name="ln82">        records-&gt;emplace_back(msg-&gt;transaction_state().commit_hybrid_time(), index);</a>
+<a name="ln83">      }</a>
+<a name="ln84">      // Ignore other transaction statuses since we only care about APPLYING</a>
+<a name="ln85">      // while sending CDC records.</a>
+<a name="ln86">      return false;</a>
+<a name="ln87">    }</a>
+<a name="ln88"> </a>
+<a name="ln89">    case consensus::OperationType::WRITE_OP: {</a>
+<a name="ln90">      if (msg-&gt;write_request().write_batch().has_transaction()) {</a>
+<a name="ln91">        auto txn_id = VERIFY_RESULT(FullyDecodeTransactionId(</a>
+<a name="ln92">            msg-&gt;write_request().write_batch().transaction().transaction_id()));</a>
+<a name="ln93">        const auto txn_status = txn_map.find(txn_id);</a>
+<a name="ln94">        if (txn_status == txn_map.end()) {</a>
+<a name="ln95">          return STATUS(IllegalState, &quot;Unexpected transaction ID&quot;, txn_id.ToString());</a>
+<a name="ln96">        }</a>
+<a name="ln97"> </a>
+<a name="ln98">        if (txn_status-&gt;second.status == PENDING || txn_status-&gt;second.status == CREATED) {</a>
+<a name="ln99">          // Ignore all records beyond this because we don't know whether those records</a>
+<a name="ln100">          // were committed before or after this record without the transaction commit time.</a>
+<a name="ln101">          return true;</a>
+<a name="ln102">        } else if (txn_status-&gt;second.status == COMMITTED) {</a>
+<a name="ln103">          // Add record to txn_msgs because there may be records appearing after this in WAL</a>
+<a name="ln104">          // but committed before this one. Example:</a>
+<a name="ln105">          // T0: WRITE K1 [TXN1]</a>
+<a name="ln106">          // T1: WRITE K2</a>
+<a name="ln107">          // T2: APPLYING TXN1</a>
+<a name="ln108">          // Here, WRITE K2 appears after WRITE K1 but is committed before K1.</a>
+<a name="ln109">          records-&gt;emplace_back(txn_status-&gt;second.status_time.ToUint64(), index);</a>
+<a name="ln110">        }</a>
+<a name="ln111">      } else {</a>
+<a name="ln112">        // Msg is not part of transaction. Use write hybrid time from msg itself.</a>
+<a name="ln113">        records-&gt;emplace_back(msg-&gt;hybrid_time(), index);</a>
+<a name="ln114">      }</a>
+<a name="ln115">      return false;</a>
+<a name="ln116">    }</a>
+<a name="ln117"> </a>
+<a name="ln118">    case consensus::OperationType::CHANGE_CONFIG_OP:</a>
+<a name="ln119">      FALLTHROUGH_INTENDED;</a>
+<a name="ln120">    case consensus::OperationType::CHANGE_METADATA_OP:</a>
+<a name="ln121">      FALLTHROUGH_INTENDED;</a>
+<a name="ln122">    case consensus::OperationType::HISTORY_CUTOFF_OP:</a>
+<a name="ln123">      FALLTHROUGH_INTENDED;</a>
+<a name="ln124">    case consensus::OperationType::NO_OP:</a>
+<a name="ln125">      FALLTHROUGH_INTENDED;</a>
+<a name="ln126">    case consensus::OperationType::SNAPSHOT_OP:</a>
+<a name="ln127">      FALLTHROUGH_INTENDED;</a>
+<a name="ln128">    case consensus::OperationType::SPLIT_OP:</a>
+<a name="ln129">      FALLTHROUGH_INTENDED;</a>
+<a name="ln130">    case consensus::OperationType::TRUNCATE_OP:</a>
+<a name="ln131">      FALLTHROUGH_INTENDED;</a>
+<a name="ln132">    case consensus::OperationType::UNKNOWN_OP:</a>
+<a name="ln133">      return false;</a>
+<a name="ln134">  }</a>
+<a name="ln135">  FATAL_INVALID_ENUM_VALUE(consensus::OperationType, msg-&gt;op_type());</a>
+<a name="ln136">}</a>
+<a name="ln137"> </a>
+<a name="ln138">Result&lt;std::vector&lt;RecordTimeIndex&gt;&gt; GetCommittedRecordIndexes(</a>
+<a name="ln139">    const ReplicateMsgs&amp; msgs, const TxnStatusMap&amp; txn_map, OpId* checkpoint) {</a>
+<a name="ln140">  size_t index = 0;</a>
+<a name="ln141">  std::vector&lt;RecordTimeIndex&gt; records;</a>
+<a name="ln142"> </a>
+<a name="ln143">  // Order ReplicateMsgs based on commit time.</a>
+<a name="ln144">  for (const auto &amp;msg : msgs) {</a>
+<a name="ln145">    if (!msg-&gt;write_request().has_external_hybrid_time()) {</a>
+<a name="ln146">      // If the message came from an external source, ignore it when producing change list.</a>
+<a name="ln147">      // Note that checkpoint, however, will be updated and will account for external message too.</a>
+<a name="ln148">      bool stop = VERIFY_RESULT(SetCommittedRecordIndexForReplicateMsg(</a>
+<a name="ln149">          msg, index, txn_map, &amp;records));</a>
+<a name="ln150">      if (stop) {</a>
+<a name="ln151">        return records;</a>
+<a name="ln152">      }</a>
+<a name="ln153">    }</a>
+<a name="ln154">    *checkpoint = OpId::FromPB(msg-&gt;id());</a>
+<a name="ln155">    index++;</a>
+<a name="ln156">  }</a>
+<a name="ln157">  return records;</a>
+<a name="ln158">}</a>
+<a name="ln159"> </a>
+<a name="ln160">// Order WAL records based on transaction commit time.</a>
+<a name="ln161">// Records in WAL don't represent the exact order in which records are written in DB due to delay</a>
+<a name="ln162">// in writing txn APPLYING record.</a>
+<a name="ln163">// Consider the following WAL entries:</a>
+<a name="ln164">// TO: WRITE K0</a>
+<a name="ln165">// T1: WRITE K1 (TXN1)</a>
+<a name="ln166">// T2: WRITE K2 (TXN2)</a>
+<a name="ln167">// T3: WRITE K3</a>
+<a name="ln168">// T4: APPLYING TXN2</a>
+<a name="ln169">// T5: APPLYING TXN1</a>
+<a name="ln170">// T6: WRITE K4</a>
+<a name="ln171">// The order in which keys are written to DB in this example is K0, K3, K2, K1, K4.</a>
+<a name="ln172">// This method will also set checkpoint to the op id of last processed record.</a>
+<a name="ln173">Result&lt;ReplicateMsgs&gt; SortWrites(const ReplicateMsgs&amp; msgs,</a>
+<a name="ln174">                                 const TxnStatusMap&amp; txn_map,</a>
+<a name="ln175">                                 OpId* checkpoint) {</a>
+<a name="ln176">  std::vector&lt;RecordTimeIndex&gt; records = VERIFY_RESULT(GetCommittedRecordIndexes(</a>
+<a name="ln177">      msgs, txn_map, checkpoint));</a>
+<a name="ln178">  std::sort(records.begin(), records.end());</a>
+<a name="ln179"> </a>
+<a name="ln180">  ReplicateMsgs ordered_msgs;</a>
+<a name="ln181">  ordered_msgs.reserve(records.size());</a>
+<a name="ln182">  for (const auto&amp; record : records) {</a>
+<a name="ln183">    ordered_msgs.emplace_back(msgs[record.second]);</a>
+<a name="ln184">  }</a>
+<a name="ln185">  return ordered_msgs;</a>
+<a name="ln186">}</a>
+<a name="ln187"> </a>
+<a name="ln188">Result&lt;TransactionStatusResult&gt; GetTransactionStatus(</a>
+<a name="ln189">    const TransactionId&amp; txn_id,</a>
+<a name="ln190">    const HybridTime&amp; hybrid_time,</a>
+<a name="ln191">    TransactionParticipant* txn_participant) {</a>
+<a name="ln192">  static const std::string reason = &quot;cdc&quot;;</a>
+<a name="ln193"> </a>
+<a name="ln194">  std::promise&lt;Result&lt;TransactionStatusResult&gt;&gt; txn_status_promise;</a>
+<a name="ln195">  auto future = txn_status_promise.get_future();</a>
+<a name="ln196">  auto callback = [&amp;txn_status_promise](Result&lt;TransactionStatusResult&gt; result) {</a>
+<a name="ln197">    txn_status_promise.set_value(std::move(result));</a>
+<a name="ln198">  };</a>
+<a name="ln199"> </a>
+<a name="ln200">  txn_participant-&gt;RequestStatusAt(</a>
+<a name="ln201">      {&amp;txn_id, hybrid_time, hybrid_time, 0, &amp;reason, TransactionLoadFlags{}, callback});</a>
+<a name="ln202">  future.wait();</a>
+<a name="ln203">  return future.get();</a>
+<a name="ln204">}</a>
+<a name="ln205"> </a>
+<a name="ln206">// Build transaction status as of hybrid_time.</a>
+<a name="ln207">Result&lt;TxnStatusMap&gt; BuildTxnStatusMap(const ReplicateMsgs&amp; messages,</a>
+<a name="ln208">                                       bool more_replicate_msgs,</a>
+<a name="ln209">                                       const HybridTime&amp; cdc_read_hybrid_time,</a>
+<a name="ln210">                                       TransactionParticipant* txn_participant) {</a>
+<a name="ln211">  TxnStatusMap txn_map;</a>
+<a name="ln212">  // First go through all APPLYING records and mark transaction as committed.</a>
+<a name="ln213">  for (const auto&amp; msg : messages) {</a>
+<a name="ln214">    if (msg-&gt;op_type() == consensus::OperationType::UPDATE_TRANSACTION_OP</a>
+<a name="ln215">        &amp;&amp; msg-&gt;transaction_state().status() == TransactionStatus::APPLYING) {</a>
+<a name="ln216">      auto txn_id = VERIFY_RESULT(FullyDecodeTransactionId(</a>
+<a name="ln217">          msg-&gt;transaction_state().transaction_id()));</a>
+<a name="ln218">      txn_map.emplace(txn_id,</a>
+<a name="ln219">                      TransactionStatusResult(</a>
+<a name="ln220">                          TransactionStatus::COMMITTED,</a>
+<a name="ln221">                          HybridTime(msg-&gt;transaction_state().commit_hybrid_time())));</a>
+<a name="ln222">    }</a>
+<a name="ln223">  }</a>
+<a name="ln224"> </a>
+<a name="ln225">  // Now go through all WRITE_OP records and get transaction status of records for which</a>
+<a name="ln226">  // corresponding APPLYING record does not exist in WAL as yet.</a>
+<a name="ln227">  for (const auto&amp; msg : messages) {</a>
+<a name="ln228">    if (msg-&gt;op_type() == consensus::OperationType::WRITE_OP</a>
+<a name="ln229">        &amp;&amp; msg-&gt;write_request().write_batch().has_transaction()) {</a>
+<a name="ln230">      auto txn_id = VERIFY_RESULT(FullyDecodeTransactionId(</a>
+<a name="ln231">          msg-&gt;write_request().write_batch().transaction().transaction_id()));</a>
+<a name="ln232"> </a>
+<a name="ln233">      if (!txn_map.count(txn_id)) {</a>
+<a name="ln234">        TransactionStatusResult txn_status(TransactionStatus::PENDING, HybridTime::kMin);</a>
+<a name="ln235"> </a>
+<a name="ln236">        auto result = GetTransactionStatus(txn_id, cdc_read_hybrid_time, txn_participant);</a>
+<a name="ln237">        if (!result.ok()) {</a>
+<a name="ln238">          if (result.status().IsNotFound()) {</a>
+<a name="ln239">            // Naive heuristic for handling whether a transaction is aborted or still pending:</a>
+<a name="ln240">            // 1. If the normal transaction timeout is not reached, assume good operation.</a>
+<a name="ln241">            // 2. If more_replicate_messages, assume a race between reading</a>
+<a name="ln242">            //    TransactionParticipant &amp; LogCache.</a>
+<a name="ln243">            // TODO (#2405) : Handle long running or very large transactions correctly.</a>
+<a name="ln244">            if (!more_replicate_msgs) {</a>
+<a name="ln245">              auto timeout = HybridTime::FromPB(msg-&gt;hybrid_time())</a>
+<a name="ln246">                  .AddMilliseconds(FLAGS_cdc_transaction_timeout_ms);</a>
+<a name="ln247">              if (timeout &lt; cdc_read_hybrid_time) {</a>
+<a name="ln248">                LOG(INFO) &lt;&lt; &quot;Transaction not found, considering it aborted: &quot; &lt;&lt; txn_id;</a>
+<a name="ln249">                txn_status = TransactionStatusResult::Aborted();</a>
+<a name="ln250">              }</a>
+<a name="ln251">            }</a>
+<a name="ln252">          } else {</a>
+<a name="ln253">            return result.status();</a>
+<a name="ln254">          }</a>
+<a name="ln255">        } else {</a>
+<a name="ln256">          txn_status = *result;</a>
+<a name="ln257">        }</a>
+<a name="ln258">        txn_map.emplace(txn_id, txn_status);</a>
+<a name="ln259">      }</a>
+<a name="ln260">    }</a>
+<a name="ln261">  }</a>
+<a name="ln262">  return txn_map;</a>
+<a name="ln263">}</a>
+<a name="ln264"> </a>
+<a name="ln265">CHECKED_STATUS SetRecordTxnAndTime(const TransactionId&amp; txn_id,</a>
+<a name="ln266">                                   const TxnStatusMap&amp; txn_map,</a>
+<a name="ln267">                                   CDCRecordPB* record) {</a>
+<a name="ln268">  auto txn_status = txn_map.find(txn_id);</a>
+<a name="ln269">  if (txn_status == txn_map.end()) {</a>
+<a name="ln270">    return STATUS(IllegalState, &quot;Unexpected transaction ID&quot;, txn_id.ToString());</a>
+<a name="ln271">  }</a>
+<a name="ln272">  record-&gt;mutable_transaction_state()-&gt;set_transaction_id(txn_id.data(), txn_id.size());</a>
+<a name="ln273">  record-&gt;set_time(txn_status-&gt;second.status_time.ToUint64());</a>
+<a name="ln274">  return Status::OK();</a>
+<a name="ln275">}</a>
+<a name="ln276"> </a>
+<a name="ln277">// Populate CDC record corresponding to WAL batch in ReplicateMsg.</a>
+<a name="ln278">CHECKED_STATUS PopulateWriteRecord(const ReplicateMsgPtr&amp; msg,</a>
+<a name="ln279">                                   const TxnStatusMap&amp; txn_map,</a>
+<a name="ln280">                                   const StreamMetadata&amp; metadata,</a>
+<a name="ln281">                                   const Schema&amp; schema,</a>
+<a name="ln282">                                   GetChangesResponsePB* resp) {</a>
+<a name="ln283">  const auto&amp; batch = msg-&gt;write_request().write_batch();</a>
+<a name="ln284"> </a>
+<a name="ln285">  // Write batch may contain records from different rows.</a>
+<a name="ln286">  // For CDC, we need to split the batch into 1 CDC record per row of the table.</a>
+<a name="ln287">  // We'll use DocDB key hash to identify the records that belong to the same row.</a>
+<a name="ln288">  Slice prev_key;</a>
+<a name="ln289">  CDCRecordPB* record = nullptr;</a>
+<a name="ln290">  for (const auto&amp; write_pair : batch.write_pairs()) {</a>
+<a name="ln291">    Slice key = write_pair.key();</a>
+<a name="ln292">    const auto key_size = VERIFY_RESULT(</a>
+<a name="ln293">        docdb::DocKey::EncodedSize(key, docdb::DocKeyPart::kWholeDocKey));</a>
+<a name="ln294"> </a>
+<a name="ln295">    Slice value = write_pair.value();</a>
+<a name="ln296">    docdb::Value decoded_value;</a>
+<a name="ln297">    RETURN_NOT_OK(decoded_value.Decode(value));</a>
+<a name="ln298"> </a>
+<a name="ln299">    // Compare key hash with previously seen key hash to determine whether the write pair</a>
+<a name="ln300">    // is part of the same row or not.</a>
+<a name="ln301">    Slice primary_key(key.data(), key_size);</a>
+<a name="ln302">    if (prev_key != primary_key) {</a>
+<a name="ln303">      // Write pair contains record for different row. Create a new CDCRecord in this case.</a>
+<a name="ln304">      record = resp-&gt;add_records();</a>
+<a name="ln305">      Slice sub_doc_key = key;</a>
+<a name="ln306">      docdb::SubDocKey decoded_key;</a>
+<a name="ln307">      RETURN_NOT_OK(decoded_key.DecodeFrom(&amp;sub_doc_key, docdb::HybridTimeRequired::kFalse));</a>
+<a name="ln308"> </a>
+<a name="ln309">      if (metadata.record_format == CDCRecordFormat::WAL) {</a>
+<a name="ln310">        // For 2DC, populate serialized data from WAL, to avoid unnecessary deserializing on</a>
+<a name="ln311">        // producer and re-serializing on consumer.</a>
+<a name="ln312">        auto kv_pair = record-&gt;add_key();</a>
+<a name="ln313">        kv_pair-&gt;set_key(std::to_string(decoded_key.doc_key().hash()));</a>
+<a name="ln314">        kv_pair-&gt;mutable_value()-&gt;set_binary_value(write_pair.key());</a>
+<a name="ln315">      } else {</a>
+<a name="ln316">        AddPrimaryKey(decoded_key, schema, record);</a>
+<a name="ln317">      }</a>
+<a name="ln318"> </a>
+<a name="ln319">      // Check whether operation is WRITE or DELETE.</a>
+<a name="ln320">      if (decoded_value.value_type() == docdb::ValueType::kTombstone &amp;&amp;</a>
+<a name="ln321">          decoded_key.num_subkeys() == 0) {</a>
+<a name="ln322">        record-&gt;set_operation(CDCRecordPB_OperationType_DELETE);</a>
+<a name="ln323">      } else {</a>
+<a name="ln324">        record-&gt;set_operation(CDCRecordPB_OperationType_WRITE);</a>
+<a name="ln325">      }</a>
+<a name="ln326"> </a>
+<a name="ln327">      if (batch.has_transaction()) {</a>
+<a name="ln328">        auto txn_id = VERIFY_RESULT(FullyDecodeTransactionId(</a>
+<a name="ln329">            batch.transaction().transaction_id()));</a>
+<a name="ln330">        RETURN_NOT_OK(SetRecordTxnAndTime(txn_id, txn_map, record));</a>
+<a name="ln331">      } else {</a>
+<a name="ln332">        record-&gt;set_time(msg-&gt;hybrid_time());</a>
+<a name="ln333">      }</a>
+<a name="ln334">    }</a>
+<a name="ln335">    prev_key = primary_key;</a>
+<a name="ln336">    DCHECK(record);</a>
+<a name="ln337"> </a>
+<a name="ln338">    if (metadata.record_format == CDCRecordFormat::WAL) {</a>
+<a name="ln339">      auto kv_pair = record-&gt;add_changes();</a>
+<a name="ln340">      kv_pair-&gt;set_key(write_pair.key());</a>
+<a name="ln341">      kv_pair-&gt;mutable_value()-&gt;set_binary_value(write_pair.value());</a>
+<a name="ln342">    } else if (record-&gt;operation() == CDCRecordPB_OperationType_WRITE) {</a>
+<a name="ln343">      PrimitiveValue column_id;</a>
+<a name="ln344">      Slice key_column = write_pair.key().data() + key_size;</a>
+<a name="ln345">      RETURN_NOT_OK(PrimitiveValue::DecodeKey(&amp;key_column, &amp;column_id));</a>
+<a name="ln346">      if (column_id.value_type() == docdb::ValueType::kColumnId) {</a>
+<a name="ln347">        const ColumnSchema&amp; col = VERIFY_RESULT(schema.column_by_id(column_id.GetColumnId()));</a>
+<a name="ln348">        AddColumnToMap(col, decoded_value.primitive_value(), record-&gt;add_changes());</a>
+<a name="ln349">      } else if (column_id.value_type() != docdb::ValueType::kSystemColumnId) {</a>
+<a name="ln350">        LOG(DFATAL) &lt;&lt; &quot;Unexpected value type in key: &quot; &lt;&lt; column_id.value_type();</a>
+<a name="ln351">      }</a>
+<a name="ln352">    }</a>
+<a name="ln353">  }</a>
+<a name="ln354">  return Status::OK();</a>
+<a name="ln355">}</a>
+<a name="ln356"> </a>
+<a name="ln357">// Populate CDC record corresponding to WAL UPDATE_TRANSACTION_OP entry.</a>
+<a name="ln358">CHECKED_STATUS PopulateTransactionRecord(const ReplicateMsgPtr&amp; msg,</a>
+<a name="ln359">                                         CDCRecordPB* record) {</a>
+<a name="ln360">  record-&gt;set_operation(CDCRecordPB_OperationType_WRITE);</a>
+<a name="ln361">  record-&gt;set_time(msg-&gt;transaction_state().commit_hybrid_time());</a>
+<a name="ln362">  record-&gt;mutable_transaction_state()-&gt;CopyFrom(msg-&gt;transaction_state());</a>
+<a name="ln363">  // TODO: Deserialize record.</a>
+<a name="ln364">  return Status::OK();</a>
+<a name="ln365">}</a>
+<a name="ln366"> </a>
+<a name="ln367">} // namespace</a>
+<a name="ln368"> </a>
+<a name="ln369">Status GetChanges(const std::string&amp; stream_id,</a>
+<a name="ln370">                  const std::string&amp; tablet_id,</a>
+<a name="ln371">                  const OpId&amp; from_op_id,</a>
+<a name="ln372">                  const StreamMetadata&amp; stream_metadata,</a>
+<a name="ln373">                  const std::shared_ptr&lt;tablet::TabletPeer&gt;&amp; tablet_peer,</a>
+<a name="ln374">                  const MemTrackerPtr&amp; mem_tracker,</a>
+<a name="ln375">                  consensus::ReplicateMsgsHolder* msgs_holder,</a>
+<a name="ln376">                  GetChangesResponsePB* resp,</a>
+<a name="ln377">                  int64_t* last_readable_opid_index) {</a>
+<a name="ln378">  // Request scope on transaction participant so that transactions are not removed from participant</a>
+<a name="ln379">  // while RequestScope is active.</a>
+<a name="ln380">  RequestScope request_scope;</a>
+<a name="ln381">  auto txn_participant = tablet_peer-&gt;tablet()-&gt;transaction_participant();</a>
+<a name="ln382">  if (txn_participant) {</a>
+<a name="ln383">    request_scope = RequestScope(txn_participant);</a>
+<a name="ln384">  }</a>
+<a name="ln385"> </a>
+<a name="ln386">  auto read_ops = VERIFY_RESULT(tablet_peer-&gt;consensus()-&gt;</a>
+<a name="ln387">    ReadReplicatedMessagesForCDC(from_op_id, last_readable_opid_index));</a>
+<a name="ln388">  ScopedTrackedConsumption consumption;</a>
+<a name="ln389">  if (read_ops.read_from_disk_size &amp;&amp; mem_tracker) {</a>
+<a name="ln390">    consumption = ScopedTrackedConsumption(mem_tracker, read_ops.read_from_disk_size);</a>
+<a name="ln391">  }</a>
+<a name="ln392"> </a>
+<a name="ln393">  TxnStatusMap txn_map = VERIFY_RESULT(BuildTxnStatusMap(</a>
+<a name="ln394">      read_ops.messages, read_ops.have_more_messages, tablet_peer-&gt;Now(), txn_participant));</a>
+<a name="ln395"> </a>
+<a name="ln396">  OpId checkpoint;</a>
+<a name="ln397">  auto ordered_messages = VERIFY_RESULT(SortWrites(read_ops.messages, txn_map, &amp;checkpoint));</a>
+<a name="ln398"> </a>
+<a name="ln399">  for (const auto&amp; msg : ordered_messages) {</a>
+<a name="ln400">    switch (msg-&gt;op_type()) {</a>
+<a name="ln401">      case consensus::OperationType::UPDATE_TRANSACTION_OP:</a>
+<a name="ln402">        RETURN_NOT_OK(PopulateTransactionRecord(msg, resp-&gt;add_records()));</a>
+<a name="ln403">        break;</a>
+<a name="ln404"> </a>
+<a name="ln405">      case consensus::OperationType::WRITE_OP:</a>
+<a name="ln406">        RETURN_NOT_OK(PopulateWriteRecord(msg, txn_map, stream_metadata,</a>
+<a name="ln407">                                          *tablet_peer-&gt;tablet()-&gt;schema(), resp));</a>
+<a name="ln408">        break;</a>
+<a name="ln409"> </a>
+<a name="ln410">      default:</a>
+<a name="ln411">        // Nothing to do for other operation types.</a>
+<a name="ln412">        break;</a>
+<a name="ln413">    }</a>
+<a name="ln414">  }</a>
+<a name="ln415"> </a>
+<a name="ln416">  if (consumption) {</a>
+<a name="ln417">    consumption.Add(resp-&gt;SpaceUsedLong());</a>
+<a name="ln418">  }</a>
+<a name="ln419">  *msgs_holder = consensus::ReplicateMsgsHolder(</a>
+<a name="ln420">      nullptr, std::move(ordered_messages), std::move(consumption));</a>
+<a name="ln421">  (checkpoint.index &gt; 0 ? checkpoint : from_op_id).ToPB(</a>
+<a name="ln422">      resp-&gt;mutable_checkpoint()-&gt;mutable_op_id());</a>
+<a name="ln423">  return Status::OK();</a>
+<a name="ln424">}</a>
+<a name="ln425"> </a>
+<a name="ln426">}  // namespace cdc</a>
+<a name="ln427">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="336"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

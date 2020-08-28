@@ -1,0 +1,966 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>write_batch.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Copyright (c) 2011 The LevelDB Authors. All rights reserved.</a>
+<a name="ln21">// Use of this source code is governed by a BSD-style license that can be</a>
+<a name="ln22">// found in the LICENSE file. See the AUTHORS file for names of contributors.</a>
+<a name="ln23">//</a>
+<a name="ln24">// WriteBatch::rep_ :=</a>
+<a name="ln25">//    sequence: fixed64</a>
+<a name="ln26">//    count: fixed32</a>
+<a name="ln27">//    data: record[count]</a>
+<a name="ln28">// record :=</a>
+<a name="ln29">//    kTypeValue varstring varstring</a>
+<a name="ln30">//    kTypeDeletion varstring</a>
+<a name="ln31">//    kTypeSingleDeletion varstring</a>
+<a name="ln32">//    kTypeMerge varstring varstring</a>
+<a name="ln33">//    kTypeColumnFamilyValue varint32 varstring varstring</a>
+<a name="ln34">//    kTypeColumnFamilyDeletion varint32 varstring varstring</a>
+<a name="ln35">//    kTypeColumnFamilySingleDeletion varint32 varstring varstring</a>
+<a name="ln36">//    kTypeColumnFamilyMerge varint32 varstring varstring</a>
+<a name="ln37">// varstring :=</a>
+<a name="ln38">//    len: varint32</a>
+<a name="ln39">//    data: uint8[len]</a>
+<a name="ln40">//</a>
+<a name="ln41">// YugaByte-specific extensions stored out-of-band:</a>
+<a name="ln42">//   user_sequence_numbers_</a>
+<a name="ln43"> </a>
+<a name="ln44">#include &quot;yb/rocksdb/write_batch.h&quot;</a>
+<a name="ln45"> </a>
+<a name="ln46">#include &lt;stack&gt;</a>
+<a name="ln47">#include &lt;stdexcept&gt;</a>
+<a name="ln48">#include &lt;vector&gt;</a>
+<a name="ln49">#include &lt;iostream&gt;</a>
+<a name="ln50"> </a>
+<a name="ln51">#include &quot;yb/rocksdb/db/column_family.h&quot;</a>
+<a name="ln52">#include &quot;yb/rocksdb/db/db_impl.h&quot;</a>
+<a name="ln53">#include &quot;yb/rocksdb/db/dbformat.h&quot;</a>
+<a name="ln54">#include &quot;yb/rocksdb/db/flush_scheduler.h&quot;</a>
+<a name="ln55">#include &quot;yb/rocksdb/db/memtable.h&quot;</a>
+<a name="ln56">#include &quot;yb/rocksdb/db/snapshot_impl.h&quot;</a>
+<a name="ln57">#include &quot;yb/rocksdb/db/write_batch_internal.h&quot;</a>
+<a name="ln58">#include &quot;yb/rocksdb/merge_operator.h&quot;</a>
+<a name="ln59">#include &quot;yb/rocksdb/util/coding.h&quot;</a>
+<a name="ln60">#include &quot;yb/rocksdb/util/perf_context_imp.h&quot;</a>
+<a name="ln61">#include &quot;yb/rocksdb/util/statistics.h&quot;</a>
+<a name="ln62"> </a>
+<a name="ln63">#include &quot;yb/gutil/macros.h&quot;</a>
+<a name="ln64"> </a>
+<a name="ln65">namespace rocksdb {</a>
+<a name="ln66"> </a>
+<a name="ln67">// anon namespace for file-local types</a>
+<a name="ln68">namespace {</a>
+<a name="ln69"> </a>
+<a name="ln70">enum ContentFlags : uint32_t {</a>
+<a name="ln71">  DEFERRED = 1,</a>
+<a name="ln72">  HAS_PUT = 2,</a>
+<a name="ln73">  HAS_DELETE = 4,</a>
+<a name="ln74">  HAS_SINGLE_DELETE = 8,</a>
+<a name="ln75">  HAS_MERGE = 16,</a>
+<a name="ln76">  HAS_FRONTIERS = 32,</a>
+<a name="ln77">};</a>
+<a name="ln78"> </a>
+<a name="ln79">struct BatchContentClassifier : public WriteBatch::Handler {</a>
+<a name="ln80">  uint32_t content_flags = 0;</a>
+<a name="ln81"> </a>
+<a name="ln82">  CHECKED_STATUS PutCF(uint32_t, const Slice&amp;, const Slice&amp;) override {</a>
+<a name="ln83">    content_flags |= ContentFlags::HAS_PUT;</a>
+<a name="ln84">    return Status::OK();</a>
+<a name="ln85">  }</a>
+<a name="ln86"> </a>
+<a name="ln87">  CHECKED_STATUS DeleteCF(uint32_t, const Slice&amp;) override {</a>
+<a name="ln88">    content_flags |= ContentFlags::HAS_DELETE;</a>
+<a name="ln89">    return Status::OK();</a>
+<a name="ln90">  }</a>
+<a name="ln91"> </a>
+<a name="ln92">  CHECKED_STATUS SingleDeleteCF(uint32_t, const Slice&amp;) override {</a>
+<a name="ln93">    content_flags |= ContentFlags::HAS_SINGLE_DELETE;</a>
+<a name="ln94">    return Status::OK();</a>
+<a name="ln95">  }</a>
+<a name="ln96"> </a>
+<a name="ln97">  CHECKED_STATUS MergeCF(uint32_t, const Slice&amp;, const Slice&amp;) override {</a>
+<a name="ln98">    content_flags |= ContentFlags::HAS_MERGE;</a>
+<a name="ln99">    return Status::OK();</a>
+<a name="ln100">  }</a>
+<a name="ln101"> </a>
+<a name="ln102">  CHECKED_STATUS Frontiers(const UserFrontiers&amp; range) override {</a>
+<a name="ln103">    content_flags |= ContentFlags::HAS_FRONTIERS;</a>
+<a name="ln104">    return Status::OK();</a>
+<a name="ln105">  }</a>
+<a name="ln106">};</a>
+<a name="ln107"> </a>
+<a name="ln108">}  // anon namespace</a>
+<a name="ln109"> </a>
+<a name="ln110">// WriteBatch header has an 8-byte sequence number followed by a 4-byte count.</a>
+<a name="ln111">static const size_t kHeader = 12;</a>
+<a name="ln112"> </a>
+<a name="ln113">struct SavePoint {</a>
+<a name="ln114">  size_t size;  // size of rep_</a>
+<a name="ln115">  uint32_t count;    // count of elements in rep_</a>
+<a name="ln116">  uint32_t content_flags;</a>
+<a name="ln117">  const UserFrontiers* frontiers;</a>
+<a name="ln118">};</a>
+<a name="ln119"> </a>
+<a name="ln120">struct SavePoints {</a>
+<a name="ln121">  std::stack&lt;SavePoint&gt; stack;</a>
+<a name="ln122">};</a>
+<a name="ln123"> </a>
+<a name="ln124">WriteBatch::WriteBatch(size_t reserved_bytes)</a>
+<a name="ln125">    : content_flags_(0) {</a>
+<a name="ln126">  rep_.reserve(std::max(reserved_bytes, kHeader));</a>
+<a name="ln127">  rep_.resize(kHeader);</a>
+<a name="ln128">}</a>
+<a name="ln129"> </a>
+<a name="ln130">WriteBatch::WriteBatch(const std::string&amp; rep)</a>
+<a name="ln131">    : content_flags_(ContentFlags::DEFERRED),</a>
+<a name="ln132">      rep_(rep) {}</a>
+<a name="ln133"> </a>
+<a name="ln134">WriteBatch::WriteBatch(const WriteBatch&amp; src)</a>
+<a name="ln135">    : content_flags_(src.content_flags_.load(std::memory_order_relaxed)),</a>
+<a name="ln136">      rep_(src.rep_),</a>
+<a name="ln137">      frontiers_(src.frontiers_) {</a>
+<a name="ln138">  if (src.save_points_) {</a>
+<a name="ln139">    save_points_.reset(new SavePoints(*src.save_points_));</a>
+<a name="ln140">  }</a>
+<a name="ln141">}</a>
+<a name="ln142"> </a>
+<a name="ln143">WriteBatch::WriteBatch(WriteBatch&amp;&amp; src)</a>
+<a name="ln144">    : save_points_(std::move(src.save_points_)),</a>
+<a name="ln145">      content_flags_(src.content_flags_.load(std::memory_order_relaxed)),</a>
+<a name="ln146">      rep_(std::move(src.rep_)),</a>
+<a name="ln147">      frontiers_(std::move(src.frontiers_)) {}</a>
+<a name="ln148"> </a>
+<a name="ln149">WriteBatch&amp; WriteBatch::operator=(const WriteBatch&amp; src) {</a>
+<a name="ln150">  if (&amp;src != this) {</a>
+<a name="ln151">    this-&gt;~WriteBatch();</a>
+<a name="ln152">    new (this) WriteBatch(src);</a>
+<a name="ln153">  }</a>
+<a name="ln154">  return *this;</a>
+<a name="ln155">}</a>
+<a name="ln156"> </a>
+<a name="ln157">WriteBatch&amp; WriteBatch::operator=(WriteBatch&amp;&amp; src) {</a>
+<a name="ln158">  if (&amp;src != this) {</a>
+<a name="ln159">    this-&gt;~WriteBatch();</a>
+<a name="ln160">    new (this) WriteBatch(std::move(src));</a>
+<a name="ln161">  }</a>
+<a name="ln162">  return *this;</a>
+<a name="ln163">}</a>
+<a name="ln164"> </a>
+<a name="ln165">WriteBatch::~WriteBatch() {}</a>
+<a name="ln166"> </a>
+<a name="ln167">WriteBatch::Handler::~Handler() { }</a>
+<a name="ln168"> </a>
+<a name="ln169">void WriteBatch::Handler::LogData(const Slice&amp; blob) {</a>
+<a name="ln170">  // If the user has not specified something to do with blobs, then we ignore</a>
+<a name="ln171">  // them.</a>
+<a name="ln172">}</a>
+<a name="ln173"> </a>
+<a name="ln174">bool WriteBatch::Handler::Continue() {</a>
+<a name="ln175">  return true;</a>
+<a name="ln176">}</a>
+<a name="ln177"> </a>
+<a name="ln178">void WriteBatch::Clear() {</a>
+<a name="ln179">  rep_.clear();</a>
+<a name="ln180">  rep_.resize(kHeader);</a>
+<a name="ln181"> </a>
+<a name="ln182">  content_flags_.store(0, std::memory_order_relaxed);</a>
+<a name="ln183"> </a>
+<a name="ln184">  if (save_points_ != nullptr) {</a>
+<a name="ln185">    while (!save_points_-&gt;stack.empty()) {</a>
+<a name="ln186">      save_points_-&gt;stack.pop();</a>
+<a name="ln187">    }</a>
+<a name="ln188">  }</a>
+<a name="ln189"> </a>
+<a name="ln190">  frontiers_ = nullptr;</a>
+<a name="ln191">}</a>
+<a name="ln192"> </a>
+<a name="ln193">uint32_t WriteBatch::Count() const {</a>
+<a name="ln194">  return WriteBatchInternal::Count(this);</a>
+<a name="ln195">}</a>
+<a name="ln196"> </a>
+<a name="ln197">uint32_t WriteBatch::ComputeContentFlags() const {</a>
+<a name="ln198">  auto rv = content_flags_.load(std::memory_order_relaxed);</a>
+<a name="ln199">  if ((rv &amp; ContentFlags::DEFERRED) != 0) {</a>
+<a name="ln200">    BatchContentClassifier classifier;</a>
+<a name="ln201">    auto status = Iterate(&amp;classifier);</a>
+<a name="ln202">    LOG_IF(ERROR, !status.ok()) &lt;&lt; &quot;Iterate failed during ComputeContentFlags: &quot; &lt;&lt; status;</a>
+<a name="ln203">    rv = classifier.content_flags;</a>
+<a name="ln204"> </a>
+<a name="ln205">    // this method is conceptually const, because it is performing a lazy</a>
+<a name="ln206">    // computation that doesn't affect the abstract state of the batch.</a>
+<a name="ln207">    // content_flags_ is marked mutable so that we can perform the</a>
+<a name="ln208">    // following assignment</a>
+<a name="ln209">    content_flags_.store(rv, std::memory_order_relaxed);</a>
+<a name="ln210">  }</a>
+<a name="ln211">  return rv;</a>
+<a name="ln212">}</a>
+<a name="ln213"> </a>
+<a name="ln214">bool WriteBatch::HasPut() const {</a>
+<a name="ln215">  return (ComputeContentFlags() &amp; ContentFlags::HAS_PUT) != 0;</a>
+<a name="ln216">}</a>
+<a name="ln217"> </a>
+<a name="ln218">bool WriteBatch::HasDelete() const {</a>
+<a name="ln219">  return (ComputeContentFlags() &amp; ContentFlags::HAS_DELETE) != 0;</a>
+<a name="ln220">}</a>
+<a name="ln221"> </a>
+<a name="ln222">bool WriteBatch::HasSingleDelete() const {</a>
+<a name="ln223">  return (ComputeContentFlags() &amp; ContentFlags::HAS_SINGLE_DELETE) != 0;</a>
+<a name="ln224">}</a>
+<a name="ln225"> </a>
+<a name="ln226">bool WriteBatch::HasMerge() const {</a>
+<a name="ln227">  return (ComputeContentFlags() &amp; ContentFlags::HAS_MERGE) != 0;</a>
+<a name="ln228">}</a>
+<a name="ln229"> </a>
+<a name="ln230">Status ReadRecordFromWriteBatch(Slice* input, char* tag,</a>
+<a name="ln231">                                uint32_t* column_family, Slice* key,</a>
+<a name="ln232">                                Slice* value, Slice* blob) {</a>
+<a name="ln233">  assert(key != nullptr &amp;&amp; value != nullptr);</a>
+<a name="ln234">  *tag = (*input)[0];</a>
+<a name="ln235">  input-&gt;remove_prefix(1);</a>
+<a name="ln236">  *column_family = 0;  // default</a>
+<a name="ln237">  switch (*tag) {</a>
+<a name="ln238">    case kTypeColumnFamilyValue:</a>
+<a name="ln239">      if (!GetVarint32(input, column_family)) {</a>
+<a name="ln240">        return STATUS(Corruption, &quot;bad WriteBatch Put&quot;);</a>
+<a name="ln241">      }</a>
+<a name="ln242">      FALLTHROUGH_INTENDED;</a>
+<a name="ln243">    case kTypeValue:</a>
+<a name="ln244">      if (!GetLengthPrefixedSlice(input, key) ||</a>
+<a name="ln245">          !GetLengthPrefixedSlice(input, value)) {</a>
+<a name="ln246">        return STATUS(Corruption, &quot;bad WriteBatch Put&quot;);</a>
+<a name="ln247">      }</a>
+<a name="ln248">      break;</a>
+<a name="ln249">    case kTypeColumnFamilyDeletion:</a>
+<a name="ln250">    case kTypeColumnFamilySingleDeletion:</a>
+<a name="ln251">      if (!GetVarint32(input, column_family)) {</a>
+<a name="ln252">        return STATUS(Corruption, &quot;bad WriteBatch Delete&quot;);</a>
+<a name="ln253">      }</a>
+<a name="ln254">      FALLTHROUGH_INTENDED;</a>
+<a name="ln255">    case kTypeDeletion:</a>
+<a name="ln256">    case kTypeSingleDeletion:</a>
+<a name="ln257">      if (!GetLengthPrefixedSlice(input, key)) {</a>
+<a name="ln258">        return STATUS(Corruption, &quot;bad WriteBatch Delete&quot;);</a>
+<a name="ln259">      }</a>
+<a name="ln260">      break;</a>
+<a name="ln261">    case kTypeColumnFamilyMerge:</a>
+<a name="ln262">      if (!GetVarint32(input, column_family)) {</a>
+<a name="ln263">        return STATUS(Corruption, &quot;bad WriteBatch Merge&quot;);</a>
+<a name="ln264">      }</a>
+<a name="ln265">      FALLTHROUGH_INTENDED;</a>
+<a name="ln266">    case kTypeMerge:</a>
+<a name="ln267">      if (!GetLengthPrefixedSlice(input, key) ||</a>
+<a name="ln268">          !GetLengthPrefixedSlice(input, value)) {</a>
+<a name="ln269">        return STATUS(Corruption, &quot;bad WriteBatch Merge&quot;);</a>
+<a name="ln270">      }</a>
+<a name="ln271">      break;</a>
+<a name="ln272">    case kTypeLogData:</a>
+<a name="ln273">      assert(blob != nullptr);</a>
+<a name="ln274">      if (!GetLengthPrefixedSlice(input, blob)) {</a>
+<a name="ln275">        return STATUS(Corruption, &quot;bad WriteBatch Blob&quot;);</a>
+<a name="ln276">      }</a>
+<a name="ln277">      break;</a>
+<a name="ln278">    default:</a>
+<a name="ln279">      return STATUS(Corruption, &quot;unknown WriteBatch tag&quot;);</a>
+<a name="ln280">  }</a>
+<a name="ln281">  return Status::OK();</a>
+<a name="ln282">}</a>
+<a name="ln283"> </a>
+<a name="ln284">Status WriteBatch::Iterate(Handler* handler) const {</a>
+<a name="ln285">  Slice input(rep_);</a>
+<a name="ln286">  if (input.size() &lt; kHeader) {</a>
+<a name="ln287">    return STATUS(Corruption, &quot;malformed WriteBatch (too small)&quot;);</a>
+<a name="ln288">  }</a>
+<a name="ln289"> </a>
+<a name="ln290">  input.remove_prefix(kHeader);</a>
+<a name="ln291">  Slice key, value, blob;</a>
+<a name="ln292">  size_t found = 0;</a>
+<a name="ln293">  Status s;</a>
+<a name="ln294"> </a>
+<a name="ln295">  if (frontiers_) {</a>
+<a name="ln296">    s = handler-&gt;Frontiers(*frontiers_);</a>
+<a name="ln297">  }</a>
+<a name="ln298">  while (s.ok() &amp;&amp; !input.empty() &amp;&amp; handler-&gt;Continue()) {</a>
+<a name="ln299">    char tag = 0;</a>
+<a name="ln300">    uint32_t column_family = 0;  // default</a>
+<a name="ln301"> </a>
+<a name="ln302">    s = ReadRecordFromWriteBatch(&amp;input, &amp;tag, &amp;column_family, &amp;key, &amp;value,</a>
+<a name="ln303">                                 &amp;blob);</a>
+<a name="ln304">    if (!s.ok()) {</a>
+<a name="ln305">      return s;</a>
+<a name="ln306">    }</a>
+<a name="ln307"> </a>
+<a name="ln308">    switch (tag) {</a>
+<a name="ln309">      case kTypeColumnFamilyValue:</a>
+<a name="ln310">      case kTypeValue:</a>
+<a name="ln311">        assert(content_flags_.load(std::memory_order_relaxed) &amp;</a>
+<a name="ln312">               (ContentFlags::DEFERRED | ContentFlags::HAS_PUT));</a>
+<a name="ln313">        s = handler-&gt;PutCF(column_family, key, value);</a>
+<a name="ln314">        found++;</a>
+<a name="ln315">        break;</a>
+<a name="ln316">      case kTypeColumnFamilyDeletion:</a>
+<a name="ln317">      case kTypeDeletion:</a>
+<a name="ln318">        assert(content_flags_.load(std::memory_order_relaxed) &amp;</a>
+<a name="ln319">               (ContentFlags::DEFERRED | ContentFlags::HAS_DELETE));</a>
+<a name="ln320">        s = handler-&gt;DeleteCF(column_family, key);</a>
+<a name="ln321">        found++;</a>
+<a name="ln322">        break;</a>
+<a name="ln323">      case kTypeColumnFamilySingleDeletion:</a>
+<a name="ln324">      case kTypeSingleDeletion:</a>
+<a name="ln325">        assert(content_flags_.load(std::memory_order_relaxed) &amp;</a>
+<a name="ln326">               (ContentFlags::DEFERRED | ContentFlags::HAS_SINGLE_DELETE));</a>
+<a name="ln327">        s = handler-&gt;SingleDeleteCF(column_family, key);</a>
+<a name="ln328">        found++;</a>
+<a name="ln329">        break;</a>
+<a name="ln330">      case kTypeColumnFamilyMerge:</a>
+<a name="ln331">      case kTypeMerge:</a>
+<a name="ln332">        assert(content_flags_.load(std::memory_order_relaxed) &amp;</a>
+<a name="ln333">               (ContentFlags::DEFERRED | ContentFlags::HAS_MERGE));</a>
+<a name="ln334">        s = handler-&gt;MergeCF(column_family, key, value);</a>
+<a name="ln335">        found++;</a>
+<a name="ln336">        break;</a>
+<a name="ln337">      case kTypeLogData:</a>
+<a name="ln338">        handler-&gt;LogData(blob);</a>
+<a name="ln339">        break;</a>
+<a name="ln340">      default:</a>
+<a name="ln341">        return STATUS(Corruption, &quot;unknown WriteBatch tag&quot;);</a>
+<a name="ln342">    }</a>
+<a name="ln343">  }</a>
+<a name="ln344">  if (!s.ok()) {</a>
+<a name="ln345">    return s;</a>
+<a name="ln346">  }</a>
+<a name="ln347">  if (found != WriteBatchInternal::Count(this)) {</a>
+<a name="ln348">    return STATUS(Corruption, &quot;WriteBatch has wrong count&quot;);</a>
+<a name="ln349">  } else {</a>
+<a name="ln350">    return Status::OK();</a>
+<a name="ln351">  }</a>
+<a name="ln352">}</a>
+<a name="ln353"> </a>
+<a name="ln354">uint32_t WriteBatchInternal::Count(const WriteBatch* b) {</a>
+<a name="ln355">  return DecodeFixed32(b-&gt;rep_.data() + 8);</a>
+<a name="ln356">}</a>
+<a name="ln357"> </a>
+<a name="ln358">void WriteBatchInternal::SetCount(WriteBatch* b, uint32_t n) {</a>
+<a name="ln359">  EncodeFixed32(&amp;b-&gt;rep_[8], n);</a>
+<a name="ln360">}</a>
+<a name="ln361"> </a>
+<a name="ln362">SequenceNumber WriteBatchInternal::Sequence(const WriteBatch* b) {</a>
+<a name="ln363">  return SequenceNumber(DecodeFixed64(b-&gt;rep_.data()));</a>
+<a name="ln364">}</a>
+<a name="ln365"> </a>
+<a name="ln366">void WriteBatchInternal::SetSequence(WriteBatch* b, SequenceNumber seq) {</a>
+<a name="ln367">  EncodeFixed64(&amp;b-&gt;rep_[0], seq);</a>
+<a name="ln368">}</a>
+<a name="ln369"> </a>
+<a name="ln370">size_t WriteBatchInternal::GetFirstOffset(WriteBatch* b) { return kHeader; }</a>
+<a name="ln371"> </a>
+<a name="ln372">void WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,</a>
+<a name="ln373">                             const Slice&amp; key, const Slice&amp; value) {</a>
+<a name="ln374">  WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);</a>
+<a name="ln375">  if (column_family_id == 0) {</a>
+<a name="ln376">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeValue));</a>
+<a name="ln377">  } else {</a>
+<a name="ln378">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeColumnFamilyValue));</a>
+<a name="ln379">    PutVarint32(&amp;b-&gt;rep_, column_family_id);</a>
+<a name="ln380">  }</a>
+<a name="ln381">  PutLengthPrefixedSlice(&amp;b-&gt;rep_, key);</a>
+<a name="ln382">  PutLengthPrefixedSlice(&amp;b-&gt;rep_, value);</a>
+<a name="ln383">  b-&gt;content_flags_.store(</a>
+<a name="ln384">      b-&gt;content_flags_.load(std::memory_order_relaxed) | ContentFlags::HAS_PUT,</a>
+<a name="ln385">      std::memory_order_relaxed);</a>
+<a name="ln386">}</a>
+<a name="ln387"> </a>
+<a name="ln388">void WriteBatch::Put(ColumnFamilyHandle* column_family, const Slice&amp; key,</a>
+<a name="ln389">                     const Slice&amp; value) {</a>
+<a name="ln390">  WriteBatchInternal::Put(this, GetColumnFamilyID(column_family), key, value);</a>
+<a name="ln391">}</a>
+<a name="ln392"> </a>
+<a name="ln393">void WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,</a>
+<a name="ln394">                             const SliceParts&amp; key, const SliceParts&amp; value) {</a>
+<a name="ln395">  WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);</a>
+<a name="ln396">  if (column_family_id == 0) {</a>
+<a name="ln397">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeValue));</a>
+<a name="ln398">  } else {</a>
+<a name="ln399">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeColumnFamilyValue));</a>
+<a name="ln400">    PutVarint32(&amp;b-&gt;rep_, column_family_id);</a>
+<a name="ln401">  }</a>
+<a name="ln402">  PutLengthPrefixedSliceParts(&amp;b-&gt;rep_, key);</a>
+<a name="ln403">  PutLengthPrefixedSliceParts(&amp;b-&gt;rep_, value);</a>
+<a name="ln404">  b-&gt;content_flags_.store(</a>
+<a name="ln405">      b-&gt;content_flags_.load(std::memory_order_relaxed) | ContentFlags::HAS_PUT,</a>
+<a name="ln406">      std::memory_order_relaxed);</a>
+<a name="ln407">}</a>
+<a name="ln408"> </a>
+<a name="ln409">void WriteBatch::Put(ColumnFamilyHandle* column_family, const SliceParts&amp; key,</a>
+<a name="ln410">                     const SliceParts&amp; value) {</a>
+<a name="ln411">  WriteBatchInternal::Put(this, GetColumnFamilyID(column_family), key, value);</a>
+<a name="ln412">}</a>
+<a name="ln413"> </a>
+<a name="ln414">void WriteBatchInternal::Delete(WriteBatch* b, uint32_t column_family_id,</a>
+<a name="ln415">                                const Slice&amp; key) {</a>
+<a name="ln416">  WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);</a>
+<a name="ln417">  if (column_family_id == 0) {</a>
+<a name="ln418">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeDeletion));</a>
+<a name="ln419">  } else {</a>
+<a name="ln420">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeColumnFamilyDeletion));</a>
+<a name="ln421">    PutVarint32(&amp;b-&gt;rep_, column_family_id);</a>
+<a name="ln422">  }</a>
+<a name="ln423">  PutLengthPrefixedSlice(&amp;b-&gt;rep_, key);</a>
+<a name="ln424">  b-&gt;content_flags_.store(b-&gt;content_flags_.load(std::memory_order_relaxed) |</a>
+<a name="ln425">                              ContentFlags::HAS_DELETE,</a>
+<a name="ln426">                          std::memory_order_relaxed);</a>
+<a name="ln427">}</a>
+<a name="ln428"> </a>
+<a name="ln429">void WriteBatch::Delete(ColumnFamilyHandle* column_family, const Slice&amp; key) {</a>
+<a name="ln430">  WriteBatchInternal::Delete(this, GetColumnFamilyID(column_family), key);</a>
+<a name="ln431">}</a>
+<a name="ln432"> </a>
+<a name="ln433">void WriteBatchInternal::Delete(WriteBatch* b, uint32_t column_family_id,</a>
+<a name="ln434">                                const SliceParts&amp; key) {</a>
+<a name="ln435">  WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);</a>
+<a name="ln436">  if (column_family_id == 0) {</a>
+<a name="ln437">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeDeletion));</a>
+<a name="ln438">  } else {</a>
+<a name="ln439">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeColumnFamilyDeletion));</a>
+<a name="ln440">    PutVarint32(&amp;b-&gt;rep_, column_family_id);</a>
+<a name="ln441">  }</a>
+<a name="ln442">  PutLengthPrefixedSliceParts(&amp;b-&gt;rep_, key);</a>
+<a name="ln443">  b-&gt;content_flags_.store(b-&gt;content_flags_.load(std::memory_order_relaxed) |</a>
+<a name="ln444">                              ContentFlags::HAS_DELETE,</a>
+<a name="ln445">                          std::memory_order_relaxed);</a>
+<a name="ln446">}</a>
+<a name="ln447"> </a>
+<a name="ln448">void WriteBatch::Delete(ColumnFamilyHandle* column_family,</a>
+<a name="ln449">                        const SliceParts&amp; key) {</a>
+<a name="ln450">  WriteBatchInternal::Delete(this, GetColumnFamilyID(column_family), key);</a>
+<a name="ln451">}</a>
+<a name="ln452"> </a>
+<a name="ln453">void WriteBatchInternal::SingleDelete(WriteBatch* b, uint32_t column_family_id,</a>
+<a name="ln454">                                      const Slice&amp; key) {</a>
+<a name="ln455">  WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);</a>
+<a name="ln456">  if (column_family_id == 0) {</a>
+<a name="ln457">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeSingleDeletion));</a>
+<a name="ln458">  } else {</a>
+<a name="ln459">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeColumnFamilySingleDeletion));</a>
+<a name="ln460">    PutVarint32(&amp;b-&gt;rep_, column_family_id);</a>
+<a name="ln461">  }</a>
+<a name="ln462">  PutLengthPrefixedSlice(&amp;b-&gt;rep_, key);</a>
+<a name="ln463">  b-&gt;content_flags_.store(b-&gt;content_flags_.load(std::memory_order_relaxed) |</a>
+<a name="ln464">                              ContentFlags::HAS_SINGLE_DELETE,</a>
+<a name="ln465">                          std::memory_order_relaxed);</a>
+<a name="ln466">}</a>
+<a name="ln467"> </a>
+<a name="ln468">void WriteBatch::SingleDelete(ColumnFamilyHandle* column_family,</a>
+<a name="ln469">                              const Slice&amp; key) {</a>
+<a name="ln470">  WriteBatchInternal::SingleDelete(this, GetColumnFamilyID(column_family), key);</a>
+<a name="ln471">}</a>
+<a name="ln472"> </a>
+<a name="ln473">void WriteBatchInternal::SingleDelete(WriteBatch* b, uint32_t column_family_id,</a>
+<a name="ln474">                                      const SliceParts&amp; key) {</a>
+<a name="ln475">  WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);</a>
+<a name="ln476">  if (column_family_id == 0) {</a>
+<a name="ln477">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeSingleDeletion));</a>
+<a name="ln478">  } else {</a>
+<a name="ln479">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeColumnFamilySingleDeletion));</a>
+<a name="ln480">    PutVarint32(&amp;b-&gt;rep_, column_family_id);</a>
+<a name="ln481">  }</a>
+<a name="ln482">  PutLengthPrefixedSliceParts(&amp;b-&gt;rep_, key);</a>
+<a name="ln483">  b-&gt;content_flags_.store(b-&gt;content_flags_.load(std::memory_order_relaxed) |</a>
+<a name="ln484">                              ContentFlags::HAS_SINGLE_DELETE,</a>
+<a name="ln485">                          std::memory_order_relaxed);</a>
+<a name="ln486">}</a>
+<a name="ln487"> </a>
+<a name="ln488">void WriteBatch::SingleDelete(ColumnFamilyHandle* column_family,</a>
+<a name="ln489">                              const SliceParts&amp; key) {</a>
+<a name="ln490">  WriteBatchInternal::SingleDelete(this, GetColumnFamilyID(column_family), key);</a>
+<a name="ln491">}</a>
+<a name="ln492"> </a>
+<a name="ln493">void WriteBatchInternal::Merge(WriteBatch* b, uint32_t column_family_id,</a>
+<a name="ln494">                               const Slice&amp; key, const Slice&amp; value) {</a>
+<a name="ln495">  WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);</a>
+<a name="ln496">  if (column_family_id == 0) {</a>
+<a name="ln497">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeMerge));</a>
+<a name="ln498">  } else {</a>
+<a name="ln499">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeColumnFamilyMerge));</a>
+<a name="ln500">    PutVarint32(&amp;b-&gt;rep_, column_family_id);</a>
+<a name="ln501">  }</a>
+<a name="ln502">  PutLengthPrefixedSlice(&amp;b-&gt;rep_, key);</a>
+<a name="ln503">  PutLengthPrefixedSlice(&amp;b-&gt;rep_, value);</a>
+<a name="ln504">  b-&gt;content_flags_.store(b-&gt;content_flags_.load(std::memory_order_relaxed) |</a>
+<a name="ln505">                              ContentFlags::HAS_MERGE,</a>
+<a name="ln506">                          std::memory_order_relaxed);</a>
+<a name="ln507">}</a>
+<a name="ln508"> </a>
+<a name="ln509">void WriteBatch::Merge(ColumnFamilyHandle* column_family, const Slice&amp; key,</a>
+<a name="ln510">                       const Slice&amp; value) {</a>
+<a name="ln511">  WriteBatchInternal::Merge(this, GetColumnFamilyID(column_family), key, value);</a>
+<a name="ln512">}</a>
+<a name="ln513"> </a>
+<a name="ln514">void WriteBatchInternal::Merge(WriteBatch* b, uint32_t column_family_id,</a>
+<a name="ln515">                               const SliceParts&amp; key,</a>
+<a name="ln516">                               const SliceParts&amp; value) {</a>
+<a name="ln517">  WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);</a>
+<a name="ln518">  if (column_family_id == 0) {</a>
+<a name="ln519">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeMerge));</a>
+<a name="ln520">  } else {</a>
+<a name="ln521">    b-&gt;rep_.push_back(static_cast&lt;char&gt;(kTypeColumnFamilyMerge));</a>
+<a name="ln522">    PutVarint32(&amp;b-&gt;rep_, column_family_id);</a>
+<a name="ln523">  }</a>
+<a name="ln524">  PutLengthPrefixedSliceParts(&amp;b-&gt;rep_, key);</a>
+<a name="ln525">  PutLengthPrefixedSliceParts(&amp;b-&gt;rep_, value);</a>
+<a name="ln526">  b-&gt;content_flags_.store(b-&gt;content_flags_.load(std::memory_order_relaxed) |</a>
+<a name="ln527">                              ContentFlags::HAS_MERGE,</a>
+<a name="ln528">                          std::memory_order_relaxed);</a>
+<a name="ln529">}</a>
+<a name="ln530"> </a>
+<a name="ln531">void WriteBatch::Merge(ColumnFamilyHandle* column_family,</a>
+<a name="ln532">                       const SliceParts&amp; key,</a>
+<a name="ln533">                       const SliceParts&amp; value) {</a>
+<a name="ln534">  WriteBatchInternal::Merge(this, GetColumnFamilyID(column_family),</a>
+<a name="ln535">                            key, value);</a>
+<a name="ln536">}</a>
+<a name="ln537"> </a>
+<a name="ln538">void WriteBatch::PutLogData(const Slice&amp; blob) {</a>
+<a name="ln539">  rep_.push_back(static_cast&lt;char&gt;(kTypeLogData));</a>
+<a name="ln540">  PutLengthPrefixedSlice(&amp;rep_, blob);</a>
+<a name="ln541">}</a>
+<a name="ln542"> </a>
+<a name="ln543">void WriteBatch::SetSavePoint() {</a>
+<a name="ln544">  if (save_points_ == nullptr) {</a>
+<a name="ln545">    save_points_.reset(new SavePoints());</a>
+<a name="ln546">  }</a>
+<a name="ln547">  // Record length and count of current batch of writes.</a>
+<a name="ln548">  save_points_-&gt;stack.push(</a>
+<a name="ln549">     {GetDataSize(), Count(), content_flags_.load(std::memory_order_relaxed), frontiers_});</a>
+<a name="ln550">}</a>
+<a name="ln551"> </a>
+<a name="ln552">Status WriteBatch::RollbackToSavePoint() {</a>
+<a name="ln553">  if (save_points_ == nullptr || save_points_-&gt;stack.size() == 0) {</a>
+<a name="ln554">    return STATUS(NotFound, &quot;&quot;);</a>
+<a name="ln555">  }</a>
+<a name="ln556"> </a>
+<a name="ln557">  // Pop the most recent savepoint off the stack</a>
+<a name="ln558">  SavePoint savepoint = save_points_-&gt;stack.top();</a>
+<a name="ln559">  save_points_-&gt;stack.pop();</a>
+<a name="ln560"> </a>
+<a name="ln561">  DCHECK_LE(savepoint.size, rep_.size());</a>
+<a name="ln562">  DCHECK_LE(savepoint.count, Count());</a>
+<a name="ln563"> </a>
+<a name="ln564">  if (savepoint.size == rep_.size()) {</a>
+<a name="ln565">    // No changes to rollback</a>
+<a name="ln566">  } else if (savepoint.size == 0) {</a>
+<a name="ln567">    // Rollback everything</a>
+<a name="ln568">    Clear();</a>
+<a name="ln569">  } else {</a>
+<a name="ln570">    rep_.resize(savepoint.size);</a>
+<a name="ln571">    WriteBatchInternal::SetCount(this, savepoint.count);</a>
+<a name="ln572">    content_flags_.store(savepoint.content_flags, std::memory_order_relaxed);</a>
+<a name="ln573">  }</a>
+<a name="ln574">  frontiers_ = savepoint.frontiers;</a>
+<a name="ln575"> </a>
+<a name="ln576">  return Status::OK();</a>
+<a name="ln577">}</a>
+<a name="ln578"> </a>
+<a name="ln579">namespace {</a>
+<a name="ln580"> </a>
+<a name="ln581">YB_STRONGLY_TYPED_BOOL(InMemoryErase);</a>
+<a name="ln582"> </a>
+<a name="ln583">class MemTableInserter : public WriteBatch::Handler {</a>
+<a name="ln584"> public:</a>
+<a name="ln585">  SequenceNumber sequence_;</a>
+<a name="ln586">  ColumnFamilyMemTables* const cf_mems_;</a>
+<a name="ln587">  FlushScheduler* const flush_scheduler_;</a>
+<a name="ln588">  const bool ignore_missing_column_families_;</a>
+<a name="ln589">  const uint64_t log_number_;</a>
+<a name="ln590">  DBImpl* db_;</a>
+<a name="ln591">  const InsertFlags insert_flags_;</a>
+<a name="ln592"> </a>
+<a name="ln593">  // cf_mems should not be shared with concurrent inserters</a>
+<a name="ln594">  MemTableInserter(SequenceNumber sequence, ColumnFamilyMemTables* cf_mems,</a>
+<a name="ln595">                   FlushScheduler* flush_scheduler,</a>
+<a name="ln596">                   bool ignore_missing_column_families, uint64_t log_number,</a>
+<a name="ln597">                   DB* db, InsertFlags insert_flags)</a>
+<a name="ln598">      : sequence_(sequence),</a>
+<a name="ln599">        cf_mems_(cf_mems),</a>
+<a name="ln600">        flush_scheduler_(flush_scheduler),</a>
+<a name="ln601">        ignore_missing_column_families_(ignore_missing_column_families),</a>
+<a name="ln602">        log_number_(log_number),</a>
+<a name="ln603">        db_(reinterpret_cast&lt;DBImpl*&gt;(db)),</a>
+<a name="ln604">        insert_flags_(insert_flags) {</a>
+<a name="ln605">    assert(cf_mems_);</a>
+<a name="ln606">    if (insert_flags_.Test(InsertFlag::kFilterDeletes)) {</a>
+<a name="ln607">      assert(db_);</a>
+<a name="ln608">    }</a>
+<a name="ln609">  }</a>
+<a name="ln610"> </a>
+<a name="ln611">  bool SeekToColumnFamily(uint32_t column_family_id, Status* s) {</a>
+<a name="ln612">    // If we are in a concurrent mode, it is the caller's responsibility</a>
+<a name="ln613">    // to clone the original ColumnFamilyMemTables so that each thread</a>
+<a name="ln614">    // has its own instance.  Otherwise, it must be guaranteed that there</a>
+<a name="ln615">    // is no concurrent access</a>
+<a name="ln616">    bool found = cf_mems_-&gt;Seek(column_family_id);</a>
+<a name="ln617">    if (!found) {</a>
+<a name="ln618">      if (ignore_missing_column_families_) {</a>
+<a name="ln619">        *s = Status::OK();</a>
+<a name="ln620">      } else {</a>
+<a name="ln621">        *s = STATUS(InvalidArgument,</a>
+<a name="ln622">            &quot;Invalid column family specified in write batch&quot;);</a>
+<a name="ln623">      }</a>
+<a name="ln624">      return false;</a>
+<a name="ln625">    }</a>
+<a name="ln626">    if (log_number_ != 0 &amp;&amp; log_number_ &lt; cf_mems_-&gt;GetLogNumber()) {</a>
+<a name="ln627">      // This is true only in recovery environment (log_number_ is always 0 in</a>
+<a name="ln628">      // non-recovery, regular write code-path)</a>
+<a name="ln629">      // * If log_number_ &lt; cf_mems_-&gt;GetLogNumber(), this means that column</a>
+<a name="ln630">      // family already contains updates from this log. We can't apply updates</a>
+<a name="ln631">      // twice because of update-in-place or merge workloads -- ignore the</a>
+<a name="ln632">      // update</a>
+<a name="ln633">      *s = Status::OK();</a>
+<a name="ln634">      return false;</a>
+<a name="ln635">    }</a>
+<a name="ln636">    return true;</a>
+<a name="ln637">  }</a>
+<a name="ln638"> </a>
+<a name="ln639">  virtual CHECKED_STATUS PutCF(uint32_t column_family_id, const Slice&amp; key,</a>
+<a name="ln640">                               const Slice&amp; value) override {</a>
+<a name="ln641">    Status seek_status;</a>
+<a name="ln642">    if (!SeekToColumnFamily(column_family_id, &amp;seek_status)) {</a>
+<a name="ln643">      ++sequence_;</a>
+<a name="ln644">      return seek_status;</a>
+<a name="ln645">    }</a>
+<a name="ln646">    MemTable* mem = cf_mems_-&gt;GetMemTable();</a>
+<a name="ln647">    auto* moptions = mem-&gt;GetMemTableOptions();</a>
+<a name="ln648">    if (!moptions-&gt;inplace_update_support) {</a>
+<a name="ln649">      mem-&gt;Add(CurrentSequenceNumber(), kTypeValue, key, value,</a>
+<a name="ln650">               insert_flags_.Test(InsertFlag::kConcurrentMemtableWrites));</a>
+<a name="ln651">    } else if (moptions-&gt;inplace_callback == nullptr) {</a>
+<a name="ln652">      assert(!insert_flags_.Test(InsertFlag::kConcurrentMemtableWrites));</a>
+<a name="ln653">      mem-&gt;Update(CurrentSequenceNumber(), key, value);</a>
+<a name="ln654">      RecordTick(moptions-&gt;statistics, NUMBER_KEYS_UPDATED);</a>
+<a name="ln655">    } else {</a>
+<a name="ln656">      assert(!insert_flags_.Test(InsertFlag::kConcurrentMemtableWrites));</a>
+<a name="ln657">      SequenceNumber current_seq = CurrentSequenceNumber();</a>
+<a name="ln658">      if (mem-&gt;UpdateCallback(current_seq, key, value)) {</a>
+<a name="ln659">      } else {</a>
+<a name="ln660">        // key not found in memtable. Do sst get, update, add</a>
+<a name="ln661">        SnapshotImpl read_from_snapshot;</a>
+<a name="ln662">        read_from_snapshot.number_ = current_seq;</a>
+<a name="ln663">        ReadOptions ropts;</a>
+<a name="ln664">        ropts.snapshot = &amp;read_from_snapshot;</a>
+<a name="ln665"> </a>
+<a name="ln666">        std::string prev_value;</a>
+<a name="ln667">        std::string merged_value;</a>
+<a name="ln668"> </a>
+<a name="ln669">        auto cf_handle = cf_mems_-&gt;GetColumnFamilyHandle();</a>
+<a name="ln670">        if (cf_handle == nullptr) {</a>
+<a name="ln671">          cf_handle = db_-&gt;DefaultColumnFamily();</a>
+<a name="ln672">        }</a>
+<a name="ln673">        Status s = db_-&gt;Get(ropts, cf_handle, key, &amp;prev_value);</a>
+<a name="ln674"> </a>
+<a name="ln675">        char* prev_buffer = const_cast&lt;char*&gt;(prev_value.c_str());</a>
+<a name="ln676">        uint32_t prev_size = static_cast&lt;uint32_t&gt;(prev_value.size());</a>
+<a name="ln677">        auto status = moptions-&gt;inplace_callback(s.ok() ? prev_buffer : nullptr,</a>
+<a name="ln678">                                                 s.ok() ? &amp;prev_size : nullptr,</a>
+<a name="ln679">                                                 value, &amp;merged_value);</a>
+<a name="ln680">        if (status == UpdateStatus::UPDATED_INPLACE) {</a>
+<a name="ln681">          // prev_value is updated in-place with final value.</a>
+<a name="ln682">          mem-&gt;Add(current_seq, kTypeValue, key, Slice(prev_buffer, prev_size));</a>
+<a name="ln683">          RecordTick(moptions-&gt;statistics, NUMBER_KEYS_WRITTEN);</a>
+<a name="ln684">        } else if (status == UpdateStatus::UPDATED) {</a>
+<a name="ln685">          // merged_value contains the final value.</a>
+<a name="ln686">          mem-&gt;Add(current_seq, kTypeValue, key, Slice(merged_value));</a>
+<a name="ln687">          RecordTick(moptions-&gt;statistics, NUMBER_KEYS_WRITTEN);</a>
+<a name="ln688">        }</a>
+<a name="ln689">      }</a>
+<a name="ln690">    }</a>
+<a name="ln691">    // Since all Puts are logged in transaction logs (if enabled), always bump</a>
+<a name="ln692">    // sequence number. Even if the update eventually fails and does not result</a>
+<a name="ln693">    // in memtable add/update.</a>
+<a name="ln694">    sequence_++;</a>
+<a name="ln695">    CheckMemtableFull();</a>
+<a name="ln696">    return Status::OK();</a>
+<a name="ln697">  }</a>
+<a name="ln698"> </a>
+<a name="ln699">  CHECKED_STATUS DeleteImpl(uint32_t column_family_id, const Slice&amp; key,</a>
+<a name="ln700">                            ValueType delete_type) {</a>
+<a name="ln701">    Status seek_status;</a>
+<a name="ln702">    if (!SeekToColumnFamily(column_family_id, &amp;seek_status)) {</a>
+<a name="ln703">      ++sequence_;</a>
+<a name="ln704">      return seek_status;</a>
+<a name="ln705">    }</a>
+<a name="ln706">    MemTable* mem = cf_mems_-&gt;GetMemTable();</a>
+<a name="ln707">    if ((delete_type == ValueType::kTypeSingleDeletion ||</a>
+<a name="ln708">         delete_type == ValueType::kTypeColumnFamilySingleDeletion) &amp;&amp;</a>
+<a name="ln709">        mem-&gt;Erase(key)) {</a>
+<a name="ln710">      return Status::OK();</a>
+<a name="ln711">    }</a>
+<a name="ln712">    auto* moptions = mem-&gt;GetMemTableOptions();</a>
+<a name="ln713">    if (insert_flags_.Test(InsertFlag::kFilterDeletes) &amp;&amp; moptions-&gt;filter_deletes) {</a>
+<a name="ln714">      assert(!insert_flags_.Test(InsertFlag::kConcurrentMemtableWrites));</a>
+<a name="ln715">      SnapshotImpl read_from_snapshot;</a>
+<a name="ln716">      read_from_snapshot.number_ = sequence_;</a>
+<a name="ln717">      ReadOptions ropts;</a>
+<a name="ln718">      ropts.snapshot = &amp;read_from_snapshot;</a>
+<a name="ln719">      std::string value;</a>
+<a name="ln720">      auto cf_handle = cf_mems_-&gt;GetColumnFamilyHandle();</a>
+<a name="ln721">      if (cf_handle == nullptr) {</a>
+<a name="ln722">        cf_handle = db_-&gt;DefaultColumnFamily();</a>
+<a name="ln723">      }</a>
+<a name="ln724">      if (!db_-&gt;KeyMayExist(ropts, cf_handle, key, &amp;value)) {</a>
+<a name="ln725">        RecordTick(moptions-&gt;statistics, NUMBER_FILTERED_DELETES);</a>
+<a name="ln726">        return Status::OK();</a>
+<a name="ln727">      }</a>
+<a name="ln728">    }</a>
+<a name="ln729">    mem-&gt;Add(CurrentSequenceNumber(), delete_type, key, Slice(),</a>
+<a name="ln730">             insert_flags_.Test(InsertFlag::kConcurrentMemtableWrites));</a>
+<a name="ln731">    sequence_++;</a>
+<a name="ln732">    CheckMemtableFull();</a>
+<a name="ln733">    return Status::OK();</a>
+<a name="ln734">  }</a>
+<a name="ln735"> </a>
+<a name="ln736">  virtual CHECKED_STATUS DeleteCF(uint32_t column_family_id,</a>
+<a name="ln737">                                  const Slice&amp; key) override {</a>
+<a name="ln738">    return DeleteImpl(column_family_id, key, kTypeDeletion);</a>
+<a name="ln739">  }</a>
+<a name="ln740"> </a>
+<a name="ln741">  virtual CHECKED_STATUS SingleDeleteCF(uint32_t column_family_id,</a>
+<a name="ln742">                                        const Slice&amp; key) override {</a>
+<a name="ln743">    return DeleteImpl(column_family_id, key, kTypeSingleDeletion);</a>
+<a name="ln744">  }</a>
+<a name="ln745"> </a>
+<a name="ln746">  virtual CHECKED_STATUS MergeCF(uint32_t column_family_id, const Slice&amp; key,</a>
+<a name="ln747">                                 const Slice&amp; value) override {</a>
+<a name="ln748">    assert(!insert_flags_.Test(InsertFlag::kConcurrentMemtableWrites));</a>
+<a name="ln749">    Status seek_status;</a>
+<a name="ln750">    if (!SeekToColumnFamily(column_family_id, &amp;seek_status)) {</a>
+<a name="ln751">      ++sequence_;</a>
+<a name="ln752">      return seek_status;</a>
+<a name="ln753">    }</a>
+<a name="ln754">    MemTable* mem = cf_mems_-&gt;GetMemTable();</a>
+<a name="ln755">    auto* moptions = mem-&gt;GetMemTableOptions();</a>
+<a name="ln756">    bool perform_merge = false;</a>
+<a name="ln757"> </a>
+<a name="ln758">    SequenceNumber current_seq = CurrentSequenceNumber();</a>
+<a name="ln759">    if (moptions-&gt;max_successive_merges &gt; 0 &amp;&amp; db_ != nullptr) {</a>
+<a name="ln760">      LookupKey lkey(key, current_seq);</a>
+<a name="ln761"> </a>
+<a name="ln762">      // Count the number of successive merges at the head</a>
+<a name="ln763">      // of the key in the memtable</a>
+<a name="ln764">      size_t num_merges = mem-&gt;CountSuccessiveMergeEntries(lkey);</a>
+<a name="ln765"> </a>
+<a name="ln766">      if (num_merges &gt;= moptions-&gt;max_successive_merges) {</a>
+<a name="ln767">        perform_merge = true;</a>
+<a name="ln768">      }</a>
+<a name="ln769">    }</a>
+<a name="ln770"> </a>
+<a name="ln771">    if (perform_merge) {</a>
+<a name="ln772">      // 1) Get the existing value</a>
+<a name="ln773">      std::string get_value;</a>
+<a name="ln774"> </a>
+<a name="ln775">      // Pass in the sequence number so that we also include previous merge</a>
+<a name="ln776">      // operations in the same batch.</a>
+<a name="ln777">      SnapshotImpl read_from_snapshot;</a>
+<a name="ln778">      read_from_snapshot.number_ = current_seq;</a>
+<a name="ln779">      ReadOptions read_options;</a>
+<a name="ln780">      read_options.snapshot = &amp;read_from_snapshot;</a>
+<a name="ln781"> </a>
+<a name="ln782">      auto cf_handle = cf_mems_-&gt;GetColumnFamilyHandle();</a>
+<a name="ln783">      if (cf_handle == nullptr) {</a>
+<a name="ln784">        cf_handle = db_-&gt;DefaultColumnFamily();</a>
+<a name="ln785">      }</a>
+<a name="ln786">      RETURN_NOT_OK(db_-&gt;Get(read_options, cf_handle, key, &amp;get_value));</a>
+<a name="ln787">      Slice get_value_slice = Slice(get_value);</a>
+<a name="ln788"> </a>
+<a name="ln789">      // 2) Apply this merge</a>
+<a name="ln790">      auto merge_operator = moptions-&gt;merge_operator;</a>
+<a name="ln791">      assert(merge_operator);</a>
+<a name="ln792"> </a>
+<a name="ln793">      std::deque&lt;std::string&gt; operands;</a>
+<a name="ln794">      operands.push_front(value.ToString());</a>
+<a name="ln795">      std::string new_value;</a>
+<a name="ln796">      bool merge_success = false;</a>
+<a name="ln797">      {</a>
+<a name="ln798">        StopWatchNano timer(Env::Default(), moptions-&gt;statistics != nullptr);</a>
+<a name="ln799">        PERF_TIMER_GUARD(merge_operator_time_nanos);</a>
+<a name="ln800">        merge_success = merge_operator-&gt;FullMerge(</a>
+<a name="ln801">            key, &amp;get_value_slice, operands, &amp;new_value, moptions-&gt;info_log);</a>
+<a name="ln802">        RecordTick(moptions-&gt;statistics, MERGE_OPERATION_TOTAL_TIME,</a>
+<a name="ln803">                   timer.ElapsedNanos());</a>
+<a name="ln804">      }</a>
+<a name="ln805"> </a>
+<a name="ln806">      if (!merge_success) {</a>
+<a name="ln807">          // Failed to merge!</a>
+<a name="ln808">        RecordTick(moptions-&gt;statistics, NUMBER_MERGE_FAILURES);</a>
+<a name="ln809"> </a>
+<a name="ln810">        // Store the delta in memtable</a>
+<a name="ln811">        perform_merge = false;</a>
+<a name="ln812">      } else {</a>
+<a name="ln813">        // 3) Add value to memtable</a>
+<a name="ln814">        mem-&gt;Add(current_seq, kTypeValue, key, new_value);</a>
+<a name="ln815">      }</a>
+<a name="ln816">    }</a>
+<a name="ln817"> </a>
+<a name="ln818">    if (!perform_merge) {</a>
+<a name="ln819">      // Add merge operator to memtable</a>
+<a name="ln820">      mem-&gt;Add(current_seq, kTypeMerge, key, value);</a>
+<a name="ln821">    }</a>
+<a name="ln822"> </a>
+<a name="ln823">    sequence_++;</a>
+<a name="ln824">    CheckMemtableFull();</a>
+<a name="ln825">    return Status::OK();</a>
+<a name="ln826">  }</a>
+<a name="ln827"> </a>
+<a name="ln828">  CHECKED_STATUS Frontiers(const UserFrontiers&amp; frontiers) override {</a>
+<a name="ln829">    Status seek_status;</a>
+<a name="ln830">    if (!SeekToColumnFamily(0, &amp;seek_status)) {</a>
+<a name="ln831">      return seek_status;</a>
+<a name="ln832">    }</a>
+<a name="ln833">    cf_mems_-&gt;GetMemTable()-&gt;UpdateFrontiers(frontiers);</a>
+<a name="ln834">    return Status::OK();</a>
+<a name="ln835">  }</a>
+<a name="ln836"> </a>
+<a name="ln837">  void CheckMemtableFull() {</a>
+<a name="ln838">    if (flush_scheduler_ != nullptr) {</a>
+<a name="ln839">      auto* cfd = cf_mems_-&gt;current();</a>
+<a name="ln840">      assert(cfd != nullptr);</a>
+<a name="ln841">      if (cfd-&gt;mem()-&gt;ShouldScheduleFlush() &amp;&amp;</a>
+<a name="ln842">          cfd-&gt;mem()-&gt;MarkFlushScheduled()) {</a>
+<a name="ln843">        // MarkFlushScheduled only returns true if we are the one that</a>
+<a name="ln844">        // should take action, so no need to dedup further</a>
+<a name="ln845">        flush_scheduler_-&gt;ScheduleFlush(cfd);</a>
+<a name="ln846">      }</a>
+<a name="ln847">    }</a>
+<a name="ln848">  }</a>
+<a name="ln849"> </a>
+<a name="ln850"> private:</a>
+<a name="ln851">  SequenceNumber CurrentSequenceNumber() {</a>
+<a name="ln852">    return sequence_;</a>
+<a name="ln853">  }</a>
+<a name="ln854">};</a>
+<a name="ln855"> </a>
+<a name="ln856">}  // namespace</a>
+<a name="ln857"> </a>
+<a name="ln858">// This function can only be called in these conditions:</a>
+<a name="ln859">// 1) During Recovery()</a>
+<a name="ln860">// 2) During Write(), in a single-threaded write thread</a>
+<a name="ln861">// 3) During Write(), in a concurrent context where memtables has been cloned</a>
+<a name="ln862">// The reason is that it calls memtables-&gt;Seek(), which has a stateful cache</a>
+<a name="ln863">Status WriteBatchInternal::InsertInto(</a>
+<a name="ln864">    const autovector&lt;WriteThread::Writer*&gt;&amp; writers, SequenceNumber sequence,</a>
+<a name="ln865">    ColumnFamilyMemTables* memtables, FlushScheduler* flush_scheduler,</a>
+<a name="ln866">    bool ignore_missing_column_families, uint64_t log_number, DB* db,</a>
+<a name="ln867">    InsertFlags insert_flags) {</a>
+<a name="ln868">  MemTableInserter inserter(sequence, memtables, flush_scheduler,</a>
+<a name="ln869">                            ignore_missing_column_families, log_number, db,</a>
+<a name="ln870">                            insert_flags);</a>
+<a name="ln871"> </a>
+<a name="ln872">  for (size_t i = 0; i &lt; writers.size(); i++) {</a>
+<a name="ln873">    if (!writers[i]-&gt;CallbackFailed()) {</a>
+<a name="ln874">      writers[i]-&gt;status = writers[i]-&gt;batch-&gt;Iterate(&amp;inserter);</a>
+<a name="ln875">      if (!writers[i]-&gt;status.ok()) {</a>
+<a name="ln876">        return writers[i]-&gt;status;</a>
+<a name="ln877">      }</a>
+<a name="ln878">    }</a>
+<a name="ln879">  }</a>
+<a name="ln880">  return Status::OK();</a>
+<a name="ln881">}</a>
+<a name="ln882"> </a>
+<a name="ln883">Status WriteBatchInternal::InsertInto(const WriteBatch* batch,</a>
+<a name="ln884">                                      ColumnFamilyMemTables* memtables,</a>
+<a name="ln885">                                      FlushScheduler* flush_scheduler,</a>
+<a name="ln886">                                      bool ignore_missing_column_families,</a>
+<a name="ln887">                                      uint64_t log_number, DB* db,</a>
+<a name="ln888">                                      InsertFlags insert_flags) {</a>
+<a name="ln889">  MemTableInserter inserter(WriteBatchInternal::Sequence(batch), memtables,</a>
+<a name="ln890">                            flush_scheduler, ignore_missing_column_families,</a>
+<a name="ln891">                            log_number, db, insert_flags);</a>
+<a name="ln892">  return batch-&gt;Iterate(&amp;inserter);</a>
+<a name="ln893">}</a>
+<a name="ln894"> </a>
+<a name="ln895">void WriteBatchInternal::SetContents(WriteBatch* b, const Slice&amp; contents) {</a>
+<a name="ln896">  DCHECK_GE(contents.size(), kHeader);</a>
+<a name="ln897">  b-&gt;rep_.assign(contents.cdata(), contents.size());</a>
+<a name="ln898">  b-&gt;content_flags_.store(ContentFlags::DEFERRED, std::memory_order_relaxed);</a>
+<a name="ln899">}</a>
+<a name="ln900"> </a>
+<a name="ln901">void WriteBatchInternal::Append(WriteBatch* dst, const WriteBatch* src) {</a>
+<a name="ln902">  SetCount(dst, Count(dst) + Count(src));</a>
+<a name="ln903">  DCHECK_GE(src-&gt;rep_.size(), kHeader);</a>
+<a name="ln904">  dst-&gt;rep_.append(src-&gt;rep_.data() + kHeader, src-&gt;rep_.size() - kHeader);</a>
+<a name="ln905">  dst-&gt;content_flags_.store(</a>
+<a name="ln906">      dst-&gt;content_flags_.load(std::memory_order_relaxed) |</a>
+<a name="ln907">          src-&gt;content_flags_.load(std::memory_order_relaxed),</a>
+<a name="ln908">      std::memory_order_relaxed);</a>
+<a name="ln909">}</a>
+<a name="ln910"> </a>
+<a name="ln911">size_t WriteBatchInternal::AppendedByteSize(size_t leftByteSize,</a>
+<a name="ln912">                                            size_t rightByteSize) {</a>
+<a name="ln913">  if (leftByteSize == 0 || rightByteSize == 0) {</a>
+<a name="ln914">    return leftByteSize + rightByteSize;</a>
+<a name="ln915">  } else {</a>
+<a name="ln916">    return leftByteSize + rightByteSize - kHeader;</a>
+<a name="ln917">  }</a>
+<a name="ln918">}</a>
+<a name="ln919"> </a>
+<a name="ln920">}  // namespace rocksdb</a>
+
+</code></pre>
+<div class="balloon" rel="202"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

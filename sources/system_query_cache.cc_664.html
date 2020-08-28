@@ -1,0 +1,319 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>system_query_cache.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15">// SystemQueryCache proactively caches system queries to be used by</a>
+<a name="ln16">// CQLProcessors.  This helps with performance and availability, since masters</a>
+<a name="ln17">// have reduced traffic when a connection is established.</a>
+<a name="ln18">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/yql/cql/cqlserver/system_query_cache.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;algorithm&gt;</a>
+<a name="ln23">#include &lt;condition_variable&gt;</a>
+<a name="ln24">#include &lt;mutex&gt;</a>
+<a name="ln25">#include &lt;unordered_map&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &lt;boost/optional.hpp&gt;</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &quot;yb/rpc/io_thread_pool.h&quot;</a>
+<a name="ln30">#include &quot;yb/rpc/scheduler.h&quot;</a>
+<a name="ln31">#include &quot;yb/util/async_util.h&quot;</a>
+<a name="ln32">#include &quot;yb/util/format.h&quot;</a>
+<a name="ln33">#include &quot;yb/util/monotime.h&quot;</a>
+<a name="ln34">#include &quot;yb/util/string_util.h&quot;</a>
+<a name="ln35">#include &quot;yb/yql/cql/cqlserver/cql_service.h&quot;</a>
+<a name="ln36">#include &quot;yb/yql/cql/ql/util/statement_params.h&quot;</a>
+<a name="ln37">#include &quot;yb/yql/cql/ql/util/statement_result.h&quot;</a>
+<a name="ln38"> </a>
+<a name="ln39">typedef struct QualifiedTable {</a>
+<a name="ln40">  std::string keyspace;</a>
+<a name="ln41">  std::string table;</a>
+<a name="ln42"> </a>
+<a name="ln43">  QualifiedTable(std::string keyspace_, std::string table_) : keyspace(keyspace_), table(table_) {</a>
+<a name="ln44">  }</a>
+<a name="ln45">} QualifiedTable;</a>
+<a name="ln46"> </a>
+<a name="ln47">static bool parse_tables(</a>
+<a name="ln48">    const std::string&amp; text,</a>
+<a name="ln49">    std::vector&lt;QualifiedTable&gt;* tables) {</a>
+<a name="ln50">  auto raw_tables = yb::StringSplit(text, ';');</a>
+<a name="ln51">  std::remove_if(raw_tables.begin(), raw_tables.end(),</a>
+<a name="ln52">      [](const std::string&amp; s) { return s.length() == 0; });</a>
+<a name="ln53"> </a>
+<a name="ln54">  for (const auto&amp; raw : raw_tables) {</a>
+<a name="ln55">    auto table_pair = yb::StringSplit(raw, '.');</a>
+<a name="ln56"> </a>
+<a name="ln57">    if (table_pair.size() != 2) {</a>
+<a name="ln58">      return false;</a>
+<a name="ln59">    }</a>
+<a name="ln60">    tables-&gt;push_back(QualifiedTable(table_pair[0], table_pair[1]));</a>
+<a name="ln61">  }</a>
+<a name="ln62"> </a>
+<a name="ln63">  return true;</a>
+<a name="ln64">}</a>
+<a name="ln65"> </a>
+<a name="ln66">static bool validate_tables(const char* flagname, const std::string&amp; value) {</a>
+<a name="ln67">  std::vector&lt;QualifiedTable&gt; tables;</a>
+<a name="ln68"> </a>
+<a name="ln69">  if (parse_tables(value, &amp;tables)) {</a>
+<a name="ln70">    return true;</a>
+<a name="ln71">  }</a>
+<a name="ln72">  printf(&quot;Invalid value for --%s: %s\n&quot;, flagname, value.c_str());</a>
+<a name="ln73">  return false;</a>
+<a name="ln74">}</a>
+<a name="ln75"> </a>
+<a name="ln76">DEFINE_int32(cql_update_system_query_cache_msecs, 0,</a>
+<a name="ln77">             &quot;How often the system query cache should be updated. &lt;= 0 disables caching.&quot;);</a>
+<a name="ln78">DEFINE_int32(cql_system_query_cache_stale_msecs, 60000,</a>
+<a name="ln79">             &quot;Maximum permitted staleness for the system query cache. &quot;</a>
+<a name="ln80">             &quot;&lt;= 0 permits infinite staleness.&quot;);</a>
+<a name="ln81">DEFINE_string(cql_system_query_cache_tables, &quot;&quot;,</a>
+<a name="ln82">    &quot;Tables to cache connection data for. Entries are semicolon-delimited, in the &quot;</a>
+<a name="ln83">    &quot;format &lt;keyspace&gt;.&lt;table&gt;.&quot;);</a>
+<a name="ln84">__attribute__((unused))</a>
+<a name="ln85">DEFINE_validator(cql_system_query_cache_tables, &amp;validate_tables);</a>
+<a name="ln86">DEFINE_bool(cql_system_query_cache_empty_responses, true,</a>
+<a name="ln87">            &quot;Whether to cache empty responses from the master.&quot;);</a>
+<a name="ln88"> </a>
+<a name="ln89">namespace yb {</a>
+<a name="ln90">namespace cqlserver {</a>
+<a name="ln91"> </a>
+<a name="ln92">using ql::RowsResult;</a>
+<a name="ln93">using ql::ExecutedResult;</a>
+<a name="ln94"> </a>
+<a name="ln95">// TODO: Possibly do a case-insensitive string comparison.  This may be easier</a>
+<a name="ln96">// said than done, since capitalization does matter for comparisons in WHERE</a>
+<a name="ln97">// clauses, etc.</a>
+<a name="ln98">const char* SYSTEM_QUERIES[] = {</a>
+<a name="ln99">  &quot;SELECT * FROM system.peers&quot;,</a>
+<a name="ln100">  &quot;SELECT peer, rpc_address, schema_version FROM system.peers&quot;,</a>
+<a name="ln101">  &quot;SELECT peer, data_center, rack, release_version, rpc_address FROM system.peers&quot;,</a>
+<a name="ln102">  &quot;SELECT keyspace_name, table_name, start_key, end_key, replica_addresses FROM system.partitions&quot;,</a>
+<a name="ln103"> </a>
+<a name="ln104">  &quot;SELECT * FROM system.local WHERE key='local'&quot;,</a>
+<a name="ln105">  &quot;SELECT schema_version FROM system.local WHERE key='local'&quot;,</a>
+<a name="ln106">  // The client evidently doesn't always have consistent formatting.</a>
+<a name="ln107">  &quot;select * from system.local where key = 'local'&quot;,</a>
+<a name="ln108">  &quot;select schema_version from system.local where key='local'&quot;,</a>
+<a name="ln109">  &quot;SELECT * FROM system_schema.keyspaces&quot;,</a>
+<a name="ln110">  &quot;SELECT * FROM system_schema.tables&quot;,</a>
+<a name="ln111">  &quot;SELECT * FROM system_schema.views&quot;,</a>
+<a name="ln112">  &quot;SELECT * FROM system_schema.columns&quot;,</a>
+<a name="ln113">  &quot;SELECT * FROM system_schema.types&quot;,</a>
+<a name="ln114">  &quot;SELECT * FROM system_schema.functions&quot;,</a>
+<a name="ln115">  &quot;SELECT * FROM system_schema.aggregates&quot;,</a>
+<a name="ln116">  &quot;SELECT * FROM system_schema.triggers&quot;,</a>
+<a name="ln117">  &quot;SELECT * FROM system_schema.indexes&quot;,</a>
+<a name="ln118">};</a>
+<a name="ln119"> </a>
+<a name="ln120">SystemQueryCache::SystemQueryCache(cqlserver::CQLServiceImpl* service_impl)</a>
+<a name="ln121">  : service_impl_(service_impl), stmt_params_() {</a>
+<a name="ln122"> </a>
+<a name="ln123">  cache_ = std::make_unique&lt;std::unordered_map&lt;std::string, RowsResult::SharedPtr&gt;&gt;();</a>
+<a name="ln124">  last_updated_ = MonoTime::kMin;</a>
+<a name="ln125">  InitializeQueries();</a>
+<a name="ln126"> </a>
+<a name="ln127">  pool_ = std::make_unique&lt;yb::rpc::IoThreadPool&gt;(&quot;system_query_cache_updater&quot;, 1);</a>
+<a name="ln128">  scheduler_ = std::make_unique&lt;yb::rpc::Scheduler&gt;(&amp;pool_-&gt;io_service());</a>
+<a name="ln129"> </a>
+<a name="ln130">  LOG(INFO) &lt;&lt; &quot;Created system query cache updater.&quot;;</a>
+<a name="ln131"> </a>
+<a name="ln132">  if (FLAGS_cql_update_system_query_cache_msecs &gt; 0) {</a>
+<a name="ln133">    if (MonoDelta::FromMilliseconds(FLAGS_cql_system_query_cache_stale_msecs) &lt;</a>
+<a name="ln134">        MonoDelta::FromMilliseconds(FLAGS_cql_update_system_query_cache_msecs)) {</a>
+<a name="ln135">      LOG(WARNING) &lt;&lt; &quot;Stale expiration shorter than update rate.&quot;;</a>
+<a name="ln136">    }</a>
+<a name="ln137"> </a>
+<a name="ln138">    ScheduleRefreshCache(false /* now */);</a>
+<a name="ln139">  } else {</a>
+<a name="ln140">    LOG(WARNING) &lt;&lt; &quot;System cache created with nonpositive timeout. Disabling scheduling&quot;;</a>
+<a name="ln141">  }</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144">SystemQueryCache::~SystemQueryCache() {</a>
+<a name="ln145">  if (pool_) {</a>
+<a name="ln146">    scheduler_-&gt;Shutdown();</a>
+<a name="ln147">    pool_-&gt;Shutdown();</a>
+<a name="ln148">    pool_-&gt;Join();</a>
+<a name="ln149">  }</a>
+<a name="ln150">}</a>
+<a name="ln151"> </a>
+<a name="ln152">void SystemQueryCache::InitializeQueries() {</a>
+<a name="ln153">  for (auto query : SYSTEM_QUERIES) {</a>
+<a name="ln154">    queries_.push_back(query);</a>
+<a name="ln155">  }</a>
+<a name="ln156"> </a>
+<a name="ln157">  std::vector&lt;QualifiedTable&gt; table_pairs;</a>
+<a name="ln158">  // This should have been caught by the flag validator</a>
+<a name="ln159">  if (!parse_tables(FLAGS_cql_system_query_cache_tables, &amp;table_pairs)) {</a>
+<a name="ln160">    return;</a>
+<a name="ln161">  }</a>
+<a name="ln162"> </a>
+<a name="ln163">  const char* formats[] = {</a>
+<a name="ln164">    &quot;SELECT * FROM system_schema.tables WHERE keyspace_name = '$0' AND table_name = '$1'&quot;,</a>
+<a name="ln165">    &quot;SELECT * FROM system_schema.columns WHERE keyspace_name = '$0' AND table_name = '$1'&quot;,</a>
+<a name="ln166">    &quot;SELECT * FROM system_schema.triggers WHERE keyspace_name = '$0' AND table_name = '$1'&quot;,</a>
+<a name="ln167">    &quot;SELECT * FROM system_schema.indexes WHERE keyspace_name = '$0' AND table_name = '$1'&quot;,</a>
+<a name="ln168">    &quot;SELECT * FROM system_schema.views WHERE keyspace_name = '$0' AND view_name = '$1'&quot;,</a>
+<a name="ln169">  };</a>
+<a name="ln170"> </a>
+<a name="ln171">  for (auto pair : table_pairs) {</a>
+<a name="ln172">    for (auto format : formats) {</a>
+<a name="ln173">      queries_.push_back(yb::Format(format, pair.keyspace, pair.table));</a>
+<a name="ln174">    }</a>
+<a name="ln175">  }</a>
+<a name="ln176"> </a>
+<a name="ln177">}</a>
+<a name="ln178"> </a>
+<a name="ln179">boost::optional&lt;RowsResult::SharedPtr&gt; SystemQueryCache::Lookup(const std::string&amp; query) {</a>
+<a name="ln180">  if (FLAGS_cql_system_query_cache_stale_msecs &gt; 0 &amp;&amp;</a>
+<a name="ln181">      GetStaleness() &gt; MonoDelta::FromMilliseconds(FLAGS_cql_system_query_cache_stale_msecs)) {</a>
+<a name="ln182">    return boost::none;</a>
+<a name="ln183">  }</a>
+<a name="ln184">  const std::lock_guard&lt;std::mutex&gt; l(cache_mutex_);</a>
+<a name="ln185"> </a>
+<a name="ln186">  const auto it = cache_-&gt;find(query);</a>
+<a name="ln187">  if (it == cache_-&gt;end()) {</a>
+<a name="ln188">    return boost::none;</a>
+<a name="ln189">  } else {</a>
+<a name="ln190">    return it-&gt;second;</a>
+<a name="ln191">  }</a>
+<a name="ln192">}</a>
+<a name="ln193"> </a>
+<a name="ln194">MonoDelta SystemQueryCache::GetStaleness() {</a>
+<a name="ln195">  const std::lock_guard&lt;std::mutex&gt; l(cache_mutex_);</a>
+<a name="ln196">  return MonoTime::Now() - last_updated_;</a>
+<a name="ln197">}</a>
+<a name="ln198"> </a>
+<a name="ln199">void SystemQueryCache::RefreshCache() {</a>
+<a name="ln200">  VLOG(1) &lt;&lt; &quot;Refreshing system query cache&quot;;</a>
+<a name="ln201">  auto new_cache = std::make_unique&lt;std::unordered_map&lt;std::string, RowsResult::SharedPtr&gt;&gt;();</a>
+<a name="ln202">  for (auto query : queries_) {</a>
+<a name="ln203">    Status status;</a>
+<a name="ln204">    ExecutedResult::SharedPtr result;</a>
+<a name="ln205">    ExecuteSync(query, &amp;status, &amp;result);</a>
+<a name="ln206"> </a>
+<a name="ln207">    if (status.ok()) {</a>
+<a name="ln208">      auto rows_result = std::dynamic_pointer_cast&lt;RowsResult&gt;(result);</a>
+<a name="ln209">      if (FLAGS_cql_system_query_cache_empty_responses ||</a>
+<a name="ln210">          rows_result-&gt;GetRowBlock()-&gt;row_count() &gt; 0) {</a>
+<a name="ln211">        (*new_cache)[query] = rows_result;</a>
+<a name="ln212">      } else {</a>
+<a name="ln213">        LOG(INFO) &lt;&lt; &quot;Skipping empty result for statement: &quot; &lt;&lt; query;</a>
+<a name="ln214">      }</a>
+<a name="ln215">    } else {</a>
+<a name="ln216">      LOG(WARNING) &lt;&lt; &quot;Could not execute statement: &quot; &lt;&lt; query;</a>
+<a name="ln217">      // We don't want to update the cache with no data; instead we'll let the</a>
+<a name="ln218">      // stale cache persist.</a>
+<a name="ln219">      ScheduleRefreshCache(false /* now */);</a>
+<a name="ln220">      return;</a>
+<a name="ln221">    }</a>
+<a name="ln222">  }</a>
+<a name="ln223"> </a>
+<a name="ln224">  {</a>
+<a name="ln225">    const std::lock_guard&lt;std::mutex&gt; l(cache_mutex_);</a>
+<a name="ln226">    cache_ = std::move(new_cache);</a>
+<a name="ln227">    last_updated_ = MonoTime::Now();</a>
+<a name="ln228">  }</a>
+<a name="ln229"> </a>
+<a name="ln230">  ScheduleRefreshCache(false /* now */);</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233">void SystemQueryCache::ScheduleRefreshCache(bool now) {</a>
+<a name="ln234">  DCHECK(pool_);</a>
+<a name="ln235">  DCHECK(scheduler_);</a>
+<a name="ln236">  VLOG(1) &lt;&lt; &quot;Scheduling cache refresh&quot;;</a>
+<a name="ln237"> </a>
+<a name="ln238">  scheduler_-&gt;Schedule([this](const Status &amp;s) {</a>
+<a name="ln239">      if (!s.ok()) {</a>
+<a name="ln240">        LOG(INFO) &lt;&lt; &quot;System cache updater scheduler was shutdown: &quot; &lt;&lt; s.ToString();</a>
+<a name="ln241">        return;</a>
+<a name="ln242">      }</a>
+<a name="ln243">      this-&gt;RefreshCache();</a>
+<a name="ln244">      }, std::chrono::milliseconds(now ? 0 : FLAGS_cql_update_system_query_cache_msecs));</a>
+<a name="ln245">}</a>
+<a name="ln246"> </a>
+<a name="ln247">void SystemQueryCache::ExecuteSync(const std::string&amp; stmt, Status* status,</a>
+<a name="ln248">    ExecutedResult::SharedPtr* result_ptr) {</a>
+<a name="ln249">  const auto processor = service_impl_-&gt;GetProcessor();</a>
+<a name="ln250">  if (!processor.ok()) {</a>
+<a name="ln251">    LOG(ERROR) &lt;&lt; &quot;Unable to get CQLProcessor for system query cache&quot;;</a>
+<a name="ln252">    *status = processor.status();</a>
+<a name="ln253">    return;</a>
+<a name="ln254">  }</a>
+<a name="ln255"> </a>
+<a name="ln256">  Synchronizer sync;</a>
+<a name="ln257">  const auto callback = [](Synchronizer* sync, ExecutedResult::SharedPtr* result_ptr,</a>
+<a name="ln258">      const Status&amp; status, const ExecutedResult::SharedPtr&amp; result) {</a>
+<a name="ln259">    *result_ptr = result;</a>
+<a name="ln260">    sync-&gt;StatusCB(status);</a>
+<a name="ln261">  };</a>
+<a name="ln262"> </a>
+<a name="ln263">  (*processor)-&gt;RunAsync(stmt, stmt_params_, yb::Bind(+callback, &amp;sync, result_ptr));</a>
+<a name="ln264">  *status = sync.Wait();</a>
+<a name="ln265">  (*processor)-&gt;Release();</a>
+<a name="ln266">}</a>
+<a name="ln267"> </a>
+<a name="ln268">} // namespace cqlserver</a>
+<a name="ln269">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="51"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v530/" target="_blank">V530</a> The return value of function 'remove_if' is required to be utilized.</p></div>
+<div class="balloon" rel="200"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="234"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="235"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="236"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

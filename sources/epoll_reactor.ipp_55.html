@@ -1,0 +1,835 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>epoll_reactor.ipp</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//</a>
+<a name="ln2">// detail/impl/epoll_reactor.ipp</a>
+<a name="ln3">// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~</a>
+<a name="ln4">//</a>
+<a name="ln5">// Copyright (c) 2003-2018 Christopher M. Kohlhoff (chris at kohlhoff dot com)</a>
+<a name="ln6">//</a>
+<a name="ln7">// Distributed under the Boost Software License, Version 1.0. (See accompanying</a>
+<a name="ln8">// file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)</a>
+<a name="ln9">//</a>
+<a name="ln10"> </a>
+<a name="ln11">#ifndef BOOST_ASIO_DETAIL_IMPL_EPOLL_REACTOR_IPP</a>
+<a name="ln12">#define BOOST_ASIO_DETAIL_IMPL_EPOLL_REACTOR_IPP</a>
+<a name="ln13"> </a>
+<a name="ln14">#if defined(_MSC_VER) &amp;&amp; (_MSC_VER &gt;= 1200)</a>
+<a name="ln15"># pragma once</a>
+<a name="ln16">#endif // defined(_MSC_VER) &amp;&amp; (_MSC_VER &gt;= 1200)</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;boost/asio/detail/config.hpp&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#if defined(BOOST_ASIO_HAS_EPOLL)</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;cstddef&gt;</a>
+<a name="ln23">#include &lt;sys/epoll.h&gt;</a>
+<a name="ln24">#include &lt;boost/asio/detail/epoll_reactor.hpp&gt;</a>
+<a name="ln25">#include &lt;boost/asio/detail/throw_error.hpp&gt;</a>
+<a name="ln26">#include &lt;boost/asio/error.hpp&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#if defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln29"># include &lt;sys/timerfd.h&gt;</a>
+<a name="ln30">#endif // defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln31"> </a>
+<a name="ln32">#include &lt;boost/asio/detail/push_options.hpp&gt;</a>
+<a name="ln33"> </a>
+<a name="ln34">namespace boost {</a>
+<a name="ln35">namespace asio {</a>
+<a name="ln36">namespace detail {</a>
+<a name="ln37"> </a>
+<a name="ln38">epoll_reactor::epoll_reactor(boost::asio::execution_context&amp; ctx)</a>
+<a name="ln39">  : execution_context_service_base&lt;epoll_reactor&gt;(ctx),</a>
+<a name="ln40">    scheduler_(use_service&lt;scheduler&gt;(ctx)),</a>
+<a name="ln41">    mutex_(BOOST_ASIO_CONCURRENCY_HINT_IS_LOCKING(</a>
+<a name="ln42">          REACTOR_REGISTRATION, scheduler_.concurrency_hint())),</a>
+<a name="ln43">    interrupter_(),</a>
+<a name="ln44">    epoll_fd_(do_epoll_create()),</a>
+<a name="ln45">    timer_fd_(do_timerfd_create()),</a>
+<a name="ln46">    shutdown_(false),</a>
+<a name="ln47">    registered_descriptors_mutex_(mutex_.enabled())</a>
+<a name="ln48">{</a>
+<a name="ln49">  // Add the interrupter's descriptor to epoll.</a>
+<a name="ln50">  epoll_event ev = { 0, { 0 } };</a>
+<a name="ln51">  ev.events = EPOLLIN | EPOLLERR | EPOLLET;</a>
+<a name="ln52">  ev.data.ptr = &amp;interrupter_;</a>
+<a name="ln53">  epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, interrupter_.read_descriptor(), &amp;ev);</a>
+<a name="ln54">  interrupter_.interrupt();</a>
+<a name="ln55"> </a>
+<a name="ln56">  // Add the timer descriptor to epoll.</a>
+<a name="ln57">  if (timer_fd_ != -1)</a>
+<a name="ln58">  {</a>
+<a name="ln59">    ev.events = EPOLLIN | EPOLLERR;</a>
+<a name="ln60">    ev.data.ptr = &amp;timer_fd_;</a>
+<a name="ln61">    epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, timer_fd_, &amp;ev);</a>
+<a name="ln62">  }</a>
+<a name="ln63">}</a>
+<a name="ln64"> </a>
+<a name="ln65">epoll_reactor::~epoll_reactor()</a>
+<a name="ln66">{</a>
+<a name="ln67">  if (epoll_fd_ != -1)</a>
+<a name="ln68">    close(epoll_fd_);</a>
+<a name="ln69">  if (timer_fd_ != -1)</a>
+<a name="ln70">    close(timer_fd_);</a>
+<a name="ln71">}</a>
+<a name="ln72"> </a>
+<a name="ln73">void epoll_reactor::shutdown()</a>
+<a name="ln74">{</a>
+<a name="ln75">  mutex::scoped_lock lock(mutex_);</a>
+<a name="ln76">  shutdown_ = true;</a>
+<a name="ln77">  lock.unlock();</a>
+<a name="ln78"> </a>
+<a name="ln79">  op_queue&lt;operation&gt; ops;</a>
+<a name="ln80"> </a>
+<a name="ln81">  while (descriptor_state* state = registered_descriptors_.first())</a>
+<a name="ln82">  {</a>
+<a name="ln83">    for (int i = 0; i &lt; max_ops; ++i)</a>
+<a name="ln84">      ops.push(state-&gt;op_queue_[i]);</a>
+<a name="ln85">    state-&gt;shutdown_ = true;</a>
+<a name="ln86">    registered_descriptors_.free(state);</a>
+<a name="ln87">  }</a>
+<a name="ln88"> </a>
+<a name="ln89">  timer_queues_.get_all_timers(ops);</a>
+<a name="ln90"> </a>
+<a name="ln91">  scheduler_.abandon_operations(ops);</a>
+<a name="ln92">}</a>
+<a name="ln93"> </a>
+<a name="ln94">void epoll_reactor::notify_fork(</a>
+<a name="ln95">    boost::asio::execution_context::fork_event fork_ev)</a>
+<a name="ln96">{</a>
+<a name="ln97">  if (fork_ev == boost::asio::execution_context::fork_child)</a>
+<a name="ln98">  {</a>
+<a name="ln99">    if (epoll_fd_ != -1)</a>
+<a name="ln100">      ::close(epoll_fd_);</a>
+<a name="ln101">    epoll_fd_ = -1;</a>
+<a name="ln102">    epoll_fd_ = do_epoll_create();</a>
+<a name="ln103"> </a>
+<a name="ln104">    if (timer_fd_ != -1)</a>
+<a name="ln105">      ::close(timer_fd_);</a>
+<a name="ln106">    timer_fd_ = -1;</a>
+<a name="ln107">    timer_fd_ = do_timerfd_create();</a>
+<a name="ln108"> </a>
+<a name="ln109">    interrupter_.recreate();</a>
+<a name="ln110"> </a>
+<a name="ln111">    // Add the interrupter's descriptor to epoll.</a>
+<a name="ln112">    epoll_event ev = { 0, { 0 } };</a>
+<a name="ln113">    ev.events = EPOLLIN | EPOLLERR | EPOLLET;</a>
+<a name="ln114">    ev.data.ptr = &amp;interrupter_;</a>
+<a name="ln115">    epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, interrupter_.read_descriptor(), &amp;ev);</a>
+<a name="ln116">    interrupter_.interrupt();</a>
+<a name="ln117"> </a>
+<a name="ln118">    // Add the timer descriptor to epoll.</a>
+<a name="ln119">    if (timer_fd_ != -1)</a>
+<a name="ln120">    {</a>
+<a name="ln121">      ev.events = EPOLLIN | EPOLLERR;</a>
+<a name="ln122">      ev.data.ptr = &amp;timer_fd_;</a>
+<a name="ln123">      epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, timer_fd_, &amp;ev);</a>
+<a name="ln124">    }</a>
+<a name="ln125"> </a>
+<a name="ln126">    update_timeout();</a>
+<a name="ln127"> </a>
+<a name="ln128">    // Re-register all descriptors with epoll.</a>
+<a name="ln129">    mutex::scoped_lock descriptors_lock(registered_descriptors_mutex_);</a>
+<a name="ln130">    for (descriptor_state* state = registered_descriptors_.first();</a>
+<a name="ln131">        state != 0; state = state-&gt;next_)</a>
+<a name="ln132">    {</a>
+<a name="ln133">      ev.events = state-&gt;registered_events_;</a>
+<a name="ln134">      ev.data.ptr = state;</a>
+<a name="ln135">      int result = epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, state-&gt;descriptor_, &amp;ev);</a>
+<a name="ln136">      if (result != 0)</a>
+<a name="ln137">      {</a>
+<a name="ln138">        boost::system::error_code ec(errno,</a>
+<a name="ln139">            boost::asio::error::get_system_category());</a>
+<a name="ln140">        boost::asio::detail::throw_error(ec, &quot;epoll re-registration&quot;);</a>
+<a name="ln141">      }</a>
+<a name="ln142">    }</a>
+<a name="ln143">  }</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146">void epoll_reactor::init_task()</a>
+<a name="ln147">{</a>
+<a name="ln148">  scheduler_.init_task();</a>
+<a name="ln149">}</a>
+<a name="ln150"> </a>
+<a name="ln151">int epoll_reactor::register_descriptor(socket_type descriptor,</a>
+<a name="ln152">    epoll_reactor::per_descriptor_data&amp; descriptor_data)</a>
+<a name="ln153">{</a>
+<a name="ln154">  descriptor_data = allocate_descriptor_state();</a>
+<a name="ln155"> </a>
+<a name="ln156">  BOOST_ASIO_HANDLER_REACTOR_REGISTRATION((</a>
+<a name="ln157">        context(), static_cast&lt;uintmax_t&gt;(descriptor),</a>
+<a name="ln158">        reinterpret_cast&lt;uintmax_t&gt;(descriptor_data)));</a>
+<a name="ln159"> </a>
+<a name="ln160">  {</a>
+<a name="ln161">    mutex::scoped_lock descriptor_lock(descriptor_data-&gt;mutex_);</a>
+<a name="ln162"> </a>
+<a name="ln163">    descriptor_data-&gt;reactor_ = this;</a>
+<a name="ln164">    descriptor_data-&gt;descriptor_ = descriptor;</a>
+<a name="ln165">    descriptor_data-&gt;shutdown_ = false;</a>
+<a name="ln166">    for (int i = 0; i &lt; max_ops; ++i)</a>
+<a name="ln167">      descriptor_data-&gt;try_speculative_[i] = true;</a>
+<a name="ln168">  }</a>
+<a name="ln169"> </a>
+<a name="ln170">  epoll_event ev = { 0, { 0 } };</a>
+<a name="ln171">  ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLPRI | EPOLLET;</a>
+<a name="ln172">  descriptor_data-&gt;registered_events_ = ev.events;</a>
+<a name="ln173">  ev.data.ptr = descriptor_data;</a>
+<a name="ln174">  int result = epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, descriptor, &amp;ev);</a>
+<a name="ln175">  if (result != 0)</a>
+<a name="ln176">  {</a>
+<a name="ln177">    if (errno == EPERM)</a>
+<a name="ln178">    {</a>
+<a name="ln179">      // This file descriptor type is not supported by epoll. However, if it is</a>
+<a name="ln180">      // a regular file then operations on it will not block. We will allow</a>
+<a name="ln181">      // this descriptor to be used and fail later if an operation on it would</a>
+<a name="ln182">      // otherwise require a trip through the reactor.</a>
+<a name="ln183">      descriptor_data-&gt;registered_events_ = 0;</a>
+<a name="ln184">      return 0;</a>
+<a name="ln185">    }</a>
+<a name="ln186">    return errno;</a>
+<a name="ln187">  }</a>
+<a name="ln188"> </a>
+<a name="ln189">  return 0;</a>
+<a name="ln190">}</a>
+<a name="ln191"> </a>
+<a name="ln192">int epoll_reactor::register_internal_descriptor(</a>
+<a name="ln193">    int op_type, socket_type descriptor,</a>
+<a name="ln194">    epoll_reactor::per_descriptor_data&amp; descriptor_data, reactor_op* op)</a>
+<a name="ln195">{</a>
+<a name="ln196">  descriptor_data = allocate_descriptor_state();</a>
+<a name="ln197"> </a>
+<a name="ln198">  BOOST_ASIO_HANDLER_REACTOR_REGISTRATION((</a>
+<a name="ln199">        context(), static_cast&lt;uintmax_t&gt;(descriptor),</a>
+<a name="ln200">        reinterpret_cast&lt;uintmax_t&gt;(descriptor_data)));</a>
+<a name="ln201"> </a>
+<a name="ln202">  {</a>
+<a name="ln203">    mutex::scoped_lock descriptor_lock(descriptor_data-&gt;mutex_);</a>
+<a name="ln204"> </a>
+<a name="ln205">    descriptor_data-&gt;reactor_ = this;</a>
+<a name="ln206">    descriptor_data-&gt;descriptor_ = descriptor;</a>
+<a name="ln207">    descriptor_data-&gt;shutdown_ = false;</a>
+<a name="ln208">    descriptor_data-&gt;op_queue_[op_type].push(op);</a>
+<a name="ln209">    for (int i = 0; i &lt; max_ops; ++i)</a>
+<a name="ln210">      descriptor_data-&gt;try_speculative_[i] = true;</a>
+<a name="ln211">  }</a>
+<a name="ln212"> </a>
+<a name="ln213">  epoll_event ev = { 0, { 0 } };</a>
+<a name="ln214">  ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLPRI | EPOLLET;</a>
+<a name="ln215">  descriptor_data-&gt;registered_events_ = ev.events;</a>
+<a name="ln216">  ev.data.ptr = descriptor_data;</a>
+<a name="ln217">  int result = epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, descriptor, &amp;ev);</a>
+<a name="ln218">  if (result != 0)</a>
+<a name="ln219">    return errno;</a>
+<a name="ln220"> </a>
+<a name="ln221">  return 0;</a>
+<a name="ln222">}</a>
+<a name="ln223"> </a>
+<a name="ln224">void epoll_reactor::move_descriptor(socket_type,</a>
+<a name="ln225">    epoll_reactor::per_descriptor_data&amp; target_descriptor_data,</a>
+<a name="ln226">    epoll_reactor::per_descriptor_data&amp; source_descriptor_data)</a>
+<a name="ln227">{</a>
+<a name="ln228">  target_descriptor_data = source_descriptor_data;</a>
+<a name="ln229">  source_descriptor_data = 0;</a>
+<a name="ln230">}</a>
+<a name="ln231"> </a>
+<a name="ln232">void epoll_reactor::start_op(int op_type, socket_type descriptor,</a>
+<a name="ln233">    epoll_reactor::per_descriptor_data&amp; descriptor_data, reactor_op* op,</a>
+<a name="ln234">    bool is_continuation, bool allow_speculative)</a>
+<a name="ln235">{</a>
+<a name="ln236">  if (!descriptor_data)</a>
+<a name="ln237">  {</a>
+<a name="ln238">    op-&gt;ec_ = boost::asio::error::bad_descriptor;</a>
+<a name="ln239">    post_immediate_completion(op, is_continuation);</a>
+<a name="ln240">    return;</a>
+<a name="ln241">  }</a>
+<a name="ln242"> </a>
+<a name="ln243">  mutex::scoped_lock descriptor_lock(descriptor_data-&gt;mutex_);</a>
+<a name="ln244"> </a>
+<a name="ln245">  if (descriptor_data-&gt;shutdown_)</a>
+<a name="ln246">  {</a>
+<a name="ln247">    post_immediate_completion(op, is_continuation);</a>
+<a name="ln248">    return;</a>
+<a name="ln249">  }</a>
+<a name="ln250"> </a>
+<a name="ln251">  if (descriptor_data-&gt;op_queue_[op_type].empty())</a>
+<a name="ln252">  {</a>
+<a name="ln253">    if (allow_speculative</a>
+<a name="ln254">        &amp;&amp; (op_type != read_op</a>
+<a name="ln255">          || descriptor_data-&gt;op_queue_[except_op].empty()))</a>
+<a name="ln256">    {</a>
+<a name="ln257">      if (descriptor_data-&gt;try_speculative_[op_type])</a>
+<a name="ln258">      {</a>
+<a name="ln259">        if (reactor_op::status status = op-&gt;perform())</a>
+<a name="ln260">        {</a>
+<a name="ln261">          if (status == reactor_op::done_and_exhausted)</a>
+<a name="ln262">            if (descriptor_data-&gt;registered_events_ != 0)</a>
+<a name="ln263">              descriptor_data-&gt;try_speculative_[op_type] = false;</a>
+<a name="ln264">          descriptor_lock.unlock();</a>
+<a name="ln265">          scheduler_.post_immediate_completion(op, is_continuation);</a>
+<a name="ln266">          return;</a>
+<a name="ln267">        }</a>
+<a name="ln268">      }</a>
+<a name="ln269"> </a>
+<a name="ln270">      if (descriptor_data-&gt;registered_events_ == 0)</a>
+<a name="ln271">      {</a>
+<a name="ln272">        op-&gt;ec_ = boost::asio::error::operation_not_supported;</a>
+<a name="ln273">        scheduler_.post_immediate_completion(op, is_continuation);</a>
+<a name="ln274">        return;</a>
+<a name="ln275">      }</a>
+<a name="ln276"> </a>
+<a name="ln277">      if (op_type == write_op)</a>
+<a name="ln278">      {</a>
+<a name="ln279">        if ((descriptor_data-&gt;registered_events_ &amp; EPOLLOUT) == 0)</a>
+<a name="ln280">        {</a>
+<a name="ln281">          epoll_event ev = { 0, { 0 } };</a>
+<a name="ln282">          ev.events = descriptor_data-&gt;registered_events_ | EPOLLOUT;</a>
+<a name="ln283">          ev.data.ptr = descriptor_data;</a>
+<a name="ln284">          if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, descriptor, &amp;ev) == 0)</a>
+<a name="ln285">          {</a>
+<a name="ln286">            descriptor_data-&gt;registered_events_ |= ev.events;</a>
+<a name="ln287">          }</a>
+<a name="ln288">          else</a>
+<a name="ln289">          {</a>
+<a name="ln290">            op-&gt;ec_ = boost::system::error_code(errno,</a>
+<a name="ln291">                boost::asio::error::get_system_category());</a>
+<a name="ln292">            scheduler_.post_immediate_completion(op, is_continuation);</a>
+<a name="ln293">            return;</a>
+<a name="ln294">          }</a>
+<a name="ln295">        }</a>
+<a name="ln296">      }</a>
+<a name="ln297">    }</a>
+<a name="ln298">    else if (descriptor_data-&gt;registered_events_ == 0)</a>
+<a name="ln299">    {</a>
+<a name="ln300">      op-&gt;ec_ = boost::asio::error::operation_not_supported;</a>
+<a name="ln301">      scheduler_.post_immediate_completion(op, is_continuation);</a>
+<a name="ln302">      return;</a>
+<a name="ln303">    }</a>
+<a name="ln304">    else</a>
+<a name="ln305">    {</a>
+<a name="ln306">      if (op_type == write_op)</a>
+<a name="ln307">      {</a>
+<a name="ln308">        descriptor_data-&gt;registered_events_ |= EPOLLOUT;</a>
+<a name="ln309">      }</a>
+<a name="ln310"> </a>
+<a name="ln311">      epoll_event ev = { 0, { 0 } };</a>
+<a name="ln312">      ev.events = descriptor_data-&gt;registered_events_;</a>
+<a name="ln313">      ev.data.ptr = descriptor_data;</a>
+<a name="ln314">      epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, descriptor, &amp;ev);</a>
+<a name="ln315">    }</a>
+<a name="ln316">  }</a>
+<a name="ln317"> </a>
+<a name="ln318">  descriptor_data-&gt;op_queue_[op_type].push(op);</a>
+<a name="ln319">  scheduler_.work_started();</a>
+<a name="ln320">}</a>
+<a name="ln321"> </a>
+<a name="ln322">void epoll_reactor::cancel_ops(socket_type,</a>
+<a name="ln323">    epoll_reactor::per_descriptor_data&amp; descriptor_data)</a>
+<a name="ln324">{</a>
+<a name="ln325">  if (!descriptor_data)</a>
+<a name="ln326">    return;</a>
+<a name="ln327"> </a>
+<a name="ln328">  mutex::scoped_lock descriptor_lock(descriptor_data-&gt;mutex_);</a>
+<a name="ln329"> </a>
+<a name="ln330">  op_queue&lt;operation&gt; ops;</a>
+<a name="ln331">  for (int i = 0; i &lt; max_ops; ++i)</a>
+<a name="ln332">  {</a>
+<a name="ln333">    while (reactor_op* op = descriptor_data-&gt;op_queue_[i].front())</a>
+<a name="ln334">    {</a>
+<a name="ln335">      op-&gt;ec_ = boost::asio::error::operation_aborted;</a>
+<a name="ln336">      descriptor_data-&gt;op_queue_[i].pop();</a>
+<a name="ln337">      ops.push(op);</a>
+<a name="ln338">    }</a>
+<a name="ln339">  }</a>
+<a name="ln340"> </a>
+<a name="ln341">  descriptor_lock.unlock();</a>
+<a name="ln342"> </a>
+<a name="ln343">  scheduler_.post_deferred_completions(ops);</a>
+<a name="ln344">}</a>
+<a name="ln345"> </a>
+<a name="ln346">void epoll_reactor::deregister_descriptor(socket_type descriptor,</a>
+<a name="ln347">    epoll_reactor::per_descriptor_data&amp; descriptor_data, bool closing)</a>
+<a name="ln348">{</a>
+<a name="ln349">  if (!descriptor_data)</a>
+<a name="ln350">    return;</a>
+<a name="ln351"> </a>
+<a name="ln352">  mutex::scoped_lock descriptor_lock(descriptor_data-&gt;mutex_);</a>
+<a name="ln353"> </a>
+<a name="ln354">  if (!descriptor_data-&gt;shutdown_)</a>
+<a name="ln355">  {</a>
+<a name="ln356">    if (closing)</a>
+<a name="ln357">    {</a>
+<a name="ln358">      // The descriptor will be automatically removed from the epoll set when</a>
+<a name="ln359">      // it is closed.</a>
+<a name="ln360">    }</a>
+<a name="ln361">    else if (descriptor_data-&gt;registered_events_ != 0)</a>
+<a name="ln362">    {</a>
+<a name="ln363">      epoll_event ev = { 0, { 0 } };</a>
+<a name="ln364">      epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, descriptor, &amp;ev);</a>
+<a name="ln365">    }</a>
+<a name="ln366"> </a>
+<a name="ln367">    op_queue&lt;operation&gt; ops;</a>
+<a name="ln368">    for (int i = 0; i &lt; max_ops; ++i)</a>
+<a name="ln369">    {</a>
+<a name="ln370">      while (reactor_op* op = descriptor_data-&gt;op_queue_[i].front())</a>
+<a name="ln371">      {</a>
+<a name="ln372">        op-&gt;ec_ = boost::asio::error::operation_aborted;</a>
+<a name="ln373">        descriptor_data-&gt;op_queue_[i].pop();</a>
+<a name="ln374">        ops.push(op);</a>
+<a name="ln375">      }</a>
+<a name="ln376">    }</a>
+<a name="ln377"> </a>
+<a name="ln378">    descriptor_data-&gt;descriptor_ = -1;</a>
+<a name="ln379">    descriptor_data-&gt;shutdown_ = true;</a>
+<a name="ln380"> </a>
+<a name="ln381">    descriptor_lock.unlock();</a>
+<a name="ln382"> </a>
+<a name="ln383">    BOOST_ASIO_HANDLER_REACTOR_DEREGISTRATION((</a>
+<a name="ln384">          context(), static_cast&lt;uintmax_t&gt;(descriptor),</a>
+<a name="ln385">          reinterpret_cast&lt;uintmax_t&gt;(descriptor_data)));</a>
+<a name="ln386"> </a>
+<a name="ln387">    scheduler_.post_deferred_completions(ops);</a>
+<a name="ln388"> </a>
+<a name="ln389">    // Leave descriptor_data set so that it will be freed by the subsequent</a>
+<a name="ln390">    // call to cleanup_descriptor_data.</a>
+<a name="ln391">  }</a>
+<a name="ln392">  else</a>
+<a name="ln393">  {</a>
+<a name="ln394">    // We are shutting down, so prevent cleanup_descriptor_data from freeing</a>
+<a name="ln395">    // the descriptor_data object and let the destructor free it instead.</a>
+<a name="ln396">    descriptor_data = 0;</a>
+<a name="ln397">  }</a>
+<a name="ln398">}</a>
+<a name="ln399"> </a>
+<a name="ln400">void epoll_reactor::deregister_internal_descriptor(socket_type descriptor,</a>
+<a name="ln401">    epoll_reactor::per_descriptor_data&amp; descriptor_data)</a>
+<a name="ln402">{</a>
+<a name="ln403">  if (!descriptor_data)</a>
+<a name="ln404">    return;</a>
+<a name="ln405"> </a>
+<a name="ln406">  mutex::scoped_lock descriptor_lock(descriptor_data-&gt;mutex_);</a>
+<a name="ln407"> </a>
+<a name="ln408">  if (!descriptor_data-&gt;shutdown_)</a>
+<a name="ln409">  {</a>
+<a name="ln410">    epoll_event ev = { 0, { 0 } };</a>
+<a name="ln411">    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, descriptor, &amp;ev);</a>
+<a name="ln412"> </a>
+<a name="ln413">    op_queue&lt;operation&gt; ops;</a>
+<a name="ln414">    for (int i = 0; i &lt; max_ops; ++i)</a>
+<a name="ln415">      ops.push(descriptor_data-&gt;op_queue_[i]);</a>
+<a name="ln416"> </a>
+<a name="ln417">    descriptor_data-&gt;descriptor_ = -1;</a>
+<a name="ln418">    descriptor_data-&gt;shutdown_ = true;</a>
+<a name="ln419"> </a>
+<a name="ln420">    descriptor_lock.unlock();</a>
+<a name="ln421"> </a>
+<a name="ln422">    BOOST_ASIO_HANDLER_REACTOR_DEREGISTRATION((</a>
+<a name="ln423">          context(), static_cast&lt;uintmax_t&gt;(descriptor),</a>
+<a name="ln424">          reinterpret_cast&lt;uintmax_t&gt;(descriptor_data)));</a>
+<a name="ln425"> </a>
+<a name="ln426">    // Leave descriptor_data set so that it will be freed by the subsequent</a>
+<a name="ln427">    // call to cleanup_descriptor_data.</a>
+<a name="ln428">  }</a>
+<a name="ln429">  else</a>
+<a name="ln430">  {</a>
+<a name="ln431">    // We are shutting down, so prevent cleanup_descriptor_data from freeing</a>
+<a name="ln432">    // the descriptor_data object and let the destructor free it instead.</a>
+<a name="ln433">    descriptor_data = 0;</a>
+<a name="ln434">  }</a>
+<a name="ln435">}</a>
+<a name="ln436"> </a>
+<a name="ln437">void epoll_reactor::cleanup_descriptor_data(</a>
+<a name="ln438">    per_descriptor_data&amp; descriptor_data)</a>
+<a name="ln439">{</a>
+<a name="ln440">  if (descriptor_data)</a>
+<a name="ln441">  {</a>
+<a name="ln442">    free_descriptor_state(descriptor_data);</a>
+<a name="ln443">    descriptor_data = 0;</a>
+<a name="ln444">  }</a>
+<a name="ln445">}</a>
+<a name="ln446"> </a>
+<a name="ln447">void epoll_reactor::run(long usec, op_queue&lt;operation&gt;&amp; ops)</a>
+<a name="ln448">{</a>
+<a name="ln449">  // This code relies on the fact that the scheduler queues the reactor task</a>
+<a name="ln450">  // behind all descriptor operations generated by this function. This means,</a>
+<a name="ln451">  // that by the time we reach this point, any previously returned descriptor</a>
+<a name="ln452">  // operations have already been dequeued. Therefore it is now safe for us to</a>
+<a name="ln453">  // reuse and return them for the scheduler to queue again.</a>
+<a name="ln454"> </a>
+<a name="ln455">  // Calculate timeout. Check the timer queues only if timerfd is not in use.</a>
+<a name="ln456">  int timeout;</a>
+<a name="ln457">  if (usec == 0)</a>
+<a name="ln458">    timeout = 0;</a>
+<a name="ln459">  else</a>
+<a name="ln460">  {</a>
+<a name="ln461">    timeout = (usec &lt; 0) ? -1 : ((usec - 1) / 1000 + 1);</a>
+<a name="ln462">    if (timer_fd_ == -1)</a>
+<a name="ln463">    {</a>
+<a name="ln464">      mutex::scoped_lock lock(mutex_);</a>
+<a name="ln465">      timeout = get_timeout(timeout);</a>
+<a name="ln466">    }</a>
+<a name="ln467">  }</a>
+<a name="ln468"> </a>
+<a name="ln469">  // Block on the epoll descriptor.</a>
+<a name="ln470">  epoll_event events[128];</a>
+<a name="ln471">  int num_events = epoll_wait(epoll_fd_, events, 128, timeout);</a>
+<a name="ln472"> </a>
+<a name="ln473">#if defined(BOOST_ASIO_ENABLE_HANDLER_TRACKING)</a>
+<a name="ln474">  // Trace the waiting events.</a>
+<a name="ln475">  for (int i = 0; i &lt; num_events; ++i)</a>
+<a name="ln476">  {</a>
+<a name="ln477">    void* ptr = events[i].data.ptr;</a>
+<a name="ln478">    if (ptr == &amp;interrupter_)</a>
+<a name="ln479">    {</a>
+<a name="ln480">      // Ignore.</a>
+<a name="ln481">    }</a>
+<a name="ln482"># if defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln483">    else if (ptr == &amp;timer_fd_)</a>
+<a name="ln484">    {</a>
+<a name="ln485">      // Ignore.</a>
+<a name="ln486">    }</a>
+<a name="ln487"># endif // defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln488">    else</a>
+<a name="ln489">    {</a>
+<a name="ln490">      unsigned event_mask = 0;</a>
+<a name="ln491">      if ((events[i].events &amp; EPOLLIN) != 0)</a>
+<a name="ln492">        event_mask |= BOOST_ASIO_HANDLER_REACTOR_READ_EVENT;</a>
+<a name="ln493">      if ((events[i].events &amp; EPOLLOUT))</a>
+<a name="ln494">        event_mask |= BOOST_ASIO_HANDLER_REACTOR_WRITE_EVENT;</a>
+<a name="ln495">      if ((events[i].events &amp; (EPOLLERR | EPOLLHUP)) != 0)</a>
+<a name="ln496">        event_mask |= BOOST_ASIO_HANDLER_REACTOR_ERROR_EVENT;</a>
+<a name="ln497">      BOOST_ASIO_HANDLER_REACTOR_EVENTS((context(),</a>
+<a name="ln498">            reinterpret_cast&lt;uintmax_t&gt;(ptr), event_mask));</a>
+<a name="ln499">    }</a>
+<a name="ln500">  }</a>
+<a name="ln501">#endif // defined(BOOST_ASIO_ENABLE_HANDLER_TRACKING)</a>
+<a name="ln502"> </a>
+<a name="ln503">#if defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln504">  bool check_timers = (timer_fd_ == -1);</a>
+<a name="ln505">#else // defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln506">  bool check_timers = true;</a>
+<a name="ln507">#endif // defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln508"> </a>
+<a name="ln509">  // Dispatch the waiting events.</a>
+<a name="ln510">  for (int i = 0; i &lt; num_events; ++i)</a>
+<a name="ln511">  {</a>
+<a name="ln512">    void* ptr = events[i].data.ptr;</a>
+<a name="ln513">    if (ptr == &amp;interrupter_)</a>
+<a name="ln514">    {</a>
+<a name="ln515">      // No need to reset the interrupter since we're leaving the descriptor</a>
+<a name="ln516">      // in a ready-to-read state and relying on edge-triggered notifications</a>
+<a name="ln517">      // to make it so that we only get woken up when the descriptor's epoll</a>
+<a name="ln518">      // registration is updated.</a>
+<a name="ln519"> </a>
+<a name="ln520">#if defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln521">      if (timer_fd_ == -1)</a>
+<a name="ln522">        check_timers = true;</a>
+<a name="ln523">#else // defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln524">      check_timers = true;</a>
+<a name="ln525">#endif // defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln526">    }</a>
+<a name="ln527">#if defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln528">    else if (ptr == &amp;timer_fd_)</a>
+<a name="ln529">    {</a>
+<a name="ln530">      check_timers = true;</a>
+<a name="ln531">    }</a>
+<a name="ln532">#endif // defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln533">    else</a>
+<a name="ln534">    {</a>
+<a name="ln535">      // The descriptor operation doesn't count as work in and of itself, so we</a>
+<a name="ln536">      // don't call work_started() here. This still allows the scheduler to</a>
+<a name="ln537">      // stop if the only remaining operations are descriptor operations.</a>
+<a name="ln538">      descriptor_state* descriptor_data = static_cast&lt;descriptor_state*&gt;(ptr);</a>
+<a name="ln539">      if (!ops.is_enqueued(descriptor_data))</a>
+<a name="ln540">      {</a>
+<a name="ln541">        descriptor_data-&gt;set_ready_events(events[i].events);</a>
+<a name="ln542">        ops.push(descriptor_data);</a>
+<a name="ln543">      }</a>
+<a name="ln544">      else</a>
+<a name="ln545">      {</a>
+<a name="ln546">        descriptor_data-&gt;add_ready_events(events[i].events);</a>
+<a name="ln547">      }</a>
+<a name="ln548">    }</a>
+<a name="ln549">  }</a>
+<a name="ln550"> </a>
+<a name="ln551">  if (check_timers)</a>
+<a name="ln552">  {</a>
+<a name="ln553">    mutex::scoped_lock common_lock(mutex_);</a>
+<a name="ln554">    timer_queues_.get_ready_timers(ops);</a>
+<a name="ln555"> </a>
+<a name="ln556">#if defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln557">    if (timer_fd_ != -1)</a>
+<a name="ln558">    {</a>
+<a name="ln559">      itimerspec new_timeout;</a>
+<a name="ln560">      itimerspec old_timeout;</a>
+<a name="ln561">      int flags = get_timeout(new_timeout);</a>
+<a name="ln562">      timerfd_settime(timer_fd_, flags, &amp;new_timeout, &amp;old_timeout);</a>
+<a name="ln563">    }</a>
+<a name="ln564">#endif // defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln565">  }</a>
+<a name="ln566">}</a>
+<a name="ln567"> </a>
+<a name="ln568">void epoll_reactor::interrupt()</a>
+<a name="ln569">{</a>
+<a name="ln570">  epoll_event ev = { 0, { 0 } };</a>
+<a name="ln571">  ev.events = EPOLLIN | EPOLLERR | EPOLLET;</a>
+<a name="ln572">  ev.data.ptr = &amp;interrupter_;</a>
+<a name="ln573">  epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, interrupter_.read_descriptor(), &amp;ev);</a>
+<a name="ln574">}</a>
+<a name="ln575"> </a>
+<a name="ln576">int epoll_reactor::do_epoll_create()</a>
+<a name="ln577">{</a>
+<a name="ln578">#if defined(EPOLL_CLOEXEC)</a>
+<a name="ln579">  int fd = epoll_create1(EPOLL_CLOEXEC);</a>
+<a name="ln580">#else // defined(EPOLL_CLOEXEC)</a>
+<a name="ln581">  int fd = -1;</a>
+<a name="ln582">  errno = EINVAL;</a>
+<a name="ln583">#endif // defined(EPOLL_CLOEXEC)</a>
+<a name="ln584"> </a>
+<a name="ln585">  if (fd == -1 &amp;&amp; (errno == EINVAL || errno == ENOSYS))</a>
+<a name="ln586">  {</a>
+<a name="ln587">    fd = epoll_create(epoll_size);</a>
+<a name="ln588">    if (fd != -1)</a>
+<a name="ln589">      ::fcntl(fd, F_SETFD, FD_CLOEXEC);</a>
+<a name="ln590">  }</a>
+<a name="ln591"> </a>
+<a name="ln592">  if (fd == -1)</a>
+<a name="ln593">  {</a>
+<a name="ln594">    boost::system::error_code ec(errno,</a>
+<a name="ln595">        boost::asio::error::get_system_category());</a>
+<a name="ln596">    boost::asio::detail::throw_error(ec, &quot;epoll&quot;);</a>
+<a name="ln597">  }</a>
+<a name="ln598"> </a>
+<a name="ln599">  return fd;</a>
+<a name="ln600">}</a>
+<a name="ln601"> </a>
+<a name="ln602">int epoll_reactor::do_timerfd_create()</a>
+<a name="ln603">{</a>
+<a name="ln604">#if defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln605"># if defined(TFD_CLOEXEC)</a>
+<a name="ln606">  int fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);</a>
+<a name="ln607"># else // defined(TFD_CLOEXEC)</a>
+<a name="ln608">  int fd = -1;</a>
+<a name="ln609">  errno = EINVAL;</a>
+<a name="ln610"># endif // defined(TFD_CLOEXEC)</a>
+<a name="ln611"> </a>
+<a name="ln612">  if (fd == -1 &amp;&amp; errno == EINVAL)</a>
+<a name="ln613">  {</a>
+<a name="ln614">    fd = timerfd_create(CLOCK_MONOTONIC, 0);</a>
+<a name="ln615">    if (fd != -1)</a>
+<a name="ln616">      ::fcntl(fd, F_SETFD, FD_CLOEXEC);</a>
+<a name="ln617">  }</a>
+<a name="ln618"> </a>
+<a name="ln619">  return fd;</a>
+<a name="ln620">#else // defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln621">  return -1;</a>
+<a name="ln622">#endif // defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln623">}</a>
+<a name="ln624"> </a>
+<a name="ln625">epoll_reactor::descriptor_state* epoll_reactor::allocate_descriptor_state()</a>
+<a name="ln626">{</a>
+<a name="ln627">  mutex::scoped_lock descriptors_lock(registered_descriptors_mutex_);</a>
+<a name="ln628">  return registered_descriptors_.alloc(BOOST_ASIO_CONCURRENCY_HINT_IS_LOCKING(</a>
+<a name="ln629">        REACTOR_IO, scheduler_.concurrency_hint()));</a>
+<a name="ln630">}</a>
+<a name="ln631"> </a>
+<a name="ln632">void epoll_reactor::free_descriptor_state(epoll_reactor::descriptor_state* s)</a>
+<a name="ln633">{</a>
+<a name="ln634">  mutex::scoped_lock descriptors_lock(registered_descriptors_mutex_);</a>
+<a name="ln635">  registered_descriptors_.free(s);</a>
+<a name="ln636">}</a>
+<a name="ln637"> </a>
+<a name="ln638">void epoll_reactor::do_add_timer_queue(timer_queue_base&amp; queue)</a>
+<a name="ln639">{</a>
+<a name="ln640">  mutex::scoped_lock lock(mutex_);</a>
+<a name="ln641">  timer_queues_.insert(&amp;queue);</a>
+<a name="ln642">}</a>
+<a name="ln643"> </a>
+<a name="ln644">void epoll_reactor::do_remove_timer_queue(timer_queue_base&amp; queue)</a>
+<a name="ln645">{</a>
+<a name="ln646">  mutex::scoped_lock lock(mutex_);</a>
+<a name="ln647">  timer_queues_.erase(&amp;queue);</a>
+<a name="ln648">}</a>
+<a name="ln649"> </a>
+<a name="ln650">void epoll_reactor::update_timeout()</a>
+<a name="ln651">{</a>
+<a name="ln652">#if defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln653">  if (timer_fd_ != -1)</a>
+<a name="ln654">  {</a>
+<a name="ln655">    itimerspec new_timeout;</a>
+<a name="ln656">    itimerspec old_timeout;</a>
+<a name="ln657">    int flags = get_timeout(new_timeout);</a>
+<a name="ln658">    timerfd_settime(timer_fd_, flags, &amp;new_timeout, &amp;old_timeout);</a>
+<a name="ln659">    return;</a>
+<a name="ln660">  }</a>
+<a name="ln661">#endif // defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln662">  interrupt();</a>
+<a name="ln663">}</a>
+<a name="ln664"> </a>
+<a name="ln665">int epoll_reactor::get_timeout(int msec)</a>
+<a name="ln666">{</a>
+<a name="ln667">  // By default we will wait no longer than 5 minutes. This will ensure that</a>
+<a name="ln668">  // any changes to the system clock are detected after no longer than this.</a>
+<a name="ln669">  const int max_msec = 5 * 60 * 1000;</a>
+<a name="ln670">  return timer_queues_.wait_duration_msec(</a>
+<a name="ln671">      (msec &lt; 0 || max_msec &lt; msec) ? max_msec : msec);</a>
+<a name="ln672">}</a>
+<a name="ln673"> </a>
+<a name="ln674">#if defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln675">int epoll_reactor::get_timeout(itimerspec&amp; ts)</a>
+<a name="ln676">{</a>
+<a name="ln677">  ts.it_interval.tv_sec = 0;</a>
+<a name="ln678">  ts.it_interval.tv_nsec = 0;</a>
+<a name="ln679"> </a>
+<a name="ln680">  long usec = timer_queues_.wait_duration_usec(5 * 60 * 1000 * 1000);</a>
+<a name="ln681">  ts.it_value.tv_sec = usec / 1000000;</a>
+<a name="ln682">  ts.it_value.tv_nsec = usec ? (usec % 1000000) * 1000 : 1;</a>
+<a name="ln683"> </a>
+<a name="ln684">  return usec ? 0 : TFD_TIMER_ABSTIME;</a>
+<a name="ln685">}</a>
+<a name="ln686">#endif // defined(BOOST_ASIO_HAS_TIMERFD)</a>
+<a name="ln687"> </a>
+<a name="ln688">struct epoll_reactor::perform_io_cleanup_on_block_exit</a>
+<a name="ln689">{</a>
+<a name="ln690">  explicit perform_io_cleanup_on_block_exit(epoll_reactor* r)</a>
+<a name="ln691">    : reactor_(r), first_op_(0)</a>
+<a name="ln692">  {</a>
+<a name="ln693">  }</a>
+<a name="ln694"> </a>
+<a name="ln695">  ~perform_io_cleanup_on_block_exit()</a>
+<a name="ln696">  {</a>
+<a name="ln697">    if (first_op_)</a>
+<a name="ln698">    {</a>
+<a name="ln699">      // Post the remaining completed operations for invocation.</a>
+<a name="ln700">      if (!ops_.empty())</a>
+<a name="ln701">        reactor_-&gt;scheduler_.post_deferred_completions(ops_);</a>
+<a name="ln702"> </a>
+<a name="ln703">      // A user-initiated operation has completed, but there's no need to</a>
+<a name="ln704">      // explicitly call work_finished() here. Instead, we'll take advantage of</a>
+<a name="ln705">      // the fact that the scheduler will call work_finished() once we return.</a>
+<a name="ln706">    }</a>
+<a name="ln707">    else</a>
+<a name="ln708">    {</a>
+<a name="ln709">      // No user-initiated operations have completed, so we need to compensate</a>
+<a name="ln710">      // for the work_finished() call that the scheduler will make once this</a>
+<a name="ln711">      // operation returns.</a>
+<a name="ln712">      reactor_-&gt;scheduler_.compensating_work_started();</a>
+<a name="ln713">    }</a>
+<a name="ln714">  }</a>
+<a name="ln715"> </a>
+<a name="ln716">  epoll_reactor* reactor_;</a>
+<a name="ln717">  op_queue&lt;operation&gt; ops_;</a>
+<a name="ln718">  operation* first_op_;</a>
+<a name="ln719">};</a>
+<a name="ln720"> </a>
+<a name="ln721">epoll_reactor::descriptor_state::descriptor_state(bool locking)</a>
+<a name="ln722">  : operation(&amp;epoll_reactor::descriptor_state::do_complete),</a>
+<a name="ln723">    mutex_(locking)</a>
+<a name="ln724">{</a>
+<a name="ln725">}</a>
+<a name="ln726"> </a>
+<a name="ln727">operation* epoll_reactor::descriptor_state::perform_io(uint32_t events)</a>
+<a name="ln728">{</a>
+<a name="ln729">  mutex_.lock();</a>
+<a name="ln730">  perform_io_cleanup_on_block_exit io_cleanup(reactor_);</a>
+<a name="ln731">  mutex::scoped_lock descriptor_lock(mutex_, mutex::scoped_lock::adopt_lock);</a>
+<a name="ln732"> </a>
+<a name="ln733">  // Exception operations must be processed first to ensure that any</a>
+<a name="ln734">  // out-of-band data is read before normal data.</a>
+<a name="ln735">  static const int flag[max_ops] = { EPOLLIN, EPOLLOUT, EPOLLPRI };</a>
+<a name="ln736">  for (int j = max_ops - 1; j &gt;= 0; --j)</a>
+<a name="ln737">  {</a>
+<a name="ln738">    if (events &amp; (flag[j] | EPOLLERR | EPOLLHUP))</a>
+<a name="ln739">    {</a>
+<a name="ln740">      try_speculative_[j] = true;</a>
+<a name="ln741">      while (reactor_op* op = op_queue_[j].front())</a>
+<a name="ln742">      {</a>
+<a name="ln743">        if (reactor_op::status status = op-&gt;perform())</a>
+<a name="ln744">        {</a>
+<a name="ln745">          op_queue_[j].pop();</a>
+<a name="ln746">          io_cleanup.ops_.push(op);</a>
+<a name="ln747">          if (status == reactor_op::done_and_exhausted)</a>
+<a name="ln748">          {</a>
+<a name="ln749">            try_speculative_[j] = false;</a>
+<a name="ln750">            break;</a>
+<a name="ln751">          }</a>
+<a name="ln752">        }</a>
+<a name="ln753">        else</a>
+<a name="ln754">          break;</a>
+<a name="ln755">      }</a>
+<a name="ln756">    }</a>
+<a name="ln757">  }</a>
+<a name="ln758"> </a>
+<a name="ln759">  // The first operation will be returned for completion now. The others will</a>
+<a name="ln760">  // be posted for later by the io_cleanup object's destructor.</a>
+<a name="ln761">  io_cleanup.first_op_ = io_cleanup.ops_.front();</a>
+<a name="ln762">  io_cleanup.ops_.pop();</a>
+<a name="ln763">  return io_cleanup.first_op_;</a>
+<a name="ln764">}</a>
+<a name="ln765"> </a>
+<a name="ln766">void epoll_reactor::descriptor_state::do_complete(</a>
+<a name="ln767">    void* owner, operation* base,</a>
+<a name="ln768">    const boost::system::error_code&amp; ec, std::size_t bytes_transferred)</a>
+<a name="ln769">{</a>
+<a name="ln770">  if (owner)</a>
+<a name="ln771">  {</a>
+<a name="ln772">    descriptor_state* descriptor_data = static_cast&lt;descriptor_state*&gt;(base);</a>
+<a name="ln773">    uint32_t events = static_cast&lt;uint32_t&gt;(bytes_transferred);</a>
+<a name="ln774">    if (operation* op = descriptor_data-&gt;perform_io(events))</a>
+<a name="ln775">    {</a>
+<a name="ln776">      op-&gt;complete(owner, ec, 0);</a>
+<a name="ln777">    }</a>
+<a name="ln778">  }</a>
+<a name="ln779">}</a>
+<a name="ln780"> </a>
+<a name="ln781">} // namespace detail</a>
+<a name="ln782">} // namespace asio</a>
+<a name="ln783">} // namespace boost</a>
+<a name="ln784"> </a>
+<a name="ln785">#include &lt;boost/asio/detail/pop_options.hpp&gt;</a>
+<a name="ln786"> </a>
+<a name="ln787">#endif // defined(BOOST_ASIO_HAS_EPOLL)</a>
+<a name="ln788"> </a>
+<a name="ln789">#endif // BOOST_ASIO_DETAIL_IMPL_EPOLL_REACTOR_IPP</a>
+
+</code></pre>
+<div class="balloon" rel="104"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1051/" target="_blank">V1051</a> Consider checking for misprints. It's possible that the 'epoll_fd_' should be checked here.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

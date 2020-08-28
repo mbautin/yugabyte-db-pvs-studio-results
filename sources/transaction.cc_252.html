@@ -1,0 +1,1216 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>transaction.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/client/transaction.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;unordered_set&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/client/async_rpc.h&quot;</a>
+<a name="ln21">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln22">#include &quot;yb/client/in_flight_op.h&quot;</a>
+<a name="ln23">#include &quot;yb/client/meta_cache.h&quot;</a>
+<a name="ln24">#include &quot;yb/client/tablet_rpc.h&quot;</a>
+<a name="ln25">#include &quot;yb/client/transaction_cleanup.h&quot;</a>
+<a name="ln26">#include &quot;yb/client/transaction_manager.h&quot;</a>
+<a name="ln27">#include &quot;yb/client/transaction_rpc.h&quot;</a>
+<a name="ln28">#include &quot;yb/client/yb_op.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;yb/common/transaction.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln33">#include &quot;yb/rpc/rpc.h&quot;</a>
+<a name="ln34">#include &quot;yb/rpc/scheduler.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln37">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln38">#include &quot;yb/util/random_util.h&quot;</a>
+<a name="ln39">#include &quot;yb/util/result.h&quot;</a>
+<a name="ln40">#include &quot;yb/util/strongly_typed_bool.h&quot;</a>
+<a name="ln41">#include &quot;yb/util/tsan_util.h&quot;</a>
+<a name="ln42"> </a>
+<a name="ln43">using namespace std::literals;</a>
+<a name="ln44">using namespace std::placeholders;</a>
+<a name="ln45"> </a>
+<a name="ln46">DEFINE_uint64(transaction_heartbeat_usec, 500000 * yb::kTimeMultiplier,</a>
+<a name="ln47">              &quot;Interval of transaction heartbeat in usec.&quot;);</a>
+<a name="ln48">DEFINE_bool(transaction_disable_heartbeat_in_tests, false, &quot;Disable heartbeat during test.&quot;);</a>
+<a name="ln49">DEFINE_bool(transaction_disable_proactive_cleanup_in_tests, false,</a>
+<a name="ln50">            &quot;Disable cleanup of intents in abort path.&quot;);</a>
+<a name="ln51">DECLARE_uint64(max_clock_skew_usec);</a>
+<a name="ln52"> </a>
+<a name="ln53">DEFINE_test_flag(int32, transaction_inject_flushed_delay_ms, 0,</a>
+<a name="ln54">                 &quot;Inject delay before processing flushed operations by transaction.&quot;);</a>
+<a name="ln55"> </a>
+<a name="ln56">namespace yb {</a>
+<a name="ln57">namespace client {</a>
+<a name="ln58"> </a>
+<a name="ln59">namespace {</a>
+<a name="ln60"> </a>
+<a name="ln61">YB_STRONGLY_TYPED_BOOL(Child);</a>
+<a name="ln62">YB_DEFINE_ENUM(TransactionState, (kRunning)(kAborted)(kCommitted)(kReleased)(kSealed));</a>
+<a name="ln63"> </a>
+<a name="ln64">} // namespace</a>
+<a name="ln65"> </a>
+<a name="ln66">Result&lt;ChildTransactionData&gt; ChildTransactionData::FromPB(const ChildTransactionDataPB&amp; data) {</a>
+<a name="ln67">  ChildTransactionData result;</a>
+<a name="ln68">  auto metadata = TransactionMetadata::FromPB(data.metadata());</a>
+<a name="ln69">  RETURN_NOT_OK(metadata);</a>
+<a name="ln70">  result.metadata = std::move(*metadata);</a>
+<a name="ln71">  result.read_time = ReadHybridTime::FromReadTimePB(data);</a>
+<a name="ln72">  for (const auto&amp; entry : data.local_limits()) {</a>
+<a name="ln73">    result.local_limits.emplace(entry.first, HybridTime(entry.second));</a>
+<a name="ln74">  }</a>
+<a name="ln75">  return result;</a>
+<a name="ln76">}</a>
+<a name="ln77"> </a>
+<a name="ln78">YB_DEFINE_ENUM(MetadataState, (kMissing)(kMaybePresent)(kPresent));</a>
+<a name="ln79"> </a>
+<a name="ln80">class YBTransaction::Impl final {</a>
+<a name="ln81"> public:</a>
+<a name="ln82">  Impl(TransactionManager* manager, YBTransaction* transaction)</a>
+<a name="ln83">      : manager_(manager),</a>
+<a name="ln84">        transaction_(transaction),</a>
+<a name="ln85">        read_point_(manager-&gt;clock()),</a>
+<a name="ln86">        child_(Child::kFalse) {</a>
+<a name="ln87">    metadata_.transaction_id = TransactionId::GenerateRandom();</a>
+<a name="ln88">    metadata_.priority = RandomUniformInt&lt;uint64_t&gt;();</a>
+<a name="ln89">    CompleteConstruction();</a>
+<a name="ln90">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Started, metadata: &quot; &lt;&lt; metadata_;</a>
+<a name="ln91">  }</a>
+<a name="ln92"> </a>
+<a name="ln93">  Impl(TransactionManager* manager, YBTransaction* transaction, const TransactionMetadata&amp; metadata)</a>
+<a name="ln94">      : manager_(manager),</a>
+<a name="ln95">        transaction_(transaction),</a>
+<a name="ln96">        metadata_(metadata),</a>
+<a name="ln97">        read_point_(manager-&gt;clock()),</a>
+<a name="ln98">        child_(Child::kFalse) {</a>
+<a name="ln99">    CompleteConstruction();</a>
+<a name="ln100">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Taken, metadata: &quot; &lt;&lt; metadata_;</a>
+<a name="ln101">  }</a>
+<a name="ln102"> </a>
+<a name="ln103">  Impl(TransactionManager* manager, YBTransaction* transaction, ChildTransactionData data)</a>
+<a name="ln104">      : manager_(manager),</a>
+<a name="ln105">        transaction_(transaction),</a>
+<a name="ln106">        read_point_(manager-&gt;clock()),</a>
+<a name="ln107">        child_(Child::kTrue),</a>
+<a name="ln108">        child_had_read_time_(data.read_time) {</a>
+<a name="ln109">    // For serializable isolation we use read intents, so could always read most recent</a>
+<a name="ln110">    // version of DB.</a>
+<a name="ln111">    // Otherwise there is possible case when we miss value change that happened after transaction</a>
+<a name="ln112">    // start.</a>
+<a name="ln113">    if (data.metadata.isolation == IsolationLevel::SNAPSHOT_ISOLATION) {</a>
+<a name="ln114">      read_point_.SetReadTime(std::move(data.read_time), std::move(data.local_limits));</a>
+<a name="ln115">    }</a>
+<a name="ln116">    metadata_ = std::move(data.metadata);</a>
+<a name="ln117">    CompleteConstruction();</a>
+<a name="ln118">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Started child, metadata: &quot; &lt;&lt; metadata_;</a>
+<a name="ln119">    ready_ = true;</a>
+<a name="ln120">  }</a>
+<a name="ln121"> </a>
+<a name="ln122">  ~Impl() {</a>
+<a name="ln123">    manager_-&gt;rpcs().Abort({&amp;heartbeat_handle_, &amp;commit_handle_, &amp;abort_handle_});</a>
+<a name="ln124">    LOG_IF_WITH_PREFIX(DFATAL, !waiters_.empty()) &lt;&lt; &quot;Non empty waiters&quot;;</a>
+<a name="ln125">  }</a>
+<a name="ln126"> </a>
+<a name="ln127">  void SetPriority(uint64_t priority) {</a>
+<a name="ln128">    metadata_.priority = priority;</a>
+<a name="ln129">  }</a>
+<a name="ln130"> </a>
+<a name="ln131">  YBTransactionPtr CreateSimilarTransaction() {</a>
+<a name="ln132">    return std::make_shared&lt;YBTransaction&gt;(manager_);</a>
+<a name="ln133">  }</a>
+<a name="ln134"> </a>
+<a name="ln135">  CHECKED_STATUS Init(IsolationLevel isolation, const ReadHybridTime&amp; read_time) {</a>
+<a name="ln136">    if (read_point_.GetReadTime().read.is_valid()) {</a>
+<a name="ln137">      return STATUS_FORMAT(IllegalState, &quot;Read point already specified: $0&quot;,</a>
+<a name="ln138">                           read_point_.GetReadTime());</a>
+<a name="ln139">    }</a>
+<a name="ln140"> </a>
+<a name="ln141">    if (read_time.read.is_valid()) {</a>
+<a name="ln142">      read_point_.SetReadTime(read_time, ConsistentReadPoint::HybridTimeMap());</a>
+<a name="ln143">    }</a>
+<a name="ln144">    CompleteInit(isolation);</a>
+<a name="ln145">    return Status::OK();</a>
+<a name="ln146">  }</a>
+<a name="ln147"> </a>
+<a name="ln148">  void InitWithReadPoint(IsolationLevel isolation, ConsistentReadPoint&amp;&amp; read_point) {</a>
+<a name="ln149">    read_point_ = std::move(read_point);</a>
+<a name="ln150">    CompleteInit(isolation);</a>
+<a name="ln151">  }</a>
+<a name="ln152"> </a>
+<a name="ln153">  const IsolationLevel isolation() const {</a>
+<a name="ln154">    return metadata_.isolation;</a>
+<a name="ln155">  }</a>
+<a name="ln156"> </a>
+<a name="ln157">  // This transaction is a restarted transaction, so we set it up with data from original one.</a>
+<a name="ln158">  CHECKED_STATUS FillRestartedTransaction(Impl* other) {</a>
+<a name="ln159">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Setup restart to &quot; &lt;&lt; other-&gt;ToString();</a>
+<a name="ln160">    auto transaction = transaction_-&gt;shared_from_this();</a>
+<a name="ln161">    {</a>
+<a name="ln162">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln163">      auto state = state_.load(std::memory_order_acquire);</a>
+<a name="ln164">      if (state != TransactionState::kRunning) {</a>
+<a name="ln165">        return STATUS_FORMAT(</a>
+<a name="ln166">            IllegalState, &quot;Restart of completed transaction $0: $1&quot;,</a>
+<a name="ln167">            metadata_.transaction_id, state);</a>
+<a name="ln168">      }</a>
+<a name="ln169">      if (!read_point_.IsRestartRequired()) {</a>
+<a name="ln170">        return STATUS_FORMAT(</a>
+<a name="ln171">            IllegalState, &quot;Restart of transaction that does not require restart: $0&quot;,</a>
+<a name="ln172">            metadata_.transaction_id);</a>
+<a name="ln173">      }</a>
+<a name="ln174">      other-&gt;read_point_ = std::move(read_point_);</a>
+<a name="ln175">      other-&gt;read_point_.Restart();</a>
+<a name="ln176">      other-&gt;metadata_.isolation = metadata_.isolation;</a>
+<a name="ln177">      if (metadata_.isolation == IsolationLevel::SNAPSHOT_ISOLATION) {</a>
+<a name="ln178">        other-&gt;metadata_.start_time = other-&gt;read_point_.GetReadTime().read;</a>
+<a name="ln179">      } else {</a>
+<a name="ln180">        other-&gt;metadata_.start_time = other-&gt;read_point_.Now();</a>
+<a name="ln181">      }</a>
+<a name="ln182">      state_.store(TransactionState::kAborted, std::memory_order_release);</a>
+<a name="ln183">    }</a>
+<a name="ln184">    DoAbort(TransactionRpcDeadline(), transaction);</a>
+<a name="ln185"> </a>
+<a name="ln186">    return Status::OK();</a>
+<a name="ln187">  }</a>
+<a name="ln188"> </a>
+<a name="ln189">  bool Prepare(const internal::InFlightOps&amp; ops,</a>
+<a name="ln190">               ForceConsistentRead force_consistent_read,</a>
+<a name="ln191">               CoarseTimePoint deadline,</a>
+<a name="ln192">               Initial initial,</a>
+<a name="ln193">               Waiter waiter,</a>
+<a name="ln194">               TransactionMetadata* metadata) {</a>
+<a name="ln195">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Prepare(&quot; &lt;&lt; AsString(ops) &lt;&lt; &quot;, &quot; &lt;&lt; force_consistent_read &lt;&lt; &quot;, &quot;</a>
+<a name="ln196">                        &lt;&lt; initial &lt;&lt; &quot;)&quot;;</a>
+<a name="ln197"> </a>
+<a name="ln198">    bool has_tablets_without_metadata = false;</a>
+<a name="ln199">    {</a>
+<a name="ln200">      std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln201">      const bool defer = !ready_;</a>
+<a name="ln202"> </a>
+<a name="ln203">      int num_tablets = 0;</a>
+<a name="ln204">      if (!defer || initial) {</a>
+<a name="ln205">        for (auto op_it = ops.begin(); op_it != ops.end();) {</a>
+<a name="ln206">          ++num_tablets;</a>
+<a name="ln207">          auto&amp; first_op = **op_it;</a>
+<a name="ln208">          auto* tablet = first_op.tablet.get();</a>
+<a name="ln209">          auto op_group = first_op.yb_op-&gt;group();</a>
+<a name="ln210">          bool should_add_intents = (**op_it).yb_op-&gt;should_add_intents(metadata_.isolation);</a>
+<a name="ln211">          for (;;) {</a>
+<a name="ln212">            if (++op_it == ops.end() || (**op_it).tablet.get() != tablet ||</a>
+<a name="ln213">                (**op_it).yb_op-&gt;group() != op_group) {</a>
+<a name="ln214">              break;</a>
+<a name="ln215">            }</a>
+<a name="ln216">          }</a>
+<a name="ln217"> </a>
+<a name="ln218">          bool has_metadata;</a>
+<a name="ln219">          if (initial &amp;&amp; should_add_intents) {</a>
+<a name="ln220">            auto&amp; tablet_state = tablets_[tablet-&gt;tablet_id()];</a>
+<a name="ln221">            // TODO(dtxn) Handle skipped writes, i.e. writes that did not write anything (#3220)</a>
+<a name="ln222">            first_op.batch_idx = tablet_state.num_batches;</a>
+<a name="ln223">            ++tablet_state.num_batches;</a>
+<a name="ln224">            has_metadata = tablet_state.has_metadata;</a>
+<a name="ln225">          } else {</a>
+<a name="ln226">            auto it = tablets_.find(tablet-&gt;tablet_id());</a>
+<a name="ln227">            has_metadata = it != tablets_.end() &amp;&amp; it-&gt;second.has_metadata;</a>
+<a name="ln228">          }</a>
+<a name="ln229">          has_tablets_without_metadata = has_tablets_without_metadata || !has_metadata;</a>
+<a name="ln230">        }</a>
+<a name="ln231">      }</a>
+<a name="ln232"> </a>
+<a name="ln233">      if (defer) {</a>
+<a name="ln234">        if (waiter) {</a>
+<a name="ln235">          waiters_.push_back(std::move(waiter));</a>
+<a name="ln236">        }</a>
+<a name="ln237">        lock.unlock();</a>
+<a name="ln238">        VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Prepare, rejected (not ready, requesting status tablet)&quot;;</a>
+<a name="ln239">        RequestStatusTablet(deadline);</a>
+<a name="ln240">        return false;</a>
+<a name="ln241">      }</a>
+<a name="ln242"> </a>
+<a name="ln243">      // For serializable isolation we never choose read time, since it always reads latest</a>
+<a name="ln244">      // snapshot.</a>
+<a name="ln245">      // For snapshot isolation, if read time was not yet picked, we have to choose it now, if there</a>
+<a name="ln246">      // multiple tablets that will process first request.</a>
+<a name="ln247">      SetReadTimeIfNeeded(num_tablets &gt; 1 || force_consistent_read);</a>
+<a name="ln248">    }</a>
+<a name="ln249"> </a>
+<a name="ln250">    VLOG_WITH_PREFIX(3) &lt;&lt; &quot;Prepare, has_tablets_without_metadata: &quot;</a>
+<a name="ln251">                        &lt;&lt; has_tablets_without_metadata;</a>
+<a name="ln252">    if (metadata) {</a>
+<a name="ln253">      if (has_tablets_without_metadata) {</a>
+<a name="ln254">        *metadata = metadata_;</a>
+<a name="ln255">      } else {</a>
+<a name="ln256">        metadata-&gt;transaction_id = metadata_.transaction_id;</a>
+<a name="ln257">      }</a>
+<a name="ln258">    }</a>
+<a name="ln259"> </a>
+<a name="ln260">    return true;</a>
+<a name="ln261">  }</a>
+<a name="ln262"> </a>
+<a name="ln263">  void ExpectOperations(size_t count) {</a>
+<a name="ln264">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln265">    running_requests_ += count;</a>
+<a name="ln266">  }</a>
+<a name="ln267"> </a>
+<a name="ln268">  void Flushed(</a>
+<a name="ln269">      const internal::InFlightOps&amp; ops, const ReadHybridTime&amp; used_read_time,</a>
+<a name="ln270">      const Status&amp; status) {</a>
+<a name="ln271">    VLOG_WITH_PREFIX(5)</a>
+<a name="ln272">        &lt;&lt; &quot;Flushed: &quot; &lt;&lt; yb::ToString(ops) &lt;&lt; &quot;, used_read_time: &quot; &lt;&lt; used_read_time</a>
+<a name="ln273">        &lt;&lt; &quot;, status: &quot; &lt;&lt; status;</a>
+<a name="ln274">    if (FLAGS_TEST_transaction_inject_flushed_delay_ms &gt; 0) {</a>
+<a name="ln275">      std::this_thread::sleep_for(FLAGS_TEST_transaction_inject_flushed_delay_ms * 1ms);</a>
+<a name="ln276">    }</a>
+<a name="ln277"> </a>
+<a name="ln278">    boost::optional&lt;Status&gt; notify_commit_status;</a>
+<a name="ln279">    bool abort = false;</a>
+<a name="ln280">    {</a>
+<a name="ln281">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln282">      running_requests_ -= ops.size();</a>
+<a name="ln283"> </a>
+<a name="ln284">      if (status.ok()) {</a>
+<a name="ln285">        if (used_read_time &amp;&amp; metadata_.isolation == IsolationLevel::SNAPSHOT_ISOLATION) {</a>
+<a name="ln286">          const bool read_point_already_set = static_cast&lt;bool&gt;(read_point_.GetReadTime());</a>
+<a name="ln287">          #ifndef NDEBUG</a>
+<a name="ln288">          if (read_point_already_set) {</a>
+<a name="ln289">            // Display details of operations before crashing in debug mode.</a>
+<a name="ln290">            int op_idx = 1;</a>
+<a name="ln291">            for (const auto&amp; op : ops) {</a>
+<a name="ln292">              LOG(ERROR) &lt;&lt; &quot;Operation &quot; &lt;&lt; op_idx &lt;&lt; &quot;: &quot; &lt;&lt; op-&gt;ToString();</a>
+<a name="ln293">              op_idx++;</a>
+<a name="ln294">            }</a>
+<a name="ln295">          }</a>
+<a name="ln296">          #endif</a>
+<a name="ln297">          LOG_IF_WITH_PREFIX(DFATAL, read_point_already_set)</a>
+<a name="ln298">              &lt;&lt; &quot;Read time already picked (&quot; &lt;&lt; read_point_.GetReadTime()</a>
+<a name="ln299">              &lt;&lt; &quot;, but server replied with used read time: &quot; &lt;&lt; used_read_time;</a>
+<a name="ln300">          read_point_.SetReadTime(used_read_time, ConsistentReadPoint::HybridTimeMap());</a>
+<a name="ln301">        }</a>
+<a name="ln302">        const std::string* prev_tablet_id = nullptr;</a>
+<a name="ln303">        for (const auto&amp; op : ops) {</a>
+<a name="ln304">          if (op-&gt;yb_op-&gt;applied() &amp;&amp; op-&gt;yb_op-&gt;should_add_intents(metadata_.isolation)) {</a>
+<a name="ln305">            const std::string&amp; tablet_id = op-&gt;tablet-&gt;tablet_id();</a>
+<a name="ln306">            if (prev_tablet_id == nullptr || tablet_id != *prev_tablet_id) {</a>
+<a name="ln307">              prev_tablet_id = &amp;tablet_id;</a>
+<a name="ln308">              tablets_[tablet_id].has_metadata = true;</a>
+<a name="ln309">            }</a>
+<a name="ln310">          }</a>
+<a name="ln311">        }</a>
+<a name="ln312">      } else {</a>
+<a name="ln313">        if (status.IsTryAgain()) {</a>
+<a name="ln314">          auto state = state_.load(std::memory_order_acquire);</a>
+<a name="ln315">          VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Abort desired, state: &quot; &lt;&lt; AsString(state);</a>
+<a name="ln316">          if (state == TransactionState::kRunning) {</a>
+<a name="ln317">            abort = true;</a>
+<a name="ln318">            // State will be changed to aborted in SetError</a>
+<a name="ln319">          }</a>
+<a name="ln320">        }</a>
+<a name="ln321">        SetError(status, &amp;lock);</a>
+<a name="ln322">      }</a>
+<a name="ln323"> </a>
+<a name="ln324">      if (running_requests_ == 0 &amp;&amp; commit_replicated_) {</a>
+<a name="ln325">        notify_commit_status = status_;</a>
+<a name="ln326">      }</a>
+<a name="ln327">    }</a>
+<a name="ln328"> </a>
+<a name="ln329">    if (notify_commit_status) {</a>
+<a name="ln330">      VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Sealing done: &quot; &lt;&lt; *notify_commit_status;</a>
+<a name="ln331">      commit_callback_(*notify_commit_status);</a>
+<a name="ln332">    }</a>
+<a name="ln333"> </a>
+<a name="ln334">    if (abort &amp;&amp; !child_) {</a>
+<a name="ln335">      DoAbort(TransactionRpcDeadline(), transaction_-&gt;shared_from_this());</a>
+<a name="ln336">    }</a>
+<a name="ln337">  }</a>
+<a name="ln338"> </a>
+<a name="ln339">  void Commit(CoarseTimePoint deadline, SealOnly seal_only, CommitCallback callback) {</a>
+<a name="ln340">    auto transaction = transaction_-&gt;shared_from_this();</a>
+<a name="ln341">    {</a>
+<a name="ln342">      std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln343">      auto status = CheckCouldCommit(seal_only, &amp;lock);</a>
+<a name="ln344">      if (!status.ok()) {</a>
+<a name="ln345">        callback(status);</a>
+<a name="ln346">        return;</a>
+<a name="ln347">      }</a>
+<a name="ln348">      state_.store(seal_only ? TransactionState::kSealed : TransactionState::kCommitted,</a>
+<a name="ln349">                   std::memory_order_release);</a>
+<a name="ln350">      commit_callback_ = std::move(callback);</a>
+<a name="ln351">      if (!ready_) {</a>
+<a name="ln352">        // If we have not written any intents and do not even have a transaction status tablet,</a>
+<a name="ln353">        // just report the transaction as committed.</a>
+<a name="ln354">        //</a>
+<a name="ln355">        // See https://github.com/yugabyte/yugabyte-db/issues/3105 for details -- we might be able</a>
+<a name="ln356">        // to remove this special case if it turns out there is a bug elsewhere.</a>
+<a name="ln357">        if (tablets_.empty() &amp;&amp; running_requests_ == 0) {</a>
+<a name="ln358">          VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Committed empty transaction&quot;;</a>
+<a name="ln359">          commit_callback_(Status::OK());</a>
+<a name="ln360">          return;</a>
+<a name="ln361">        }</a>
+<a name="ln362"> </a>
+<a name="ln363">        waiters_.emplace_back(std::bind(</a>
+<a name="ln364">            &amp;Impl::DoCommit, this, deadline, seal_only, _1, transaction));</a>
+<a name="ln365">        lock.unlock();</a>
+<a name="ln366">        RequestStatusTablet(deadline);</a>
+<a name="ln367">        return;</a>
+<a name="ln368">      }</a>
+<a name="ln369">    }</a>
+<a name="ln370">    DoCommit(deadline, seal_only, Status::OK(), transaction);</a>
+<a name="ln371">  }</a>
+<a name="ln372"> </a>
+<a name="ln373">  void Abort(CoarseTimePoint deadline) {</a>
+<a name="ln374">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Abort&quot;;</a>
+<a name="ln375"> </a>
+<a name="ln376">    auto transaction = transaction_-&gt;shared_from_this();</a>
+<a name="ln377">    {</a>
+<a name="ln378">      std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln379">      auto state = state_.load(std::memory_order_acquire);</a>
+<a name="ln380">      if (state != TransactionState::kRunning) {</a>
+<a name="ln381">        LOG_IF_WITH_PREFIX(DFATAL, state != TransactionState::kAborted)</a>
+<a name="ln382">            &lt;&lt; &quot;Abort of committed transaction: &quot; &lt;&lt; AsString(state);</a>
+<a name="ln383">        return;</a>
+<a name="ln384">      }</a>
+<a name="ln385">      if (child_) {</a>
+<a name="ln386">        LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Abort of child transaction&quot;;</a>
+<a name="ln387">        return;</a>
+<a name="ln388">      }</a>
+<a name="ln389">      state_.store(TransactionState::kAborted, std::memory_order_release);</a>
+<a name="ln390">      if (!ready_) {</a>
+<a name="ln391">        std::vector&lt;Waiter&gt; waiters;</a>
+<a name="ln392">        waiters_.swap(waiters);</a>
+<a name="ln393">        lock.unlock();</a>
+<a name="ln394">        const auto aborted_status = STATUS(Aborted, &quot;Transaction aborted&quot;);</a>
+<a name="ln395">        for(const auto&amp; waiter : waiters) {</a>
+<a name="ln396">          waiter(aborted_status);</a>
+<a name="ln397">        }</a>
+<a name="ln398">        return;</a>
+<a name="ln399">      }</a>
+<a name="ln400">    }</a>
+<a name="ln401">    DoAbort(deadline, transaction);</a>
+<a name="ln402">  }</a>
+<a name="ln403"> </a>
+<a name="ln404">  bool IsRestartRequired() const {</a>
+<a name="ln405">    return read_point_.IsRestartRequired();</a>
+<a name="ln406">  }</a>
+<a name="ln407"> </a>
+<a name="ln408">  std::shared_future&lt;TransactionMetadata&gt; TEST_GetMetadata() {</a>
+<a name="ln409">    std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln410">    if (metadata_future_.valid()) {</a>
+<a name="ln411">      return metadata_future_;</a>
+<a name="ln412">    }</a>
+<a name="ln413">    metadata_future_ = std::shared_future&lt;TransactionMetadata&gt;(metadata_promise_.get_future());</a>
+<a name="ln414">    if (!ready_) {</a>
+<a name="ln415">      auto transaction = transaction_-&gt;shared_from_this();</a>
+<a name="ln416">      waiters_.push_back([this, transaction](const Status&amp; status) {</a>
+<a name="ln417">        // OK to crash here, because we are in test</a>
+<a name="ln418">        CHECK_OK(status);</a>
+<a name="ln419">        metadata_promise_.set_value(metadata_);</a>
+<a name="ln420">      });</a>
+<a name="ln421">      lock.unlock();</a>
+<a name="ln422">      RequestStatusTablet(TransactionRpcDeadline());</a>
+<a name="ln423">    }</a>
+<a name="ln424">    metadata_promise_.set_value(metadata_);</a>
+<a name="ln425">    return metadata_future_;</a>
+<a name="ln426">  }</a>
+<a name="ln427"> </a>
+<a name="ln428">  void PrepareChild(</a>
+<a name="ln429">      ForceConsistentRead force_consistent_read, CoarseTimePoint deadline,</a>
+<a name="ln430">      PrepareChildCallback callback) {</a>
+<a name="ln431">    auto transaction = transaction_-&gt;shared_from_this();</a>
+<a name="ln432">    std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln433">    auto status = CheckRunning(&amp;lock);</a>
+<a name="ln434">    if (!status.ok()) {</a>
+<a name="ln435">      callback(status);</a>
+<a name="ln436">      return;</a>
+<a name="ln437">    }</a>
+<a name="ln438">    if (IsRestartRequired()) {</a>
+<a name="ln439">      lock.unlock();</a>
+<a name="ln440">      callback(STATUS(IllegalState, &quot;Restart required&quot;));</a>
+<a name="ln441">      return;</a>
+<a name="ln442">    }</a>
+<a name="ln443"> </a>
+<a name="ln444">    SetReadTimeIfNeeded(force_consistent_read);</a>
+<a name="ln445"> </a>
+<a name="ln446">    if (!ready_) {</a>
+<a name="ln447">      waiters_.emplace_back(std::bind(</a>
+<a name="ln448">          &amp;Impl::DoPrepareChild, this, _1, transaction, std::move(callback), nullptr /* lock */));</a>
+<a name="ln449">      lock.unlock();</a>
+<a name="ln450">      RequestStatusTablet(deadline);</a>
+<a name="ln451">      return;</a>
+<a name="ln452">    }</a>
+<a name="ln453"> </a>
+<a name="ln454">    DoPrepareChild(Status::OK(), transaction, std::move(callback), &amp;lock);</a>
+<a name="ln455">  }</a>
+<a name="ln456"> </a>
+<a name="ln457">  Result&lt;ChildTransactionResultPB&gt; FinishChild() {</a>
+<a name="ln458">    std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln459">    RETURN_NOT_OK(CheckRunning(&amp;lock));</a>
+<a name="ln460">    if (!child_) {</a>
+<a name="ln461">      return STATUS(IllegalState, &quot;Finish child of non child transaction&quot;);</a>
+<a name="ln462">    }</a>
+<a name="ln463">    state_.store(TransactionState::kCommitted, std::memory_order_release);</a>
+<a name="ln464">    ChildTransactionResultPB result;</a>
+<a name="ln465">    auto&amp; tablets = *result.mutable_tablets();</a>
+<a name="ln466">    tablets.Reserve(tablets_.size());</a>
+<a name="ln467">    for (const auto&amp; tablet : tablets_) {</a>
+<a name="ln468">      auto&amp; out = *tablets.Add();</a>
+<a name="ln469">      out.set_tablet_id(tablet.first);</a>
+<a name="ln470">      out.set_num_batches(tablet.second.num_batches);</a>
+<a name="ln471">      out.set_metadata_state(</a>
+<a name="ln472">          tablet.second.has_metadata ? InvolvedTabletMetadataState::EXIST</a>
+<a name="ln473">                                     : InvolvedTabletMetadataState::MISSING);</a>
+<a name="ln474">    }</a>
+<a name="ln475">    read_point_.FinishChildTransactionResult(HadReadTime(child_had_read_time_), &amp;result);</a>
+<a name="ln476">    return result;</a>
+<a name="ln477">  }</a>
+<a name="ln478"> </a>
+<a name="ln479">  Status ApplyChildResult(const ChildTransactionResultPB&amp; result) {</a>
+<a name="ln480">    std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln481">    RETURN_NOT_OK(CheckRunning(&amp;lock));</a>
+<a name="ln482">    if (child_) {</a>
+<a name="ln483">      return STATUS(IllegalState, &quot;Apply child result of child transaction&quot;);</a>
+<a name="ln484">    }</a>
+<a name="ln485"> </a>
+<a name="ln486">    for (const auto&amp; tablet : result.tablets()) {</a>
+<a name="ln487">      auto&amp; tablet_state = tablets_[tablet.tablet_id()];</a>
+<a name="ln488">      tablet_state.num_batches += tablet.num_batches();</a>
+<a name="ln489">      tablet_state.has_metadata =</a>
+<a name="ln490">          tablet_state.has_metadata ||</a>
+<a name="ln491">          tablet.metadata_state() == InvolvedTabletMetadataState::EXIST;</a>
+<a name="ln492">    }</a>
+<a name="ln493">    read_point_.ApplyChildTransactionResult(result);</a>
+<a name="ln494"> </a>
+<a name="ln495">    return Status::OK();</a>
+<a name="ln496">  }</a>
+<a name="ln497"> </a>
+<a name="ln498">  const std::string&amp; LogPrefix() {</a>
+<a name="ln499">    return log_prefix_;</a>
+<a name="ln500">  }</a>
+<a name="ln501"> </a>
+<a name="ln502">  std::string ToString() {</a>
+<a name="ln503">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln504">    return Format(&quot;{ metadata: $0 state: $1 }&quot;, metadata_, state_.load(std::memory_order_acquire));</a>
+<a name="ln505">  }</a>
+<a name="ln506"> </a>
+<a name="ln507">  const TransactionId&amp; id() const {</a>
+<a name="ln508">    return metadata_.transaction_id;</a>
+<a name="ln509">  }</a>
+<a name="ln510"> </a>
+<a name="ln511">  ConsistentReadPoint&amp; read_point() {</a>
+<a name="ln512">    return read_point_;</a>
+<a name="ln513">  }</a>
+<a name="ln514"> </a>
+<a name="ln515">  Result&lt;TransactionMetadata&gt; Release() {</a>
+<a name="ln516">    std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln517">    auto state = state_.load(std::memory_order_acquire);</a>
+<a name="ln518">    if (state != TransactionState::kRunning) {</a>
+<a name="ln519">      return STATUS_FORMAT(IllegalState, &quot;Attempt to release transaction in the wrong state $0: $1&quot;,</a>
+<a name="ln520">                           metadata_.transaction_id, AsString(state));</a>
+<a name="ln521">    }</a>
+<a name="ln522">    state_.store(TransactionState::kReleased, std::memory_order_release);</a>
+<a name="ln523"> </a>
+<a name="ln524">    if (!ready_) {</a>
+<a name="ln525">      CountDownLatch latch(1);</a>
+<a name="ln526">      Status pick_status;</a>
+<a name="ln527">      auto transaction = transaction_-&gt;shared_from_this();</a>
+<a name="ln528">      waiters_.push_back([&amp;latch, &amp;pick_status](const Status&amp; status) {</a>
+<a name="ln529">        pick_status = status;</a>
+<a name="ln530">        latch.CountDown();</a>
+<a name="ln531">      });</a>
+<a name="ln532">      lock.unlock();</a>
+<a name="ln533">      RequestStatusTablet(TransactionRpcDeadline());</a>
+<a name="ln534">      latch.Wait();</a>
+<a name="ln535">      RETURN_NOT_OK(pick_status);</a>
+<a name="ln536">      lock.lock();</a>
+<a name="ln537">    }</a>
+<a name="ln538">    return metadata_;</a>
+<a name="ln539">  }</a>
+<a name="ln540"> </a>
+<a name="ln541">  void StartHeartbeat() {</a>
+<a name="ln542">    VLOG_WITH_PREFIX(2) &lt;&lt; __PRETTY_FUNCTION__;</a>
+<a name="ln543">    RequestStatusTablet(TransactionRpcDeadline());</a>
+<a name="ln544">  }</a>
+<a name="ln545"> </a>
+<a name="ln546"> private:</a>
+<a name="ln547">  void CompleteConstruction() {</a>
+<a name="ln548">    log_prefix_ = Format(&quot;$0: &quot;, metadata_.transaction_id);</a>
+<a name="ln549">    heartbeat_handle_ = manager_-&gt;rpcs().InvalidHandle();</a>
+<a name="ln550">    commit_handle_ = manager_-&gt;rpcs().InvalidHandle();</a>
+<a name="ln551">    abort_handle_ = manager_-&gt;rpcs().InvalidHandle();</a>
+<a name="ln552">  }</a>
+<a name="ln553"> </a>
+<a name="ln554">  void CompleteInit(IsolationLevel isolation) {</a>
+<a name="ln555">    metadata_.isolation = isolation;</a>
+<a name="ln556">    if (read_point_.GetReadTime()) {</a>
+<a name="ln557">      metadata_.start_time = read_point_.GetReadTime().read;</a>
+<a name="ln558">    } else {</a>
+<a name="ln559">      metadata_.start_time = read_point_.Now();</a>
+<a name="ln560">    }</a>
+<a name="ln561">  }</a>
+<a name="ln562"> </a>
+<a name="ln563">  void SetReadTimeIfNeeded(bool do_it) {</a>
+<a name="ln564">    if (!read_point_.GetReadTime() &amp;&amp; do_it &amp;&amp;</a>
+<a name="ln565">        metadata_.isolation == IsolationLevel::SNAPSHOT_ISOLATION) {</a>
+<a name="ln566">      read_point_.SetCurrentReadTime();</a>
+<a name="ln567">    }</a>
+<a name="ln568">  }</a>
+<a name="ln569"> </a>
+<a name="ln570">  CHECKED_STATUS CheckRunning(std::unique_lock&lt;std::mutex&gt;* lock) {</a>
+<a name="ln571">    if (state_.load(std::memory_order_acquire) != TransactionState::kRunning) {</a>
+<a name="ln572">      auto status = status_;</a>
+<a name="ln573">      lock-&gt;unlock();</a>
+<a name="ln574">      if (status.ok()) {</a>
+<a name="ln575">        status = STATUS(IllegalState, &quot;Transaction already completed&quot;);</a>
+<a name="ln576">      }</a>
+<a name="ln577">      return status;</a>
+<a name="ln578">    }</a>
+<a name="ln579">    return Status::OK();</a>
+<a name="ln580">  }</a>
+<a name="ln581"> </a>
+<a name="ln582">  void DoCommit(</a>
+<a name="ln583">      CoarseTimePoint deadline, SealOnly seal_only, const Status&amp; status,</a>
+<a name="ln584">      const YBTransactionPtr&amp; transaction) {</a>
+<a name="ln585">    VLOG_WITH_PREFIX(1)</a>
+<a name="ln586">        &lt;&lt; Format(&quot;Commit, seal_only: $0, tablets: $1, status: $2&quot;,</a>
+<a name="ln587">                  seal_only, tablets_, status);</a>
+<a name="ln588"> </a>
+<a name="ln589">    if (!status.ok()) {</a>
+<a name="ln590">      VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Commit failed: &quot; &lt;&lt; status;</a>
+<a name="ln591">      commit_callback_(status);</a>
+<a name="ln592">      return;</a>
+<a name="ln593">    }</a>
+<a name="ln594"> </a>
+<a name="ln595">    tserver::UpdateTransactionRequestPB req;</a>
+<a name="ln596">    req.set_tablet_id(status_tablet_-&gt;tablet_id());</a>
+<a name="ln597">    req.set_propagated_hybrid_time(manager_-&gt;Now().ToUint64());</a>
+<a name="ln598">    auto&amp; state = *req.mutable_state();</a>
+<a name="ln599">    state.set_transaction_id(metadata_.transaction_id.data(), metadata_.transaction_id.size());</a>
+<a name="ln600">    state.set_status(seal_only ? TransactionStatus::SEALED : TransactionStatus::COMMITTED);</a>
+<a name="ln601">    state.mutable_tablets()-&gt;Reserve(tablets_.size());</a>
+<a name="ln602">    for (const auto&amp; tablet : tablets_) {</a>
+<a name="ln603">      // If tablet does not have metadata it should not participate in commit.</a>
+<a name="ln604">      if (!seal_only &amp;&amp; !tablet.second.has_metadata) {</a>
+<a name="ln605">        continue;</a>
+<a name="ln606">      }</a>
+<a name="ln607">      state.add_tablets(tablet.first);</a>
+<a name="ln608">      if (seal_only) {</a>
+<a name="ln609">        state.add_tablet_batches(tablet.second.num_batches);</a>
+<a name="ln610">      }</a>
+<a name="ln611">    }</a>
+<a name="ln612"> </a>
+<a name="ln613">    // If we don't have any tablets that have intents written to them, just abort it.</a>
+<a name="ln614">    // But notify caller that commit was successful, so it is transparent for him.</a>
+<a name="ln615">    if (state.tablets().empty()) {</a>
+<a name="ln616">      VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Committed empty&quot;;</a>
+<a name="ln617">      DoAbort(deadline, transaction);</a>
+<a name="ln618">      commit_callback_(Status::OK());</a>
+<a name="ln619">      return;</a>
+<a name="ln620">    }</a>
+<a name="ln621"> </a>
+<a name="ln622">    manager_-&gt;rpcs().RegisterAndStart(</a>
+<a name="ln623">        UpdateTransaction(</a>
+<a name="ln624">            deadline,</a>
+<a name="ln625">            status_tablet_.get(),</a>
+<a name="ln626">            manager_-&gt;client(),</a>
+<a name="ln627">            &amp;req,</a>
+<a name="ln628">            std::bind(&amp;Impl::CommitDone, this, _1, _2, transaction)),</a>
+<a name="ln629">        &amp;commit_handle_);</a>
+<a name="ln630">  }</a>
+<a name="ln631"> </a>
+<a name="ln632">  void DoAbort(CoarseTimePoint deadline, const YBTransactionPtr&amp; transaction) {</a>
+<a name="ln633">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Abort&quot;;</a>
+<a name="ln634"> </a>
+<a name="ln635">    tserver::AbortTransactionRequestPB req;</a>
+<a name="ln636">    req.set_tablet_id(status_tablet_-&gt;tablet_id());</a>
+<a name="ln637">    req.set_propagated_hybrid_time(manager_-&gt;Now().ToUint64());</a>
+<a name="ln638">    req.set_transaction_id(metadata_.transaction_id.data(), metadata_.transaction_id.size());</a>
+<a name="ln639"> </a>
+<a name="ln640">    manager_-&gt;rpcs().RegisterAndStart(</a>
+<a name="ln641">        AbortTransaction(</a>
+<a name="ln642">            deadline,</a>
+<a name="ln643">            status_tablet_.get(),</a>
+<a name="ln644">            manager_-&gt;client(),</a>
+<a name="ln645">            &amp;req,</a>
+<a name="ln646">            std::bind(&amp;Impl::AbortDone, this, _1, _2, transaction)),</a>
+<a name="ln647">        &amp;abort_handle_);</a>
+<a name="ln648"> </a>
+<a name="ln649">    DoAbortCleanup(transaction);</a>
+<a name="ln650">  }</a>
+<a name="ln651"> </a>
+<a name="ln652">  void DoAbortCleanup(const YBTransactionPtr&amp; transaction) {</a>
+<a name="ln653">    if (FLAGS_transaction_disable_proactive_cleanup_in_tests) {</a>
+<a name="ln654">      return;</a>
+<a name="ln655">    }</a>
+<a name="ln656"> </a>
+<a name="ln657">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Cleaning up intents for &quot; &lt;&lt; metadata_.transaction_id;</a>
+<a name="ln658"> </a>
+<a name="ln659">    std::vector&lt;std::string&gt; tablet_ids;</a>
+<a name="ln660">    {</a>
+<a name="ln661">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln662">      tablet_ids.reserve(tablets_.size());</a>
+<a name="ln663">      for (const auto&amp; tablet : tablets_) {</a>
+<a name="ln664">        if (tablet.second.has_metadata) {</a>
+<a name="ln665">          tablet_ids.push_back(tablet.first);</a>
+<a name="ln666">        }</a>
+<a name="ln667">      }</a>
+<a name="ln668">    }</a>
+<a name="ln669"> </a>
+<a name="ln670">    CleanupTransaction(</a>
+<a name="ln671">        manager_-&gt;client(), manager_-&gt;clock(), metadata_.transaction_id, Sealed::kFalse,</a>
+<a name="ln672">        tablet_ids);</a>
+<a name="ln673">  }</a>
+<a name="ln674"> </a>
+<a name="ln675">  void CommitDone(const Status&amp; status,</a>
+<a name="ln676">                  const tserver::UpdateTransactionResponsePB&amp; response,</a>
+<a name="ln677">                  const YBTransactionPtr&amp; transaction) {</a>
+<a name="ln678">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Committed: &quot; &lt;&lt; status;</a>
+<a name="ln679"> </a>
+<a name="ln680">    UpdateClock(response, manager_);</a>
+<a name="ln681">    manager_-&gt;rpcs().Unregister(&amp;commit_handle_);</a>
+<a name="ln682"> </a>
+<a name="ln683">    Status actual_status = status.IsAlreadyPresent() ? Status::OK() : status;</a>
+<a name="ln684">    if (state_.load(std::memory_order_acquire) != TransactionState::kCommitted &amp;&amp;</a>
+<a name="ln685">        actual_status.ok()) {</a>
+<a name="ln686">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln687">      commit_replicated_ = true;</a>
+<a name="ln688">      if (running_requests_ != 0) {</a>
+<a name="ln689">        return;</a>
+<a name="ln690">      }</a>
+<a name="ln691">    }</a>
+<a name="ln692">    VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Commit done: &quot; &lt;&lt; actual_status;</a>
+<a name="ln693">    commit_callback_(actual_status);</a>
+<a name="ln694">  }</a>
+<a name="ln695"> </a>
+<a name="ln696">  void AbortDone(const Status&amp; status,</a>
+<a name="ln697">                 const tserver::AbortTransactionResponsePB&amp; response,</a>
+<a name="ln698">                 const YBTransactionPtr&amp; transaction) {</a>
+<a name="ln699">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Aborted: &quot; &lt;&lt; status;</a>
+<a name="ln700"> </a>
+<a name="ln701">    if (response.has_propagated_hybrid_time()) {</a>
+<a name="ln702">      manager_-&gt;UpdateClock(HybridTime(response.propagated_hybrid_time()));</a>
+<a name="ln703">    }</a>
+<a name="ln704">    manager_-&gt;rpcs().Unregister(&amp;abort_handle_);</a>
+<a name="ln705">  }</a>
+<a name="ln706"> </a>
+<a name="ln707">  void RequestStatusTablet(const CoarseTimePoint&amp; deadline) {</a>
+<a name="ln708">    bool expected = false;</a>
+<a name="ln709">    if (!requested_status_tablet_.compare_exchange_strong(</a>
+<a name="ln710">        expected, true, std::memory_order_acq_rel)) {</a>
+<a name="ln711">      return;</a>
+<a name="ln712">    }</a>
+<a name="ln713">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;RequestStatusTablet()&quot;;</a>
+<a name="ln714">    auto transaction = transaction_-&gt;shared_from_this();</a>
+<a name="ln715">    if (metadata_.status_tablet.empty()) {</a>
+<a name="ln716">      manager_-&gt;PickStatusTablet(</a>
+<a name="ln717">          std::bind(&amp;Impl::StatusTabletPicked, this, _1, deadline, transaction));</a>
+<a name="ln718">    } else {</a>
+<a name="ln719">      LookupStatusTablet(metadata_.status_tablet, deadline, transaction);</a>
+<a name="ln720">    }</a>
+<a name="ln721">  }</a>
+<a name="ln722"> </a>
+<a name="ln723">  void StatusTabletPicked(const Result&lt;std::string&gt;&amp; tablet,</a>
+<a name="ln724">                          const CoarseTimePoint&amp; deadline,</a>
+<a name="ln725">                          const YBTransactionPtr&amp; transaction) {</a>
+<a name="ln726">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Picked status tablet: &quot; &lt;&lt; tablet;</a>
+<a name="ln727"> </a>
+<a name="ln728">    if (!tablet.ok()) {</a>
+<a name="ln729">      NotifyWaiters(tablet.status());</a>
+<a name="ln730">      return;</a>
+<a name="ln731">    }</a>
+<a name="ln732"> </a>
+<a name="ln733">    LookupStatusTablet(*tablet, deadline, transaction);</a>
+<a name="ln734">  }</a>
+<a name="ln735"> </a>
+<a name="ln736">  void LookupStatusTablet(const std::string&amp; tablet_id,</a>
+<a name="ln737">                          const CoarseTimePoint&amp; deadline,</a>
+<a name="ln738">                          const YBTransactionPtr&amp; transaction) {</a>
+<a name="ln739">    manager_-&gt;client()-&gt;LookupTabletById(</a>
+<a name="ln740">        tablet_id,</a>
+<a name="ln741">        deadline,</a>
+<a name="ln742">        std::bind(&amp;Impl::LookupTabletDone, this, _1, transaction),</a>
+<a name="ln743">        client::UseCache::kTrue);</a>
+<a name="ln744">  }</a>
+<a name="ln745"> </a>
+<a name="ln746">  void LookupTabletDone(const Result&lt;client::internal::RemoteTabletPtr&gt;&amp; result,</a>
+<a name="ln747">                        const YBTransactionPtr&amp; transaction) {</a>
+<a name="ln748">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Lookup tablet done: &quot; &lt;&lt; yb::ToString(result);</a>
+<a name="ln749"> </a>
+<a name="ln750">    if (!result.ok()) {</a>
+<a name="ln751">      NotifyWaiters(result.status());</a>
+<a name="ln752">      return;</a>
+<a name="ln753">    }</a>
+<a name="ln754"> </a>
+<a name="ln755">    bool precreated;</a>
+<a name="ln756">    std::vector&lt;Waiter&gt; waiters;</a>
+<a name="ln757">    {</a>
+<a name="ln758">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln759">      status_tablet_ = std::move(*result);</a>
+<a name="ln760">      if (metadata_.status_tablet.empty()) {</a>
+<a name="ln761">        metadata_.status_tablet = status_tablet_-&gt;tablet_id();</a>
+<a name="ln762">        precreated = false;</a>
+<a name="ln763">      } else {</a>
+<a name="ln764">        precreated = true;</a>
+<a name="ln765">        ready_ = true;</a>
+<a name="ln766">        waiters_.swap(waiters);</a>
+<a name="ln767">      }</a>
+<a name="ln768">    }</a>
+<a name="ln769">    if (precreated) {</a>
+<a name="ln770">      for (const auto&amp; waiter : waiters) {</a>
+<a name="ln771">        waiter(Status::OK());</a>
+<a name="ln772">      }</a>
+<a name="ln773">    }</a>
+<a name="ln774">    SendHeartbeat(precreated ? TransactionStatus::PENDING : TransactionStatus::CREATED,</a>
+<a name="ln775">                  metadata_.transaction_id, transaction_-&gt;shared_from_this());</a>
+<a name="ln776">  }</a>
+<a name="ln777"> </a>
+<a name="ln778">  void NotifyWaiters(const Status&amp; status) {</a>
+<a name="ln779">    std::vector&lt;Waiter&gt; waiters;</a>
+<a name="ln780">    {</a>
+<a name="ln781">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln782">      if (status.ok()) {</a>
+<a name="ln783">        DCHECK(!ready_);</a>
+<a name="ln784">        ready_ = true;</a>
+<a name="ln785">      } else {</a>
+<a name="ln786">        SetError(status, &amp;lock);</a>
+<a name="ln787">      }</a>
+<a name="ln788">      waiters_.swap(waiters);</a>
+<a name="ln789">    }</a>
+<a name="ln790">    for (const auto&amp; waiter : waiters) {</a>
+<a name="ln791">      waiter(status);</a>
+<a name="ln792">    }</a>
+<a name="ln793">  }</a>
+<a name="ln794"> </a>
+<a name="ln795">  void SendHeartbeat(TransactionStatus status,</a>
+<a name="ln796">                     const TransactionId&amp; id,</a>
+<a name="ln797">                     const std::weak_ptr&lt;YBTransaction&gt;&amp; weak_transaction) {</a>
+<a name="ln798">    auto transaction = weak_transaction.lock();</a>
+<a name="ln799">    if (!transaction) {</a>
+<a name="ln800">      // Cannot use LOG_WITH_PREFIX here, since this was actually destroyed.</a>
+<a name="ln801">      VLOG(1) &lt;&lt; id &lt;&lt; &quot;: Transaction destroyed&quot;;</a>
+<a name="ln802">      return;</a>
+<a name="ln803">    }</a>
+<a name="ln804"> </a>
+<a name="ln805">    auto current_state = state_.load(std::memory_order_acquire);</a>
+<a name="ln806"> </a>
+<a name="ln807">    if (!AllowHeartbeat(current_state, status)) {</a>
+<a name="ln808">      VLOG_WITH_PREFIX(1) &lt;&lt; &quot; Send heartbeat cancelled: &quot; &lt;&lt; yb::ToString(transaction);</a>
+<a name="ln809">      return;</a>
+<a name="ln810">    }</a>
+<a name="ln811"> </a>
+<a name="ln812">    VLOG_WITH_PREFIX(4) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; TransactionStatus_Name(status) &lt;&lt; &quot;)&quot;;</a>
+<a name="ln813"> </a>
+<a name="ln814">    MonoDelta timeout;</a>
+<a name="ln815">    if (status != TransactionStatus::CREATED) {</a>
+<a name="ln816">      if (GetAtomicFlag(&amp;FLAGS_transaction_disable_heartbeat_in_tests)) {</a>
+<a name="ln817">        HeartbeatDone(Status::OK(), tserver::UpdateTransactionResponsePB(), status, transaction);</a>
+<a name="ln818">        return;</a>
+<a name="ln819">      }</a>
+<a name="ln820">      timeout = std::chrono::microseconds(FLAGS_transaction_heartbeat_usec);</a>
+<a name="ln821">    } else {</a>
+<a name="ln822">      timeout = TransactionRpcTimeout();</a>
+<a name="ln823">    }</a>
+<a name="ln824"> </a>
+<a name="ln825">    tserver::UpdateTransactionRequestPB req;</a>
+<a name="ln826">    req.set_tablet_id(status_tablet_-&gt;tablet_id());</a>
+<a name="ln827">    req.set_propagated_hybrid_time(manager_-&gt;Now().ToUint64());</a>
+<a name="ln828">    auto&amp; state = *req.mutable_state();</a>
+<a name="ln829">    state.set_transaction_id(metadata_.transaction_id.data(), metadata_.transaction_id.size());</a>
+<a name="ln830">    state.set_status(status);</a>
+<a name="ln831">    manager_-&gt;rpcs().RegisterAndStart(</a>
+<a name="ln832">        UpdateTransaction(</a>
+<a name="ln833">            CoarseMonoClock::now() + timeout,</a>
+<a name="ln834">            status_tablet_.get(),</a>
+<a name="ln835">            manager_-&gt;client(),</a>
+<a name="ln836">            &amp;req,</a>
+<a name="ln837">            std::bind(&amp;Impl::HeartbeatDone, this, _1, _2, status, transaction)),</a>
+<a name="ln838">        &amp;heartbeat_handle_);</a>
+<a name="ln839">  }</a>
+<a name="ln840"> </a>
+<a name="ln841">  static bool AllowHeartbeat(TransactionState current_state, TransactionStatus status) {</a>
+<a name="ln842">    switch (current_state) {</a>
+<a name="ln843">      case TransactionState::kRunning:</a>
+<a name="ln844">        return true;</a>
+<a name="ln845">      case TransactionState::kReleased: FALLTHROUGH_INTENDED;</a>
+<a name="ln846">      case TransactionState::kSealed:</a>
+<a name="ln847">        return status == TransactionStatus::CREATED;</a>
+<a name="ln848">      case TransactionState::kAborted: FALLTHROUGH_INTENDED;</a>
+<a name="ln849">      case TransactionState::kCommitted:</a>
+<a name="ln850">        return false;</a>
+<a name="ln851">    }</a>
+<a name="ln852">    FATAL_INVALID_ENUM_VALUE(TransactionState, current_state);</a>
+<a name="ln853">  }</a>
+<a name="ln854"> </a>
+<a name="ln855">  void HeartbeatDone(const Status&amp; status,</a>
+<a name="ln856">                     const tserver::UpdateTransactionResponsePB&amp; response,</a>
+<a name="ln857">                     TransactionStatus transaction_status,</a>
+<a name="ln858">                     const YBTransactionPtr&amp; transaction) {</a>
+<a name="ln859">    UpdateClock(response, manager_);</a>
+<a name="ln860">    manager_-&gt;rpcs().Unregister(&amp;heartbeat_handle_);</a>
+<a name="ln861"> </a>
+<a name="ln862">    VLOG_WITH_PREFIX(4) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; status &lt;&lt; &quot;, &quot;</a>
+<a name="ln863">                        &lt;&lt; TransactionStatus_Name(transaction_status) &lt;&lt; &quot;)&quot;;</a>
+<a name="ln864"> </a>
+<a name="ln865">    if (status.ok()) {</a>
+<a name="ln866">      if (transaction_status == TransactionStatus::CREATED) {</a>
+<a name="ln867">        NotifyWaiters(Status::OK());</a>
+<a name="ln868">      }</a>
+<a name="ln869">      std::weak_ptr&lt;YBTransaction&gt; weak_transaction(transaction);</a>
+<a name="ln870">      manager_-&gt;client()-&gt;messenger()-&gt;scheduler().Schedule(</a>
+<a name="ln871">          [this, weak_transaction, id = metadata_.transaction_id](const Status&amp;) {</a>
+<a name="ln872">              SendHeartbeat(TransactionStatus::PENDING, id, weak_transaction);</a>
+<a name="ln873">          },</a>
+<a name="ln874">          std::chrono::microseconds(FLAGS_transaction_heartbeat_usec));</a>
+<a name="ln875">    } else {</a>
+<a name="ln876">      LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Send heartbeat failed: &quot; &lt;&lt; status;</a>
+<a name="ln877">      if (status.IsAborted()) {</a>
+<a name="ln878">        // Service is shutting down, no reason to retry.</a>
+<a name="ln879">        SetError(status);</a>
+<a name="ln880">        if (transaction_status == TransactionStatus::CREATED) {</a>
+<a name="ln881">          NotifyWaiters(status);</a>
+<a name="ln882">        }</a>
+<a name="ln883">        return;</a>
+<a name="ln884">      } else if (status.IsExpired()) {</a>
+<a name="ln885">        SetError(status);</a>
+<a name="ln886">        // If state is committed, then we should not cleanup.</a>
+<a name="ln887">        if (state_.load(std::memory_order_acquire) == TransactionState::kRunning) {</a>
+<a name="ln888">          DoAbortCleanup(transaction);</a>
+<a name="ln889">        }</a>
+<a name="ln890">        if (transaction_status == TransactionStatus::CREATED) {</a>
+<a name="ln891">          NotifyWaiters(status);</a>
+<a name="ln892">        }</a>
+<a name="ln893">        return;</a>
+<a name="ln894">      }</a>
+<a name="ln895">      // Other errors could have different causes, but we should just retry sending heartbeat</a>
+<a name="ln896">      // in this case.</a>
+<a name="ln897">      SendHeartbeat(transaction_status, metadata_.transaction_id, transaction);</a>
+<a name="ln898">    }</a>
+<a name="ln899">  }</a>
+<a name="ln900"> </a>
+<a name="ln901">  void SetError(const Status&amp; status, std::lock_guard&lt;std::mutex&gt;* lock = nullptr) {</a>
+<a name="ln902">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Failed: &quot; &lt;&lt; status;</a>
+<a name="ln903">    if (!lock) {</a>
+<a name="ln904">      std::lock_guard&lt;std::mutex&gt; new_lock(mutex_);</a>
+<a name="ln905">      SetError(status, &amp;new_lock);</a>
+<a name="ln906">      return;</a>
+<a name="ln907">    }</a>
+<a name="ln908">    if (status_.ok()) {</a>
+<a name="ln909">      status_ = status;</a>
+<a name="ln910">      state_.store(TransactionState::kAborted, std::memory_order_release);</a>
+<a name="ln911">    }</a>
+<a name="ln912">  }</a>
+<a name="ln913"> </a>
+<a name="ln914">  void DoPrepareChild(const Status&amp; status,</a>
+<a name="ln915">                      const YBTransactionPtr&amp; transaction,</a>
+<a name="ln916">                      PrepareChildCallback callback,</a>
+<a name="ln917">                      std::unique_lock&lt;std::mutex&gt;* parent_lock) {</a>
+<a name="ln918">    if (!status.ok()) {</a>
+<a name="ln919">      callback(status);</a>
+<a name="ln920">      return;</a>
+<a name="ln921">    }</a>
+<a name="ln922"> </a>
+<a name="ln923">    std::unique_lock&lt;std::mutex&gt; lock(mutex_, std::defer_lock);</a>
+<a name="ln924">    if (!parent_lock) {</a>
+<a name="ln925">      lock.lock();</a>
+<a name="ln926">    }</a>
+<a name="ln927">    ChildTransactionDataPB data;</a>
+<a name="ln928">    metadata_.ToPB(data.mutable_metadata());</a>
+<a name="ln929">    read_point_.PrepareChildTransactionData(&amp;data);</a>
+<a name="ln930">    callback(data);</a>
+<a name="ln931">  }</a>
+<a name="ln932"> </a>
+<a name="ln933">  CHECKED_STATUS CheckCouldCommit(SealOnly seal_only, std::unique_lock&lt;std::mutex&gt;* lock) {</a>
+<a name="ln934">    RETURN_NOT_OK(CheckRunning(lock));</a>
+<a name="ln935">    if (child_) {</a>
+<a name="ln936">      return STATUS(IllegalState, &quot;Commit of child transaction is not allowed&quot;);</a>
+<a name="ln937">    }</a>
+<a name="ln938">    if (IsRestartRequired()) {</a>
+<a name="ln939">      return STATUS(</a>
+<a name="ln940">          IllegalState, &quot;Commit of transaction that requires restart is not allowed&quot;);</a>
+<a name="ln941">    }</a>
+<a name="ln942">    if (!seal_only &amp;&amp; running_requests_ &gt; 0) {</a>
+<a name="ln943">      return STATUS(IllegalState, &quot;Commit of transaction with running requests&quot;);</a>
+<a name="ln944">    }</a>
+<a name="ln945"> </a>
+<a name="ln946">    return Status::OK();</a>
+<a name="ln947">  }</a>
+<a name="ln948"> </a>
+<a name="ln949">  // Manager is created once per service.</a>
+<a name="ln950">  TransactionManager* const manager_;</a>
+<a name="ln951"> </a>
+<a name="ln952">  // Transaction related to this impl.</a>
+<a name="ln953">  YBTransaction* const transaction_;</a>
+<a name="ln954"> </a>
+<a name="ln955">  TransactionMetadata metadata_;</a>
+<a name="ln956">  ConsistentReadPoint read_point_;</a>
+<a name="ln957"> </a>
+<a name="ln958">  std::string log_prefix_;</a>
+<a name="ln959">  std::atomic&lt;bool&gt; requested_status_tablet_{false};</a>
+<a name="ln960">  internal::RemoteTabletPtr status_tablet_;</a>
+<a name="ln961">  std::atomic&lt;TransactionState&gt; state_{TransactionState::kRunning};</a>
+<a name="ln962">  // Transaction is successfully initialized and ready to process intents.</a>
+<a name="ln963">  const bool child_;</a>
+<a name="ln964">  bool child_had_read_time_ = false;</a>
+<a name="ln965">  bool ready_ = false;</a>
+<a name="ln966">  CommitCallback commit_callback_;</a>
+<a name="ln967">  Status status_;</a>
+<a name="ln968">  rpc::Rpcs::Handle heartbeat_handle_;</a>
+<a name="ln969">  rpc::Rpcs::Handle commit_handle_;</a>
+<a name="ln970">  rpc::Rpcs::Handle abort_handle_;</a>
+<a name="ln971"> </a>
+<a name="ln972">  struct TabletState {</a>
+<a name="ln973">    size_t num_batches = 0;</a>
+<a name="ln974">    bool has_metadata = false;</a>
+<a name="ln975"> </a>
+<a name="ln976">    std::string ToString() const {</a>
+<a name="ln977">      return Format(&quot;{ num_batches: $0 has_metadata: $1 }&quot;, num_batches, has_metadata);</a>
+<a name="ln978">    }</a>
+<a name="ln979">  };</a>
+<a name="ln980"> </a>
+<a name="ln981">  typedef std::unordered_map&lt;TabletId, TabletState&gt; TabletStates;</a>
+<a name="ln982"> </a>
+<a name="ln983">  std::mutex mutex_;</a>
+<a name="ln984">  TabletStates tablets_;</a>
+<a name="ln985">  std::vector&lt;Waiter&gt; waiters_;</a>
+<a name="ln986">  std::promise&lt;TransactionMetadata&gt; metadata_promise_;</a>
+<a name="ln987">  std::shared_future&lt;TransactionMetadata&gt; metadata_future_;</a>
+<a name="ln988">  size_t running_requests_ = 0;</a>
+<a name="ln989">  // Set to true after commit record is replicated. Used only during transaction sealing.</a>
+<a name="ln990">  bool commit_replicated_ = false;</a>
+<a name="ln991">};</a>
+<a name="ln992"> </a>
+<a name="ln993">CoarseTimePoint AdjustDeadline(CoarseTimePoint deadline) {</a>
+<a name="ln994">  if (deadline == CoarseTimePoint()) {</a>
+<a name="ln995">    return TransactionRpcDeadline();</a>
+<a name="ln996">  }</a>
+<a name="ln997">  return deadline;</a>
+<a name="ln998">}</a>
+<a name="ln999"> </a>
+<a name="ln1000">YBTransaction::YBTransaction(TransactionManager* manager)</a>
+<a name="ln1001">    : impl_(new Impl(manager, this)) {</a>
+<a name="ln1002">}</a>
+<a name="ln1003"> </a>
+<a name="ln1004">YBTransaction::YBTransaction(</a>
+<a name="ln1005">    TransactionManager* manager, const TransactionMetadata&amp; metadata, PrivateOnlyTag)</a>
+<a name="ln1006">    : impl_(new Impl(manager, this, metadata)) {</a>
+<a name="ln1007">}</a>
+<a name="ln1008"> </a>
+<a name="ln1009">YBTransaction::YBTransaction(TransactionManager* manager, ChildTransactionData data)</a>
+<a name="ln1010">    : impl_(new Impl(manager, this, std::move(data))) {</a>
+<a name="ln1011">}</a>
+<a name="ln1012"> </a>
+<a name="ln1013">YBTransaction::~YBTransaction() {</a>
+<a name="ln1014">}</a>
+<a name="ln1015"> </a>
+<a name="ln1016">void YBTransaction::SetPriority(uint64_t priority) {</a>
+<a name="ln1017">  impl_-&gt;SetPriority(priority);</a>
+<a name="ln1018">}</a>
+<a name="ln1019"> </a>
+<a name="ln1020">Status YBTransaction::Init(IsolationLevel isolation, const ReadHybridTime&amp; read_time) {</a>
+<a name="ln1021">  return impl_-&gt;Init(isolation, read_time);</a>
+<a name="ln1022">}</a>
+<a name="ln1023"> </a>
+<a name="ln1024">void YBTransaction::InitWithReadPoint(</a>
+<a name="ln1025">    IsolationLevel isolation,</a>
+<a name="ln1026">    ConsistentReadPoint&amp;&amp; read_point) {</a>
+<a name="ln1027">  return impl_-&gt;InitWithReadPoint(isolation, std::move(read_point));</a>
+<a name="ln1028">}</a>
+<a name="ln1029"> </a>
+<a name="ln1030">bool YBTransaction::Prepare(const internal::InFlightOps&amp; ops,</a>
+<a name="ln1031">                            ForceConsistentRead force_consistent_read,</a>
+<a name="ln1032">                            CoarseTimePoint deadline,</a>
+<a name="ln1033">                            Initial initial,</a>
+<a name="ln1034">                            Waiter waiter,</a>
+<a name="ln1035">                            TransactionMetadata* metadata) {</a>
+<a name="ln1036">  return impl_-&gt;Prepare(</a>
+<a name="ln1037">      ops, force_consistent_read, deadline, initial, std::move(waiter), metadata);</a>
+<a name="ln1038">}</a>
+<a name="ln1039"> </a>
+<a name="ln1040">void YBTransaction::ExpectOperations(size_t count) {</a>
+<a name="ln1041">  impl_-&gt;ExpectOperations(count);</a>
+<a name="ln1042">}</a>
+<a name="ln1043"> </a>
+<a name="ln1044">void YBTransaction::Flushed(</a>
+<a name="ln1045">    const internal::InFlightOps&amp; ops, const ReadHybridTime&amp; used_read_time, const Status&amp; status) {</a>
+<a name="ln1046">  impl_-&gt;Flushed(ops, used_read_time, status);</a>
+<a name="ln1047">}</a>
+<a name="ln1048"> </a>
+<a name="ln1049">void YBTransaction::Commit(</a>
+<a name="ln1050">    CoarseTimePoint deadline, SealOnly seal_only, CommitCallback callback) {</a>
+<a name="ln1051">  impl_-&gt;Commit(AdjustDeadline(deadline), seal_only, std::move(callback));</a>
+<a name="ln1052">}</a>
+<a name="ln1053"> </a>
+<a name="ln1054">const TransactionId&amp; YBTransaction::id() const {</a>
+<a name="ln1055">  return impl_-&gt;id();</a>
+<a name="ln1056">}</a>
+<a name="ln1057"> </a>
+<a name="ln1058">const IsolationLevel YBTransaction::isolation() const {</a>
+<a name="ln1059">  return impl_-&gt;isolation();</a>
+<a name="ln1060">}</a>
+<a name="ln1061"> </a>
+<a name="ln1062">const ConsistentReadPoint&amp; YBTransaction::read_point() const {</a>
+<a name="ln1063">  return impl_-&gt;read_point();</a>
+<a name="ln1064">}</a>
+<a name="ln1065"> </a>
+<a name="ln1066">ConsistentReadPoint&amp; YBTransaction::read_point() {</a>
+<a name="ln1067">  return impl_-&gt;read_point();</a>
+<a name="ln1068">}</a>
+<a name="ln1069"> </a>
+<a name="ln1070">std::future&lt;Status&gt; YBTransaction::CommitFuture(</a>
+<a name="ln1071">    CoarseTimePoint deadline, SealOnly seal_only) {</a>
+<a name="ln1072">  return MakeFuture&lt;Status&gt;([this, deadline, seal_only](auto callback) {</a>
+<a name="ln1073">    impl_-&gt;Commit(AdjustDeadline(deadline), seal_only, std::move(callback));</a>
+<a name="ln1074">  });</a>
+<a name="ln1075">}</a>
+<a name="ln1076"> </a>
+<a name="ln1077">void YBTransaction::Abort(CoarseTimePoint deadline) {</a>
+<a name="ln1078">  impl_-&gt;Abort(AdjustDeadline(deadline));</a>
+<a name="ln1079">}</a>
+<a name="ln1080"> </a>
+<a name="ln1081">bool YBTransaction::IsRestartRequired() const {</a>
+<a name="ln1082">  return impl_-&gt;IsRestartRequired();</a>
+<a name="ln1083">}</a>
+<a name="ln1084"> </a>
+<a name="ln1085">Result&lt;YBTransactionPtr&gt; YBTransaction::CreateRestartedTransaction() {</a>
+<a name="ln1086">  auto result = impl_-&gt;CreateSimilarTransaction();</a>
+<a name="ln1087">  RETURN_NOT_OK(impl_-&gt;FillRestartedTransaction(result-&gt;impl_.get()));</a>
+<a name="ln1088">  return result;</a>
+<a name="ln1089">}</a>
+<a name="ln1090"> </a>
+<a name="ln1091">Status YBTransaction::FillRestartedTransaction(const YBTransactionPtr&amp; dest) {</a>
+<a name="ln1092">  return impl_-&gt;FillRestartedTransaction(dest-&gt;impl_.get());</a>
+<a name="ln1093">}</a>
+<a name="ln1094"> </a>
+<a name="ln1095">void YBTransaction::PrepareChild(</a>
+<a name="ln1096">    ForceConsistentRead force_consistent_read, CoarseTimePoint deadline,</a>
+<a name="ln1097">    PrepareChildCallback callback) {</a>
+<a name="ln1098">  return impl_-&gt;PrepareChild(force_consistent_read, deadline, std::move(callback));</a>
+<a name="ln1099">}</a>
+<a name="ln1100"> </a>
+<a name="ln1101">std::future&lt;Result&lt;ChildTransactionDataPB&gt;&gt; YBTransaction::PrepareChildFuture(</a>
+<a name="ln1102">    ForceConsistentRead force_consistent_read, CoarseTimePoint deadline) {</a>
+<a name="ln1103">  return MakeFuture&lt;Result&lt;ChildTransactionDataPB&gt;&gt;(</a>
+<a name="ln1104">      [this, deadline, force_consistent_read](auto callback) {</a>
+<a name="ln1105">    impl_-&gt;PrepareChild(force_consistent_read, AdjustDeadline(deadline), std::move(callback));</a>
+<a name="ln1106">  });</a>
+<a name="ln1107">}</a>
+<a name="ln1108"> </a>
+<a name="ln1109">Result&lt;ChildTransactionResultPB&gt; YBTransaction::FinishChild() {</a>
+<a name="ln1110">  return impl_-&gt;FinishChild();</a>
+<a name="ln1111">}</a>
+<a name="ln1112"> </a>
+<a name="ln1113">std::shared_future&lt;TransactionMetadata&gt; YBTransaction::TEST_GetMetadata() const {</a>
+<a name="ln1114">  return impl_-&gt;TEST_GetMetadata();</a>
+<a name="ln1115">}</a>
+<a name="ln1116"> </a>
+<a name="ln1117">Status YBTransaction::ApplyChildResult(const ChildTransactionResultPB&amp; result) {</a>
+<a name="ln1118">  return impl_-&gt;ApplyChildResult(result);</a>
+<a name="ln1119">}</a>
+<a name="ln1120"> </a>
+<a name="ln1121">std::string YBTransaction::ToString() const {</a>
+<a name="ln1122">  return impl_-&gt;ToString();</a>
+<a name="ln1123">}</a>
+<a name="ln1124"> </a>
+<a name="ln1125">Result&lt;TransactionMetadata&gt; YBTransaction::Release() {</a>
+<a name="ln1126">  return impl_-&gt;Release();</a>
+<a name="ln1127">}</a>
+<a name="ln1128"> </a>
+<a name="ln1129">YBTransactionPtr YBTransaction::Take(</a>
+<a name="ln1130">    TransactionManager* manager, const TransactionMetadata&amp; metadata) {</a>
+<a name="ln1131">  auto result = std::make_shared&lt;YBTransaction&gt;(manager, metadata, PrivateOnlyTag());</a>
+<a name="ln1132">  result-&gt;impl_-&gt;StartHeartbeat();</a>
+<a name="ln1133">  return result;</a>
+<a name="ln1134">}</a>
+<a name="ln1135"> </a>
+<a name="ln1136">} // namespace client</a>
+<a name="ln1137">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="90"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="100"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="118"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="124"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="159"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="195"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="238"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="250"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="271"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="297"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="315"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="330"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="358"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="374"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="381"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="418"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="542"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="585"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="590"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="616"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="633"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="657"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="678"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="692"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="699"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="713"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="726"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="748"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="783"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="801"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="808"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="812"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="862"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="902"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

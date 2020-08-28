@@ -1,0 +1,243 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>scheduler.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/rpc/scheduler.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;boost/asio/steady_timer.hpp&gt;</a>
+<a name="ln19">#include &lt;boost/asio/strand.hpp&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;boost/multi_index_container.hpp&gt;</a>
+<a name="ln22">#include &lt;boost/multi_index/hashed_index.hpp&gt;</a>
+<a name="ln23">#include &lt;boost/multi_index/mem_fun.hpp&gt;</a>
+<a name="ln24">#include &lt;boost/multi_index/ordered_index.hpp&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;glog/logging.h&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/util/errno.h&quot;</a>
+<a name="ln29">#include &quot;yb/util/status.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31">using namespace std::placeholders;</a>
+<a name="ln32">using boost::multi_index::const_mem_fun;</a>
+<a name="ln33">using boost::multi_index::hashed_unique;</a>
+<a name="ln34">using boost::multi_index::ordered_non_unique;</a>
+<a name="ln35"> </a>
+<a name="ln36">namespace yb {</a>
+<a name="ln37">namespace rpc {</a>
+<a name="ln38"> </a>
+<a name="ln39">class Scheduler::Impl {</a>
+<a name="ln40"> public:</a>
+<a name="ln41">  explicit Impl(IoService* io_service)</a>
+<a name="ln42">      : io_service_(*io_service), strand_(*io_service), timer_(*io_service) {}</a>
+<a name="ln43"> </a>
+<a name="ln44">  ~Impl() {</a>
+<a name="ln45">    Shutdown();</a>
+<a name="ln46">    DCHECK_EQ(timer_counter_, 0);</a>
+<a name="ln47">    DCHECK(tasks_.empty());</a>
+<a name="ln48">  }</a>
+<a name="ln49"> </a>
+<a name="ln50">  void Abort(ScheduledTaskId task_id) {</a>
+<a name="ln51">    strand_.dispatch([this, task_id] {</a>
+<a name="ln52">      auto&amp; index = tasks_.get&lt;IdTag&gt;();</a>
+<a name="ln53">      auto it = index.find(task_id);</a>
+<a name="ln54">      if (it != index.end()) {</a>
+<a name="ln55">        io_service_.post([task = *it] { task-&gt;Run(STATUS(Aborted, &quot;Task aborted&quot;)); });</a>
+<a name="ln56">        index.erase(it);</a>
+<a name="ln57">      }</a>
+<a name="ln58">    });</a>
+<a name="ln59">  }</a>
+<a name="ln60"> </a>
+<a name="ln61">  void Shutdown() {</a>
+<a name="ln62">    bool old_value = false;</a>
+<a name="ln63">    if (closing_.compare_exchange_strong(old_value, true)) {</a>
+<a name="ln64">      strand_.dispatch([this] {</a>
+<a name="ln65">        boost::system::error_code ec;</a>
+<a name="ln66">        timer_.cancel(ec);</a>
+<a name="ln67">        LOG_IF(ERROR, ec) &lt;&lt; &quot;Failed to cancel timer: &quot; &lt;&lt; ec.message();</a>
+<a name="ln68"> </a>
+<a name="ln69">        auto status = STATUS(</a>
+<a name="ln70">            ServiceUnavailable, &quot;Scheduler is shutting down&quot;, &quot;&quot; /* msg2 */, Errno(ESHUTDOWN));</a>
+<a name="ln71">        // Abort all scheduled tasks. It is ok to run task earlier than it was scheduled because</a>
+<a name="ln72">        // we pass error status to it.</a>
+<a name="ln73">        for (auto task : tasks_) {</a>
+<a name="ln74">          io_service_.post([task, status] { task-&gt;Run(status); });</a>
+<a name="ln75">        }</a>
+<a name="ln76">        tasks_.clear();</a>
+<a name="ln77">      });</a>
+<a name="ln78">    }</a>
+<a name="ln79">  }</a>
+<a name="ln80"> </a>
+<a name="ln81">  void DoSchedule(std::shared_ptr&lt;ScheduledTaskBase&gt; task) {</a>
+<a name="ln82">    strand_.dispatch([this, task] {</a>
+<a name="ln83">      if (closing_.load(std::memory_order_acquire)) {</a>
+<a name="ln84">        io_service_.post([task] {</a>
+<a name="ln85">          task-&gt;Run(STATUS(Aborted, &quot;Scheduler shutdown&quot;, &quot;&quot; /* msg2 */, Errno(ESHUTDOWN)));</a>
+<a name="ln86">        });</a>
+<a name="ln87">        return;</a>
+<a name="ln88">      }</a>
+<a name="ln89"> </a>
+<a name="ln90">      auto pair = tasks_.insert(task);</a>
+<a name="ln91">      CHECK(pair.second);</a>
+<a name="ln92">      if (pair.first == tasks_.begin()) {</a>
+<a name="ln93">        StartTimer();</a>
+<a name="ln94">      }</a>
+<a name="ln95">    });</a>
+<a name="ln96">  }</a>
+<a name="ln97"> </a>
+<a name="ln98">  ScheduledTaskId NextId() {</a>
+<a name="ln99">    return ++id_;</a>
+<a name="ln100">  }</a>
+<a name="ln101"> </a>
+<a name="ln102">  IoService&amp; io_service() {</a>
+<a name="ln103">    return io_service_;</a>
+<a name="ln104">  }</a>
+<a name="ln105"> </a>
+<a name="ln106"> private:</a>
+<a name="ln107">  void StartTimer() {</a>
+<a name="ln108">    DCHECK(strand_.running_in_this_thread());</a>
+<a name="ln109">    DCHECK(!tasks_.empty());</a>
+<a name="ln110"> </a>
+<a name="ln111">    boost::system::error_code ec;</a>
+<a name="ln112">    timer_.expires_at((*tasks_.begin())-&gt;time(), ec);</a>
+<a name="ln113">    LOG_IF(ERROR, ec) &lt;&lt; &quot;Reschedule timer failed: &quot; &lt;&lt; ec.message();</a>
+<a name="ln114">    ++timer_counter_;</a>
+<a name="ln115">    timer_.async_wait(strand_.wrap(std::bind(&amp;Impl::HandleTimer, this, _1)));</a>
+<a name="ln116">  }</a>
+<a name="ln117"> </a>
+<a name="ln118">  void HandleTimer(const boost::system::error_code&amp; ec) {</a>
+<a name="ln119">    DCHECK(strand_.running_in_this_thread());</a>
+<a name="ln120">    --timer_counter_;</a>
+<a name="ln121"> </a>
+<a name="ln122">    if (ec) {</a>
+<a name="ln123">      LOG_IF(ERROR, ec != boost::asio::error::operation_aborted) &lt;&lt; &quot;Wait failed: &quot; &lt;&lt; ec.message();</a>
+<a name="ln124">      return;</a>
+<a name="ln125">    }</a>
+<a name="ln126">    if (closing_.load(std::memory_order_acquire)) {</a>
+<a name="ln127">      return;</a>
+<a name="ln128">    }</a>
+<a name="ln129"> </a>
+<a name="ln130">    auto now = std::chrono::steady_clock::now();</a>
+<a name="ln131">    while (!tasks_.empty() &amp;&amp; (*tasks_.begin())-&gt;time() &lt;= now) {</a>
+<a name="ln132">      io_service_.post([task = *tasks_.begin()] { task-&gt;Run(Status::OK()); });</a>
+<a name="ln133">      tasks_.erase(tasks_.begin());</a>
+<a name="ln134">    }</a>
+<a name="ln135"> </a>
+<a name="ln136">    if (!tasks_.empty()) {</a>
+<a name="ln137">      StartTimer();</a>
+<a name="ln138">    }</a>
+<a name="ln139">  }</a>
+<a name="ln140"> </a>
+<a name="ln141">  class IdTag;</a>
+<a name="ln142"> </a>
+<a name="ln143">  typedef boost::multi_index_container&lt;</a>
+<a name="ln144">      std::shared_ptr&lt;ScheduledTaskBase&gt;,</a>
+<a name="ln145">      boost::multi_index::indexed_by&lt;</a>
+<a name="ln146">          ordered_non_unique&lt;</a>
+<a name="ln147">              const_mem_fun&lt;ScheduledTaskBase, SteadyTimePoint, &amp;ScheduledTaskBase::time&gt;</a>
+<a name="ln148">          &gt;,</a>
+<a name="ln149">          hashed_unique&lt;</a>
+<a name="ln150">              boost::multi_index::tag&lt;IdTag&gt;,</a>
+<a name="ln151">              const_mem_fun&lt;ScheduledTaskBase, ScheduledTaskId, &amp;ScheduledTaskBase::id&gt;</a>
+<a name="ln152">          &gt;</a>
+<a name="ln153">      &gt;</a>
+<a name="ln154">  &gt; Tasks;</a>
+<a name="ln155"> </a>
+<a name="ln156">  IoService&amp; io_service_;</a>
+<a name="ln157">  std::atomic&lt;ScheduledTaskId&gt; id_ = {0};</a>
+<a name="ln158">  Tasks tasks_;</a>
+<a name="ln159">  // Strand that protects tasks_ and timer_ fields.</a>
+<a name="ln160">  boost::asio::io_service::strand strand_;</a>
+<a name="ln161">  boost::asio::steady_timer timer_;</a>
+<a name="ln162">  int timer_counter_ = 0;</a>
+<a name="ln163">  std::atomic&lt;bool&gt; closing_ = {false};</a>
+<a name="ln164">};</a>
+<a name="ln165"> </a>
+<a name="ln166">Scheduler::Scheduler(IoService* io_service) : impl_(new Impl(io_service)) {}</a>
+<a name="ln167">Scheduler::~Scheduler() {}</a>
+<a name="ln168"> </a>
+<a name="ln169">void Scheduler::Shutdown() {</a>
+<a name="ln170">  impl_-&gt;Shutdown();</a>
+<a name="ln171">}</a>
+<a name="ln172"> </a>
+<a name="ln173">void Scheduler::Abort(ScheduledTaskId task_id) {</a>
+<a name="ln174">  impl_-&gt;Abort(task_id);</a>
+<a name="ln175">}</a>
+<a name="ln176"> </a>
+<a name="ln177">void Scheduler::DoSchedule(std::shared_ptr&lt;ScheduledTaskBase&gt; task) {</a>
+<a name="ln178">  impl_-&gt;DoSchedule(std::move(task));</a>
+<a name="ln179">}</a>
+<a name="ln180"> </a>
+<a name="ln181">ScheduledTaskId Scheduler::NextId() {</a>
+<a name="ln182">  return impl_-&gt;NextId();</a>
+<a name="ln183">}</a>
+<a name="ln184"> </a>
+<a name="ln185">IoService&amp; Scheduler::io_service() {</a>
+<a name="ln186">  return impl_-&gt;io_service();</a>
+<a name="ln187">}</a>
+<a name="ln188"> </a>
+<a name="ln189">} // namespace rpc</a>
+<a name="ln190">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="47"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="67"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="91"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="108"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="109"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="113"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="119"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="123"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

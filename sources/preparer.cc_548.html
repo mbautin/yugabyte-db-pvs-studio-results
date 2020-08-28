@@ -1,0 +1,409 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>preparer.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;atomic&gt;</a>
+<a name="ln15">#include &lt;condition_variable&gt;</a>
+<a name="ln16">#include &lt;memory&gt;</a>
+<a name="ln17">#include &lt;mutex&gt;</a>
+<a name="ln18">#include &lt;thread&gt;</a>
+<a name="ln19">#include &lt;vector&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/consensus/consensus.h&quot;</a>
+<a name="ln24">#include &quot;yb/gutil/macros.h&quot;</a>
+<a name="ln25">#include &quot;yb/tablet/preparer.h&quot;</a>
+<a name="ln26">#include &quot;yb/tablet/operations/operation_driver.h&quot;</a>
+<a name="ln27">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln28">#include &quot;yb/util/threadpool.h&quot;</a>
+<a name="ln29">#include &quot;yb/util/lockfree.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31">DEFINE_int32(max_group_replicate_batch_size, 16,</a>
+<a name="ln32">             &quot;Maximum number of operations to submit to consensus for replication in a batch.&quot;);</a>
+<a name="ln33"> </a>
+<a name="ln34">using namespace std::literals;</a>
+<a name="ln35">using std::vector;</a>
+<a name="ln36"> </a>
+<a name="ln37">namespace yb {</a>
+<a name="ln38">class ThreadPool;</a>
+<a name="ln39">class ThreadPoolToken;</a>
+<a name="ln40"> </a>
+<a name="ln41">namespace tablet {</a>
+<a name="ln42"> </a>
+<a name="ln43">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln44">// PreparerImpl</a>
+<a name="ln45"> </a>
+<a name="ln46">class PreparerImpl {</a>
+<a name="ln47"> public:</a>
+<a name="ln48">  explicit PreparerImpl(consensus::Consensus* consensus, ThreadPool* tablet_prepare_pool);</a>
+<a name="ln49">  ~PreparerImpl();</a>
+<a name="ln50">  CHECKED_STATUS Start();</a>
+<a name="ln51">  void Stop();</a>
+<a name="ln52"> </a>
+<a name="ln53">  CHECKED_STATUS Submit(OperationDriver* operation_driver);</a>
+<a name="ln54"> </a>
+<a name="ln55">  ThreadPoolToken* PoolToken() {</a>
+<a name="ln56">    return tablet_prepare_pool_token_.get();</a>
+<a name="ln57">  }</a>
+<a name="ln58"> </a>
+<a name="ln59"> private:</a>
+<a name="ln60">  using OperationDrivers = std::vector&lt;OperationDriver*&gt;;</a>
+<a name="ln61"> </a>
+<a name="ln62">  consensus::Consensus* const consensus_;</a>
+<a name="ln63"> </a>
+<a name="ln64">  // We set this to true to tell the Run function to return. No new tasks will be accepted, but</a>
+<a name="ln65">  // existing tasks will still be processed.</a>
+<a name="ln66">  std::atomic&lt;bool&gt; stop_requested_{false};</a>
+<a name="ln67"> </a>
+<a name="ln68">  // If true, a task is running for this tablet already.</a>
+<a name="ln69">  // If false, no tasks are running for this tablet,</a>
+<a name="ln70">  // and we can submit a task to the thread pool token.</a>
+<a name="ln71">  std::atomic&lt;bool&gt; running_{false};</a>
+<a name="ln72"> </a>
+<a name="ln73">  // This is set to true immediately before the thread exits.</a>
+<a name="ln74">  std::atomic&lt;bool&gt; stopped_{false};</a>
+<a name="ln75"> </a>
+<a name="ln76">  // Number or active tasks is incremented before task added to queue and decremented after</a>
+<a name="ln77">  // it was popped.</a>
+<a name="ln78">  // So it always greater than or equal to number of entries in queue.</a>
+<a name="ln79">  std::atomic&lt;int64_t&gt; active_tasks_{0};</a>
+<a name="ln80"> </a>
+<a name="ln81">  MPSCQueue&lt;OperationDriver&gt; queue_;</a>
+<a name="ln82"> </a>
+<a name="ln83">  // This mutex/condition combination is used in Stop() in case multiple threads are calling that</a>
+<a name="ln84">  // function concurrently. One of them will ask the prepare thread to stop and wait for it, and</a>
+<a name="ln85">  // then will notify other threads that have called Stop().</a>
+<a name="ln86">  std::mutex stop_mtx_;</a>
+<a name="ln87">  std::condition_variable stop_cond_;</a>
+<a name="ln88"> </a>
+<a name="ln89">  OperationDrivers leader_side_batch_;</a>
+<a name="ln90"> </a>
+<a name="ln91">  std::unique_ptr&lt;ThreadPoolToken&gt; tablet_prepare_pool_token_;</a>
+<a name="ln92"> </a>
+<a name="ln93">  // A temporary buffer of rounds to replicate, used to reduce reallocation.</a>
+<a name="ln94">  consensus::ConsensusRounds rounds_to_replicate_;</a>
+<a name="ln95"> </a>
+<a name="ln96">  void Run();</a>
+<a name="ln97">  void ProcessItem(OperationDriver* item);</a>
+<a name="ln98"> </a>
+<a name="ln99">  void ProcessAndClearLeaderSideBatch();</a>
+<a name="ln100"> </a>
+<a name="ln101">  // A wrapper around ProcessAndClearLeaderSideBatch that assumes we are currently holding the</a>
+<a name="ln102">  // mutex.</a>
+<a name="ln103"> </a>
+<a name="ln104">  void ReplicateSubBatch(OperationDrivers::iterator begin,</a>
+<a name="ln105">                         OperationDrivers::iterator end);</a>
+<a name="ln106">};</a>
+<a name="ln107"> </a>
+<a name="ln108">PreparerImpl::PreparerImpl(consensus::Consensus* consensus, ThreadPool* tablet_prepare_pool)</a>
+<a name="ln109">    : consensus_(consensus),</a>
+<a name="ln110">      tablet_prepare_pool_token_(tablet_prepare_pool</a>
+<a name="ln111">                                     -&gt;NewToken(ThreadPool::ExecutionMode::SERIAL)) {</a>
+<a name="ln112">}</a>
+<a name="ln113"> </a>
+<a name="ln114">PreparerImpl::~PreparerImpl() {</a>
+<a name="ln115">  Stop();</a>
+<a name="ln116">}</a>
+<a name="ln117"> </a>
+<a name="ln118">Status PreparerImpl::Start() {</a>
+<a name="ln119">  return Status::OK();</a>
+<a name="ln120">}</a>
+<a name="ln121"> </a>
+<a name="ln122">void PreparerImpl::Stop() {</a>
+<a name="ln123">  if (stopped_.load(std::memory_order_acquire)) {</a>
+<a name="ln124">    return;</a>
+<a name="ln125">  }</a>
+<a name="ln126">  stop_requested_ = true;</a>
+<a name="ln127">  {</a>
+<a name="ln128">    std::unique_lock&lt;std::mutex&gt; stop_lock(stop_mtx_);</a>
+<a name="ln129">    stop_cond_.wait(stop_lock, [this] {</a>
+<a name="ln130">      return !running_.load(std::memory_order_acquire) &amp;&amp;</a>
+<a name="ln131">             active_tasks_.load(std::memory_order_acquire) == 0;</a>
+<a name="ln132">    });</a>
+<a name="ln133">  }</a>
+<a name="ln134">  stopped_.store(true, std::memory_order_release);</a>
+<a name="ln135">}</a>
+<a name="ln136"> </a>
+<a name="ln137">Status PreparerImpl::Submit(OperationDriver* operation_driver) {</a>
+<a name="ln138">  if (stop_requested_.load(std::memory_order_acquire)) {</a>
+<a name="ln139">    return STATUS(IllegalState, &quot;Tablet is shutting down&quot;);</a>
+<a name="ln140">  }</a>
+<a name="ln141"> </a>
+<a name="ln142">  if (!operation_driver-&gt;is_leader_side()) {</a>
+<a name="ln143">    while (active_tasks_.load(std::memory_order_acquire) != 0) {</a>
+<a name="ln144">      YB_LOG_EVERY_N_SECS(WARNING, 1)</a>
+<a name="ln145">          &lt;&lt; &quot;Waiting for active tasks to become zero: &quot;</a>
+<a name="ln146">          &lt;&lt; active_tasks_.load(std::memory_order_acquire);</a>
+<a name="ln147">      // It should be very rare case, so could do busy wait.</a>
+<a name="ln148">      std::this_thread::sleep_for(1ms);</a>
+<a name="ln149">    }</a>
+<a name="ln150">    operation_driver-&gt;PrepareAndStartTask();</a>
+<a name="ln151">  } else {</a>
+<a name="ln152">    active_tasks_.fetch_add(1, std::memory_order_release);</a>
+<a name="ln153">    queue_.Push(operation_driver);</a>
+<a name="ln154">  }</a>
+<a name="ln155"> </a>
+<a name="ln156">  auto expected = false;</a>
+<a name="ln157">  if (!running_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {</a>
+<a name="ln158">    // running_ was already true, so we are not creating a task to process operations.</a>
+<a name="ln159">    return Status::OK();</a>
+<a name="ln160">  }</a>
+<a name="ln161">  // We flipped running_ from 0 to 1. The previously running thread could go back to doing another</a>
+<a name="ln162">  // iteration, but in that case since we are submitting to a token of a thread pool, only one</a>
+<a name="ln163">  // such thread will be running, the other will be in the queue.</a>
+<a name="ln164">  return tablet_prepare_pool_token_-&gt;SubmitFunc(std::bind(&amp;PreparerImpl::Run, this));</a>
+<a name="ln165">}</a>
+<a name="ln166"> </a>
+<a name="ln167">void PreparerImpl::Run() {</a>
+<a name="ln168">  VLOG(2) &lt;&lt; &quot;Starting prepare task:&quot; &lt;&lt; this;</a>
+<a name="ln169">  for (;;) {</a>
+<a name="ln170">    while (OperationDriver *item = queue_.Pop()) {</a>
+<a name="ln171">      active_tasks_.fetch_sub(1, std::memory_order_release);</a>
+<a name="ln172">      ProcessItem(item);</a>
+<a name="ln173">    }</a>
+<a name="ln174">    ProcessAndClearLeaderSideBatch();</a>
+<a name="ln175">    std::unique_lock&lt;std::mutex&gt; stop_lock(stop_mtx_);</a>
+<a name="ln176">    running_.store(false, std::memory_order_release);</a>
+<a name="ln177">    // Check whether tasks we added while we were setting running to false.</a>
+<a name="ln178">    if (active_tasks_.load(std::memory_order_acquire)) {</a>
+<a name="ln179">      // Got more operations, try stay in the loop.</a>
+<a name="ln180">      bool expected = false;</a>
+<a name="ln181">      if (running_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {</a>
+<a name="ln182">        continue;</a>
+<a name="ln183">      }</a>
+<a name="ln184">      // If someone else has flipped running_ to true, we can safely exit this function because</a>
+<a name="ln185">      // another task is already submitted to the same token.</a>
+<a name="ln186">    }</a>
+<a name="ln187">    if (stop_requested_.load(std::memory_order_acquire)) {</a>
+<a name="ln188">      VLOG(2) &lt;&lt; &quot;Prepare task's Run() function is returning because stop is requested.&quot;;</a>
+<a name="ln189">      stop_cond_.notify_all();</a>
+<a name="ln190">    }</a>
+<a name="ln191">    VLOG(2) &lt;&lt; &quot;Returning from prepare task after inactivity: &quot; &lt;&lt; this;</a>
+<a name="ln192">    return;</a>
+<a name="ln193">  }</a>
+<a name="ln194">}</a>
+<a name="ln195"> </a>
+<a name="ln196">namespace {</a>
+<a name="ln197"> </a>
+<a name="ln198">bool ShouldApplySeparately(OperationType operation_type) {</a>
+<a name="ln199">  switch (operation_type) {</a>
+<a name="ln200">    // For certain operations types we have to apply them in a batch of their own.</a>
+<a name="ln201">    // E.g. ChangeMetadataOperation::Prepare calls Tablet::CreatePreparedChangeMetadata, which</a>
+<a name="ln202">    // acquires the schema lock. Because of this, we must not attempt to process two</a>
+<a name="ln203">    // ChangeMetadataOperations in one batch, otherwise we'll deadlock.</a>
+<a name="ln204">    //</a>
+<a name="ln205">    // Also, for infrequently occuring operations batching has little performance benefit in</a>
+<a name="ln206">    // general.</a>
+<a name="ln207">    case OperationType::kChangeMetadata: FALLTHROUGH_INTENDED;</a>
+<a name="ln208">    case OperationType::kSnapshot: FALLTHROUGH_INTENDED;</a>
+<a name="ln209">    case OperationType::kTruncate: FALLTHROUGH_INTENDED;</a>
+<a name="ln210">    case OperationType::kSplit: FALLTHROUGH_INTENDED;</a>
+<a name="ln211">    case OperationType::kEmpty: FALLTHROUGH_INTENDED;</a>
+<a name="ln212">    case OperationType::kHistoryCutoff:</a>
+<a name="ln213">      return true;</a>
+<a name="ln214"> </a>
+<a name="ln215">    case OperationType::kWrite: FALLTHROUGH_INTENDED;</a>
+<a name="ln216">    case OperationType::kUpdateTransaction:</a>
+<a name="ln217">      return false;</a>
+<a name="ln218">  }</a>
+<a name="ln219">  FATAL_INVALID_ENUM_VALUE(OperationType, operation_type);</a>
+<a name="ln220">}</a>
+<a name="ln221"> </a>
+<a name="ln222">}  // anonymous namespace</a>
+<a name="ln223"> </a>
+<a name="ln224">void PreparerImpl::ProcessItem(OperationDriver* item) {</a>
+<a name="ln225">  CHECK_NOTNULL(item);</a>
+<a name="ln226"> </a>
+<a name="ln227">  LOG_IF(DFATAL, !item-&gt;is_leader_side()) &lt;&lt; &quot;Processing follower-side item&quot;;</a>
+<a name="ln228"> </a>
+<a name="ln229">  auto operation_type = item-&gt;operation_type();</a>
+<a name="ln230"> </a>
+<a name="ln231">  const bool apply_separately = ShouldApplySeparately(operation_type);</a>
+<a name="ln232">  const int64_t bound_term = apply_separately ? -1 : item-&gt;consensus_round()-&gt;bound_term();</a>
+<a name="ln233"> </a>
+<a name="ln234">  // Don't add more than the max number of operations to a batch, and also don't add</a>
+<a name="ln235">  // operations bound to different terms, so as not to fail unrelated operations</a>
+<a name="ln236">  // unnecessarily in case of a bound term mismatch.</a>
+<a name="ln237">  if (leader_side_batch_.size() &gt;= FLAGS_max_group_replicate_batch_size ||</a>
+<a name="ln238">      (!leader_side_batch_.empty() &amp;&amp;</a>
+<a name="ln239">          bound_term != leader_side_batch_.back()-&gt;consensus_round()-&gt;bound_term())) {</a>
+<a name="ln240">    ProcessAndClearLeaderSideBatch();</a>
+<a name="ln241">  }</a>
+<a name="ln242">  leader_side_batch_.push_back(item);</a>
+<a name="ln243">  if (apply_separately) {</a>
+<a name="ln244">    ProcessAndClearLeaderSideBatch();</a>
+<a name="ln245">  }</a>
+<a name="ln246">}</a>
+<a name="ln247"> </a>
+<a name="ln248">void PreparerImpl::ProcessAndClearLeaderSideBatch() {</a>
+<a name="ln249">  if (leader_side_batch_.empty()) {</a>
+<a name="ln250">    return;</a>
+<a name="ln251">  }</a>
+<a name="ln252"> </a>
+<a name="ln253">  VLOG(2) &lt;&lt; &quot;Preparing a batch of &quot; &lt;&lt; leader_side_batch_.size() &lt;&lt; &quot; leader-side operations&quot;;</a>
+<a name="ln254"> </a>
+<a name="ln255">  auto iter = leader_side_batch_.begin();</a>
+<a name="ln256">  auto replication_subbatch_begin = iter;</a>
+<a name="ln257">  auto replication_subbatch_end = iter;</a>
+<a name="ln258"> </a>
+<a name="ln259">  // PrepareAndStart does not call Consensus::Replicate anymore as of 07/07/2017, and it is our</a>
+<a name="ln260">  // responsibility to do so in case of success. We call Consensus::ReplicateBatch for batches</a>
+<a name="ln261">  // of consecutive successfully prepared operations.</a>
+<a name="ln262"> </a>
+<a name="ln263">  while (iter != leader_side_batch_.end()) {</a>
+<a name="ln264">    auto* operation_driver = *iter;</a>
+<a name="ln265"> </a>
+<a name="ln266">    Status s = operation_driver-&gt;PrepareAndStart();</a>
+<a name="ln267"> </a>
+<a name="ln268">    if (PREDICT_TRUE(s.ok())) {</a>
+<a name="ln269">      replication_subbatch_end = ++iter;</a>
+<a name="ln270">    } else {</a>
+<a name="ln271">      ReplicateSubBatch(replication_subbatch_begin, replication_subbatch_end);</a>
+<a name="ln272"> </a>
+<a name="ln273">      // Handle failure for this operation itself.</a>
+<a name="ln274">      operation_driver-&gt;HandleFailure(s);</a>
+<a name="ln275"> </a>
+<a name="ln276">      // Now we'll start accumulating a new batch.</a>
+<a name="ln277">      replication_subbatch_begin = replication_subbatch_end = ++iter;</a>
+<a name="ln278">    }</a>
+<a name="ln279">  }</a>
+<a name="ln280"> </a>
+<a name="ln281">  // Replicate the remaining batch. No-op for an empty batch.</a>
+<a name="ln282">  ReplicateSubBatch(replication_subbatch_begin, replication_subbatch_end);</a>
+<a name="ln283"> </a>
+<a name="ln284">  leader_side_batch_.clear();</a>
+<a name="ln285">}</a>
+<a name="ln286"> </a>
+<a name="ln287">void PreparerImpl::ReplicateSubBatch(</a>
+<a name="ln288">    OperationDrivers::iterator batch_begin,</a>
+<a name="ln289">    OperationDrivers::iterator batch_end) {</a>
+<a name="ln290">  DCHECK_GE(std::distance(batch_begin, batch_end), 0);</a>
+<a name="ln291">  if (batch_begin == batch_end) {</a>
+<a name="ln292">    return;</a>
+<a name="ln293">  }</a>
+<a name="ln294">  VLOG(2) &lt;&lt; &quot;Replicating a sub-batch of &quot; &lt;&lt; std::distance(batch_begin, batch_end)</a>
+<a name="ln295">          &lt;&lt; &quot; leader-side operations&quot;;</a>
+<a name="ln296">  if (VLOG_IS_ON(3)) {</a>
+<a name="ln297">    for (auto batch_iter = batch_begin; batch_iter != batch_end; ++batch_iter) {</a>
+<a name="ln298">      VLOG(3) &lt;&lt; &quot;Leader-side operation to be replicated: &quot; &lt;&lt; (*batch_iter)-&gt;ToString();</a>
+<a name="ln299">    }</a>
+<a name="ln300">  }</a>
+<a name="ln301"> </a>
+<a name="ln302">  rounds_to_replicate_.clear();</a>
+<a name="ln303">  rounds_to_replicate_.reserve(std::distance(batch_begin, batch_end));</a>
+<a name="ln304">  for (auto batch_iter = batch_begin; batch_iter != batch_end; ++batch_iter) {</a>
+<a name="ln305">    DCHECK_ONLY_NOTNULL(*batch_iter);</a>
+<a name="ln306">    DCHECK_ONLY_NOTNULL((*batch_iter)-&gt;consensus_round());</a>
+<a name="ln307">    rounds_to_replicate_.push_back((*batch_iter)-&gt;consensus_round());</a>
+<a name="ln308">  }</a>
+<a name="ln309"> </a>
+<a name="ln310">  const Status s = consensus_-&gt;ReplicateBatch(&amp;rounds_to_replicate_);</a>
+<a name="ln311">  rounds_to_replicate_.clear();</a>
+<a name="ln312"> </a>
+<a name="ln313">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln314">    VLOG(1) &lt;&lt; &quot;ReplicateBatch failed with status &quot; &lt;&lt; s.ToString()</a>
+<a name="ln315">            &lt;&lt; &quot;, treating all &quot; &lt;&lt; std::distance(batch_begin, batch_end) &lt;&lt; &quot; operations as &quot;</a>
+<a name="ln316">            &lt;&lt; &quot;failed with that status&quot;;</a>
+<a name="ln317">    // Treat all the operations in the batch as failed.</a>
+<a name="ln318">    for (auto batch_iter = batch_begin; batch_iter != batch_end; ++batch_iter) {</a>
+<a name="ln319">      (*batch_iter)-&gt;ReplicationFailed(s);</a>
+<a name="ln320">    }</a>
+<a name="ln321">  }</a>
+<a name="ln322">}</a>
+<a name="ln323"> </a>
+<a name="ln324">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln325">// Preparer</a>
+<a name="ln326"> </a>
+<a name="ln327">Preparer::Preparer(consensus::Consensus* consensus, ThreadPool* tablet_prepare_thread)</a>
+<a name="ln328">    : impl_(std::make_unique&lt;PreparerImpl&gt;(consensus, tablet_prepare_thread)) {</a>
+<a name="ln329">}</a>
+<a name="ln330"> </a>
+<a name="ln331">Preparer::~Preparer() = default;</a>
+<a name="ln332"> </a>
+<a name="ln333">Status Preparer::Start() {</a>
+<a name="ln334">  VLOG(1) &lt;&lt; &quot;Starting the preparer&quot;;</a>
+<a name="ln335">  return impl_-&gt;Start();</a>
+<a name="ln336">}</a>
+<a name="ln337"> </a>
+<a name="ln338">void Preparer::Stop() {</a>
+<a name="ln339">  VLOG(1) &lt;&lt; &quot;Stopping the preparer&quot;;</a>
+<a name="ln340">  impl_-&gt;Stop();</a>
+<a name="ln341">  VLOG(1) &lt;&lt; &quot;The preparer has stopped&quot;;</a>
+<a name="ln342">}</a>
+<a name="ln343"> </a>
+<a name="ln344">Status Preparer::Submit(OperationDriver* operation_driver) {</a>
+<a name="ln345">  return impl_-&gt;Submit(operation_driver);</a>
+<a name="ln346">}</a>
+<a name="ln347"> </a>
+<a name="ln348">ThreadPoolToken* Preparer::PoolToken() {</a>
+<a name="ln349">  return impl_-&gt;PoolToken();</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352">}  // namespace tablet</a>
+<a name="ln353">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="168"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="188"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="191"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="227"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="253"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="294"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="298"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="314"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="334"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="339"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="341"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,811 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>write_batch_with_index.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20"> </a>
+<a name="ln21">#ifndef ROCKSDB_LITE</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/rocksdb/utilities/write_batch_with_index.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &lt;limits&gt;</a>
+<a name="ln26">#include &lt;memory&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/rocksdb/db/column_family.h&quot;</a>
+<a name="ln29">#include &quot;yb/rocksdb/db/merge_context.h&quot;</a>
+<a name="ln30">#include &quot;yb/rocksdb/db/merge_helper.h&quot;</a>
+<a name="ln31">#include &quot;yb/rocksdb/db/skiplist.h&quot;</a>
+<a name="ln32">#include &quot;yb/rocksdb/comparator.h&quot;</a>
+<a name="ln33">#include &quot;yb/rocksdb/iterator.h&quot;</a>
+<a name="ln34">#include &quot;yb/rocksdb/util/arena.h&quot;</a>
+<a name="ln35">#include &quot;yb/rocksdb/utilities/write_batch_with_index/write_batch_with_index_internal.h&quot;</a>
+<a name="ln36"> </a>
+<a name="ln37">namespace rocksdb {</a>
+<a name="ln38"> </a>
+<a name="ln39">// when direction == forward</a>
+<a name="ln40">// * current_at_base_ &lt;=&gt; base_iterator &gt; delta_iterator</a>
+<a name="ln41">// when direction == backwards</a>
+<a name="ln42">// * current_at_base_ &lt;=&gt; base_iterator &lt; delta_iterator</a>
+<a name="ln43">// always:</a>
+<a name="ln44">// * equal_keys_ &lt;=&gt; base_iterator == delta_iterator</a>
+<a name="ln45">class BaseDeltaIterator : public Iterator {</a>
+<a name="ln46"> public:</a>
+<a name="ln47">  BaseDeltaIterator(Iterator* base_iterator, WBWIIterator* delta_iterator,</a>
+<a name="ln48">                    const Comparator* comparator)</a>
+<a name="ln49">      : forward_(true),</a>
+<a name="ln50">        current_at_base_(true),</a>
+<a name="ln51">        equal_keys_(false),</a>
+<a name="ln52">        status_(Status::OK()),</a>
+<a name="ln53">        base_iterator_(base_iterator),</a>
+<a name="ln54">        delta_iterator_(delta_iterator),</a>
+<a name="ln55">        comparator_(comparator) {}</a>
+<a name="ln56"> </a>
+<a name="ln57">  virtual ~BaseDeltaIterator() {}</a>
+<a name="ln58"> </a>
+<a name="ln59">  bool Valid() const override {</a>
+<a name="ln60">    return current_at_base_ ? BaseValid() : DeltaValid();</a>
+<a name="ln61">  }</a>
+<a name="ln62"> </a>
+<a name="ln63">  void SeekToFirst() override {</a>
+<a name="ln64">    forward_ = true;</a>
+<a name="ln65">    base_iterator_-&gt;SeekToFirst();</a>
+<a name="ln66">    delta_iterator_-&gt;SeekToFirst();</a>
+<a name="ln67">    UpdateCurrent();</a>
+<a name="ln68">  }</a>
+<a name="ln69"> </a>
+<a name="ln70">  void SeekToLast() override {</a>
+<a name="ln71">    forward_ = false;</a>
+<a name="ln72">    base_iterator_-&gt;SeekToLast();</a>
+<a name="ln73">    delta_iterator_-&gt;SeekToLast();</a>
+<a name="ln74">    UpdateCurrent();</a>
+<a name="ln75">  }</a>
+<a name="ln76"> </a>
+<a name="ln77">  void Seek(const Slice&amp; k) override {</a>
+<a name="ln78">    forward_ = true;</a>
+<a name="ln79">    base_iterator_-&gt;Seek(k);</a>
+<a name="ln80">    delta_iterator_-&gt;Seek(k);</a>
+<a name="ln81">    UpdateCurrent();</a>
+<a name="ln82">  }</a>
+<a name="ln83"> </a>
+<a name="ln84">  void Next() override {</a>
+<a name="ln85">    if (!Valid()) {</a>
+<a name="ln86">      status_ = STATUS(NotSupported, &quot;Next() on invalid iterator&quot;);</a>
+<a name="ln87">    }</a>
+<a name="ln88"> </a>
+<a name="ln89">    if (!forward_) {</a>
+<a name="ln90">      // Need to change direction</a>
+<a name="ln91">      // if our direction was backward and we're not equal, we have two states:</a>
+<a name="ln92">      // * both iterators are valid: we're already in a good state (current</a>
+<a name="ln93">      // shows to smaller)</a>
+<a name="ln94">      // * only one iterator is valid: we need to advance that iterator</a>
+<a name="ln95">      forward_ = true;</a>
+<a name="ln96">      equal_keys_ = false;</a>
+<a name="ln97">      if (!BaseValid()) {</a>
+<a name="ln98">        assert(DeltaValid());</a>
+<a name="ln99">        base_iterator_-&gt;SeekToFirst();</a>
+<a name="ln100">      } else if (!DeltaValid()) {</a>
+<a name="ln101">        delta_iterator_-&gt;SeekToFirst();</a>
+<a name="ln102">      } else if (current_at_base_) {</a>
+<a name="ln103">        // Change delta from larger than base to smaller</a>
+<a name="ln104">        AdvanceDelta();</a>
+<a name="ln105">      } else {</a>
+<a name="ln106">        // Change base from larger than delta to smaller</a>
+<a name="ln107">        AdvanceBase();</a>
+<a name="ln108">      }</a>
+<a name="ln109">      if (DeltaValid() &amp;&amp; BaseValid()) {</a>
+<a name="ln110">        if (comparator_-&gt;Equal(delta_iterator_-&gt;Entry().key,</a>
+<a name="ln111">                               base_iterator_-&gt;key())) {</a>
+<a name="ln112">          equal_keys_ = true;</a>
+<a name="ln113">        }</a>
+<a name="ln114">      }</a>
+<a name="ln115">    }</a>
+<a name="ln116">    Advance();</a>
+<a name="ln117">  }</a>
+<a name="ln118"> </a>
+<a name="ln119">  void Prev() override {</a>
+<a name="ln120">    if (!Valid()) {</a>
+<a name="ln121">      status_ = STATUS(NotSupported, &quot;Prev() on invalid iterator&quot;);</a>
+<a name="ln122">    }</a>
+<a name="ln123"> </a>
+<a name="ln124">    if (forward_) {</a>
+<a name="ln125">      // Need to change direction</a>
+<a name="ln126">      // if our direction was backward and we're not equal, we have two states:</a>
+<a name="ln127">      // * both iterators are valid: we're already in a good state (current</a>
+<a name="ln128">      // shows to smaller)</a>
+<a name="ln129">      // * only one iterator is valid: we need to advance that iterator</a>
+<a name="ln130">      forward_ = false;</a>
+<a name="ln131">      equal_keys_ = false;</a>
+<a name="ln132">      if (!BaseValid()) {</a>
+<a name="ln133">        assert(DeltaValid());</a>
+<a name="ln134">        base_iterator_-&gt;SeekToLast();</a>
+<a name="ln135">      } else if (!DeltaValid()) {</a>
+<a name="ln136">        delta_iterator_-&gt;SeekToLast();</a>
+<a name="ln137">      } else if (current_at_base_) {</a>
+<a name="ln138">        // Change delta from less advanced than base to more advanced</a>
+<a name="ln139">        AdvanceDelta();</a>
+<a name="ln140">      } else {</a>
+<a name="ln141">        // Change base from less advanced than delta to more advanced</a>
+<a name="ln142">        AdvanceBase();</a>
+<a name="ln143">      }</a>
+<a name="ln144">      if (DeltaValid() &amp;&amp; BaseValid()) {</a>
+<a name="ln145">        if (comparator_-&gt;Equal(delta_iterator_-&gt;Entry().key,</a>
+<a name="ln146">                               base_iterator_-&gt;key())) {</a>
+<a name="ln147">          equal_keys_ = true;</a>
+<a name="ln148">        }</a>
+<a name="ln149">      }</a>
+<a name="ln150">    }</a>
+<a name="ln151"> </a>
+<a name="ln152">    Advance();</a>
+<a name="ln153">  }</a>
+<a name="ln154"> </a>
+<a name="ln155">  Slice key() const override {</a>
+<a name="ln156">    return current_at_base_ ? base_iterator_-&gt;key()</a>
+<a name="ln157">                            : delta_iterator_-&gt;Entry().key;</a>
+<a name="ln158">  }</a>
+<a name="ln159"> </a>
+<a name="ln160">  Slice value() const override {</a>
+<a name="ln161">    return current_at_base_ ? base_iterator_-&gt;value()</a>
+<a name="ln162">                            : delta_iterator_-&gt;Entry().value;</a>
+<a name="ln163">  }</a>
+<a name="ln164"> </a>
+<a name="ln165">  Status status() const override {</a>
+<a name="ln166">    if (!status_.ok()) {</a>
+<a name="ln167">      return status_;</a>
+<a name="ln168">    }</a>
+<a name="ln169">    if (!base_iterator_-&gt;status().ok()) {</a>
+<a name="ln170">      return base_iterator_-&gt;status();</a>
+<a name="ln171">    }</a>
+<a name="ln172">    return delta_iterator_-&gt;status();</a>
+<a name="ln173">  }</a>
+<a name="ln174"> </a>
+<a name="ln175"> private:</a>
+<a name="ln176">  void AssertInvariants() {</a>
+<a name="ln177">#ifndef NDEBUG</a>
+<a name="ln178">    if (!Valid()) {</a>
+<a name="ln179">      return;</a>
+<a name="ln180">    }</a>
+<a name="ln181">    if (!BaseValid()) {</a>
+<a name="ln182">      assert(!current_at_base_ &amp;&amp; delta_iterator_-&gt;Valid());</a>
+<a name="ln183">      return;</a>
+<a name="ln184">    }</a>
+<a name="ln185">    if (!DeltaValid()) {</a>
+<a name="ln186">      assert(current_at_base_ &amp;&amp; base_iterator_-&gt;Valid());</a>
+<a name="ln187">      return;</a>
+<a name="ln188">    }</a>
+<a name="ln189">    // we don't support those yet</a>
+<a name="ln190">    assert(delta_iterator_-&gt;Entry().type != kMergeRecord &amp;&amp;</a>
+<a name="ln191">           delta_iterator_-&gt;Entry().type != kLogDataRecord);</a>
+<a name="ln192">    int compare = comparator_-&gt;Compare(delta_iterator_-&gt;Entry().key,</a>
+<a name="ln193">                                       base_iterator_-&gt;key());</a>
+<a name="ln194">    if (forward_) {</a>
+<a name="ln195">      // current_at_base -&gt; compare &lt; 0</a>
+<a name="ln196">      assert(!current_at_base_ || compare &lt; 0);</a>
+<a name="ln197">      // !current_at_base -&gt; compare &lt;= 0</a>
+<a name="ln198">      assert(current_at_base_ &amp;&amp; compare &gt;= 0);</a>
+<a name="ln199">    } else {</a>
+<a name="ln200">      // current_at_base -&gt; compare &gt; 0</a>
+<a name="ln201">      assert(!current_at_base_ || compare &gt; 0);</a>
+<a name="ln202">      // !current_at_base -&gt; compare &lt;= 0</a>
+<a name="ln203">      assert(current_at_base_ &amp;&amp; compare &lt;= 0);</a>
+<a name="ln204">    }</a>
+<a name="ln205">    // equal_keys_ &lt;=&gt; compare == 0</a>
+<a name="ln206">    assert((equal_keys_ || compare != 0) &amp;&amp; (!equal_keys_ || compare == 0));</a>
+<a name="ln207">#endif</a>
+<a name="ln208">  }</a>
+<a name="ln209"> </a>
+<a name="ln210">  void Advance() {</a>
+<a name="ln211">    if (equal_keys_) {</a>
+<a name="ln212">      assert(BaseValid() &amp;&amp; DeltaValid());</a>
+<a name="ln213">      AdvanceBase();</a>
+<a name="ln214">      AdvanceDelta();</a>
+<a name="ln215">    } else {</a>
+<a name="ln216">      if (current_at_base_) {</a>
+<a name="ln217">        assert(BaseValid());</a>
+<a name="ln218">        AdvanceBase();</a>
+<a name="ln219">      } else {</a>
+<a name="ln220">        assert(DeltaValid());</a>
+<a name="ln221">        AdvanceDelta();</a>
+<a name="ln222">      }</a>
+<a name="ln223">    }</a>
+<a name="ln224">    UpdateCurrent();</a>
+<a name="ln225">  }</a>
+<a name="ln226"> </a>
+<a name="ln227">  void AdvanceDelta() {</a>
+<a name="ln228">    if (forward_) {</a>
+<a name="ln229">      delta_iterator_-&gt;Next();</a>
+<a name="ln230">    } else {</a>
+<a name="ln231">      delta_iterator_-&gt;Prev();</a>
+<a name="ln232">    }</a>
+<a name="ln233">  }</a>
+<a name="ln234">  void AdvanceBase() {</a>
+<a name="ln235">    if (forward_) {</a>
+<a name="ln236">      base_iterator_-&gt;Next();</a>
+<a name="ln237">    } else {</a>
+<a name="ln238">      base_iterator_-&gt;Prev();</a>
+<a name="ln239">    }</a>
+<a name="ln240">  }</a>
+<a name="ln241">  bool BaseValid() const { return base_iterator_-&gt;Valid(); }</a>
+<a name="ln242">  bool DeltaValid() const { return delta_iterator_-&gt;Valid(); }</a>
+<a name="ln243">  void UpdateCurrent() {</a>
+<a name="ln244">    while (true) {</a>
+<a name="ln245">      WriteEntry delta_entry;</a>
+<a name="ln246">      if (DeltaValid()) {</a>
+<a name="ln247">        delta_entry = delta_iterator_-&gt;Entry();</a>
+<a name="ln248">      }</a>
+<a name="ln249">      equal_keys_ = false;</a>
+<a name="ln250">      if (!BaseValid()) {</a>
+<a name="ln251">        // Base has finished.</a>
+<a name="ln252">        if (!DeltaValid()) {</a>
+<a name="ln253">          // Finished</a>
+<a name="ln254">          return;</a>
+<a name="ln255">        }</a>
+<a name="ln256">        if (delta_entry.type == kDeleteRecord ||</a>
+<a name="ln257">            delta_entry.type == kSingleDeleteRecord) {</a>
+<a name="ln258">          AdvanceDelta();</a>
+<a name="ln259">        } else {</a>
+<a name="ln260">          current_at_base_ = false;</a>
+<a name="ln261">          return;</a>
+<a name="ln262">        }</a>
+<a name="ln263">      } else if (!DeltaValid()) {</a>
+<a name="ln264">        // Delta has finished.</a>
+<a name="ln265">        current_at_base_ = true;</a>
+<a name="ln266">        return;</a>
+<a name="ln267">      } else {</a>
+<a name="ln268">        int compare =</a>
+<a name="ln269">            (forward_ ? 1 : -1) *</a>
+<a name="ln270">            comparator_-&gt;Compare(delta_entry.key, base_iterator_-&gt;key());</a>
+<a name="ln271">        if (compare &lt;= 0) {  // delta bigger or equal</a>
+<a name="ln272">          if (compare == 0) {</a>
+<a name="ln273">            equal_keys_ = true;</a>
+<a name="ln274">          }</a>
+<a name="ln275">          if (delta_entry.type != kDeleteRecord &amp;&amp;</a>
+<a name="ln276">              delta_entry.type != kSingleDeleteRecord) {</a>
+<a name="ln277">            current_at_base_ = false;</a>
+<a name="ln278">            return;</a>
+<a name="ln279">          }</a>
+<a name="ln280">          // Delta is less advanced and is delete.</a>
+<a name="ln281">          AdvanceDelta();</a>
+<a name="ln282">          if (equal_keys_) {</a>
+<a name="ln283">            AdvanceBase();</a>
+<a name="ln284">          }</a>
+<a name="ln285">        } else {</a>
+<a name="ln286">          current_at_base_ = true;</a>
+<a name="ln287">          return;</a>
+<a name="ln288">        }</a>
+<a name="ln289">      }</a>
+<a name="ln290">    }</a>
+<a name="ln291"> </a>
+<a name="ln292">    AssertInvariants();</a>
+<a name="ln293">  }</a>
+<a name="ln294"> </a>
+<a name="ln295">  bool forward_;</a>
+<a name="ln296">  bool current_at_base_;</a>
+<a name="ln297">  bool equal_keys_;</a>
+<a name="ln298">  Status status_;</a>
+<a name="ln299">  std::unique_ptr&lt;Iterator&gt; base_iterator_;</a>
+<a name="ln300">  std::unique_ptr&lt;WBWIIterator&gt; delta_iterator_;</a>
+<a name="ln301">  const Comparator* comparator_;  // not owned</a>
+<a name="ln302">};</a>
+<a name="ln303"> </a>
+<a name="ln304">typedef SkipList&lt;WriteBatchIndexEntry*, const WriteBatchEntryComparator&amp;&gt;</a>
+<a name="ln305">    WriteBatchEntrySkipList;</a>
+<a name="ln306"> </a>
+<a name="ln307">class WBWIIteratorImpl : public WBWIIterator {</a>
+<a name="ln308"> public:</a>
+<a name="ln309">  WBWIIteratorImpl(uint32_t column_family_id,</a>
+<a name="ln310">                   WriteBatchEntrySkipList* skip_list,</a>
+<a name="ln311">                   const ReadableWriteBatch* write_batch)</a>
+<a name="ln312">      : column_family_id_(column_family_id),</a>
+<a name="ln313">        skip_list_iter_(skip_list),</a>
+<a name="ln314">        write_batch_(write_batch) {}</a>
+<a name="ln315"> </a>
+<a name="ln316">  virtual ~WBWIIteratorImpl() {}</a>
+<a name="ln317"> </a>
+<a name="ln318">  bool Valid() const override {</a>
+<a name="ln319">    if (!skip_list_iter_.Valid()) {</a>
+<a name="ln320">      return false;</a>
+<a name="ln321">    }</a>
+<a name="ln322">    const WriteBatchIndexEntry* iter_entry = skip_list_iter_.key();</a>
+<a name="ln323">    return (iter_entry != nullptr &amp;&amp;</a>
+<a name="ln324">            iter_entry-&gt;column_family == column_family_id_);</a>
+<a name="ln325">  }</a>
+<a name="ln326"> </a>
+<a name="ln327">  void SeekToFirst() override {</a>
+<a name="ln328">    WriteBatchIndexEntry search_entry(WriteBatchIndexEntry::kFlagMin,</a>
+<a name="ln329">                                      column_family_id_);</a>
+<a name="ln330">    skip_list_iter_.Seek(&amp;search_entry);</a>
+<a name="ln331">  }</a>
+<a name="ln332"> </a>
+<a name="ln333">  void SeekToLast() override {</a>
+<a name="ln334">    WriteBatchIndexEntry search_entry(WriteBatchIndexEntry::kFlagMin,</a>
+<a name="ln335">                                      column_family_id_ + 1);</a>
+<a name="ln336">    skip_list_iter_.Seek(&amp;search_entry);</a>
+<a name="ln337">    if (!skip_list_iter_.Valid()) {</a>
+<a name="ln338">      skip_list_iter_.SeekToLast();</a>
+<a name="ln339">    } else {</a>
+<a name="ln340">      skip_list_iter_.Prev();</a>
+<a name="ln341">    }</a>
+<a name="ln342">  }</a>
+<a name="ln343"> </a>
+<a name="ln344">  void Seek(const Slice&amp; key) override {</a>
+<a name="ln345">    WriteBatchIndexEntry search_entry(&amp;key, column_family_id_);</a>
+<a name="ln346">    skip_list_iter_.Seek(&amp;search_entry);</a>
+<a name="ln347">  }</a>
+<a name="ln348"> </a>
+<a name="ln349">  void Next() override { skip_list_iter_.Next(); }</a>
+<a name="ln350"> </a>
+<a name="ln351">  void Prev() override { skip_list_iter_.Prev(); }</a>
+<a name="ln352"> </a>
+<a name="ln353">  WriteEntry Entry() const override {</a>
+<a name="ln354">    WriteEntry ret;</a>
+<a name="ln355">    Slice blob;</a>
+<a name="ln356">    const WriteBatchIndexEntry* iter_entry = skip_list_iter_.key();</a>
+<a name="ln357">    // this is guaranteed with Valid()</a>
+<a name="ln358">    assert(iter_entry != nullptr &amp;&amp;</a>
+<a name="ln359">           iter_entry-&gt;column_family == column_family_id_);</a>
+<a name="ln360">    auto s = write_batch_-&gt;GetEntryFromDataOffset(iter_entry-&gt;offset, &amp;ret.type,</a>
+<a name="ln361">                                                  &amp;ret.key, &amp;ret.value, &amp;blob);</a>
+<a name="ln362">    assert(s.ok());</a>
+<a name="ln363">    assert(ret.type == kPutRecord || ret.type == kDeleteRecord ||</a>
+<a name="ln364">           ret.type == kSingleDeleteRecord || ret.type == kMergeRecord);</a>
+<a name="ln365">    return ret;</a>
+<a name="ln366">  }</a>
+<a name="ln367"> </a>
+<a name="ln368">  Status status() const override {</a>
+<a name="ln369">    // this is in-memory data structure, so the only way status can be non-ok is</a>
+<a name="ln370">    // through memory corruption</a>
+<a name="ln371">    return Status::OK();</a>
+<a name="ln372">  }</a>
+<a name="ln373"> </a>
+<a name="ln374">  const WriteBatchIndexEntry* GetRawEntry() const {</a>
+<a name="ln375">    return skip_list_iter_.key();</a>
+<a name="ln376">  }</a>
+<a name="ln377"> </a>
+<a name="ln378"> private:</a>
+<a name="ln379">  uint32_t column_family_id_;</a>
+<a name="ln380">  WriteBatchEntrySkipList::Iterator skip_list_iter_;</a>
+<a name="ln381">  const ReadableWriteBatch* write_batch_;</a>
+<a name="ln382">};</a>
+<a name="ln383"> </a>
+<a name="ln384">struct WriteBatchWithIndex::Rep {</a>
+<a name="ln385">  Rep(const Comparator* index_comparator, size_t reserved_bytes = 0,</a>
+<a name="ln386">      bool _overwrite_key = false)</a>
+<a name="ln387">      : write_batch(reserved_bytes),</a>
+<a name="ln388">        comparator(index_comparator, &amp;write_batch),</a>
+<a name="ln389">        skip_list(comparator, &amp;arena),</a>
+<a name="ln390">        overwrite_key(_overwrite_key),</a>
+<a name="ln391">        last_entry_offset(0) {}</a>
+<a name="ln392">  ReadableWriteBatch write_batch;</a>
+<a name="ln393">  WriteBatchEntryComparator comparator;</a>
+<a name="ln394">  Arena arena;</a>
+<a name="ln395">  WriteBatchEntrySkipList skip_list;</a>
+<a name="ln396">  bool overwrite_key;</a>
+<a name="ln397">  size_t last_entry_offset;</a>
+<a name="ln398"> </a>
+<a name="ln399">  // Remember current offset of internal write batch, which is used as</a>
+<a name="ln400">  // the starting offset of the next record.</a>
+<a name="ln401">  void SetLastEntryOffset() { last_entry_offset = write_batch.GetDataSize(); }</a>
+<a name="ln402"> </a>
+<a name="ln403">  // In overwrite mode, find the existing entry for the same key and update it</a>
+<a name="ln404">  // to point to the current entry.</a>
+<a name="ln405">  // Return true if the key is found and updated.</a>
+<a name="ln406">  bool UpdateExistingEntry(ColumnFamilyHandle* column_family, const Slice&amp; key);</a>
+<a name="ln407">  bool UpdateExistingEntryWithCfId(uint32_t column_family_id, const Slice&amp; key);</a>
+<a name="ln408"> </a>
+<a name="ln409">  // Add the recent entry to the update.</a>
+<a name="ln410">  // In overwrite mode, if key already exists in the index, update it.</a>
+<a name="ln411">  void AddOrUpdateIndex(ColumnFamilyHandle* column_family, const Slice&amp; key);</a>
+<a name="ln412">  void AddOrUpdateIndex(const Slice&amp; key);</a>
+<a name="ln413"> </a>
+<a name="ln414">  // Allocate an index entry pointing to the last entry in the write batch and</a>
+<a name="ln415">  // put it to skip list.</a>
+<a name="ln416">  void AddNewEntry(uint32_t column_family_id);</a>
+<a name="ln417"> </a>
+<a name="ln418">  // Clear all updates buffered in this batch.</a>
+<a name="ln419">  void Clear();</a>
+<a name="ln420">  void ClearIndex();</a>
+<a name="ln421"> </a>
+<a name="ln422">  // Rebuild index by reading all records from the batch.</a>
+<a name="ln423">  // Returns non-ok status on corruption.</a>
+<a name="ln424">  Status ReBuildIndex();</a>
+<a name="ln425">};</a>
+<a name="ln426"> </a>
+<a name="ln427">bool WriteBatchWithIndex::Rep::UpdateExistingEntry(</a>
+<a name="ln428">    ColumnFamilyHandle* column_family, const Slice&amp; key) {</a>
+<a name="ln429">  uint32_t cf_id = GetColumnFamilyID(column_family);</a>
+<a name="ln430">  return UpdateExistingEntryWithCfId(cf_id, key);</a>
+<a name="ln431">}</a>
+<a name="ln432"> </a>
+<a name="ln433">bool WriteBatchWithIndex::Rep::UpdateExistingEntryWithCfId(</a>
+<a name="ln434">    uint32_t column_family_id, const Slice&amp; key) {</a>
+<a name="ln435">  if (!overwrite_key) {</a>
+<a name="ln436">    return false;</a>
+<a name="ln437">  }</a>
+<a name="ln438"> </a>
+<a name="ln439">  WBWIIteratorImpl iter(column_family_id, &amp;skip_list, &amp;write_batch);</a>
+<a name="ln440">  iter.Seek(key);</a>
+<a name="ln441">  if (!iter.Valid()) {</a>
+<a name="ln442">    return false;</a>
+<a name="ln443">  }</a>
+<a name="ln444">  if (comparator.CompareKey(column_family_id, key, iter.Entry().key) != 0) {</a>
+<a name="ln445">    return false;</a>
+<a name="ln446">  }</a>
+<a name="ln447">  WriteBatchIndexEntry* non_const_entry =</a>
+<a name="ln448">      const_cast&lt;WriteBatchIndexEntry*&gt;(iter.GetRawEntry());</a>
+<a name="ln449">  non_const_entry-&gt;offset = last_entry_offset;</a>
+<a name="ln450">  return true;</a>
+<a name="ln451">}</a>
+<a name="ln452"> </a>
+<a name="ln453">void WriteBatchWithIndex::Rep::AddOrUpdateIndex(</a>
+<a name="ln454">    ColumnFamilyHandle* column_family, const Slice&amp; key) {</a>
+<a name="ln455">  if (!UpdateExistingEntry(column_family, key)) {</a>
+<a name="ln456">    uint32_t cf_id = GetColumnFamilyID(column_family);</a>
+<a name="ln457">    const auto* cf_cmp = GetColumnFamilyUserComparator(column_family);</a>
+<a name="ln458">    if (cf_cmp != nullptr) {</a>
+<a name="ln459">      comparator.SetComparatorForCF(cf_id, cf_cmp);</a>
+<a name="ln460">    }</a>
+<a name="ln461">    AddNewEntry(cf_id);</a>
+<a name="ln462">  }</a>
+<a name="ln463">}</a>
+<a name="ln464"> </a>
+<a name="ln465">void WriteBatchWithIndex::Rep::AddOrUpdateIndex(const Slice&amp; key) {</a>
+<a name="ln466">  if (!UpdateExistingEntryWithCfId(0, key)) {</a>
+<a name="ln467">    AddNewEntry(0);</a>
+<a name="ln468">  }</a>
+<a name="ln469">}</a>
+<a name="ln470"> </a>
+<a name="ln471">void WriteBatchWithIndex::Rep::AddNewEntry(uint32_t column_family_id) {</a>
+<a name="ln472">    auto* mem = arena.Allocate(sizeof(WriteBatchIndexEntry));</a>
+<a name="ln473">    auto* index_entry =</a>
+<a name="ln474">        new (mem) WriteBatchIndexEntry(last_entry_offset, column_family_id);</a>
+<a name="ln475">    skip_list.Insert(index_entry);</a>
+<a name="ln476">  }</a>
+<a name="ln477"> </a>
+<a name="ln478">  void WriteBatchWithIndex::Rep::Clear() {</a>
+<a name="ln479">    write_batch.Clear();</a>
+<a name="ln480">    ClearIndex();</a>
+<a name="ln481">  }</a>
+<a name="ln482"> </a>
+<a name="ln483">  void WriteBatchWithIndex::Rep::ClearIndex() {</a>
+<a name="ln484">    skip_list.~WriteBatchEntrySkipList();</a>
+<a name="ln485">    arena.~Arena();</a>
+<a name="ln486">    new (&amp;arena) Arena();</a>
+<a name="ln487">    new (&amp;skip_list) WriteBatchEntrySkipList(comparator, &amp;arena);</a>
+<a name="ln488">    last_entry_offset = 0;</a>
+<a name="ln489">  }</a>
+<a name="ln490"> </a>
+<a name="ln491">  Status WriteBatchWithIndex::Rep::ReBuildIndex() {</a>
+<a name="ln492">    Status s;</a>
+<a name="ln493"> </a>
+<a name="ln494">    ClearIndex();</a>
+<a name="ln495"> </a>
+<a name="ln496">    if (write_batch.Count() == 0) {</a>
+<a name="ln497">      // Nothing to re-index</a>
+<a name="ln498">      return s;</a>
+<a name="ln499">    }</a>
+<a name="ln500"> </a>
+<a name="ln501">    size_t offset = WriteBatchInternal::GetFirstOffset(&amp;write_batch);</a>
+<a name="ln502"> </a>
+<a name="ln503">    Slice input(write_batch.Data());</a>
+<a name="ln504">    input.remove_prefix(offset);</a>
+<a name="ln505"> </a>
+<a name="ln506">    // Loop through all entries in Rep and add each one to the index</a>
+<a name="ln507">    size_t found = 0;</a>
+<a name="ln508">    while (s.ok() &amp;&amp; !input.empty()) {</a>
+<a name="ln509">      Slice key, value, blob;</a>
+<a name="ln510">      uint32_t column_family_id = 0;  // default</a>
+<a name="ln511">      char tag = 0;</a>
+<a name="ln512"> </a>
+<a name="ln513">      // set offset of current entry for call to AddNewEntry()</a>
+<a name="ln514">      last_entry_offset = input.cdata() - write_batch.Data().data();</a>
+<a name="ln515"> </a>
+<a name="ln516">      s = ReadRecordFromWriteBatch(&amp;input, &amp;tag, &amp;column_family_id, &amp;key,</a>
+<a name="ln517">                                   &amp;value, &amp;blob);</a>
+<a name="ln518">      if (!s.ok()) {</a>
+<a name="ln519">        break;</a>
+<a name="ln520">      }</a>
+<a name="ln521"> </a>
+<a name="ln522">      switch (tag) {</a>
+<a name="ln523">        case kTypeColumnFamilyValue:</a>
+<a name="ln524">        case kTypeValue:</a>
+<a name="ln525">        case kTypeColumnFamilyDeletion:</a>
+<a name="ln526">        case kTypeDeletion:</a>
+<a name="ln527">        case kTypeColumnFamilySingleDeletion:</a>
+<a name="ln528">        case kTypeSingleDeletion:</a>
+<a name="ln529">        case kTypeColumnFamilyMerge:</a>
+<a name="ln530">        case kTypeMerge:</a>
+<a name="ln531">          found++;</a>
+<a name="ln532">          if (!UpdateExistingEntryWithCfId(column_family_id, key)) {</a>
+<a name="ln533">            AddNewEntry(column_family_id);</a>
+<a name="ln534">          }</a>
+<a name="ln535">          break;</a>
+<a name="ln536">        case kTypeLogData:</a>
+<a name="ln537">          break;</a>
+<a name="ln538">        default:</a>
+<a name="ln539">          return STATUS(Corruption, &quot;unknown WriteBatch tag&quot;);</a>
+<a name="ln540">      }</a>
+<a name="ln541">    }</a>
+<a name="ln542"> </a>
+<a name="ln543">    if (s.ok() &amp;&amp; found != write_batch.Count()) {</a>
+<a name="ln544">      s = STATUS(Corruption, &quot;WriteBatch has wrong count&quot;);</a>
+<a name="ln545">    }</a>
+<a name="ln546"> </a>
+<a name="ln547">    return s;</a>
+<a name="ln548">  }</a>
+<a name="ln549"> </a>
+<a name="ln550">WriteBatchWithIndex::WriteBatchWithIndex(</a>
+<a name="ln551">    const Comparator* default_index_comparator, size_t reserved_bytes,</a>
+<a name="ln552">    bool overwrite_key)</a>
+<a name="ln553">    : rep(new Rep(default_index_comparator, reserved_bytes, overwrite_key)) {}</a>
+<a name="ln554"> </a>
+<a name="ln555">WriteBatchWithIndex::~WriteBatchWithIndex() { delete rep; }</a>
+<a name="ln556"> </a>
+<a name="ln557">WriteBatch* WriteBatchWithIndex::GetWriteBatch() { return &amp;rep-&gt;write_batch; }</a>
+<a name="ln558"> </a>
+<a name="ln559">WBWIIterator* WriteBatchWithIndex::NewIterator() {</a>
+<a name="ln560">  return new WBWIIteratorImpl(0, &amp;(rep-&gt;skip_list), &amp;rep-&gt;write_batch);</a>
+<a name="ln561">}</a>
+<a name="ln562"> </a>
+<a name="ln563">WBWIIterator* WriteBatchWithIndex::NewIterator(</a>
+<a name="ln564">    ColumnFamilyHandle* column_family) {</a>
+<a name="ln565">  return new WBWIIteratorImpl(GetColumnFamilyID(column_family),</a>
+<a name="ln566">                              &amp;(rep-&gt;skip_list), &amp;rep-&gt;write_batch);</a>
+<a name="ln567">}</a>
+<a name="ln568"> </a>
+<a name="ln569">Iterator* WriteBatchWithIndex::NewIteratorWithBase(</a>
+<a name="ln570">    ColumnFamilyHandle* column_family, Iterator* base_iterator) {</a>
+<a name="ln571">  if (rep-&gt;overwrite_key == false) {</a>
+<a name="ln572">    assert(false);</a>
+<a name="ln573">    return nullptr;</a>
+<a name="ln574">  }</a>
+<a name="ln575">  return new BaseDeltaIterator(base_iterator, NewIterator(column_family),</a>
+<a name="ln576">                               GetColumnFamilyUserComparator(column_family));</a>
+<a name="ln577">}</a>
+<a name="ln578"> </a>
+<a name="ln579">Iterator* WriteBatchWithIndex::NewIteratorWithBase(Iterator* base_iterator) {</a>
+<a name="ln580">  if (rep-&gt;overwrite_key == false) {</a>
+<a name="ln581">    assert(false);</a>
+<a name="ln582">    return nullptr;</a>
+<a name="ln583">  }</a>
+<a name="ln584">  // default column family's comparator</a>
+<a name="ln585">  return new BaseDeltaIterator(base_iterator, NewIterator(),</a>
+<a name="ln586">                               rep-&gt;comparator.default_comparator());</a>
+<a name="ln587">}</a>
+<a name="ln588"> </a>
+<a name="ln589">void WriteBatchWithIndex::Put(ColumnFamilyHandle* column_family,</a>
+<a name="ln590">                              const Slice&amp; key, const Slice&amp; value) {</a>
+<a name="ln591">  rep-&gt;SetLastEntryOffset();</a>
+<a name="ln592">  rep-&gt;write_batch.Put(column_family, key, value);</a>
+<a name="ln593">  rep-&gt;AddOrUpdateIndex(column_family, key);</a>
+<a name="ln594">}</a>
+<a name="ln595"> </a>
+<a name="ln596">void WriteBatchWithIndex::Put(const Slice&amp; key, const Slice&amp; value) {</a>
+<a name="ln597">  rep-&gt;SetLastEntryOffset();</a>
+<a name="ln598">  rep-&gt;write_batch.Put(key, value);</a>
+<a name="ln599">  rep-&gt;AddOrUpdateIndex(key);</a>
+<a name="ln600">}</a>
+<a name="ln601"> </a>
+<a name="ln602">void WriteBatchWithIndex::Delete(ColumnFamilyHandle* column_family,</a>
+<a name="ln603">                                 const Slice&amp; key) {</a>
+<a name="ln604">  rep-&gt;SetLastEntryOffset();</a>
+<a name="ln605">  rep-&gt;write_batch.Delete(column_family, key);</a>
+<a name="ln606">  rep-&gt;AddOrUpdateIndex(column_family, key);</a>
+<a name="ln607">}</a>
+<a name="ln608"> </a>
+<a name="ln609">void WriteBatchWithIndex::Delete(const Slice&amp; key) {</a>
+<a name="ln610">  rep-&gt;SetLastEntryOffset();</a>
+<a name="ln611">  rep-&gt;write_batch.Delete(key);</a>
+<a name="ln612">  rep-&gt;AddOrUpdateIndex(key);</a>
+<a name="ln613">}</a>
+<a name="ln614"> </a>
+<a name="ln615">void WriteBatchWithIndex::SingleDelete(ColumnFamilyHandle* column_family,</a>
+<a name="ln616">                                       const Slice&amp; key) {</a>
+<a name="ln617">  rep-&gt;SetLastEntryOffset();</a>
+<a name="ln618">  rep-&gt;write_batch.SingleDelete(column_family, key);</a>
+<a name="ln619">  rep-&gt;AddOrUpdateIndex(column_family, key);</a>
+<a name="ln620">}</a>
+<a name="ln621"> </a>
+<a name="ln622">void WriteBatchWithIndex::SingleDelete(const Slice&amp; key) {</a>
+<a name="ln623">  rep-&gt;SetLastEntryOffset();</a>
+<a name="ln624">  rep-&gt;write_batch.SingleDelete(key);</a>
+<a name="ln625">  rep-&gt;AddOrUpdateIndex(key);</a>
+<a name="ln626">}</a>
+<a name="ln627"> </a>
+<a name="ln628">void WriteBatchWithIndex::Merge(ColumnFamilyHandle* column_family,</a>
+<a name="ln629">                                const Slice&amp; key, const Slice&amp; value) {</a>
+<a name="ln630">  rep-&gt;SetLastEntryOffset();</a>
+<a name="ln631">  rep-&gt;write_batch.Merge(column_family, key, value);</a>
+<a name="ln632">  rep-&gt;AddOrUpdateIndex(column_family, key);</a>
+<a name="ln633">}</a>
+<a name="ln634"> </a>
+<a name="ln635">void WriteBatchWithIndex::Merge(const Slice&amp; key, const Slice&amp; value) {</a>
+<a name="ln636">  rep-&gt;SetLastEntryOffset();</a>
+<a name="ln637">  rep-&gt;write_batch.Merge(key, value);</a>
+<a name="ln638">  rep-&gt;AddOrUpdateIndex(key);</a>
+<a name="ln639">}</a>
+<a name="ln640"> </a>
+<a name="ln641">void WriteBatchWithIndex::PutLogData(const Slice&amp; blob) {</a>
+<a name="ln642">  rep-&gt;write_batch.PutLogData(blob);</a>
+<a name="ln643">}</a>
+<a name="ln644"> </a>
+<a name="ln645">void WriteBatchWithIndex::Clear() { rep-&gt;Clear(); }</a>
+<a name="ln646"> </a>
+<a name="ln647">Status WriteBatchWithIndex::GetFromBatch(ColumnFamilyHandle* column_family,</a>
+<a name="ln648">                                         const DBOptions&amp; options,</a>
+<a name="ln649">                                         const Slice&amp; key, std::string* value) {</a>
+<a name="ln650">  Status s;</a>
+<a name="ln651">  MergeContext merge_context;</a>
+<a name="ln652"> </a>
+<a name="ln653">  WriteBatchWithIndexInternal::Result result =</a>
+<a name="ln654">      WriteBatchWithIndexInternal::GetFromBatch(</a>
+<a name="ln655">          options, this, column_family, key, &amp;merge_context, &amp;rep-&gt;comparator,</a>
+<a name="ln656">          value, rep-&gt;overwrite_key, &amp;s);</a>
+<a name="ln657"> </a>
+<a name="ln658">  switch (result) {</a>
+<a name="ln659">    case WriteBatchWithIndexInternal::Result::kFound:</a>
+<a name="ln660">    case WriteBatchWithIndexInternal::Result::kError:</a>
+<a name="ln661">      // use returned status</a>
+<a name="ln662">      break;</a>
+<a name="ln663">    case WriteBatchWithIndexInternal::Result::kDeleted:</a>
+<a name="ln664">    case WriteBatchWithIndexInternal::Result::kNotFound:</a>
+<a name="ln665">      s = STATUS(NotFound, &quot;&quot;);</a>
+<a name="ln666">      break;</a>
+<a name="ln667">    case WriteBatchWithIndexInternal::Result::kMergeInProgress:</a>
+<a name="ln668">      s = STATUS(MergeInProgress, &quot;&quot;);</a>
+<a name="ln669">      break;</a>
+<a name="ln670">    default:</a>
+<a name="ln671">      assert(false);</a>
+<a name="ln672">  }</a>
+<a name="ln673"> </a>
+<a name="ln674">  return s;</a>
+<a name="ln675">}</a>
+<a name="ln676"> </a>
+<a name="ln677">Status WriteBatchWithIndex::GetFromBatchAndDB(DB* db,</a>
+<a name="ln678">                                              const ReadOptions&amp; read_options,</a>
+<a name="ln679">                                              const Slice&amp; key,</a>
+<a name="ln680">                                              std::string* value) {</a>
+<a name="ln681">  return GetFromBatchAndDB(db, read_options, db-&gt;DefaultColumnFamily(), key,</a>
+<a name="ln682">                           value);</a>
+<a name="ln683">}</a>
+<a name="ln684"> </a>
+<a name="ln685">Status WriteBatchWithIndex::GetFromBatchAndDB(DB* db,</a>
+<a name="ln686">                                              const ReadOptions&amp; read_options,</a>
+<a name="ln687">                                              ColumnFamilyHandle* column_family,</a>
+<a name="ln688">                                              const Slice&amp; key,</a>
+<a name="ln689">                                              std::string* value) {</a>
+<a name="ln690">  Status s;</a>
+<a name="ln691">  MergeContext merge_context;</a>
+<a name="ln692">  const DBOptions&amp; options = db-&gt;GetDBOptions();</a>
+<a name="ln693"> </a>
+<a name="ln694">  std::string batch_value;</a>
+<a name="ln695">  WriteBatchWithIndexInternal::Result result =</a>
+<a name="ln696">      WriteBatchWithIndexInternal::GetFromBatch(</a>
+<a name="ln697">          options, this, column_family, key, &amp;merge_context, &amp;rep-&gt;comparator,</a>
+<a name="ln698">          &amp;batch_value, rep-&gt;overwrite_key, &amp;s);</a>
+<a name="ln699"> </a>
+<a name="ln700">  if (result == WriteBatchWithIndexInternal::Result::kFound) {</a>
+<a name="ln701">    value-&gt;assign(batch_value.data(), batch_value.size());</a>
+<a name="ln702">    return s;</a>
+<a name="ln703">  }</a>
+<a name="ln704">  if (result == WriteBatchWithIndexInternal::Result::kDeleted) {</a>
+<a name="ln705">    return STATUS(NotFound, &quot;&quot;);</a>
+<a name="ln706">  }</a>
+<a name="ln707">  if (result == WriteBatchWithIndexInternal::Result::kError) {</a>
+<a name="ln708">    return s;</a>
+<a name="ln709">  }</a>
+<a name="ln710">  if (result == WriteBatchWithIndexInternal::Result::kMergeInProgress &amp;&amp;</a>
+<a name="ln711">      rep-&gt;overwrite_key == true) {</a>
+<a name="ln712">    // Since we've overwritten keys, we do not know what other operations are</a>
+<a name="ln713">    // in this batch for this key, so we cannot do a Merge to compute the</a>
+<a name="ln714">    // result.  Instead, we will simply return MergeInProgress.</a>
+<a name="ln715">    return STATUS(MergeInProgress, &quot;&quot;);</a>
+<a name="ln716">  }</a>
+<a name="ln717"> </a>
+<a name="ln718">  assert(result == WriteBatchWithIndexInternal::Result::kMergeInProgress ||</a>
+<a name="ln719">         result == WriteBatchWithIndexInternal::Result::kNotFound);</a>
+<a name="ln720"> </a>
+<a name="ln721">  // Did not find key in batch OR could not resolve Merges.  Try DB.</a>
+<a name="ln722">  s = db-&gt;Get(read_options, column_family, key, value);</a>
+<a name="ln723"> </a>
+<a name="ln724">  if (s.ok() || s.IsNotFound()) {  // DB Get Succeeded</a>
+<a name="ln725">    if (result == WriteBatchWithIndexInternal::Result::kMergeInProgress) {</a>
+<a name="ln726">      // Merge result from DB with merges in Batch</a>
+<a name="ln727">      auto cfh = reinterpret_cast&lt;ColumnFamilyHandleImpl*&gt;(column_family);</a>
+<a name="ln728">      const MergeOperator* merge_operator =</a>
+<a name="ln729">          cfh-&gt;cfd()-&gt;ioptions()-&gt;merge_operator;</a>
+<a name="ln730">      Statistics* statistics = options.statistics.get();</a>
+<a name="ln731">      Env* env = options.env;</a>
+<a name="ln732">      Logger* logger = options.info_log.get();</a>
+<a name="ln733"> </a>
+<a name="ln734">      Slice db_slice(*value);</a>
+<a name="ln735">      Slice* merge_data;</a>
+<a name="ln736">      if (s.ok()) {</a>
+<a name="ln737">        merge_data = &amp;db_slice;</a>
+<a name="ln738">      } else {  // Key not present in db (s.IsNotFound())</a>
+<a name="ln739">        merge_data = nullptr;</a>
+<a name="ln740">      }</a>
+<a name="ln741"> </a>
+<a name="ln742">      s = MergeHelper::TimedFullMerge(</a>
+<a name="ln743">          key, merge_data, merge_context.GetOperands(), merge_operator,</a>
+<a name="ln744">          statistics, env, logger, value);</a>
+<a name="ln745">    }</a>
+<a name="ln746">  }</a>
+<a name="ln747"> </a>
+<a name="ln748">  return s;</a>
+<a name="ln749">}</a>
+<a name="ln750"> </a>
+<a name="ln751">void WriteBatchWithIndex::SetSavePoint() { rep-&gt;write_batch.SetSavePoint(); }</a>
+<a name="ln752"> </a>
+<a name="ln753">Status WriteBatchWithIndex::RollbackToSavePoint() {</a>
+<a name="ln754">  Status s = rep-&gt;write_batch.RollbackToSavePoint();</a>
+<a name="ln755"> </a>
+<a name="ln756">  if (s.ok()) {</a>
+<a name="ln757">    s = rep-&gt;ReBuildIndex();</a>
+<a name="ln758">  }</a>
+<a name="ln759"> </a>
+<a name="ln760">  return s;</a>
+<a name="ln761">}</a>
+<a name="ln762"> </a>
+<a name="ln763">}  // namespace rocksdb</a>
+<a name="ln764">#endif  // !ROCKSDB_LITE</a>
+
+</code></pre>
+<div class="balloon" rel="256"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v614/" target="_blank">V614</a> Potentially uninitialized variable 'delta_entry.type' used.</p></div>
+<div class="balloon" rel="292"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v779/" target="_blank">V779</a> Unreachable code detected. It is possible that an error is present.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,223 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>db_repl_stress.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20"> </a>
+<a name="ln21">#ifndef ROCKSDB_LITE</a>
+<a name="ln22">#ifndef GFLAGS</a>
+<a name="ln23">#include &lt;cstdio&gt;</a>
+<a name="ln24">int main() {</a>
+<a name="ln25">  fprintf(stderr, &quot;Please install gflags to run rocksdb tools\n&quot;);</a>
+<a name="ln26">  return 1;</a>
+<a name="ln27">}</a>
+<a name="ln28">#else</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &lt;cstdio&gt;</a>
+<a name="ln31">#include &lt;atomic&gt;</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &quot;yb/rocksdb/db/write_batch_internal.h&quot;</a>
+<a name="ln36">#include &quot;yb/rocksdb/db.h&quot;</a>
+<a name="ln37">#include &quot;yb/rocksdb/types.h&quot;</a>
+<a name="ln38">#include &quot;yb/rocksdb/util/testutil.h&quot;</a>
+<a name="ln39"> </a>
+<a name="ln40">// Run a thread to perform Put's.</a>
+<a name="ln41">// Another thread uses GetUpdatesSince API to keep getting the updates.</a>
+<a name="ln42">// options :</a>
+<a name="ln43">// --num_inserts = the num of inserts the first thread should perform.</a>
+<a name="ln44">// --wal_ttl = the wal ttl for the run.</a>
+<a name="ln45"> </a>
+<a name="ln46">using GFLAGS::ParseCommandLineFlags;</a>
+<a name="ln47">using GFLAGS::SetUsageMessage;</a>
+<a name="ln48"> </a>
+<a name="ln49">namespace rocksdb {</a>
+<a name="ln50"> </a>
+<a name="ln51">struct DataPumpThread {</a>
+<a name="ln52">  size_t no_records;</a>
+<a name="ln53">  DB* db; // Assumption DB is Open'ed already.</a>
+<a name="ln54">};</a>
+<a name="ln55"> </a>
+<a name="ln56">static void DataPumpThreadBody(void* arg) {</a>
+<a name="ln57">  DataPumpThread* t = reinterpret_cast&lt;DataPumpThread*&gt;(arg);</a>
+<a name="ln58">  DB* db = t-&gt;db;</a>
+<a name="ln59">  Random rnd(301);</a>
+<a name="ln60">  size_t i = 0;</a>
+<a name="ln61">  while (i++ &lt; t-&gt;no_records) {</a>
+<a name="ln62">    if (!db-&gt;Put(</a>
+<a name="ln63">        WriteOptions(), Slice(RandomString(&amp;rnd, 500)),</a>
+<a name="ln64">        Slice(RandomString(&amp;rnd, 500))).ok()) {</a>
+<a name="ln65">      fprintf(stderr, &quot;Error in put\n&quot;);</a>
+<a name="ln66">      exit(1);</a>
+<a name="ln67">    }</a>
+<a name="ln68">  }</a>
+<a name="ln69">}</a>
+<a name="ln70"> </a>
+<a name="ln71">struct ReplicationThread {</a>
+<a name="ln72">  std::atomic&lt;bool&gt; stop;</a>
+<a name="ln73">  DB* db;</a>
+<a name="ln74">  volatile size_t no_read;</a>
+<a name="ln75">};</a>
+<a name="ln76"> </a>
+<a name="ln77">static void ReplicationThreadBody(void* arg) {</a>
+<a name="ln78">  ReplicationThread* t = reinterpret_cast&lt;ReplicationThread*&gt;(arg);</a>
+<a name="ln79">  DB* db = t-&gt;db;</a>
+<a name="ln80">  unique_ptr&lt;TransactionLogIterator&gt; iter;</a>
+<a name="ln81">  SequenceNumber currentSeqNum = 1;</a>
+<a name="ln82">  while (!t-&gt;stop.load(std::memory_order_acquire)) {</a>
+<a name="ln83">    iter.reset();</a>
+<a name="ln84">    Status s;</a>
+<a name="ln85">    while (!db-&gt;GetUpdatesSince(currentSeqNum, &amp;iter).ok()) {</a>
+<a name="ln86">      if (t-&gt;stop.load(std::memory_order_acquire)) {</a>
+<a name="ln87">        return;</a>
+<a name="ln88">      }</a>
+<a name="ln89">    }</a>
+<a name="ln90">    fprintf(stderr, &quot;Refreshing iterator\n&quot;);</a>
+<a name="ln91">    for (; iter-&gt;Valid(); iter-&gt;Next(), t-&gt;no_read++, currentSeqNum++) {</a>
+<a name="ln92">      BatchResult res = iter-&gt;GetBatch();</a>
+<a name="ln93">      if (res.sequence != currentSeqNum) {</a>
+<a name="ln94">        fprintf(</a>
+<a name="ln95">            stderr,</a>
+<a name="ln96">            &quot;Missed a seq no. b/w %&quot; PRISN &quot; and %&quot; PRISN &quot;\n&quot;,</a>
+<a name="ln97">            currentSeqNum,</a>
+<a name="ln98">            res.sequence);</a>
+<a name="ln99">        exit(1);</a>
+<a name="ln100">      }</a>
+<a name="ln101">    }</a>
+<a name="ln102">  }</a>
+<a name="ln103">}</a>
+<a name="ln104"> </a>
+<a name="ln105">DEFINE_uint64(num_inserts, 1000, &quot;the num of inserts the first thread should&quot;</a>
+<a name="ln106">    &quot; perform.&quot;);</a>
+<a name="ln107">DEFINE_uint64(wal_ttl_seconds, 1000, &quot;the wal ttl for the run(in seconds)&quot;);</a>
+<a name="ln108">DEFINE_uint64(wal_size_limit_MB, 10, &quot;the wal size limit for the run&quot;</a>
+<a name="ln109">    &quot;(in MB)&quot;);</a>
+<a name="ln110"> </a>
+<a name="ln111">int db_repl_stress(int argc, const char** argv) {</a>
+<a name="ln112">  SetUsageMessage(</a>
+<a name="ln113">      std::string(&quot;\nUSAGE:\n&quot;) + std::string(argv[0]) +</a>
+<a name="ln114">          &quot; --num_inserts=&lt;num_inserts&gt; --wal_ttl_seconds=&lt;WAL_ttl_seconds&gt;&quot; +</a>
+<a name="ln115">          &quot; --wal_size_limit_MB=&lt;WAL_size_limit_MB&gt;&quot;);</a>
+<a name="ln116">  ParseCommandLineFlags(&amp;argc, const_cast&lt;char***&gt;(&amp;argv), true);</a>
+<a name="ln117"> </a>
+<a name="ln118">  Env* env = Env::Default();</a>
+<a name="ln119">  std::string default_db_path;</a>
+<a name="ln120">  CHECK_OK(env-&gt;GetTestDirectory(&amp;default_db_path));</a>
+<a name="ln121">  default_db_path += &quot;db_repl_stress&quot;;</a>
+<a name="ln122">  Options options;</a>
+<a name="ln123">  options.create_if_missing = true;</a>
+<a name="ln124">  options.WAL_ttl_seconds = FLAGS_wal_ttl_seconds;</a>
+<a name="ln125">  options.WAL_size_limit_MB = FLAGS_wal_size_limit_MB;</a>
+<a name="ln126">  DB* db;</a>
+<a name="ln127">  CHECK_OK(DestroyDB(default_db_path, options));</a>
+<a name="ln128"> </a>
+<a name="ln129">  Status s = DB::Open(options, default_db_path, &amp;db);</a>
+<a name="ln130"> </a>
+<a name="ln131">  if (!s.ok()) {</a>
+<a name="ln132">    fprintf(stderr, &quot;Could not open DB due to %s\n&quot;, s.ToString().c_str());</a>
+<a name="ln133">    exit(1);</a>
+<a name="ln134">  }</a>
+<a name="ln135"> </a>
+<a name="ln136">  DataPumpThread dataPump;</a>
+<a name="ln137">  dataPump.no_records = FLAGS_num_inserts;</a>
+<a name="ln138">  dataPump.db = db;</a>
+<a name="ln139">  env-&gt;StartThread(DataPumpThreadBody, &amp;dataPump);</a>
+<a name="ln140"> </a>
+<a name="ln141">  ReplicationThread replThread;</a>
+<a name="ln142">  replThread.db = db;</a>
+<a name="ln143">  replThread.no_read = 0;</a>
+<a name="ln144">  replThread.stop.store(false, std::memory_order_release);</a>
+<a name="ln145"> </a>
+<a name="ln146">  env-&gt;StartThread(ReplicationThreadBody, &amp;replThread);</a>
+<a name="ln147">  while (replThread.no_read &lt; FLAGS_num_inserts) {}</a>
+<a name="ln148">  replThread.stop.store(true, std::memory_order_release);</a>
+<a name="ln149">  if (replThread.no_read &lt; dataPump.no_records) {</a>
+<a name="ln150">    // no. read should be =&gt; than inserted.</a>
+<a name="ln151">    fprintf(</a>
+<a name="ln152">        stderr,</a>
+<a name="ln153">        &quot;No. of Record's written and read not same\nRead : %&quot; ROCKSDB_PRIszt</a>
+<a name="ln154">            &quot; Written : %&quot; ROCKSDB_PRIszt &quot;\n&quot;,</a>
+<a name="ln155">        replThread.no_read, dataPump.no_records);</a>
+<a name="ln156">    exit(1);</a>
+<a name="ln157">  }</a>
+<a name="ln158">  fprintf(stderr, &quot;Successful!\n&quot;);</a>
+<a name="ln159">  exit(0);</a>
+<a name="ln160">}</a>
+<a name="ln161"> </a>
+<a name="ln162">} // namespace rocksdb</a>
+<a name="ln163"> </a>
+<a name="ln164">int main(int argc, const char** argv) { rocksdb::db_repl_stress(argc, argv); }</a>
+<a name="ln165"> </a>
+<a name="ln166">#endif  // GFLAGS</a>
+<a name="ln167"> </a>
+<a name="ln168">#else  // ROCKSDB_LITE</a>
+<a name="ln169">#include &lt;stdio.h&gt;</a>
+<a name="ln170">int main(int argc, char** argv) {</a>
+<a name="ln171">  fprintf(stderr, &quot;Not supported in lite mode.\n&quot;);</a>
+<a name="ln172">  return 1;</a>
+<a name="ln173">}</a>
+<a name="ln174">#endif  // ROCKSDB_LITE</a>
+
+</code></pre>
+<div class="balloon" rel="94"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the third actual argument of the 'fprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="94"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the fourth actual argument of the 'fprintf' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="120"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="127"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

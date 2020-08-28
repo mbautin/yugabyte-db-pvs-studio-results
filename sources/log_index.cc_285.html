@@ -1,0 +1,385 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>log_index.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">// The implementation of the Log Index.</a>
+<a name="ln34">//</a>
+<a name="ln35">// The log index is implemented by a set of on-disk files, each containing a fixed number</a>
+<a name="ln36">// (kEntriesPerIndexChunk) of fixed size entries. Each index chunk is numbered such that,</a>
+<a name="ln37">// for a given log index, we can determine which chunk contains its index entry by a</a>
+<a name="ln38">// simple division operation. Because the entries are fixed size, we can compute the</a>
+<a name="ln39">// index offset by a modulo.</a>
+<a name="ln40">//</a>
+<a name="ln41">// When the log is GCed, we remove any index chunks which are no longer needed, and</a>
+<a name="ln42">// unmap them.</a>
+<a name="ln43"> </a>
+<a name="ln44">#include &quot;yb/consensus/log_index.h&quot;</a>
+<a name="ln45"> </a>
+<a name="ln46">#include &lt;fcntl.h&gt;</a>
+<a name="ln47">#include &lt;sys/mman.h&gt;</a>
+<a name="ln48">#include &lt;sys/stat.h&gt;</a>
+<a name="ln49">#include &lt;sys/types.h&gt;</a>
+<a name="ln50">#include &lt;unistd.h&gt;</a>
+<a name="ln51"> </a>
+<a name="ln52">#include &lt;mutex&gt;</a>
+<a name="ln53">#include &lt;string&gt;</a>
+<a name="ln54">#include &lt;vector&gt;</a>
+<a name="ln55"> </a>
+<a name="ln56">#include &quot;yb/consensus/opid_util.h&quot;</a>
+<a name="ln57">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln58">#include &quot;yb/gutil/stringprintf.h&quot;</a>
+<a name="ln59">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln60">#include &quot;yb/util/locks.h&quot;</a>
+<a name="ln61"> </a>
+<a name="ln62">using std::string;</a>
+<a name="ln63">using strings::Substitute;</a>
+<a name="ln64"> </a>
+<a name="ln65">#define RETRY_ON_EINTR(ret, expr) do { \</a>
+<a name="ln66">  ret = expr; \</a>
+<a name="ln67">} while ((ret == -1) &amp;&amp; (errno == EINTR));</a>
+<a name="ln68"> </a>
+<a name="ln69">namespace yb {</a>
+<a name="ln70">namespace log {</a>
+<a name="ln71"> </a>
+<a name="ln72">// The actual physical entry in the file.</a>
+<a name="ln73">// This mirrors LogIndexEntry but uses simple primitives only so we can</a>
+<a name="ln74">// read/write it via mmap.</a>
+<a name="ln75">// See LogIndexEntry for docs.</a>
+<a name="ln76">struct PhysicalEntry {</a>
+<a name="ln77">  int64_t term;</a>
+<a name="ln78">  uint64_t segment_sequence_number;</a>
+<a name="ln79">  uint64_t offset_in_segment;</a>
+<a name="ln80">} PACKED;</a>
+<a name="ln81"> </a>
+<a name="ln82">// The number of index entries per index chunk.</a>
+<a name="ln83">//</a>
+<a name="ln84">// **** Note: This number cannot be changed after production!!!!! ***</a>
+<a name="ln85">//</a>
+<a name="ln86">// Why? Because, given a raft log index, the chunk (i.e. the specific index file) and index</a>
+<a name="ln87">// of the entry within the file is determined via simple &quot;/&quot; and &quot;%&quot; calculations respectively</a>
+<a name="ln88">// on this value. [Technically, if we did decide to change this number, we would have to</a>
+<a name="ln89">// implement some logic to compute the number of entries in each file from its size. But</a>
+<a name="ln90">// currently, that's not implemented.]</a>
+<a name="ln91">//</a>
+<a name="ln92">// On MacOS, ftruncate()'ing a file to its desired size before doing the mmap, immediately uses up</a>
+<a name="ln93">// actual disk space, whereas on Linux, it appears to be lazy. Since MacOS is unlikely to be</a>
+<a name="ln94">// used for production scenarios, to reduce disk space requirements and testing load (when creating</a>
+<a name="ln95">// lots of tables (and therefore tablets)), we set this number to a lower value for MacOS.</a>
+<a name="ln96">//</a>
+<a name="ln97">#if defined(__APPLE__)</a>
+<a name="ln98">static const int64_t kEntriesPerIndexChunk = 16 * 1024;</a>
+<a name="ln99">#else</a>
+<a name="ln100">static const int64_t kEntriesPerIndexChunk = 1000000;</a>
+<a name="ln101">#endif</a>
+<a name="ln102"> </a>
+<a name="ln103">static const int64_t kChunkFileSize = kEntriesPerIndexChunk * sizeof(PhysicalEntry);</a>
+<a name="ln104"> </a>
+<a name="ln105">////////////////////////////////////////////////////////////</a>
+<a name="ln106">// LogIndex::IndexChunk implementation</a>
+<a name="ln107">////////////////////////////////////////////////////////////</a>
+<a name="ln108"> </a>
+<a name="ln109">// A single chunk of the index, representing a fixed number of entries.</a>
+<a name="ln110">// This class maintains the open file descriptor and mapped memory.</a>
+<a name="ln111">class LogIndex::IndexChunk : public RefCountedThreadSafe&lt;LogIndex::IndexChunk&gt; {</a>
+<a name="ln112"> public:</a>
+<a name="ln113">  explicit IndexChunk(string path);</a>
+<a name="ln114">  ~IndexChunk();</a>
+<a name="ln115"> </a>
+<a name="ln116">  // Open and map the memory.</a>
+<a name="ln117">  Status Open();</a>
+<a name="ln118">  void GetEntry(int entry_index, PhysicalEntry* ret);</a>
+<a name="ln119">  void SetEntry(int entry_index, const PhysicalEntry&amp; entry);</a>
+<a name="ln120"> </a>
+<a name="ln121">  // Flush memory-mapped chunk to file.</a>
+<a name="ln122">  Status Flush();</a>
+<a name="ln123"> </a>
+<a name="ln124"> private:</a>
+<a name="ln125">  const string path_;</a>
+<a name="ln126">  int fd_;</a>
+<a name="ln127">  uint8_t* mapping_;</a>
+<a name="ln128">};</a>
+<a name="ln129"> </a>
+<a name="ln130">namespace  {</a>
+<a name="ln131">Status CheckError(int rc, const char* operation) {</a>
+<a name="ln132">  if (PREDICT_FALSE(rc &lt; 0)) {</a>
+<a name="ln133">    return STATUS(IOError, operation, Errno(errno));</a>
+<a name="ln134">  }</a>
+<a name="ln135">  return Status::OK();</a>
+<a name="ln136">}</a>
+<a name="ln137">} // anonymous namespace</a>
+<a name="ln138"> </a>
+<a name="ln139">LogIndex::IndexChunk::IndexChunk(std::string path)</a>
+<a name="ln140">    : path_(std::move(path)), fd_(-1), mapping_(nullptr) {}</a>
+<a name="ln141"> </a>
+<a name="ln142">LogIndex::IndexChunk::~IndexChunk() {</a>
+<a name="ln143">  if (mapping_ != nullptr) {</a>
+<a name="ln144">    munmap(mapping_, kChunkFileSize);</a>
+<a name="ln145">  }</a>
+<a name="ln146"> </a>
+<a name="ln147">  if (fd_ &gt;= 0) {</a>
+<a name="ln148">    close(fd_);</a>
+<a name="ln149">  }</a>
+<a name="ln150">}</a>
+<a name="ln151"> </a>
+<a name="ln152">Status LogIndex::IndexChunk::Open() {</a>
+<a name="ln153">  RETRY_ON_EINTR(fd_, open(path_.c_str(), O_CLOEXEC | O_CREAT | O_RDWR, 0666));</a>
+<a name="ln154">  RETURN_NOT_OK(CheckError(fd_, &quot;open&quot;));</a>
+<a name="ln155"> </a>
+<a name="ln156">  int err;</a>
+<a name="ln157">  RETRY_ON_EINTR(err, ftruncate(fd_, kChunkFileSize));</a>
+<a name="ln158">  RETURN_NOT_OK(CheckError(fd_, &quot;truncate&quot;));</a>
+<a name="ln159"> </a>
+<a name="ln160">  mapping_ = static_cast&lt;uint8_t*&gt;(mmap(nullptr, kChunkFileSize, PROT_READ | PROT_WRITE,</a>
+<a name="ln161">                                        MAP_SHARED, fd_, 0));</a>
+<a name="ln162">  if (mapping_ == nullptr) {</a>
+<a name="ln163">    return STATUS(IOError, &quot;Unable to mmap()&quot;, Errno(err));</a>
+<a name="ln164">  }</a>
+<a name="ln165"> </a>
+<a name="ln166">  return Status::OK();</a>
+<a name="ln167">}</a>
+<a name="ln168"> </a>
+<a name="ln169">void LogIndex::IndexChunk::GetEntry(int entry_index, PhysicalEntry* ret) {</a>
+<a name="ln170">  DCHECK_GE(fd_, 0) &lt;&lt; &quot;Must Open() first&quot;;</a>
+<a name="ln171">  DCHECK_LT(entry_index, kEntriesPerIndexChunk);</a>
+<a name="ln172"> </a>
+<a name="ln173">  memcpy(ret, mapping_ + sizeof(PhysicalEntry) * entry_index, sizeof(PhysicalEntry));</a>
+<a name="ln174">}</a>
+<a name="ln175"> </a>
+<a name="ln176">void LogIndex::IndexChunk::SetEntry(int entry_index, const PhysicalEntry&amp; phys) {</a>
+<a name="ln177">  DCHECK_GE(fd_, 0) &lt;&lt; &quot;Must Open() first&quot;;</a>
+<a name="ln178">  DCHECK_LT(entry_index, kEntriesPerIndexChunk);</a>
+<a name="ln179"> </a>
+<a name="ln180">  memcpy(mapping_ + sizeof(PhysicalEntry) * entry_index, &amp;phys, sizeof(PhysicalEntry));</a>
+<a name="ln181">}</a>
+<a name="ln182"> </a>
+<a name="ln183">Status LogIndex::IndexChunk::Flush() {</a>
+<a name="ln184">  if (mapping_ != nullptr) {</a>
+<a name="ln185">    auto result = msync(mapping_, kChunkFileSize, MS_SYNC);</a>
+<a name="ln186">    return CheckError(result, &quot;msync&quot;);</a>
+<a name="ln187">  }</a>
+<a name="ln188">  return Status::OK();</a>
+<a name="ln189">}</a>
+<a name="ln190"> </a>
+<a name="ln191">////////////////////////////////////////////////////////////</a>
+<a name="ln192">// LogIndex</a>
+<a name="ln193">////////////////////////////////////////////////////////////</a>
+<a name="ln194"> </a>
+<a name="ln195">LogIndex::LogIndex(std::string base_dir) : base_dir_(std::move(base_dir)) {}</a>
+<a name="ln196"> </a>
+<a name="ln197">LogIndex::~LogIndex() {</a>
+<a name="ln198">}</a>
+<a name="ln199"> </a>
+<a name="ln200">string LogIndex::GetChunkPath(int64_t chunk_idx) {</a>
+<a name="ln201">  return StringPrintf(&quot;%s/index.%09&quot; PRId64, base_dir_.c_str(), chunk_idx);</a>
+<a name="ln202">}</a>
+<a name="ln203"> </a>
+<a name="ln204">Status LogIndex::OpenChunk(int64_t chunk_idx, scoped_refptr&lt;IndexChunk&gt;* chunk) {</a>
+<a name="ln205">  string path = GetChunkPath(chunk_idx);</a>
+<a name="ln206"> </a>
+<a name="ln207">  scoped_refptr&lt;IndexChunk&gt; new_chunk(new IndexChunk(path));</a>
+<a name="ln208">  RETURN_NOT_OK(new_chunk-&gt;Open());</a>
+<a name="ln209">  chunk-&gt;swap(new_chunk);</a>
+<a name="ln210">  return Status::OK();</a>
+<a name="ln211">}</a>
+<a name="ln212"> </a>
+<a name="ln213">Status LogIndex::GetChunkForIndex(int64_t log_index, bool create,</a>
+<a name="ln214">                                  scoped_refptr&lt;IndexChunk&gt;* chunk) {</a>
+<a name="ln215">  CHECK_GT(log_index, 0);</a>
+<a name="ln216">  int64_t chunk_idx = log_index / kEntriesPerIndexChunk;</a>
+<a name="ln217"> </a>
+<a name="ln218">  {</a>
+<a name="ln219">    std::lock_guard&lt;simple_spinlock&gt; l(open_chunks_lock_);</a>
+<a name="ln220">    if (FindCopy(open_chunks_, chunk_idx, chunk)) {</a>
+<a name="ln221">      return Status::OK();</a>
+<a name="ln222">    }</a>
+<a name="ln223">  }</a>
+<a name="ln224"> </a>
+<a name="ln225">  if (!create) {</a>
+<a name="ln226">    return STATUS(NotFound, &quot;chunk not found&quot;);</a>
+<a name="ln227">  }</a>
+<a name="ln228"> </a>
+<a name="ln229">  RETURN_NOT_OK_PREPEND(OpenChunk(chunk_idx, chunk),</a>
+<a name="ln230">                        &quot;Couldn't open index chunk&quot;);</a>
+<a name="ln231">  {</a>
+<a name="ln232">    std::lock_guard&lt;simple_spinlock&gt; l(open_chunks_lock_);</a>
+<a name="ln233">    if (PREDICT_FALSE(ContainsKey(open_chunks_, chunk_idx))) {</a>
+<a name="ln234">      // Someone else opened the chunk in the meantime.</a>
+<a name="ln235">      // We'll just return that one.</a>
+<a name="ln236">      *chunk = FindOrDie(open_chunks_, chunk_idx);</a>
+<a name="ln237">      return Status::OK();</a>
+<a name="ln238">    }</a>
+<a name="ln239"> </a>
+<a name="ln240">    InsertOrDie(&amp;open_chunks_, chunk_idx, *chunk);</a>
+<a name="ln241">  }</a>
+<a name="ln242"> </a>
+<a name="ln243">  return Status::OK();</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246">Status LogIndex::AddEntry(const LogIndexEntry&amp; entry) {</a>
+<a name="ln247">  scoped_refptr&lt;IndexChunk&gt; chunk;</a>
+<a name="ln248">  RETURN_NOT_OK(GetChunkForIndex(entry.op_id.index,</a>
+<a name="ln249">                                 true /* create if not found */,</a>
+<a name="ln250">                                 &amp;chunk));</a>
+<a name="ln251">  int index_in_chunk = entry.op_id.index % kEntriesPerIndexChunk;</a>
+<a name="ln252"> </a>
+<a name="ln253">  PhysicalEntry phys;</a>
+<a name="ln254">  phys.term = entry.op_id.term;</a>
+<a name="ln255">  phys.segment_sequence_number = entry.segment_sequence_number;</a>
+<a name="ln256">  phys.offset_in_segment = entry.offset_in_segment;</a>
+<a name="ln257"> </a>
+<a name="ln258">  chunk-&gt;SetEntry(index_in_chunk, phys);</a>
+<a name="ln259">  VLOG(3) &lt;&lt; &quot;Added log index entry &quot; &lt;&lt; entry.ToString();</a>
+<a name="ln260"> </a>
+<a name="ln261">  return Status::OK();</a>
+<a name="ln262">}</a>
+<a name="ln263"> </a>
+<a name="ln264">Status LogIndex::GetEntry(int64_t index, LogIndexEntry* entry) {</a>
+<a name="ln265">  scoped_refptr&lt;IndexChunk&gt; chunk;</a>
+<a name="ln266">  RETURN_NOT_OK(GetChunkForIndex(index, false /* do not create */, &amp;chunk));</a>
+<a name="ln267">  int index_in_chunk = index % kEntriesPerIndexChunk;</a>
+<a name="ln268">  PhysicalEntry phys;</a>
+<a name="ln269">  chunk-&gt;GetEntry(index_in_chunk, &amp;phys);</a>
+<a name="ln270"> </a>
+<a name="ln271">  // We never write any real entries to offset 0, because there's a header</a>
+<a name="ln272">  // in each log segment. So, this indicates an entry that was never written.</a>
+<a name="ln273">  if (phys.offset_in_segment == 0) {</a>
+<a name="ln274">    return STATUS(NotFound, &quot;entry not found&quot;);</a>
+<a name="ln275">  }</a>
+<a name="ln276"> </a>
+<a name="ln277">  entry-&gt;op_id = yb::OpId(phys.term, index);</a>
+<a name="ln278">  entry-&gt;segment_sequence_number = phys.segment_sequence_number;</a>
+<a name="ln279">  entry-&gt;offset_in_segment = phys.offset_in_segment;</a>
+<a name="ln280"> </a>
+<a name="ln281">  return Status::OK();</a>
+<a name="ln282">}</a>
+<a name="ln283"> </a>
+<a name="ln284">void LogIndex::GC(int64_t min_index_to_retain) {</a>
+<a name="ln285">  int min_chunk_to_retain = min_index_to_retain / kEntriesPerIndexChunk;</a>
+<a name="ln286"> </a>
+<a name="ln287">  // Enumerate which chunks to delete.</a>
+<a name="ln288">  vector&lt;int64_t&gt; chunks_to_delete;</a>
+<a name="ln289">  {</a>
+<a name="ln290">    std::lock_guard&lt;simple_spinlock&gt; l(open_chunks_lock_);</a>
+<a name="ln291">    for (auto it = open_chunks_.begin();</a>
+<a name="ln292">         it != open_chunks_.lower_bound(min_chunk_to_retain); ++it) {</a>
+<a name="ln293">      chunks_to_delete.push_back(it-&gt;first);</a>
+<a name="ln294">    }</a>
+<a name="ln295">  }</a>
+<a name="ln296"> </a>
+<a name="ln297">  // Outside of the lock, try to delete them (avoid holding the lock during IO).</a>
+<a name="ln298">  for (int64_t chunk_idx : chunks_to_delete) {</a>
+<a name="ln299">    string path = GetChunkPath(chunk_idx);</a>
+<a name="ln300">    int rc = unlink(path.c_str());</a>
+<a name="ln301">    if (rc != 0) {</a>
+<a name="ln302">      PLOG(WARNING) &lt;&lt; &quot;Unable to delete index chunk &quot; &lt;&lt; path;</a>
+<a name="ln303">      continue;</a>
+<a name="ln304">    }</a>
+<a name="ln305">    LOG(INFO) &lt;&lt; &quot;Deleted log index segment &quot; &lt;&lt; path;</a>
+<a name="ln306">    {</a>
+<a name="ln307">      std::lock_guard&lt;simple_spinlock&gt; l(open_chunks_lock_);</a>
+<a name="ln308">      open_chunks_.erase(chunk_idx);</a>
+<a name="ln309">    }</a>
+<a name="ln310">  }</a>
+<a name="ln311">}</a>
+<a name="ln312"> </a>
+<a name="ln313">Status LogIndex::Flush() {</a>
+<a name="ln314">  std::vector&lt;scoped_refptr&lt;IndexChunk&gt;&gt; chunks_to_flush;</a>
+<a name="ln315"> </a>
+<a name="ln316">  {</a>
+<a name="ln317">    std::lock_guard&lt;simple_spinlock&gt; l(open_chunks_lock_);</a>
+<a name="ln318">    chunks_to_flush.reserve(open_chunks_.size());</a>
+<a name="ln319">    for (auto&amp; it : open_chunks_) {</a>
+<a name="ln320">      chunks_to_flush.push_back(it.second);</a>
+<a name="ln321">    }</a>
+<a name="ln322">  }</a>
+<a name="ln323"> </a>
+<a name="ln324">  for (auto&amp; chunk : chunks_to_flush) {</a>
+<a name="ln325">    RETURN_NOT_OK(chunk-&gt;Flush());</a>
+<a name="ln326">  }</a>
+<a name="ln327"> </a>
+<a name="ln328">  return Status::OK();</a>
+<a name="ln329">}</a>
+<a name="ln330"> </a>
+<a name="ln331">string LogIndexEntry::ToString() const {</a>
+<a name="ln332">  return Substitute(&quot;op_id=$0.$1 segment_sequence_number=$2 offset=$3&quot;,</a>
+<a name="ln333">                    op_id.term, op_id.index,</a>
+<a name="ln334">                    segment_sequence_number,</a>
+<a name="ln335">                    offset_in_segment);</a>
+<a name="ln336">}</a>
+<a name="ln337"> </a>
+<a name="ln338">} // namespace log</a>
+<a name="ln339">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="259"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

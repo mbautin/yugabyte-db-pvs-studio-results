@@ -1,0 +1,240 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>doc_kv_util.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/docdb/doc_kv_util.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/docdb/doc_key.h&quot;</a>
+<a name="ln17">#include &quot;yb/docdb/doc_ttl_util.h&quot;</a>
+<a name="ln18">#include &quot;yb/docdb/value.h&quot;</a>
+<a name="ln19">#include &quot;yb/rocksutil/yb_rocksdb.h&quot;</a>
+<a name="ln20">#include &quot;yb/server/hybrid_clock.h&quot;</a>
+<a name="ln21">#include &quot;yb/util/bytes_formatter.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">using std::string;</a>
+<a name="ln24"> </a>
+<a name="ln25">using strings::Substitute;</a>
+<a name="ln26">using yb::HybridTime;</a>
+<a name="ln27">using yb::FormatBytesAsStr;</a>
+<a name="ln28"> </a>
+<a name="ln29">namespace yb {</a>
+<a name="ln30">namespace docdb {</a>
+<a name="ln31"> </a>
+<a name="ln32">bool KeyBelongsToDocKeyInTest(const rocksdb::Slice &amp;key, const string &amp;encoded_doc_key) {</a>
+<a name="ln33">  if (key.starts_with(encoded_doc_key)) {</a>
+<a name="ln34">    const int encoded_doc_key_size = encoded_doc_key.size();</a>
+<a name="ln35">    const char* key_data = key.cdata();</a>
+<a name="ln36">    return key.size() &gt;= encoded_doc_key_size + 2 &amp;&amp;</a>
+<a name="ln37">           key_data[encoded_doc_key_size] == '\0' &amp;&amp;</a>
+<a name="ln38">           key_data[encoded_doc_key_size + 1] == '\0';</a>
+<a name="ln39">  } else {</a>
+<a name="ln40">    return false;</a>
+<a name="ln41">  }</a>
+<a name="ln42">}</a>
+<a name="ln43"> </a>
+<a name="ln44">Status ConsumeHybridTimeFromKey(rocksdb::Slice* slice, DocHybridTime* hybrid_time)  {</a>
+<a name="ln45">  return hybrid_time-&gt;DecodeFrom(slice);</a>
+<a name="ln46">}</a>
+<a name="ln47"> </a>
+<a name="ln48">Status DecodeHybridTimeFromEndOfKey(</a>
+<a name="ln49">    const rocksdb::Slice &amp;key,</a>
+<a name="ln50">    DocHybridTime *dest) {</a>
+<a name="ln51">  return dest-&gt;DecodeFromEnd(key);</a>
+<a name="ln52">}</a>
+<a name="ln53"> </a>
+<a name="ln54">// Given a DocDB key stored in RocksDB, validate the DocHybridTime size stored as the</a>
+<a name="ln55">// last few bits of the final byte of the key, and ensure that the ValueType byte preceding that</a>
+<a name="ln56">// encoded DocHybridTime is ValueType::kHybridTime.</a>
+<a name="ln57">Status CheckHybridTimeSizeAndValueType(</a>
+<a name="ln58">    const rocksdb::Slice&amp; key,</a>
+<a name="ln59">    int* ht_byte_size_dest) {</a>
+<a name="ln60">  RETURN_NOT_OK(</a>
+<a name="ln61">      DocHybridTime::CheckAndGetEncodedSize(key, ht_byte_size_dest));</a>
+<a name="ln62">  const size_t hybrid_time_value_type_offset = key.size() - *ht_byte_size_dest - 1;</a>
+<a name="ln63">  const ValueType value_type = DecodeValueType(key[hybrid_time_value_type_offset]);</a>
+<a name="ln64">  if (value_type != ValueType::kHybridTime) {</a>
+<a name="ln65">    return STATUS_FORMAT(</a>
+<a name="ln66">        Corruption,</a>
+<a name="ln67">        &quot;Expected to find value type kHybridTime preceding the HybridTime component of the &quot;</a>
+<a name="ln68">            &quot;encoded key, found $0. DocHybridTime bytes: $1&quot;,</a>
+<a name="ln69">        value_type,</a>
+<a name="ln70">        ToShortDebugStr(rocksdb::Slice(key.data() + hybrid_time_value_type_offset,</a>
+<a name="ln71">                                       key.size() - hybrid_time_value_type_offset)));</a>
+<a name="ln72">  }</a>
+<a name="ln73"> </a>
+<a name="ln74">  return Status::OK();</a>
+<a name="ln75">}</a>
+<a name="ln76"> </a>
+<a name="ln77">template &lt;char END_OF_STRING&gt;</a>
+<a name="ln78">void AppendEncodedStrToKey(const string &amp;s, KeyBuffer *dest) {</a>
+<a name="ln79">  static_assert(END_OF_STRING == '\0' || END_OF_STRING == '\xff',</a>
+<a name="ln80">                &quot;Only characters '\0' and '\xff' allowed as a template parameter&quot;);</a>
+<a name="ln81">  if (END_OF_STRING == '\0' &amp;&amp; s.find('\0') == string::npos) {</a>
+<a name="ln82">    // Fast path: no zero characters, nothing to encode.</a>
+<a name="ln83">    dest-&gt;append(s);</a>
+<a name="ln84">  } else {</a>
+<a name="ln85">    for (char c : s) {</a>
+<a name="ln86">      if (c == '\0') {</a>
+<a name="ln87">        dest-&gt;push_back(END_OF_STRING);</a>
+<a name="ln88">        dest-&gt;push_back(END_OF_STRING ^ 1);</a>
+<a name="ln89">      } else {</a>
+<a name="ln90">        dest-&gt;push_back(END_OF_STRING ^ c);</a>
+<a name="ln91">      }</a>
+<a name="ln92">    }</a>
+<a name="ln93">  }</a>
+<a name="ln94">}</a>
+<a name="ln95"> </a>
+<a name="ln96">void AppendZeroEncodedStrToKey(const string &amp;s, KeyBuffer *dest) {</a>
+<a name="ln97">  AppendEncodedStrToKey&lt;'\0'&gt;(s, dest);</a>
+<a name="ln98">}</a>
+<a name="ln99"> </a>
+<a name="ln100">void AppendComplementZeroEncodedStrToKey(const string &amp;s, KeyBuffer *dest) {</a>
+<a name="ln101">  AppendEncodedStrToKey&lt;'\xff'&gt;(s, dest);</a>
+<a name="ln102">}</a>
+<a name="ln103"> </a>
+<a name="ln104">template &lt;char A&gt;</a>
+<a name="ln105">inline void TerminateEncodedKeyStr(KeyBuffer *dest) {</a>
+<a name="ln106">  dest-&gt;push_back(A);</a>
+<a name="ln107">  dest-&gt;push_back(A);</a>
+<a name="ln108">}</a>
+<a name="ln109"> </a>
+<a name="ln110">void TerminateZeroEncodedKeyStr(KeyBuffer *dest) {</a>
+<a name="ln111">  TerminateEncodedKeyStr&lt;'\0'&gt;(dest);</a>
+<a name="ln112">}</a>
+<a name="ln113"> </a>
+<a name="ln114">void TerminateComplementZeroEncodedKeyStr(KeyBuffer *dest) {</a>
+<a name="ln115">  TerminateEncodedKeyStr&lt;'\xff'&gt;(dest);</a>
+<a name="ln116">}</a>
+<a name="ln117"> </a>
+<a name="ln118">template&lt;char END_OF_STRING&gt;</a>
+<a name="ln119">Status DecodeEncodedStr(rocksdb::Slice* slice, string* result) {</a>
+<a name="ln120">  static_assert(END_OF_STRING == '\0' || END_OF_STRING == '\xff',</a>
+<a name="ln121">                &quot;Invalid END_OF_STRING character. Only '\0' and '\xff' accepted&quot;);</a>
+<a name="ln122">  constexpr char END_OF_STRING_ESCAPE = END_OF_STRING ^ 1;</a>
+<a name="ln123">  const char* p = slice-&gt;cdata();</a>
+<a name="ln124">  const char* end = p + slice-&gt;size();</a>
+<a name="ln125"> </a>
+<a name="ln126">  while (p != end) {</a>
+<a name="ln127">    if (*p == END_OF_STRING) {</a>
+<a name="ln128">      ++p;</a>
+<a name="ln129">      if (p == end) {</a>
+<a name="ln130">        return STATUS(Corruption, StringPrintf(&quot;Encoded string ends with only one \\0x%02x &quot;,</a>
+<a name="ln131">                                               END_OF_STRING));</a>
+<a name="ln132">      }</a>
+<a name="ln133">      if (*p == END_OF_STRING) {</a>
+<a name="ln134">        // Found two END_OF_STRING characters, this is the end of the encoded string.</a>
+<a name="ln135">        ++p;</a>
+<a name="ln136">        break;</a>
+<a name="ln137">      }</a>
+<a name="ln138">      if (*p == END_OF_STRING_ESCAPE) {</a>
+<a name="ln139">        // Character END_OF_STRING is encoded as AB.</a>
+<a name="ln140">        if (result != nullptr) {</a>
+<a name="ln141">          result-&gt;push_back(END_OF_STRING ^ END_OF_STRING);</a>
+<a name="ln142">        }</a>
+<a name="ln143">        ++p;</a>
+<a name="ln144">      } else {</a>
+<a name="ln145">        return STATUS(Corruption, StringPrintf(</a>
+<a name="ln146">            &quot;Invalid sequence in encoded string: &quot;</a>
+<a name="ln147">            R&quot;#(\0x%02x\0x%02x (must be either \0x%02x\0x%02x or \0x%02x\0x%02x))#&quot;,</a>
+<a name="ln148">            END_OF_STRING, *p, END_OF_STRING, END_OF_STRING, END_OF_STRING, END_OF_STRING_ESCAPE));</a>
+<a name="ln149">      }</a>
+<a name="ln150">    } else {</a>
+<a name="ln151">      if (result != nullptr) {</a>
+<a name="ln152">        result-&gt;push_back((*p) ^ END_OF_STRING);</a>
+<a name="ln153">      }</a>
+<a name="ln154">      ++p;</a>
+<a name="ln155">    }</a>
+<a name="ln156">  }</a>
+<a name="ln157">  if (result != nullptr) {</a>
+<a name="ln158">    result-&gt;shrink_to_fit();</a>
+<a name="ln159">  }</a>
+<a name="ln160">  slice-&gt;remove_prefix(p - slice-&gt;cdata());</a>
+<a name="ln161">  return Status::OK();</a>
+<a name="ln162">}</a>
+<a name="ln163"> </a>
+<a name="ln164">Status DecodeComplementZeroEncodedStr(rocksdb::Slice* slice, std::string* result) {</a>
+<a name="ln165">  return DecodeEncodedStr&lt;'\xff'&gt;(slice, result);</a>
+<a name="ln166">}</a>
+<a name="ln167"> </a>
+<a name="ln168">Status DecodeZeroEncodedStr(rocksdb::Slice* slice, string* result) {</a>
+<a name="ln169">  return DecodeEncodedStr&lt;'\0'&gt;(slice, result);</a>
+<a name="ln170">}</a>
+<a name="ln171"> </a>
+<a name="ln172">string DecodeZeroEncodedStr(string encoded_str) {</a>
+<a name="ln173">  string result;</a>
+<a name="ln174">  rocksdb::Slice slice(encoded_str);</a>
+<a name="ln175">  Status status = DecodeZeroEncodedStr(&amp;slice, &amp;result);</a>
+<a name="ln176">  if (!status.ok()) {</a>
+<a name="ln177">    LOG(FATAL) &lt;&lt; &quot;Failed to decode zero-encoded string &quot; &lt;&lt; FormatBytesAsStr(encoded_str) &lt;&lt; &quot;: &quot;</a>
+<a name="ln178">               &lt;&lt; status.ToString();</a>
+<a name="ln179">  }</a>
+<a name="ln180">  if (!slice.empty()) {</a>
+<a name="ln181">    LOG(FATAL) &lt;&lt; &quot;Did not consume all characters from a zero-encoded string &quot;</a>
+<a name="ln182">               &lt;&lt; FormatBytesAsStr(encoded_str) &lt;&lt; &quot;: &quot;</a>
+<a name="ln183">               &lt;&lt; &quot;bytes left: &quot; &lt;&lt; slice.size() &lt;&lt; &quot;, &quot;</a>
+<a name="ln184">               &lt;&lt; &quot;encoded_str.size(): &quot; &lt;&lt; encoded_str.size();</a>
+<a name="ln185">  }</a>
+<a name="ln186">  return result;</a>
+<a name="ln187">}</a>
+<a name="ln188"> </a>
+<a name="ln189">std::string ToShortDebugStr(rocksdb::Slice slice) {</a>
+<a name="ln190">  return FormatSliceAsStr(slice, QuotesType::kDoubleQuotes, kShortDebugStringLength);</a>
+<a name="ln191">}</a>
+<a name="ln192"> </a>
+<a name="ln193">}  // namespace docdb</a>
+<a name="ln194">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="141"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v501/" target="_blank">V501</a> There are identical sub-expressions to the left and to the right of the '^' operator: END_OF_STRING ^ END_OF_STRING</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,653 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>yb_rpc.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/rpc/yb_rpc.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;google/protobuf/io/coded_stream.h&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/gutil/endian.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/rpc/connection.h&quot;</a>
+<a name="ln23">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln24">#include &quot;yb/rpc/reactor.h&quot;</a>
+<a name="ln25">#include &quot;yb/rpc/rpc_introspection.pb.h&quot;</a>
+<a name="ln26">#include &quot;yb/rpc/serialization.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln29">#include &quot;yb/util/debug/trace_event.h&quot;</a>
+<a name="ln30">#include &quot;yb/util/memory/memory.h&quot;</a>
+<a name="ln31">#include &quot;yb/util/size_literals.h&quot;</a>
+<a name="ln32"> </a>
+<a name="ln33">using google::protobuf::io::CodedInputStream;</a>
+<a name="ln34">using namespace yb::size_literals;</a>
+<a name="ln35">using namespace std::literals;</a>
+<a name="ln36"> </a>
+<a name="ln37">DECLARE_bool(rpc_dump_all_traces);</a>
+<a name="ln38">// Maximum size of RPC should be larger than size of consensus batch</a>
+<a name="ln39">// At each layer, we embed the &quot;message&quot; from the previous layer.</a>
+<a name="ln40">// In order to send three strings of 64, the request from cql/redis will be larger</a>
+<a name="ln41">// than that because we will have overheads from that layer.</a>
+<a name="ln42">// Hence, we have a limit of 254MB at the consensus layer.</a>
+<a name="ln43">// The rpc layer adds its own headers, so we limit the rpc message size to 255MB.</a>
+<a name="ln44">DEFINE_int32(rpc_max_message_size, 255_MB,</a>
+<a name="ln45">             &quot;The maximum size of a message of any RPC that the server will accept.&quot;);</a>
+<a name="ln46"> </a>
+<a name="ln47">DEFINE_bool(enable_rpc_keepalive, true, &quot;Whether to enable RPC keepalive mechanism&quot;);</a>
+<a name="ln48"> </a>
+<a name="ln49">DEFINE_uint64(min_sidecar_buffer_size, 16_KB, &quot;Minimal buffer to allocate for sidecar&quot;);</a>
+<a name="ln50"> </a>
+<a name="ln51">DEFINE_test_flag(int32, yb_inbound_big_calls_parse_delay_ms, false,</a>
+<a name="ln52">    &quot;Test flag for simulating slow parsing of inbound calls larger than &quot;</a>
+<a name="ln53">    &quot;rpc_throttle_threshold_bytes&quot;);</a>
+<a name="ln54"> </a>
+<a name="ln55">using std::placeholders::_1;</a>
+<a name="ln56">DECLARE_uint64(rpc_connection_timeout_ms);</a>
+<a name="ln57">DECLARE_int32(rpc_slow_query_threshold_ms);</a>
+<a name="ln58">DECLARE_int32(rpc_throttle_threshold_bytes);</a>
+<a name="ln59"> </a>
+<a name="ln60">namespace yb {</a>
+<a name="ln61">namespace rpc {</a>
+<a name="ln62"> </a>
+<a name="ln63">constexpr const auto kHeartbeatsPerTimeoutPeriod = 3;</a>
+<a name="ln64"> </a>
+<a name="ln65">namespace {</a>
+<a name="ln66"> </a>
+<a name="ln67">// One byte after YugaByte is reserved for future use. It could control type of connection.</a>
+<a name="ln68">const char kConnectionHeaderBytes[] = &quot;YB\1&quot;;</a>
+<a name="ln69">const size_t kConnectionHeaderSize = sizeof(kConnectionHeaderBytes) - 1;</a>
+<a name="ln70"> </a>
+<a name="ln71">OutboundDataPtr ConnectionHeaderInstance() {</a>
+<a name="ln72">  static OutboundDataPtr result(</a>
+<a name="ln73">      new StringOutboundData(kConnectionHeaderBytes, kConnectionHeaderSize, &quot;ConnectionHeader&quot;));</a>
+<a name="ln74">  return result;</a>
+<a name="ln75">}</a>
+<a name="ln76"> </a>
+<a name="ln77">const char kEmptyMsgLengthPrefix[kMsgLengthPrefixLength] = {0};</a>
+<a name="ln78"> </a>
+<a name="ln79">class HeartbeatOutboundData : public StringOutboundData {</a>
+<a name="ln80"> public:</a>
+<a name="ln81">  bool IsHeartbeat() const override { return true; }</a>
+<a name="ln82"> </a>
+<a name="ln83">  static std::shared_ptr&lt;HeartbeatOutboundData&gt; Instance() {</a>
+<a name="ln84">    static std::shared_ptr&lt;HeartbeatOutboundData&gt; instance(new HeartbeatOutboundData());</a>
+<a name="ln85">    return instance;</a>
+<a name="ln86">  }</a>
+<a name="ln87"> </a>
+<a name="ln88"> private:</a>
+<a name="ln89">  HeartbeatOutboundData() :</a>
+<a name="ln90">      StringOutboundData(kEmptyMsgLengthPrefix, kMsgLengthPrefixLength, &quot;Heartbeat&quot;) {}</a>
+<a name="ln91">};</a>
+<a name="ln92"> </a>
+<a name="ln93">} // namespace</a>
+<a name="ln94"> </a>
+<a name="ln95">using google::protobuf::FieldDescriptor;</a>
+<a name="ln96">using google::protobuf::Message;</a>
+<a name="ln97">using google::protobuf::MessageLite;</a>
+<a name="ln98">using google::protobuf::io::CodedOutputStream;</a>
+<a name="ln99"> </a>
+<a name="ln100">YBConnectionContext::YBConnectionContext(</a>
+<a name="ln101">    size_t receive_buffer_size, const MemTrackerPtr&amp; buffer_tracker,</a>
+<a name="ln102">    const MemTrackerPtr&amp; call_tracker)</a>
+<a name="ln103">    : parser_(buffer_tracker, kMsgLengthPrefixLength, 0 /* size_offset */,</a>
+<a name="ln104">              FLAGS_rpc_max_message_size, IncludeHeader::kFalse, rpc::SkipEmptyMessages::kTrue,</a>
+<a name="ln105">              this),</a>
+<a name="ln106">      read_buffer_(receive_buffer_size, buffer_tracker),</a>
+<a name="ln107">      call_tracker_(call_tracker) {}</a>
+<a name="ln108"> </a>
+<a name="ln109">void YBConnectionContext::SetEventLoop(ev::loop_ref* loop) {</a>
+<a name="ln110">  loop_ = loop;</a>
+<a name="ln111">}</a>
+<a name="ln112"> </a>
+<a name="ln113">void YBConnectionContext::Shutdown(const Status&amp; status) {</a>
+<a name="ln114">  timer_.Shutdown();</a>
+<a name="ln115">  loop_ = nullptr;</a>
+<a name="ln116">}</a>
+<a name="ln117"> </a>
+<a name="ln118">YBConnectionContext::~YBConnectionContext() {}</a>
+<a name="ln119"> </a>
+<a name="ln120">namespace {</a>
+<a name="ln121"> </a>
+<a name="ln122">CoarseMonoClock::Duration Timeout() {</a>
+<a name="ln123">  return FLAGS_rpc_connection_timeout_ms * 1ms;</a>
+<a name="ln124">}</a>
+<a name="ln125"> </a>
+<a name="ln126">CoarseMonoClock::Duration HeartbeatPeriod() {</a>
+<a name="ln127">  return Timeout() / kHeartbeatsPerTimeoutPeriod;</a>
+<a name="ln128">}</a>
+<a name="ln129"> </a>
+<a name="ln130">} // namespace</a>
+<a name="ln131"> </a>
+<a name="ln132">uint64_t YBConnectionContext::ExtractCallId(InboundCall* call) {</a>
+<a name="ln133">  return down_cast&lt;YBInboundCall*&gt;(call)-&gt;call_id();</a>
+<a name="ln134">}</a>
+<a name="ln135"> </a>
+<a name="ln136">Result&lt;ProcessDataResult&gt; YBInboundConnectionContext::ProcessCalls(</a>
+<a name="ln137">    const ConnectionPtr&amp; connection, const IoVecs&amp; data, ReadBufferFull read_buffer_full) {</a>
+<a name="ln138">  if (state_ == RpcConnectionPB::NEGOTIATING) {</a>
+<a name="ln139">    // We assume that header is fully contained in the first block.</a>
+<a name="ln140">    if (data[0].iov_len &lt; kConnectionHeaderSize) {</a>
+<a name="ln141">      return ProcessDataResult{ 0, Slice() };</a>
+<a name="ln142">    }</a>
+<a name="ln143"> </a>
+<a name="ln144">    Slice slice(static_cast&lt;const char*&gt;(data[0].iov_base), data[0].iov_len);</a>
+<a name="ln145">    if (!slice.starts_with(kConnectionHeaderBytes, kConnectionHeaderSize)) {</a>
+<a name="ln146">      return STATUS_FORMAT(NetworkError,</a>
+<a name="ln147">                           &quot;Invalid connection header: $0&quot;,</a>
+<a name="ln148">                           slice.ToDebugHexString());</a>
+<a name="ln149">    }</a>
+<a name="ln150">    state_ = RpcConnectionPB::OPEN;</a>
+<a name="ln151">    IoVecs data_copy(data);</a>
+<a name="ln152">    data_copy[0].iov_len -= kConnectionHeaderSize;</a>
+<a name="ln153">    data_copy[0].iov_base = const_cast&lt;uint8_t*&gt;(slice.data() + kConnectionHeaderSize);</a>
+<a name="ln154">    auto result = VERIFY_RESULT(</a>
+<a name="ln155">        parser().Parse(connection, data_copy, ReadBufferFull::kFalse, &amp;call_tracker()));</a>
+<a name="ln156">    result.consumed += kConnectionHeaderSize;</a>
+<a name="ln157">    return result;</a>
+<a name="ln158">  }</a>
+<a name="ln159"> </a>
+<a name="ln160">  return parser().Parse(connection, data, read_buffer_full, &amp;call_tracker());</a>
+<a name="ln161">}</a>
+<a name="ln162"> </a>
+<a name="ln163">namespace {</a>
+<a name="ln164"> </a>
+<a name="ln165">CHECKED_STATUS ThrottleRpcStatus(const MemTrackerPtr&amp; throttle_tracker, const YBInboundCall&amp; call) {</a>
+<a name="ln166">  if (ShouldThrottleRpc(throttle_tracker, call.request_data().size(), &quot;Rejecting RPC call: &quot;)) {</a>
+<a name="ln167">    return STATUS_FORMAT(ServiceUnavailable, &quot;Call rejected due to memory pressure: $0&quot;, call);</a>
+<a name="ln168">  } else {</a>
+<a name="ln169">    return Status::OK();</a>
+<a name="ln170">  }</a>
+<a name="ln171">}</a>
+<a name="ln172"> </a>
+<a name="ln173">} // namespace</a>
+<a name="ln174"> </a>
+<a name="ln175">Status YBInboundConnectionContext::HandleCall(</a>
+<a name="ln176">    const ConnectionPtr&amp; connection, CallData* call_data) {</a>
+<a name="ln177">  auto reactor = connection-&gt;reactor();</a>
+<a name="ln178">  DCHECK(reactor-&gt;IsCurrentThread());</a>
+<a name="ln179"> </a>
+<a name="ln180">  auto call = InboundCall::Create&lt;YBInboundCall&gt;(connection, call_processed_listener());</a>
+<a name="ln181"> </a>
+<a name="ln182">  Status s = call-&gt;ParseFrom(call_tracker(), call_data);</a>
+<a name="ln183">  if (!s.ok()) {</a>
+<a name="ln184">    return s;</a>
+<a name="ln185">  }</a>
+<a name="ln186"> </a>
+<a name="ln187">  s = Store(call.get());</a>
+<a name="ln188">  if (!s.ok()) {</a>
+<a name="ln189">    return s;</a>
+<a name="ln190">  }</a>
+<a name="ln191"> </a>
+<a name="ln192">  auto throttle_status = ThrottleRpcStatus(call_tracker(), *call);</a>
+<a name="ln193">  if (!throttle_status.ok()) {</a>
+<a name="ln194">    call-&gt;RespondFailure(ErrorStatusPB::ERROR_APPLICATION, throttle_status);</a>
+<a name="ln195">    return Status::OK();</a>
+<a name="ln196">  }</a>
+<a name="ln197"> </a>
+<a name="ln198">  reactor-&gt;messenger()-&gt;QueueInboundCall(call);</a>
+<a name="ln199"> </a>
+<a name="ln200">  return Status::OK();</a>
+<a name="ln201">}</a>
+<a name="ln202"> </a>
+<a name="ln203">void YBInboundConnectionContext::Connected(const ConnectionPtr&amp; connection) {</a>
+<a name="ln204">  DCHECK_EQ(connection-&gt;direction(), Connection::Direction::SERVER);</a>
+<a name="ln205"> </a>
+<a name="ln206">  state_ = RpcConnectionPB::NEGOTIATING;</a>
+<a name="ln207"> </a>
+<a name="ln208">  connection_ = connection;</a>
+<a name="ln209">  last_write_time_ = connection-&gt;reactor()-&gt;cur_time();</a>
+<a name="ln210">  if (FLAGS_enable_rpc_keepalive) {</a>
+<a name="ln211">    timer_.Init(*loop_);</a>
+<a name="ln212">    timer_.SetCallback&lt;</a>
+<a name="ln213">        YBInboundConnectionContext, &amp;YBInboundConnectionContext::HandleTimeout&gt;(this);</a>
+<a name="ln214">    timer_.Start(HeartbeatPeriod());</a>
+<a name="ln215">  }</a>
+<a name="ln216">}</a>
+<a name="ln217"> </a>
+<a name="ln218">void YBInboundConnectionContext::UpdateLastWrite(const ConnectionPtr&amp; connection) {</a>
+<a name="ln219">  last_write_time_ = connection-&gt;reactor()-&gt;cur_time();</a>
+<a name="ln220">  VLOG(4) &lt;&lt; connection-&gt;ToString() &lt;&lt; &quot;: &quot; &lt;&lt; &quot;Updated last_write_time_=&quot;</a>
+<a name="ln221">          &lt;&lt; AsString(last_write_time_);</a>
+<a name="ln222">}</a>
+<a name="ln223"> </a>
+<a name="ln224">void YBInboundConnectionContext::HandleTimeout(ev::timer&amp; watcher, int revents) {  // NOLINT</a>
+<a name="ln225">  const auto connection = connection_.lock();</a>
+<a name="ln226">  if (connection) {</a>
+<a name="ln227">    if (EV_ERROR &amp; revents) {</a>
+<a name="ln228">      LOG(WARNING) &lt;&lt; connection-&gt;ToString() &lt;&lt; &quot;: &quot; &lt;&lt; &quot;Got an error in handle timeout&quot;;</a>
+<a name="ln229">      return;</a>
+<a name="ln230">    }</a>
+<a name="ln231"> </a>
+<a name="ln232">    const auto now = connection-&gt;reactor()-&gt;cur_time();</a>
+<a name="ln233"> </a>
+<a name="ln234">    const auto deadline =</a>
+<a name="ln235">        std::max(last_heartbeat_sending_time_, last_write_time_) + HeartbeatPeriod();</a>
+<a name="ln236">    if (now &gt;= deadline) {</a>
+<a name="ln237">      if (last_write_time_ &gt;= last_heartbeat_sending_time_) {</a>
+<a name="ln238">        // last_write_time_ &lt; last_heartbeat_sending_time_ means that last heartbeat we've queued</a>
+<a name="ln239">        // for sending is still in queue due to RPC/networking issues, so no need to queue</a>
+<a name="ln240">        // another one.</a>
+<a name="ln241">        VLOG(4) &lt;&lt; connection-&gt;ToString() &lt;&lt; &quot;: &quot; &lt;&lt; &quot;Sending heartbeat, now: &quot; &lt;&lt; AsString(now)</a>
+<a name="ln242">                &lt;&lt; &quot;, deadline: &quot; &lt;&lt; AsString(deadline)</a>
+<a name="ln243">                &lt;&lt; &quot;, last_write_time_: &quot; &lt;&lt; AsString(last_write_time_)</a>
+<a name="ln244">                &lt;&lt; &quot;, last_heartbeat_sending_time_: &quot; &lt;&lt; AsString(last_heartbeat_sending_time_);</a>
+<a name="ln245">        connection-&gt;QueueOutboundData(HeartbeatOutboundData::Instance());</a>
+<a name="ln246">        last_heartbeat_sending_time_ = now;</a>
+<a name="ln247">      }</a>
+<a name="ln248">      timer_.Start(HeartbeatPeriod());</a>
+<a name="ln249">    } else {</a>
+<a name="ln250">      timer_.Start(deadline - now);</a>
+<a name="ln251">    }</a>
+<a name="ln252">  }</a>
+<a name="ln253">}</a>
+<a name="ln254"> </a>
+<a name="ln255">YBInboundCall::YBInboundCall(ConnectionPtr conn, CallProcessedListener call_processed_listener)</a>
+<a name="ln256">    : InboundCall(std::move(conn), nullptr /* rpc_metrics */, std::move(call_processed_listener)) {}</a>
+<a name="ln257"> </a>
+<a name="ln258">YBInboundCall::YBInboundCall(RpcMetrics* rpc_metrics, const RemoteMethod&amp; remote_method)</a>
+<a name="ln259">    : InboundCall(nullptr /* conn */, rpc_metrics, nullptr /* call_processed_listener */) {</a>
+<a name="ln260">  remote_method_ = remote_method;</a>
+<a name="ln261">}</a>
+<a name="ln262"> </a>
+<a name="ln263">YBInboundCall::~YBInboundCall() {}</a>
+<a name="ln264"> </a>
+<a name="ln265">CoarseTimePoint YBInboundCall::GetClientDeadline() const {</a>
+<a name="ln266">  if (!header_.has_timeout_millis() || header_.timeout_millis() == 0) {</a>
+<a name="ln267">    return CoarseTimePoint::max();</a>
+<a name="ln268">  }</a>
+<a name="ln269">  return ToCoarse(timing_.time_received) + header_.timeout_millis() * 1ms;</a>
+<a name="ln270">}</a>
+<a name="ln271"> </a>
+<a name="ln272">Status YBInboundCall::ParseFrom(const MemTrackerPtr&amp; mem_tracker, CallData* call_data) {</a>
+<a name="ln273">  TRACE_EVENT_FLOW_BEGIN0(&quot;rpc&quot;, &quot;YBInboundCall&quot;, this);</a>
+<a name="ln274">  TRACE_EVENT0(&quot;rpc&quot;, &quot;YBInboundCall::ParseFrom&quot;);</a>
+<a name="ln275"> </a>
+<a name="ln276">  Slice source(call_data-&gt;data(), call_data-&gt;size());</a>
+<a name="ln277">  RETURN_NOT_OK(serialization::ParseYBMessage(source, &amp;header_, &amp;serialized_request_));</a>
+<a name="ln278">  DVLOG(4) &lt;&lt; &quot;Parsed YBInboundCall header: &quot; &lt;&lt; AsString(header_);</a>
+<a name="ln279"> </a>
+<a name="ln280">  consumption_ = ScopedTrackedConsumption(mem_tracker, call_data-&gt;size());</a>
+<a name="ln281">  request_data_ = std::move(*call_data);</a>
+<a name="ln282"> </a>
+<a name="ln283">  // Adopt the service/method info from the header as soon as it's available.</a>
+<a name="ln284">  if (PREDICT_FALSE(!header_.has_remote_method())) {</a>
+<a name="ln285">    return STATUS(Corruption, &quot;Non-connection context request header must specify remote_method&quot;);</a>
+<a name="ln286">  }</a>
+<a name="ln287">  if (PREDICT_FALSE(!header_.remote_method().IsInitialized())) {</a>
+<a name="ln288">    return STATUS(Corruption, &quot;remote_method in request header is not initialized&quot;,</a>
+<a name="ln289">        header_.remote_method().InitializationErrorString());</a>
+<a name="ln290">  }</a>
+<a name="ln291">  remote_method_.FromPB(header_.remote_method());</a>
+<a name="ln292"> </a>
+<a name="ln293">  return Status::OK();</a>
+<a name="ln294">}</a>
+<a name="ln295"> </a>
+<a name="ln296">size_t YBInboundCall::CopyToLastSidecarBuffer(const Slice&amp; car) {</a>
+<a name="ln297">  if (sidecar_buffers_.empty()) {</a>
+<a name="ln298">    return 0;</a>
+<a name="ln299">  }</a>
+<a name="ln300">  auto&amp; last_buffer =  sidecar_buffers_.back();</a>
+<a name="ln301">  auto len = std::min(last_buffer.size() - filled_bytes_in_last_sidecar_buffer_, car.size());</a>
+<a name="ln302">  memcpy(last_buffer.data() + filled_bytes_in_last_sidecar_buffer_, car.data(), len);</a>
+<a name="ln303">  filled_bytes_in_last_sidecar_buffer_ += len;</a>
+<a name="ln304"> </a>
+<a name="ln305">  return len;</a>
+<a name="ln306">}</a>
+<a name="ln307"> </a>
+<a name="ln308">size_t YBInboundCall::AddRpcSidecar(Slice car) {</a>
+<a name="ln309">  sidecar_offsets_.Add(total_sidecars_size_);</a>
+<a name="ln310">  total_sidecars_size_ += car.size();</a>
+<a name="ln311">  // Copy start of sidecar to existing buffer if present.</a>
+<a name="ln312">  car.remove_prefix(CopyToLastSidecarBuffer(car));</a>
+<a name="ln313"> </a>
+<a name="ln314">  // If sidecar did not fit into last buffer, then we should allocate a new one.</a>
+<a name="ln315">  if (!car.empty()) {</a>
+<a name="ln316">    DCHECK(sidecar_buffers_.empty() ||</a>
+<a name="ln317">           filled_bytes_in_last_sidecar_buffer_ == sidecar_buffers_.back().size());</a>
+<a name="ln318"> </a>
+<a name="ln319">    // Allocate new sidecar buffer and copy remaining part of sidecar to it.</a>
+<a name="ln320">    AllocateSidecarBuffer(std::max&lt;size_t&gt;(car.size(), FLAGS_min_sidecar_buffer_size));</a>
+<a name="ln321">    memcpy(sidecar_buffers_.back().data(), car.data(), car.size());</a>
+<a name="ln322">    filled_bytes_in_last_sidecar_buffer_ = car.size();</a>
+<a name="ln323">  }</a>
+<a name="ln324"> </a>
+<a name="ln325">  return num_sidecars_++;</a>
+<a name="ln326">}</a>
+<a name="ln327"> </a>
+<a name="ln328">void YBInboundCall::ResetRpcSidecars() {</a>
+<a name="ln329">  if (consumption_) {</a>
+<a name="ln330">    for (const auto&amp; buffer : sidecar_buffers_) {</a>
+<a name="ln331">      consumption_.Add(-buffer.size());</a>
+<a name="ln332">    }</a>
+<a name="ln333">  }</a>
+<a name="ln334">  num_sidecars_ = 0;</a>
+<a name="ln335">  filled_bytes_in_last_sidecar_buffer_ = 0;</a>
+<a name="ln336">  total_sidecars_size_ = 0;</a>
+<a name="ln337">  sidecar_buffers_.clear();</a>
+<a name="ln338">  sidecar_offsets_.Clear();</a>
+<a name="ln339">}</a>
+<a name="ln340"> </a>
+<a name="ln341">void YBInboundCall::ReserveSidecarSpace(size_t space) {</a>
+<a name="ln342">  if (num_sidecars_ != 0) {</a>
+<a name="ln343">    LOG(DFATAL) &lt;&lt; &quot;Attempt to ReserveSidecarSpace when there are already sidecars present&quot;;</a>
+<a name="ln344">    return;</a>
+<a name="ln345">  }</a>
+<a name="ln346"> </a>
+<a name="ln347">  AllocateSidecarBuffer(space);</a>
+<a name="ln348">}</a>
+<a name="ln349"> </a>
+<a name="ln350">void YBInboundCall::AllocateSidecarBuffer(size_t size) {</a>
+<a name="ln351">  sidecar_buffers_.push_back(RefCntBuffer(size));</a>
+<a name="ln352">  if (consumption_) {</a>
+<a name="ln353">    consumption_.Add(size);</a>
+<a name="ln354">  }</a>
+<a name="ln355">}</a>
+<a name="ln356"> </a>
+<a name="ln357">Status YBInboundCall::SerializeResponseBuffer(const google::protobuf::MessageLite&amp; response,</a>
+<a name="ln358">                                              bool is_success) {</a>
+<a name="ln359">  using serialization::SerializeMessage;</a>
+<a name="ln360">  using serialization::SerializeHeader;</a>
+<a name="ln361"> </a>
+<a name="ln362">  uint32_t protobuf_msg_size = response.ByteSize();</a>
+<a name="ln363"> </a>
+<a name="ln364">  ResponseHeader resp_hdr;</a>
+<a name="ln365">  resp_hdr.set_call_id(header_.call_id());</a>
+<a name="ln366">  resp_hdr.set_is_error(!is_success);</a>
+<a name="ln367">  for (auto&amp; offset : sidecar_offsets_) {</a>
+<a name="ln368">    offset += protobuf_msg_size;</a>
+<a name="ln369">  }</a>
+<a name="ln370">  *resp_hdr.mutable_sidecar_offsets() = std::move(sidecar_offsets_);</a>
+<a name="ln371"> </a>
+<a name="ln372">  size_t message_size = 0;</a>
+<a name="ln373">  auto status = SerializeMessage(response,</a>
+<a name="ln374">                                 /* param_buf */ nullptr,</a>
+<a name="ln375">                                 total_sidecars_size_,</a>
+<a name="ln376">                                 /* use_cached_size */ true,</a>
+<a name="ln377">                                 /* offset */ 0,</a>
+<a name="ln378">                                 &amp;message_size);</a>
+<a name="ln379">  if (!status.ok()) {</a>
+<a name="ln380">    return status;</a>
+<a name="ln381">  }</a>
+<a name="ln382">  size_t header_size = 0;</a>
+<a name="ln383">  status = SerializeHeader(resp_hdr,</a>
+<a name="ln384">                           message_size + total_sidecars_size_,</a>
+<a name="ln385">                           &amp;response_buf_,</a>
+<a name="ln386">                           message_size,</a>
+<a name="ln387">                           &amp;header_size);</a>
+<a name="ln388">  if (!status.ok()) {</a>
+<a name="ln389">    return status;</a>
+<a name="ln390">  }</a>
+<a name="ln391">  return SerializeMessage(response,</a>
+<a name="ln392">                          &amp;response_buf_,</a>
+<a name="ln393">                          total_sidecars_size_,</a>
+<a name="ln394">                          /* use_cached_size */ true,</a>
+<a name="ln395">                          header_size);</a>
+<a name="ln396">}</a>
+<a name="ln397"> </a>
+<a name="ln398">string YBInboundCall::ToString() const {</a>
+<a name="ln399">  return strings::Substitute(&quot;Call $0 $1 =&gt; $2 (request call id $3)&quot;,</a>
+<a name="ln400">      remote_method_.ToString(),</a>
+<a name="ln401">      AsString(remote_address()),</a>
+<a name="ln402">      AsString(local_address()),</a>
+<a name="ln403">      header_.call_id());</a>
+<a name="ln404">}</a>
+<a name="ln405"> </a>
+<a name="ln406">bool YBInboundCall::DumpPB(const DumpRunningRpcsRequestPB&amp; req,</a>
+<a name="ln407">                           RpcCallInProgressPB* resp) {</a>
+<a name="ln408">  resp-&gt;mutable_header()-&gt;CopyFrom(header_);</a>
+<a name="ln409">  if (req.include_traces() &amp;&amp; trace_) {</a>
+<a name="ln410">    resp-&gt;set_trace_buffer(trace_-&gt;DumpToString(true));</a>
+<a name="ln411">  }</a>
+<a name="ln412">  resp-&gt;set_elapsed_millis(MonoTime::Now().GetDeltaSince(timing_.time_received)</a>
+<a name="ln413">      .ToMilliseconds());</a>
+<a name="ln414">  return true;</a>
+<a name="ln415">}</a>
+<a name="ln416"> </a>
+<a name="ln417">void YBInboundCall::LogTrace() const {</a>
+<a name="ln418">  MonoTime now = MonoTime::Now();</a>
+<a name="ln419">  int total_time = now.GetDeltaSince(timing_.time_received).ToMilliseconds();</a>
+<a name="ln420"> </a>
+<a name="ln421">  if (header_.has_timeout_millis() &amp;&amp; header_.timeout_millis() &gt; 0) {</a>
+<a name="ln422">    double log_threshold = header_.timeout_millis() * 0.75f;</a>
+<a name="ln423">    if (total_time &gt; log_threshold) {</a>
+<a name="ln424">      // TODO: consider pushing this onto another thread since it may be slow.</a>
+<a name="ln425">      // The traces may also be too large to fit in a log message.</a>
+<a name="ln426">      LOG(WARNING) &lt;&lt; ToString() &lt;&lt; &quot; took &quot; &lt;&lt; total_time &lt;&lt; &quot;ms (client timeout &quot;</a>
+<a name="ln427">                   &lt;&lt; header_.timeout_millis() &lt;&lt; &quot;ms).&quot;;</a>
+<a name="ln428">      std::string s = trace_-&gt;DumpToString(true);</a>
+<a name="ln429">      if (!s.empty()) {</a>
+<a name="ln430">        LOG(WARNING) &lt;&lt; &quot;Trace:\n&quot; &lt;&lt; s;</a>
+<a name="ln431">      }</a>
+<a name="ln432">      return;</a>
+<a name="ln433">    }</a>
+<a name="ln434">  }</a>
+<a name="ln435"> </a>
+<a name="ln436">  if (PREDICT_FALSE(</a>
+<a name="ln437">          FLAGS_rpc_dump_all_traces ||</a>
+<a name="ln438">          total_time &gt; FLAGS_rpc_slow_query_threshold_ms)) {</a>
+<a name="ln439">    LOG(INFO) &lt;&lt; ToString() &lt;&lt; &quot; took &quot; &lt;&lt; total_time &lt;&lt; &quot;ms. Trace:&quot;;</a>
+<a name="ln440">    trace_-&gt;Dump(&amp;LOG(INFO), true);</a>
+<a name="ln441">  }</a>
+<a name="ln442">}</a>
+<a name="ln443"> </a>
+<a name="ln444">void YBInboundCall::Serialize(boost::container::small_vector_base&lt;RefCntBuffer&gt;* output) {</a>
+<a name="ln445">  TRACE_EVENT0(&quot;rpc&quot;, &quot;YBInboundCall::Serialize&quot;);</a>
+<a name="ln446">  CHECK_GT(response_buf_.size(), 0);</a>
+<a name="ln447">  output-&gt;push_back(std::move(response_buf_));</a>
+<a name="ln448">  if (!sidecar_buffers_.empty()) {</a>
+<a name="ln449">    sidecar_buffers_.back().Shrink(filled_bytes_in_last_sidecar_buffer_);</a>
+<a name="ln450">    for (auto&amp; car : sidecar_buffers_) {</a>
+<a name="ln451">      output-&gt;push_back(std::move(car));</a>
+<a name="ln452">    }</a>
+<a name="ln453">    sidecar_buffers_.clear();</a>
+<a name="ln454">  }</a>
+<a name="ln455">}</a>
+<a name="ln456"> </a>
+<a name="ln457">Status YBInboundCall::ParseParam(google::protobuf::Message *message) {</a>
+<a name="ln458">  RETURN_NOT_OK(ThrottleRpcStatus(consumption_.mem_tracker(), *this));</a>
+<a name="ln459"> </a>
+<a name="ln460">  Slice param(serialized_request());</a>
+<a name="ln461">  CodedInputStream in(param.data(), param.size());</a>
+<a name="ln462">  in.SetTotalBytesLimit(FLAGS_rpc_max_message_size, FLAGS_rpc_max_message_size*3/4);</a>
+<a name="ln463">  if (PREDICT_FALSE(!message-&gt;ParseFromCodedStream(&amp;in))) {</a>
+<a name="ln464">    string err = Format(&quot;Invalid parameter for call $0: $1&quot;,</a>
+<a name="ln465">                        remote_method_.ToString(),</a>
+<a name="ln466">                        message-&gt;InitializationErrorString().c_str());</a>
+<a name="ln467">    LOG(WARNING) &lt;&lt; err;</a>
+<a name="ln468">    return STATUS(InvalidArgument, err);</a>
+<a name="ln469">  }</a>
+<a name="ln470">  consumption_.Add(message-&gt;SpaceUsedLong());</a>
+<a name="ln471"> </a>
+<a name="ln472">  if (PREDICT_FALSE(FLAGS_TEST_yb_inbound_big_calls_parse_delay_ms &gt; 0 &amp;&amp;</a>
+<a name="ln473">        request_data_.size() &gt; FLAGS_rpc_throttle_threshold_bytes)) {</a>
+<a name="ln474">    std::this_thread::sleep_for(FLAGS_TEST_yb_inbound_big_calls_parse_delay_ms * 1ms);</a>
+<a name="ln475">  }</a>
+<a name="ln476"> </a>
+<a name="ln477">  return Status::OK();</a>
+<a name="ln478">}</a>
+<a name="ln479"> </a>
+<a name="ln480">void YBInboundCall::RespondBadMethod() {</a>
+<a name="ln481">  auto err = Format(&quot;Call on service $0 received from $1 with an invalid method name: $2&quot;,</a>
+<a name="ln482">                    remote_method_.service_name(),</a>
+<a name="ln483">                    connection()-&gt;ToString(),</a>
+<a name="ln484">                    remote_method_.method_name());</a>
+<a name="ln485">  LOG(WARNING) &lt;&lt; err;</a>
+<a name="ln486">  RespondFailure(ErrorStatusPB::ERROR_NO_SUCH_METHOD, STATUS(InvalidArgument, err));</a>
+<a name="ln487">}</a>
+<a name="ln488"> </a>
+<a name="ln489">void YBInboundCall::RespondSuccess(const MessageLite&amp; response) {</a>
+<a name="ln490">  TRACE_EVENT0(&quot;rpc&quot;, &quot;InboundCall::RespondSuccess&quot;);</a>
+<a name="ln491">  Respond(response, true);</a>
+<a name="ln492">}</a>
+<a name="ln493"> </a>
+<a name="ln494">void YBInboundCall::RespondFailure(ErrorStatusPB::RpcErrorCodePB error_code,</a>
+<a name="ln495">                                   const Status&amp; status) {</a>
+<a name="ln496">  TRACE_EVENT0(&quot;rpc&quot;, &quot;InboundCall::RespondFailure&quot;);</a>
+<a name="ln497">  ErrorStatusPB err;</a>
+<a name="ln498">  err.set_message(status.ToString());</a>
+<a name="ln499">  err.set_code(error_code);</a>
+<a name="ln500"> </a>
+<a name="ln501">  Respond(err, false);</a>
+<a name="ln502">}</a>
+<a name="ln503"> </a>
+<a name="ln504">void YBInboundCall::RespondApplicationError(int error_ext_id, const std::string&amp; message,</a>
+<a name="ln505">                                            const MessageLite&amp; app_error_pb) {</a>
+<a name="ln506">  ErrorStatusPB err;</a>
+<a name="ln507">  ApplicationErrorToPB(error_ext_id, message, app_error_pb, &amp;err);</a>
+<a name="ln508">  Respond(err, false);</a>
+<a name="ln509">}</a>
+<a name="ln510"> </a>
+<a name="ln511">void YBInboundCall::ApplicationErrorToPB(int error_ext_id, const std::string&amp; message,</a>
+<a name="ln512">                                         const google::protobuf::MessageLite&amp; app_error_pb,</a>
+<a name="ln513">                                         ErrorStatusPB* err) {</a>
+<a name="ln514">  err-&gt;set_message(message);</a>
+<a name="ln515">  const FieldDescriptor* app_error_field =</a>
+<a name="ln516">      err-&gt;GetReflection()-&gt;FindKnownExtensionByNumber(error_ext_id);</a>
+<a name="ln517">  if (app_error_field != nullptr) {</a>
+<a name="ln518">    err-&gt;GetReflection()-&gt;MutableMessage(err, app_error_field)-&gt;CheckTypeAndMergeFrom(app_error_pb);</a>
+<a name="ln519">  } else {</a>
+<a name="ln520">    LOG(DFATAL) &lt;&lt; &quot;Unable to find application error extension ID &quot; &lt;&lt; error_ext_id</a>
+<a name="ln521">                &lt;&lt; &quot; (message=&quot; &lt;&lt; message &lt;&lt; &quot;)&quot;;</a>
+<a name="ln522">  }</a>
+<a name="ln523">}</a>
+<a name="ln524"> </a>
+<a name="ln525">void YBInboundCall::Respond(const MessageLite&amp; response, bool is_success) {</a>
+<a name="ln526">  TRACE_EVENT_FLOW_END0(&quot;rpc&quot;, &quot;InboundCall&quot;, this);</a>
+<a name="ln527">  Status s = SerializeResponseBuffer(response, is_success);</a>
+<a name="ln528">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln529">    // TODO: test error case, serialize error response instead</a>
+<a name="ln530">    LOG(DFATAL) &lt;&lt; &quot;Unable to serialize response: &quot; &lt;&lt; s.ToString();</a>
+<a name="ln531">  }</a>
+<a name="ln532"> </a>
+<a name="ln533">  TRACE_EVENT_ASYNC_END1(&quot;rpc&quot;, &quot;InboundCall&quot;, this, &quot;method&quot;, method_name());</a>
+<a name="ln534"> </a>
+<a name="ln535">  QueueResponse(is_success);</a>
+<a name="ln536">}</a>
+<a name="ln537"> </a>
+<a name="ln538">Status YBOutboundConnectionContext::HandleCall(</a>
+<a name="ln539">    const ConnectionPtr&amp; connection, CallData* call_data) {</a>
+<a name="ln540">  return connection-&gt;HandleCallResponse(call_data);</a>
+<a name="ln541">}</a>
+<a name="ln542"> </a>
+<a name="ln543">void YBOutboundConnectionContext::Connected(const ConnectionPtr&amp; connection) {</a>
+<a name="ln544">  DCHECK_EQ(connection-&gt;direction(), Connection::Direction::CLIENT);</a>
+<a name="ln545">  connection_ = connection;</a>
+<a name="ln546">  last_read_time_ = connection-&gt;reactor()-&gt;cur_time();</a>
+<a name="ln547">  if (FLAGS_enable_rpc_keepalive) {</a>
+<a name="ln548">    timer_.Init(*loop_);</a>
+<a name="ln549">    timer_.SetCallback&lt;</a>
+<a name="ln550">        YBOutboundConnectionContext, &amp;YBOutboundConnectionContext::HandleTimeout&gt;(this);</a>
+<a name="ln551">    timer_.Start(Timeout());</a>
+<a name="ln552">  }</a>
+<a name="ln553">}</a>
+<a name="ln554"> </a>
+<a name="ln555">void YBOutboundConnectionContext::AssignConnection(const ConnectionPtr&amp; connection) {</a>
+<a name="ln556">  connection-&gt;QueueOutboundData(ConnectionHeaderInstance());</a>
+<a name="ln557">}</a>
+<a name="ln558"> </a>
+<a name="ln559">Result&lt;ProcessDataResult&gt; YBOutboundConnectionContext::ProcessCalls(</a>
+<a name="ln560">    const ConnectionPtr&amp; connection, const IoVecs&amp; data, ReadBufferFull read_buffer_full) {</a>
+<a name="ln561">  return parser().Parse(connection, data, read_buffer_full, nullptr /* tracker_for_throttle */);</a>
+<a name="ln562">}</a>
+<a name="ln563"> </a>
+<a name="ln564">void YBOutboundConnectionContext::UpdateLastRead(const ConnectionPtr&amp; connection) {</a>
+<a name="ln565">  last_read_time_ = connection-&gt;reactor()-&gt;cur_time();</a>
+<a name="ln566">  VLOG(4) &lt;&lt; Format(&quot;$0: Updated last_read_time_=$1&quot;, connection, last_read_time_);</a>
+<a name="ln567">}</a>
+<a name="ln568"> </a>
+<a name="ln569">void YBOutboundConnectionContext::HandleTimeout(ev::timer&amp; watcher, int revents) {  // NOLINT</a>
+<a name="ln570">  const auto connection = connection_.lock();</a>
+<a name="ln571">  if (connection) {</a>
+<a name="ln572">    VLOG(5) &lt;&lt; Format(&quot;$0: YBOutboundConnectionContext::HandleTimeout&quot;, connection);</a>
+<a name="ln573">    if (EV_ERROR &amp; revents) {</a>
+<a name="ln574">      LOG(WARNING) &lt;&lt; connection-&gt;ToString() &lt;&lt; &quot;: &quot; &lt;&lt; &quot;Got an error in handle timeout&quot;;</a>
+<a name="ln575">      return;</a>
+<a name="ln576">    }</a>
+<a name="ln577"> </a>
+<a name="ln578">    const auto now = connection-&gt;reactor()-&gt;cur_time();</a>
+<a name="ln579">    const MonoDelta timeout = Timeout();</a>
+<a name="ln580"> </a>
+<a name="ln581">    auto deadline = last_read_time_ + timeout;</a>
+<a name="ln582">    VLOG(5) &lt;&lt; Format(</a>
+<a name="ln583">        &quot;$0: YBOutboundConnectionContext::HandleTimeout last_read_time_: $1, timeout: $2&quot;,</a>
+<a name="ln584">        connection, last_read_time_, timeout);</a>
+<a name="ln585">    if (now &gt; deadline) {</a>
+<a name="ln586">      auto passed = now - last_read_time_;</a>
+<a name="ln587">      const auto status = STATUS_FORMAT(</a>
+<a name="ln588">          NetworkError, &quot;Read timeout, passed: $0, timeout: $1, now: $2, last_read_time_: $3&quot;,</a>
+<a name="ln589">          passed, timeout, now, last_read_time_);</a>
+<a name="ln590">      LOG(WARNING) &lt;&lt; connection-&gt;ToString() &lt;&lt; &quot;: &quot; &lt;&lt; status;</a>
+<a name="ln591">      connection-&gt;reactor()-&gt;DestroyConnection(connection.get(), status);</a>
+<a name="ln592">      return;</a>
+<a name="ln593">    }</a>
+<a name="ln594"> </a>
+<a name="ln595">    timer_.Start(deadline - now);</a>
+<a name="ln596">  }</a>
+<a name="ln597">}</a>
+<a name="ln598"> </a>
+<a name="ln599">} // namespace rpc</a>
+<a name="ln600">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="178"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="220"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="241"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="278"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="316"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="566"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="572"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="582"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

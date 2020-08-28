@@ -1,0 +1,1129 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>master_snapshot_coordinator.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/master/master_snapshot_coordinator.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;unordered_map&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;boost/multi_index_container.hpp&gt;</a>
+<a name="ln19">#include &lt;boost/multi_index/hashed_index.hpp&gt;</a>
+<a name="ln20">#include &lt;boost/multi_index/ordered_index.hpp&gt;</a>
+<a name="ln21">#include &lt;boost/multi_index/member.hpp&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/common/snapshot.h&quot;</a>
+<a name="ln24">#include &quot;yb/common/transaction_error.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/docdb/doc_key.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/master/catalog_entity_info.h&quot;</a>
+<a name="ln29">#include &quot;yb/master/master_error.h&quot;</a>
+<a name="ln30">#include &quot;yb/master/sys_catalog_constants.h&quot;</a>
+<a name="ln31">#include &quot;yb/master/sys_catalog_writer.h&quot;</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/rpc/poller.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &quot;yb/tablet/tablet.h&quot;</a>
+<a name="ln36">#include &quot;yb/tablet/operations/snapshot_operation.h&quot;</a>
+<a name="ln37">#include &quot;yb/tablet/operations/write_operation.h&quot;</a>
+<a name="ln38"> </a>
+<a name="ln39">#include &quot;yb/tserver/tserver_error.h&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41">#include &quot;yb/util/pb_util.h&quot;</a>
+<a name="ln42"> </a>
+<a name="ln43">using namespace std::literals;</a>
+<a name="ln44">using namespace std::placeholders;</a>
+<a name="ln45"> </a>
+<a name="ln46">DECLARE_int32(sys_catalog_write_timeout_ms);</a>
+<a name="ln47"> </a>
+<a name="ln48">DEFINE_uint64(snapshot_coordinator_poll_interval_ms, 5000,</a>
+<a name="ln49">              &quot;Poll interval for snapshot coordinator in milliseconds.&quot;);</a>
+<a name="ln50"> </a>
+<a name="ln51">DEFINE_uint64(snapshot_coordinator_cleanup_delay_ms, 30000,</a>
+<a name="ln52">              &quot;Delay for snapshot cleanup after deletion.&quot;);</a>
+<a name="ln53"> </a>
+<a name="ln54">namespace yb {</a>
+<a name="ln55">namespace master {</a>
+<a name="ln56"> </a>
+<a name="ln57">using yb::tserver::TabletServerError;</a>
+<a name="ln58">using yb::tserver::TabletServerErrorPB;</a>
+<a name="ln59"> </a>
+<a name="ln60">namespace {</a>
+<a name="ln61"> </a>
+<a name="ln62">YB_STRONGLY_TYPED_BOOL(ForClient);</a>
+<a name="ln63"> </a>
+<a name="ln64">Result&lt;ColumnId&gt; MetadataColumnId(SnapshotCoordinatorContext* context) {</a>
+<a name="ln65">  return context-&gt;schema().ColumnIdByName(kSysCatalogTableColMetadata);</a>
+<a name="ln66">}</a>
+<a name="ln67"> </a>
+<a name="ln68">const std::initializer_list&lt;std::pair&lt;SysSnapshotEntryPB::State, SysSnapshotEntryPB::State&gt;&gt;</a>
+<a name="ln69">    kStateTransitions = {</a>
+<a name="ln70">  { SysSnapshotEntryPB::CREATING, SysSnapshotEntryPB::COMPLETE },</a>
+<a name="ln71">  { SysSnapshotEntryPB::DELETING, SysSnapshotEntryPB::DELETED },</a>
+<a name="ln72">  { SysSnapshotEntryPB::RESTORING, SysSnapshotEntryPB::RESTORED },</a>
+<a name="ln73">};</a>
+<a name="ln74"> </a>
+<a name="ln75">SysSnapshotEntryPB::State InitialStateToTerminalState(SysSnapshotEntryPB::State state) {</a>
+<a name="ln76">  for (const auto&amp; initial_and_terminal_states : kStateTransitions) {</a>
+<a name="ln77">    if (state == initial_and_terminal_states.first) {</a>
+<a name="ln78">      return initial_and_terminal_states.second;</a>
+<a name="ln79">    }</a>
+<a name="ln80">  }</a>
+<a name="ln81"> </a>
+<a name="ln82">  FATAL_INVALID_PB_ENUM_VALUE(SysSnapshotEntryPB::State, state);</a>
+<a name="ln83">}</a>
+<a name="ln84"> </a>
+<a name="ln85">struct TabletSnapshotOperation {</a>
+<a name="ln86">  TabletId tablet_id;</a>
+<a name="ln87">  TxnSnapshotId snapshot_id;</a>
+<a name="ln88">  SysSnapshotEntryPB::State state;</a>
+<a name="ln89">  HybridTime snapshot_hybrid_time;</a>
+<a name="ln90"> </a>
+<a name="ln91">  std::string ToString() const {</a>
+<a name="ln92">    return YB_STRUCT_TO_STRING(tablet_id, snapshot_id, state, snapshot_hybrid_time);</a>
+<a name="ln93">  }</a>
+<a name="ln94">};</a>
+<a name="ln95"> </a>
+<a name="ln96">Result&lt;docdb::KeyBytes&gt; EncodedSnapshotKey(</a>
+<a name="ln97">    const TxnSnapshotId&amp; id, SnapshotCoordinatorContext* context) {</a>
+<a name="ln98">  docdb::DocKey doc_key({ docdb::PrimitiveValue::Int32(SysRowEntry::SNAPSHOT),</a>
+<a name="ln99">                          docdb::PrimitiveValue(id.AsSlice().ToBuffer()) });</a>
+<a name="ln100">  docdb::SubDocKey sub_doc_key(</a>
+<a name="ln101">      doc_key, docdb::PrimitiveValue(VERIFY_RESULT(MetadataColumnId(context))));</a>
+<a name="ln102">  return sub_doc_key.Encode();</a>
+<a name="ln103">}</a>
+<a name="ln104"> </a>
+<a name="ln105">void SubmitWrite(</a>
+<a name="ln106">    docdb::KeyValueWriteBatchPB&amp;&amp; write_batch, SnapshotCoordinatorContext* context) {</a>
+<a name="ln107">  tserver::WriteRequestPB empty_write_request;</a>
+<a name="ln108">  auto state = std::make_unique&lt;tablet::WriteOperationState&gt;(</a>
+<a name="ln109">      /* tablet= */ nullptr, &amp;empty_write_request);</a>
+<a name="ln110">  auto&amp; request = *state-&gt;mutable_request();</a>
+<a name="ln111">  *request.mutable_write_batch() = std::move(write_batch);</a>
+<a name="ln112">  auto operation = std::make_unique&lt;tablet::WriteOperation&gt;(</a>
+<a name="ln113">      std::move(state), yb::OpId::kUnknownTerm, ScopedOperation(),</a>
+<a name="ln114">      CoarseMonoClock::now() + FLAGS_sys_catalog_write_timeout_ms * 1ms, /* context */ nullptr);</a>
+<a name="ln115">  context-&gt;Submit(std::move(operation));</a>
+<a name="ln116">}</a>
+<a name="ln117"> </a>
+<a name="ln118">using TabletSnapshotOperations = std::vector&lt;TabletSnapshotOperation&gt;;</a>
+<a name="ln119"> </a>
+<a name="ln120">class StateWithTablets {</a>
+<a name="ln121"> public:</a>
+<a name="ln122">  StateWithTablets(</a>
+<a name="ln123">      SnapshotCoordinatorContext* context, SysSnapshotEntryPB::State initial_state)</a>
+<a name="ln124">      : context_(*context), initial_state_(initial_state) {</a>
+<a name="ln125">  }</a>
+<a name="ln126"> </a>
+<a name="ln127">  virtual ~StateWithTablets() = default;</a>
+<a name="ln128"> </a>
+<a name="ln129">  template &lt;class TabletIds&gt;</a>
+<a name="ln130">  void InitTabletIds(const TabletIds&amp; tablet_ids, SysSnapshotEntryPB::State state) {</a>
+<a name="ln131">    for (const auto&amp; id : tablet_ids) {</a>
+<a name="ln132">      tablets_.emplace(id, state);</a>
+<a name="ln133">    }</a>
+<a name="ln134">    num_tablets_in_initial_state_ = state == initial_state_ ? tablet_ids.size() : 0;</a>
+<a name="ln135">    CheckCompleteness();</a>
+<a name="ln136">  }</a>
+<a name="ln137"> </a>
+<a name="ln138">  // Initialize tablet states using tablet ids, i.e. put all tablets in initial state.</a>
+<a name="ln139">  template &lt;class TabletIds&gt;</a>
+<a name="ln140">  void InitTabletIds(const TabletIds&amp; tablet_ids) {</a>
+<a name="ln141">    InitTabletIds(tablet_ids, initial_state_);</a>
+<a name="ln142">  }</a>
+<a name="ln143"> </a>
+<a name="ln144">  // Initialize tablet states from serialized data.</a>
+<a name="ln145">  void InitTablets(</a>
+<a name="ln146">      const google::protobuf::RepeatedPtrField&lt;SysSnapshotEntryPB::TabletSnapshotPB&gt;&amp; tablets) {</a>
+<a name="ln147">    for (const auto&amp; tablet : tablets) {</a>
+<a name="ln148">      tablets_.emplace(tablet.id(), tablet.state());</a>
+<a name="ln149">      if (tablet.state() == initial_state_) {</a>
+<a name="ln150">        ++num_tablets_in_initial_state_;</a>
+<a name="ln151">      }</a>
+<a name="ln152">    }</a>
+<a name="ln153">    CheckCompleteness();</a>
+<a name="ln154">  }</a>
+<a name="ln155"> </a>
+<a name="ln156">  StateWithTablets(const StateWithTablets&amp;) = delete;</a>
+<a name="ln157">  void operator=(const StateWithTablets&amp;) = delete;</a>
+<a name="ln158"> </a>
+<a name="ln159">  // If any of tablets failed returns this failure.</a>
+<a name="ln160">  // Otherwise if any of tablets is in initial state returns initial state.</a>
+<a name="ln161">  // Otherwise all tablets should be in the same state, which is returned.</a>
+<a name="ln162">  Result&lt;SysSnapshotEntryPB::State&gt; AggregatedState() {</a>
+<a name="ln163">    SysSnapshotEntryPB::State result = initial_state_;</a>
+<a name="ln164">    bool has_initial = false;</a>
+<a name="ln165">    for (const auto&amp; tablet : tablets_) {</a>
+<a name="ln166">      if (tablet.state == SysSnapshotEntryPB::FAILED) {</a>
+<a name="ln167">        return SysSnapshotEntryPB::FAILED;</a>
+<a name="ln168">      } else if (tablet.state == initial_state_) {</a>
+<a name="ln169">        has_initial = true;</a>
+<a name="ln170">      } else if (result == initial_state_) {</a>
+<a name="ln171">        result = tablet.state;</a>
+<a name="ln172">      } else if (tablet.state != result) {</a>
+<a name="ln173">        // Should not happen.</a>
+<a name="ln174">        return STATUS_FORMAT(IllegalState, &quot;Tablets in different terminal states: $0 and $1&quot;,</a>
+<a name="ln175">                             SysSnapshotEntryPB::State_Name(result),</a>
+<a name="ln176">                             SysSnapshotEntryPB::State_Name(tablet.state));</a>
+<a name="ln177">      }</a>
+<a name="ln178">    }</a>
+<a name="ln179">    return has_initial ? initial_state_ : result;</a>
+<a name="ln180">  }</a>
+<a name="ln181"> </a>
+<a name="ln182">  Result&lt;bool&gt; Complete() {</a>
+<a name="ln183">    return VERIFY_RESULT(AggregatedState()) != initial_state_;</a>
+<a name="ln184">  }</a>
+<a name="ln185"> </a>
+<a name="ln186">  bool AllTabletsDone() const {</a>
+<a name="ln187">    return num_tablets_in_initial_state_ == 0;</a>
+<a name="ln188">  }</a>
+<a name="ln189"> </a>
+<a name="ln190">  bool PassedSinceCompletion(const MonoDelta&amp; duration) const {</a>
+<a name="ln191">    if (!AllTabletsDone()) {</a>
+<a name="ln192">      return false;</a>
+<a name="ln193">    }</a>
+<a name="ln194"> </a>
+<a name="ln195">    if (complete_at_ == CoarseTimePoint()) {</a>
+<a name="ln196">      YB_LOG_EVERY_N_SECS(DFATAL, 30) &lt;&lt; &quot;All tablets done but complete done was not set&quot;;</a>
+<a name="ln197">      return false;</a>
+<a name="ln198">    }</a>
+<a name="ln199"> </a>
+<a name="ln200">    return CoarseMonoClock::Now() &gt; complete_at_ + duration;</a>
+<a name="ln201">  }</a>
+<a name="ln202"> </a>
+<a name="ln203">  std::vector&lt;TabletId&gt; TabletIdsInState(SysSnapshotEntryPB::State state) {</a>
+<a name="ln204">    std::vector&lt;TabletId&gt; result;</a>
+<a name="ln205">    result.reserve(tablets_.size());</a>
+<a name="ln206">    for (const auto&amp; tablet : tablets_) {</a>
+<a name="ln207">      if (tablet.state == state) {</a>
+<a name="ln208">        result.push_back(tablet.id);</a>
+<a name="ln209">      }</a>
+<a name="ln210">    }</a>
+<a name="ln211">    return result;</a>
+<a name="ln212">  }</a>
+<a name="ln213"> </a>
+<a name="ln214">  // Invoking callback for all operations that are not running and are still in the initial state.</a>
+<a name="ln215">  // Marking such operations as running.</a>
+<a name="ln216">  template &lt;class Functor&gt;</a>
+<a name="ln217">  void DoPrepareOperations(const Functor&amp; functor) {</a>
+<a name="ln218">    auto&amp; running_index = tablets_.get&lt;RunningTag&gt;();</a>
+<a name="ln219">    for (auto it = running_index.begin(); it != running_index.end();) {</a>
+<a name="ln220">      if (it-&gt;running) {</a>
+<a name="ln221">        // Could exit here, because we have already iterated over all non-running operations.</a>
+<a name="ln222">        break;</a>
+<a name="ln223">      }</a>
+<a name="ln224">      bool should_run = it-&gt;state == initial_state_;</a>
+<a name="ln225">      if (should_run) {</a>
+<a name="ln226">        VLOG(4) &lt;&lt; &quot;Prepare operation for &quot; &lt;&lt; it-&gt;ToString();</a>
+<a name="ln227">        functor(*it);</a>
+<a name="ln228"> </a>
+<a name="ln229">        // Here we modify indexed value, so iterator could be advanced to the next element.</a>
+<a name="ln230">        // Taking next before modify.</a>
+<a name="ln231">        auto new_it = it;</a>
+<a name="ln232">        ++new_it;</a>
+<a name="ln233">        running_index.modify(it, [](TabletData&amp; data) { data.running = true; });</a>
+<a name="ln234">        it = new_it;</a>
+<a name="ln235">      } else {</a>
+<a name="ln236">        ++it;</a>
+<a name="ln237">      }</a>
+<a name="ln238">    }</a>
+<a name="ln239">  }</a>
+<a name="ln240"> </a>
+<a name="ln241">  void TabletsToPB(google::protobuf::RepeatedPtrField&lt;SysSnapshotEntryPB::TabletSnapshotPB&gt;* out) {</a>
+<a name="ln242">    out-&gt;Reserve(tablets_.size());</a>
+<a name="ln243">    for (const auto&amp; tablet : tablets_) {</a>
+<a name="ln244">      auto* tablet_state = out-&gt;Add();</a>
+<a name="ln245">      tablet_state-&gt;set_id(tablet.id);</a>
+<a name="ln246">      tablet_state-&gt;set_state(tablet.state);</a>
+<a name="ln247">    }</a>
+<a name="ln248">  }</a>
+<a name="ln249"> </a>
+<a name="ln250">  void Done(const TabletId&amp; tablet_id, const Status&amp; status) {</a>
+<a name="ln251">    VLOG(4) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; tablet_id &lt;&lt; &quot;, &quot; &lt;&lt; status &lt;&lt; &quot;)&quot;;</a>
+<a name="ln252"> </a>
+<a name="ln253">    auto it = tablets_.find(tablet_id);</a>
+<a name="ln254">    if (it == tablets_.end()) {</a>
+<a name="ln255">      LOG(DFATAL) &lt;&lt; &quot;Finished &quot; &lt;&lt; InitialStateName() &lt;&lt;  &quot; snapshot at unknown tablet &quot;</a>
+<a name="ln256">                  &lt;&lt; tablet_id &lt;&lt; &quot;: &quot; &lt;&lt; status;</a>
+<a name="ln257">      return;</a>
+<a name="ln258">    }</a>
+<a name="ln259">    if (!it-&gt;running) {</a>
+<a name="ln260">      LOG(DFATAL) &lt;&lt; &quot;Finished &quot; &lt;&lt; InitialStateName() &lt;&lt;  &quot; snapshot at &quot; &lt;&lt; tablet_id</a>
+<a name="ln261">                  &lt;&lt; &quot; that is not running and in state &quot;</a>
+<a name="ln262">                  &lt;&lt; SysSnapshotEntryPB::State_Name(it-&gt;state) &lt;&lt; &quot;: &quot; &lt;&lt; status;</a>
+<a name="ln263">      return;</a>
+<a name="ln264">    }</a>
+<a name="ln265">    tablets_.modify(it, [](TabletData&amp; data) { data.running = false; });</a>
+<a name="ln266">    const auto&amp; state = it-&gt;state;</a>
+<a name="ln267">    if (state == initial_state_) {</a>
+<a name="ln268">      if (status.ok()) {</a>
+<a name="ln269">        tablets_.modify(</a>
+<a name="ln270">            it, [terminal_state = InitialStateToTerminalState(initial_state_)](TabletData&amp; data) {</a>
+<a name="ln271">          data.state = terminal_state;</a>
+<a name="ln272">        });</a>
+<a name="ln273">        LOG(INFO) &lt;&lt; &quot;Finished &quot; &lt;&lt; InitialStateName() &lt;&lt; &quot; snapshot at &quot; &lt;&lt; tablet_id;</a>
+<a name="ln274">      } else {</a>
+<a name="ln275">        auto full_status = status.CloneAndPrepend(</a>
+<a name="ln276">            Format(&quot;Failed to $0 snapshot at $1&quot;, InitialStateName(), tablet_id));</a>
+<a name="ln277">        LOG(WARNING) &lt;&lt; full_status;</a>
+<a name="ln278">        bool terminal = IsTerminalFailure(status);</a>
+<a name="ln279">        tablets_.modify(it, [&amp;full_status, terminal](TabletData&amp; data) {</a>
+<a name="ln280">          if (terminal) {</a>
+<a name="ln281">            data.state = SysSnapshotEntryPB::FAILED;</a>
+<a name="ln282">          }</a>
+<a name="ln283">          data.last_error = full_status;</a>
+<a name="ln284">        });</a>
+<a name="ln285">        if (!terminal) {</a>
+<a name="ln286">          return;</a>
+<a name="ln287">        }</a>
+<a name="ln288">      }</a>
+<a name="ln289">      --num_tablets_in_initial_state_;</a>
+<a name="ln290">      CheckCompleteness();</a>
+<a name="ln291">    } else {</a>
+<a name="ln292">      LOG(DFATAL) &lt;&lt; &quot;Finished &quot; &lt;&lt; InitialStateName() &lt;&lt; &quot; snapshot at tablet &quot; &lt;&lt; tablet_id</a>
+<a name="ln293">                  &lt;&lt; &quot; in a wrong state &quot; &lt;&lt; state &lt;&lt; &quot;: &quot; &lt;&lt; status;</a>
+<a name="ln294">    }</a>
+<a name="ln295">  }</a>
+<a name="ln296"> </a>
+<a name="ln297">  SnapshotCoordinatorContext&amp; context() const {</a>
+<a name="ln298">    return context_;</a>
+<a name="ln299">  }</a>
+<a name="ln300"> </a>
+<a name="ln301">  bool AllInState(SysSnapshotEntryPB::State state) {</a>
+<a name="ln302">    for (const auto&amp; tablet : tablets_) {</a>
+<a name="ln303">      if (tablet.state != state) {</a>
+<a name="ln304">        return false;</a>
+<a name="ln305">      }</a>
+<a name="ln306">    }</a>
+<a name="ln307"> </a>
+<a name="ln308">    return true;</a>
+<a name="ln309">  }</a>
+<a name="ln310"> </a>
+<a name="ln311">  bool HasInState(SysSnapshotEntryPB::State state) {</a>
+<a name="ln312">    for (const auto&amp; tablet : tablets_) {</a>
+<a name="ln313">      if (tablet.state == state) {</a>
+<a name="ln314">        return true;</a>
+<a name="ln315">      }</a>
+<a name="ln316">    }</a>
+<a name="ln317"> </a>
+<a name="ln318">    return false;</a>
+<a name="ln319">  }</a>
+<a name="ln320"> </a>
+<a name="ln321">  void SetInitialTabletsState(SysSnapshotEntryPB::State state) {</a>
+<a name="ln322">    initial_state_ = state;</a>
+<a name="ln323">    for (auto it = tablets_.begin(); it != tablets_.end(); ++it) {</a>
+<a name="ln324">      tablets_.modify(it, [state](TabletData&amp; data) {</a>
+<a name="ln325">        data.state = state;</a>
+<a name="ln326">      });</a>
+<a name="ln327">    }</a>
+<a name="ln328">    num_tablets_in_initial_state_ = tablets_.size();</a>
+<a name="ln329">  }</a>
+<a name="ln330"> </a>
+<a name="ln331">  virtual bool IsTerminalFailure(const Status&amp; status) = 0;</a>
+<a name="ln332"> </a>
+<a name="ln333">  SysSnapshotEntryPB::State initial_state() const {</a>
+<a name="ln334">    return initial_state_;</a>
+<a name="ln335">  }</a>
+<a name="ln336"> </a>
+<a name="ln337"> protected:</a>
+<a name="ln338">  struct TabletData {</a>
+<a name="ln339">    TabletId id;</a>
+<a name="ln340">    SysSnapshotEntryPB::State state;</a>
+<a name="ln341">    Status last_error;</a>
+<a name="ln342">    bool running = false;</a>
+<a name="ln343"> </a>
+<a name="ln344">    TabletData(const TabletId&amp; id_, SysSnapshotEntryPB::State state_)</a>
+<a name="ln345">        : id(id_), state(state_) {</a>
+<a name="ln346">    }</a>
+<a name="ln347"> </a>
+<a name="ln348">    std::string ToString() const {</a>
+<a name="ln349">      return YB_STRUCT_TO_STRING(id, state, last_error, running);</a>
+<a name="ln350">    }</a>
+<a name="ln351">  };</a>
+<a name="ln352"> </a>
+<a name="ln353">  const std::string&amp; InitialStateName() const {</a>
+<a name="ln354">    return SysSnapshotEntryPB::State_Name(initial_state_);</a>
+<a name="ln355">  }</a>
+<a name="ln356"> </a>
+<a name="ln357">  class RunningTag;</a>
+<a name="ln358"> </a>
+<a name="ln359">  typedef boost::multi_index_container&lt;</a>
+<a name="ln360">    TabletData,</a>
+<a name="ln361">    boost::multi_index::indexed_by&lt;</a>
+<a name="ln362">      boost::multi_index::hashed_unique&lt;</a>
+<a name="ln363">        boost::multi_index::member&lt;TabletData, TabletId, &amp;TabletData::id&gt;</a>
+<a name="ln364">      &gt;,</a>
+<a name="ln365">      boost::multi_index::ordered_non_unique&lt;</a>
+<a name="ln366">        boost::multi_index::tag&lt;RunningTag&gt;,</a>
+<a name="ln367">        boost::multi_index::member&lt;TabletData, bool, &amp;TabletData::running&gt;</a>
+<a name="ln368">      &gt;</a>
+<a name="ln369">    &gt;</a>
+<a name="ln370">  &gt; Tablets;</a>
+<a name="ln371"> </a>
+<a name="ln372">  const Tablets&amp; tablets() const {</a>
+<a name="ln373">    return tablets_;</a>
+<a name="ln374">  }</a>
+<a name="ln375"> </a>
+<a name="ln376"> private:</a>
+<a name="ln377">  void CheckCompleteness() {</a>
+<a name="ln378">    if (num_tablets_in_initial_state_ == 0) {</a>
+<a name="ln379">      complete_at_ = CoarseMonoClock::Now();</a>
+<a name="ln380">    }</a>
+<a name="ln381">  }</a>
+<a name="ln382"> </a>
+<a name="ln383">  SnapshotCoordinatorContext&amp; context_;</a>
+<a name="ln384">  SysSnapshotEntryPB::State initial_state_;</a>
+<a name="ln385"> </a>
+<a name="ln386">  Tablets tablets_;</a>
+<a name="ln387"> </a>
+<a name="ln388">  size_t num_tablets_in_initial_state_ = 0;</a>
+<a name="ln389">  // Time when last tablet were transferred from initial state.</a>
+<a name="ln390">  CoarseTimePoint complete_at_;</a>
+<a name="ln391">};</a>
+<a name="ln392"> </a>
+<a name="ln393">class SnapshotState : public StateWithTablets {</a>
+<a name="ln394"> public:</a>
+<a name="ln395">  SnapshotState(</a>
+<a name="ln396">      SnapshotCoordinatorContext* context, const TxnSnapshotId&amp; id,</a>
+<a name="ln397">      const tserver::TabletSnapshotOpRequestPB&amp; request)</a>
+<a name="ln398">      : StateWithTablets(context, SysSnapshotEntryPB::CREATING),</a>
+<a name="ln399">        id_(id), snapshot_hybrid_time_(request.snapshot_hybrid_time()), version_(1) {</a>
+<a name="ln400">    InitTabletIds(request.tablet_id(),</a>
+<a name="ln401">                  request.imported() ? SysSnapshotEntryPB::COMPLETE : SysSnapshotEntryPB::CREATING);</a>
+<a name="ln402">    request.extra_data().UnpackTo(&amp;entries_);</a>
+<a name="ln403">  }</a>
+<a name="ln404"> </a>
+<a name="ln405">  SnapshotState(</a>
+<a name="ln406">      SnapshotCoordinatorContext* context, const TxnSnapshotId&amp; id,</a>
+<a name="ln407">      const SysSnapshotEntryPB&amp; entry)</a>
+<a name="ln408">      : StateWithTablets(context, entry.state()),</a>
+<a name="ln409">        id_(id), snapshot_hybrid_time_(entry.snapshot_hybrid_time()), version_(entry.version()) {</a>
+<a name="ln410">    InitTablets(entry.tablet_snapshots());</a>
+<a name="ln411">    *entries_.mutable_entries() = entry.entries();</a>
+<a name="ln412">  }</a>
+<a name="ln413"> </a>
+<a name="ln414">  const TxnSnapshotId&amp; id() const {</a>
+<a name="ln415">    return id_;</a>
+<a name="ln416">  }</a>
+<a name="ln417"> </a>
+<a name="ln418">  HybridTime snapshot_hybrid_time() const {</a>
+<a name="ln419">    return snapshot_hybrid_time_;</a>
+<a name="ln420">  }</a>
+<a name="ln421"> </a>
+<a name="ln422">  std::string ToString() const {</a>
+<a name="ln423">    return Format(&quot;{ id: $0 snapshot_hybrid_time: $1 version: $2 initial_state: $3 tablets: $4 }&quot;,</a>
+<a name="ln424">                  id_, snapshot_hybrid_time_, version_, InitialStateName(), tablets());</a>
+<a name="ln425">  }</a>
+<a name="ln426"> </a>
+<a name="ln427">  CHECKED_STATUS ToPB(SnapshotInfoPB* out) {</a>
+<a name="ln428">    out-&gt;set_id(id_.data(), id_.size());</a>
+<a name="ln429">    return ToEntryPB(out-&gt;mutable_entry(), ForClient::kTrue);</a>
+<a name="ln430">  }</a>
+<a name="ln431"> </a>
+<a name="ln432">  CHECKED_STATUS ToEntryPB(SysSnapshotEntryPB* out, ForClient for_client) {</a>
+<a name="ln433">    out-&gt;set_state(for_client ? VERIFY_RESULT(AggregatedState()) : initial_state());</a>
+<a name="ln434">    out-&gt;set_snapshot_hybrid_time(snapshot_hybrid_time_.ToUint64());</a>
+<a name="ln435"> </a>
+<a name="ln436">    TabletsToPB(out-&gt;mutable_tablet_snapshots());</a>
+<a name="ln437"> </a>
+<a name="ln438">    *out-&gt;mutable_entries() = entries_.entries();</a>
+<a name="ln439"> </a>
+<a name="ln440">    out-&gt;set_version(version_);</a>
+<a name="ln441"> </a>
+<a name="ln442">    return Status::OK();</a>
+<a name="ln443">  }</a>
+<a name="ln444"> </a>
+<a name="ln445">  CHECKED_STATUS StoreToWriteBatch(docdb::KeyValueWriteBatchPB* out) {</a>
+<a name="ln446">    ++version_;</a>
+<a name="ln447">    auto encoded_key = VERIFY_RESULT(EncodedSnapshotKey(id_, &amp;context()));</a>
+<a name="ln448">    auto pair = out-&gt;add_write_pairs();</a>
+<a name="ln449">    pair-&gt;set_key(encoded_key.AsSlice().cdata(), encoded_key.size());</a>
+<a name="ln450">    faststring value;</a>
+<a name="ln451">    value.push_back(docdb::ValueTypeAsChar::kString);</a>
+<a name="ln452">    SysSnapshotEntryPB entry;</a>
+<a name="ln453">    RETURN_NOT_OK(ToEntryPB(&amp;entry, ForClient::kFalse));</a>
+<a name="ln454">    pb_util::AppendToString(entry, &amp;value);</a>
+<a name="ln455">    pair-&gt;set_value(value.data(), value.size());</a>
+<a name="ln456">    return Status::OK();</a>
+<a name="ln457">  }</a>
+<a name="ln458"> </a>
+<a name="ln459">  CHECKED_STATUS CheckCanDelete() {</a>
+<a name="ln460">    if (AllInState(SysSnapshotEntryPB::DELETED)) {</a>
+<a name="ln461">      return STATUS(NotFound, &quot;The snapshot was deleted&quot;, id_.ToString(),</a>
+<a name="ln462">                    MasterError(MasterErrorPB::SNAPSHOT_NOT_FOUND));</a>
+<a name="ln463">    }</a>
+<a name="ln464">    if (HasInState(SysSnapshotEntryPB::DELETING)) {</a>
+<a name="ln465">      return STATUS(NotFound, &quot;The snapshot is being deleted&quot;, id_.ToString(),</a>
+<a name="ln466">                    MasterError(MasterErrorPB::SNAPSHOT_NOT_FOUND));</a>
+<a name="ln467">    }</a>
+<a name="ln468"> </a>
+<a name="ln469">    return Status::OK();</a>
+<a name="ln470">  }</a>
+<a name="ln471"> </a>
+<a name="ln472">  void PrepareOperations(TabletSnapshotOperations* out) {</a>
+<a name="ln473">    DoPrepareOperations([this, out](const TabletData&amp; tablet) {</a>
+<a name="ln474">      out-&gt;push_back(TabletSnapshotOperation {</a>
+<a name="ln475">        .tablet_id = tablet.id,</a>
+<a name="ln476">        .snapshot_id = id_,</a>
+<a name="ln477">        .state = initial_state(),</a>
+<a name="ln478">        .snapshot_hybrid_time = snapshot_hybrid_time_,</a>
+<a name="ln479">      });</a>
+<a name="ln480">    });</a>
+<a name="ln481">  }</a>
+<a name="ln482"> </a>
+<a name="ln483">  void SetVersion(int value) {</a>
+<a name="ln484">    version_ = value;</a>
+<a name="ln485">  }</a>
+<a name="ln486"> </a>
+<a name="ln487">  int version() const {</a>
+<a name="ln488">    return version_;</a>
+<a name="ln489">  }</a>
+<a name="ln490"> </a>
+<a name="ln491">  bool NeedCleanup() const {</a>
+<a name="ln492">    return initial_state() == SysSnapshotEntryPB::DELETING &amp;&amp;</a>
+<a name="ln493">           PassedSinceCompletion(GetAtomicFlag(&amp;FLAGS_snapshot_coordinator_cleanup_delay_ms) * 1ms);</a>
+<a name="ln494">  }</a>
+<a name="ln495"> </a>
+<a name="ln496"> private:</a>
+<a name="ln497">  bool IsTerminalFailure(const Status&amp; status) override {</a>
+<a name="ln498">    // Table was removed.</a>
+<a name="ln499">    if (status.IsExpired()) {</a>
+<a name="ln500">      return true;</a>
+<a name="ln501">    }</a>
+<a name="ln502">    // Would not be able to create snapshot at specific time, since history was garbage collected.</a>
+<a name="ln503">    if (TransactionError(status) == TransactionErrorCode::kSnapshotTooOld) {</a>
+<a name="ln504">      return true;</a>
+<a name="ln505">    }</a>
+<a name="ln506">    return false;</a>
+<a name="ln507">  }</a>
+<a name="ln508"> </a>
+<a name="ln509">  TxnSnapshotId id_;</a>
+<a name="ln510">  HybridTime snapshot_hybrid_time_;</a>
+<a name="ln511">  SysRowEntries entries_;</a>
+<a name="ln512">  int version_;</a>
+<a name="ln513">};</a>
+<a name="ln514"> </a>
+<a name="ln515">class RestorationState : public StateWithTablets {</a>
+<a name="ln516"> public:</a>
+<a name="ln517">  RestorationState(</a>
+<a name="ln518">      SnapshotCoordinatorContext* context, const TxnSnapshotRestorationId&amp; restoration_id,</a>
+<a name="ln519">      SnapshotState* snapshot)</a>
+<a name="ln520">      : StateWithTablets(context, SysSnapshotEntryPB::RESTORING),</a>
+<a name="ln521">        restoration_id_(restoration_id), snapshot_id_(snapshot-&gt;id()) {</a>
+<a name="ln522">    InitTabletIds(snapshot-&gt;TabletIdsInState(SysSnapshotEntryPB::COMPLETE));</a>
+<a name="ln523">  }</a>
+<a name="ln524"> </a>
+<a name="ln525">  const TxnSnapshotRestorationId&amp; restoration_id() const {</a>
+<a name="ln526">    return restoration_id_;</a>
+<a name="ln527">  }</a>
+<a name="ln528"> </a>
+<a name="ln529">  const TxnSnapshotId&amp; snapshot_id() const {</a>
+<a name="ln530">    return snapshot_id_;</a>
+<a name="ln531">  }</a>
+<a name="ln532"> </a>
+<a name="ln533">  CHECKED_STATUS ToPB(SnapshotInfoPB* out) {</a>
+<a name="ln534">    out-&gt;set_id(restoration_id_.data(), restoration_id_.size());</a>
+<a name="ln535">    auto&amp; entry = *out-&gt;mutable_entry();</a>
+<a name="ln536"> </a>
+<a name="ln537">    entry.set_state(VERIFY_RESULT(AggregatedState()));</a>
+<a name="ln538"> </a>
+<a name="ln539">    TabletsToPB(entry.mutable_tablet_snapshots());</a>
+<a name="ln540"> </a>
+<a name="ln541">    return Status::OK();</a>
+<a name="ln542">  }</a>
+<a name="ln543"> </a>
+<a name="ln544">  TabletInfos PrepareOperations() {</a>
+<a name="ln545">    std::vector&lt;TabletId&gt; tablet_ids;</a>
+<a name="ln546">    DoPrepareOperations([&amp;tablet_ids](const TabletData&amp; data) {</a>
+<a name="ln547">      tablet_ids.push_back(data.id);</a>
+<a name="ln548">    });</a>
+<a name="ln549">    return context().GetTabletInfos(tablet_ids);</a>
+<a name="ln550">  }</a>
+<a name="ln551"> </a>
+<a name="ln552"> private:</a>
+<a name="ln553">  bool IsTerminalFailure(const Status&amp; status) override {</a>
+<a name="ln554">    return status.IsAborted() ||</a>
+<a name="ln555">           TabletServerError(status) == TabletServerErrorPB::INVALID_SNAPSHOT;</a>
+<a name="ln556">  }</a>
+<a name="ln557"> </a>
+<a name="ln558">  TxnSnapshotRestorationId restoration_id_;</a>
+<a name="ln559">  TxnSnapshotId snapshot_id_;</a>
+<a name="ln560">};</a>
+<a name="ln561"> </a>
+<a name="ln562">struct NoOp {</a>
+<a name="ln563">  template &lt;class... Args&gt;</a>
+<a name="ln564">  void operator()(Args&amp;&amp;... args) const {}</a>
+<a name="ln565">};</a>
+<a name="ln566"> </a>
+<a name="ln567">// Utility to create callback that is invoked when operation done.</a>
+<a name="ln568">// Finds appropriate entry in passed collection and invokes Done on it.</a>
+<a name="ln569">template &lt;class Collection, class PostProcess = NoOp&gt;</a>
+<a name="ln570">auto MakeDoneCallback(</a>
+<a name="ln571">    std::mutex* mutex, const Collection&amp; collection, const typename Collection::key_type&amp; key,</a>
+<a name="ln572">    const TabletId&amp; tablet_id, const PostProcess&amp; post_process = PostProcess()) {</a>
+<a name="ln573">  struct DoneFunctor {</a>
+<a name="ln574">    std::mutex&amp; mutex;</a>
+<a name="ln575">    const Collection&amp; collection;</a>
+<a name="ln576">    typename Collection::key_type key;</a>
+<a name="ln577">    TabletId tablet_id;</a>
+<a name="ln578">    PostProcess post_process;</a>
+<a name="ln579"> </a>
+<a name="ln580">    void operator()(Result&lt;const tserver::TabletSnapshotOpResponsePB&amp;&gt; resp) const {</a>
+<a name="ln581">      std::unique_lock&lt;std::mutex&gt; lock(mutex);</a>
+<a name="ln582">      auto it = collection.find(key);</a>
+<a name="ln583">      if (it == collection.end()) {</a>
+<a name="ln584">        LOG(DFATAL) &lt;&lt; &quot;Received reply for unknown &quot; &lt;&lt; key;</a>
+<a name="ln585">        return;</a>
+<a name="ln586">      }</a>
+<a name="ln587"> </a>
+<a name="ln588">      it-&gt;second-&gt;Done(tablet_id, ResultToStatus(resp));</a>
+<a name="ln589">      post_process(it-&gt;second.get(), &amp;lock);</a>
+<a name="ln590">    }</a>
+<a name="ln591">  };</a>
+<a name="ln592"> </a>
+<a name="ln593">  return DoneFunctor {</a>
+<a name="ln594">    .mutex = *mutex,</a>
+<a name="ln595">    .collection = collection,</a>
+<a name="ln596">    .key = key,</a>
+<a name="ln597">    .tablet_id = tablet_id,</a>
+<a name="ln598">    .post_process = post_process,</a>
+<a name="ln599">  };</a>
+<a name="ln600">}</a>
+<a name="ln601"> </a>
+<a name="ln602">auto SnapshotUpdater(SnapshotCoordinatorContext* context) {</a>
+<a name="ln603">  struct UpdateFunctor {</a>
+<a name="ln604">    SnapshotCoordinatorContext&amp; context;</a>
+<a name="ln605"> </a>
+<a name="ln606">    void operator()(SnapshotState* snapshot, std::unique_lock&lt;std::mutex&gt;* lock) const {</a>
+<a name="ln607">      if (!snapshot-&gt;AllTabletsDone()) {</a>
+<a name="ln608">        return;</a>
+<a name="ln609">      }</a>
+<a name="ln610">      docdb::KeyValueWriteBatchPB write_batch;</a>
+<a name="ln611">      auto status = snapshot-&gt;StoreToWriteBatch(&amp;write_batch);</a>
+<a name="ln612">      if (!status.ok()) {</a>
+<a name="ln613">        LOG(DFATAL) &lt;&lt; &quot;Failed to prepare write batch for snapshot: &quot; &lt;&lt; status;</a>
+<a name="ln614">        return;</a>
+<a name="ln615">      }</a>
+<a name="ln616">      lock-&gt;unlock();</a>
+<a name="ln617"> </a>
+<a name="ln618">      SubmitWrite(std::move(write_batch), &amp;context);</a>
+<a name="ln619">    }</a>
+<a name="ln620">  };</a>
+<a name="ln621"> </a>
+<a name="ln622">  return UpdateFunctor {</a>
+<a name="ln623">    .context = *context</a>
+<a name="ln624">  };</a>
+<a name="ln625">}</a>
+<a name="ln626"> </a>
+<a name="ln627">} // namespace</a>
+<a name="ln628"> </a>
+<a name="ln629">class MasterSnapshotCoordinator::Impl {</a>
+<a name="ln630"> public:</a>
+<a name="ln631">  explicit Impl(SnapshotCoordinatorContext* context)</a>
+<a name="ln632">      : context_(*context), poller_(std::bind(&amp;Impl::Poll, this)) {}</a>
+<a name="ln633"> </a>
+<a name="ln634">  Result&lt;TxnSnapshotId&gt; Create(</a>
+<a name="ln635">      const SysRowEntries&amp; entries, bool imported, HybridTime snapshot_hybrid_time,</a>
+<a name="ln636">      CoarseTimePoint deadline) {</a>
+<a name="ln637">    auto synchronizer = std::make_shared&lt;Synchronizer&gt;();</a>
+<a name="ln638">    auto operation_state = std::make_unique&lt;tablet::SnapshotOperationState&gt;(/* tablet= */ nullptr);</a>
+<a name="ln639">    auto request = operation_state-&gt;AllocateRequest();</a>
+<a name="ln640"> </a>
+<a name="ln641">    for (const auto&amp; entry : entries.entries()) {</a>
+<a name="ln642">      if (entry.type() == SysRowEntry::TABLET) {</a>
+<a name="ln643">        request-&gt;add_tablet_id(entry.id());</a>
+<a name="ln644">      }</a>
+<a name="ln645">    }</a>
+<a name="ln646"> </a>
+<a name="ln647">    request-&gt;set_snapshot_hybrid_time(snapshot_hybrid_time.ToUint64());</a>
+<a name="ln648">    request-&gt;set_operation(tserver::TabletSnapshotOpRequestPB::CREATE_ON_MASTER);</a>
+<a name="ln649">    auto snapshot_id = TxnSnapshotId::GenerateRandom();</a>
+<a name="ln650">    request-&gt;set_snapshot_id(snapshot_id.data(), snapshot_id.size());</a>
+<a name="ln651">    request-&gt;set_imported(imported);</a>
+<a name="ln652"> </a>
+<a name="ln653">    request-&gt;mutable_extra_data()-&gt;PackFrom(entries);</a>
+<a name="ln654"> </a>
+<a name="ln655">    operation_state-&gt;set_completion_callback(std::make_unique&lt;</a>
+<a name="ln656">        tablet::WeakSynchronizerOperationCompletionCallback&gt;(synchronizer));</a>
+<a name="ln657">    auto operation = std::make_unique&lt;tablet::SnapshotOperation&gt;(std::move(operation_state));</a>
+<a name="ln658"> </a>
+<a name="ln659">    context_.Submit(std::move(operation));</a>
+<a name="ln660">    RETURN_NOT_OK(synchronizer-&gt;WaitUntil(ToSteady(deadline)));</a>
+<a name="ln661"> </a>
+<a name="ln662">    return snapshot_id;</a>
+<a name="ln663">  }</a>
+<a name="ln664"> </a>
+<a name="ln665">  CHECKED_STATUS CreateReplicated(</a>
+<a name="ln666">      int64_t leader_term, const tablet::SnapshotOperationState&amp; state) {</a>
+<a name="ln667">    // TODO(txn_backup) retain logs with this operation while doing snapshot</a>
+<a name="ln668">    auto id = VERIFY_RESULT(FullyDecodeTxnSnapshotId(state.request()-&gt;snapshot_id()));</a>
+<a name="ln669"> </a>
+<a name="ln670">    VLOG(1) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; id &lt;&lt; &quot;, &quot; &lt;&lt; state.ToString() &lt;&lt; &quot;)&quot;;</a>
+<a name="ln671"> </a>
+<a name="ln672">    auto snapshot = std::make_unique&lt;SnapshotState&gt;(&amp;context_, id, *state.request());</a>
+<a name="ln673"> </a>
+<a name="ln674">    TabletSnapshotOperations operations;</a>
+<a name="ln675">    docdb::KeyValueWriteBatchPB write_batch;</a>
+<a name="ln676">    RETURN_NOT_OK(snapshot-&gt;StoreToWriteBatch(&amp;write_batch));</a>
+<a name="ln677">    {</a>
+<a name="ln678">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln679">      auto emplace_result = snapshots_.emplace(id, std::move(snapshot));</a>
+<a name="ln680">      if (!emplace_result.second) {</a>
+<a name="ln681">        return STATUS_FORMAT(IllegalState, &quot;Duplicate snapshot id: $0&quot;, id);</a>
+<a name="ln682">      }</a>
+<a name="ln683"> </a>
+<a name="ln684">      if (leader_term &gt;= 0) {</a>
+<a name="ln685">        emplace_result.first-&gt;second-&gt;PrepareOperations(&amp;operations);</a>
+<a name="ln686">      }</a>
+<a name="ln687">    }</a>
+<a name="ln688"> </a>
+<a name="ln689">    RETURN_NOT_OK(state.tablet()-&gt;ApplyOperationState(state, /* batch_idx= */ -1, write_batch));</a>
+<a name="ln690"> </a>
+<a name="ln691">    ExecuteOperations(operations);</a>
+<a name="ln692"> </a>
+<a name="ln693">    return Status::OK();</a>
+<a name="ln694">  }</a>
+<a name="ln695"> </a>
+<a name="ln696">  CHECKED_STATUS Load(tablet::Tablet* tablet) {</a>
+<a name="ln697">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln698">    return EnumerateSysCatalog(tablet, context_.schema(), SysRowEntry::SNAPSHOT,</a>
+<a name="ln699">        [this](const Slice&amp; id, const Slice&amp; data) NO_THREAD_SAFETY_ANALYSIS -&gt; Status {</a>
+<a name="ln700">      return LoadSnapshot(id, data);</a>
+<a name="ln701">    });</a>
+<a name="ln702">  }</a>
+<a name="ln703"> </a>
+<a name="ln704">  CHECKED_STATUS ApplyWritePair(Slice key, const Slice&amp; value) {</a>
+<a name="ln705">    docdb::SubDocKey sub_doc_key;</a>
+<a name="ln706">    RETURN_NOT_OK(sub_doc_key.FullyDecodeFrom(key, docdb::HybridTimeRequired::kFalse));</a>
+<a name="ln707"> </a>
+<a name="ln708">    if (sub_doc_key.doc_key().has_cotable_id()) {</a>
+<a name="ln709">      return Status::OK();</a>
+<a name="ln710">    }</a>
+<a name="ln711"> </a>
+<a name="ln712">    if (sub_doc_key.doc_key().range_group().size() != 2) {</a>
+<a name="ln713">      LOG(DFATAL) &lt;&lt; &quot;Unexpected size of range group in sys catalog entry (2 expected): &quot;</a>
+<a name="ln714">                  &lt;&lt; AsString(sub_doc_key.doc_key().range_group()) &lt;&lt; &quot;(&quot; &lt;&lt; sub_doc_key.ToString()</a>
+<a name="ln715">                  &lt;&lt; &quot;)&quot;;</a>
+<a name="ln716">      return Status::OK();</a>
+<a name="ln717">    }</a>
+<a name="ln718"> </a>
+<a name="ln719">    auto first_key = sub_doc_key.doc_key().range_group().front();</a>
+<a name="ln720">    if (first_key.value_type() != docdb::ValueType::kInt32) {</a>
+<a name="ln721">      LOG(DFATAL) &lt;&lt; &quot;Unexpected value type for the first range component of sys catalgo entry &quot;</a>
+<a name="ln722">                  &lt;&lt; &quot;(kInt32 expected): &quot;</a>
+<a name="ln723">                  &lt;&lt; AsString(sub_doc_key.doc_key().range_group());;</a>
+<a name="ln724">    }</a>
+<a name="ln725"> </a>
+<a name="ln726">    if (first_key.GetInt32() != SysRowEntry::SNAPSHOT) {</a>
+<a name="ln727">      return Status::OK();</a>
+<a name="ln728">    }</a>
+<a name="ln729"> </a>
+<a name="ln730">    docdb::Value decoded_value;</a>
+<a name="ln731">    RETURN_NOT_OK(decoded_value.Decode(value));</a>
+<a name="ln732"> </a>
+<a name="ln733">    auto value_type = decoded_value.primitive_value().value_type();</a>
+<a name="ln734">    const auto&amp; id_str = sub_doc_key.doc_key().range_group()[1].GetString();</a>
+<a name="ln735"> </a>
+<a name="ln736">    if (value_type == docdb::ValueType::kTombstone) {</a>
+<a name="ln737">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln738">      auto id = TryFullyDecodeTxnSnapshotId(id_str);</a>
+<a name="ln739">      if (!id) {</a>
+<a name="ln740">        LOG(WARNING) &lt;&lt; &quot;Unable to decode snapshot id: &quot; &lt;&lt; id_str;</a>
+<a name="ln741">        return Status::OK();</a>
+<a name="ln742">      }</a>
+<a name="ln743">      bool erased = snapshots_.erase(id) != 0;</a>
+<a name="ln744">      LOG_IF(DFATAL, !erased) &lt;&lt; &quot;Unknown shapshot tombstoned: &quot; &lt;&lt; id;</a>
+<a name="ln745">      return Status::OK();</a>
+<a name="ln746">    }</a>
+<a name="ln747"> </a>
+<a name="ln748">    if (value_type != docdb::ValueType::kString) {</a>
+<a name="ln749">      return STATUS_FORMAT(</a>
+<a name="ln750">          Corruption,</a>
+<a name="ln751">          &quot;Bad value type: $0, expected kString while replaying write for sys catalog&quot;,</a>
+<a name="ln752">          decoded_value.primitive_value().value_type());</a>
+<a name="ln753">    }</a>
+<a name="ln754"> </a>
+<a name="ln755">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln756">    return LoadSnapshot(id_str, decoded_value.primitive_value().GetString());</a>
+<a name="ln757">  }</a>
+<a name="ln758"> </a>
+<a name="ln759">  CHECKED_STATUS ListSnapshots(</a>
+<a name="ln760">      const TxnSnapshotId&amp; snapshot_id, bool list_deleted, ListSnapshotsResponsePB* resp) {</a>
+<a name="ln761">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln762">    if (snapshot_id.IsNil()) {</a>
+<a name="ln763">      for (const auto&amp; p : snapshots_) {</a>
+<a name="ln764">        if (!list_deleted) {</a>
+<a name="ln765">          auto aggreaged_state = p.second-&gt;AggregatedState();</a>
+<a name="ln766">          if (aggreaged_state.ok() &amp;&amp; *aggreaged_state == SysSnapshotEntryPB::DELETED) {</a>
+<a name="ln767">            continue;</a>
+<a name="ln768">          }</a>
+<a name="ln769">        }</a>
+<a name="ln770">        RETURN_NOT_OK(p.second-&gt;ToPB(resp-&gt;add_snapshots()));</a>
+<a name="ln771">      }</a>
+<a name="ln772">      return Status::OK();</a>
+<a name="ln773">    }</a>
+<a name="ln774"> </a>
+<a name="ln775">    SnapshotState&amp; snapshot = VERIFY_RESULT(FindSnapshot(snapshot_id));</a>
+<a name="ln776">    return snapshot.ToPB(resp-&gt;add_snapshots());</a>
+<a name="ln777">  }</a>
+<a name="ln778"> </a>
+<a name="ln779">  CHECKED_STATUS Delete(const TxnSnapshotId&amp; snapshot_id, CoarseTimePoint deadline) {</a>
+<a name="ln780">    {</a>
+<a name="ln781">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln782">      SnapshotState&amp; snapshot = VERIFY_RESULT(FindSnapshot(snapshot_id));</a>
+<a name="ln783">      RETURN_NOT_OK(snapshot.CheckCanDelete());</a>
+<a name="ln784">    }</a>
+<a name="ln785"> </a>
+<a name="ln786">    auto synchronizer = std::make_shared&lt;Synchronizer&gt;();</a>
+<a name="ln787">    auto operation_state = std::make_unique&lt;tablet::SnapshotOperationState&gt;(nullptr);</a>
+<a name="ln788">    auto request = operation_state-&gt;AllocateRequest();</a>
+<a name="ln789"> </a>
+<a name="ln790">    request-&gt;set_operation(tserver::TabletSnapshotOpRequestPB::DELETE_ON_MASTER);</a>
+<a name="ln791">    request-&gt;set_snapshot_id(snapshot_id.data(), snapshot_id.size());</a>
+<a name="ln792"> </a>
+<a name="ln793">    operation_state-&gt;set_completion_callback(std::make_unique&lt;</a>
+<a name="ln794">        tablet::WeakSynchronizerOperationCompletionCallback&gt;(synchronizer));</a>
+<a name="ln795">    auto operation = std::make_unique&lt;tablet::SnapshotOperation&gt;(std::move(operation_state));</a>
+<a name="ln796"> </a>
+<a name="ln797">    context_.Submit(std::move(operation));</a>
+<a name="ln798">    RETURN_NOT_OK(synchronizer-&gt;WaitUntil(ToSteady(deadline)));</a>
+<a name="ln799">    return Status::OK();</a>
+<a name="ln800">  }</a>
+<a name="ln801"> </a>
+<a name="ln802">  CHECKED_STATUS DeleteReplicated(</a>
+<a name="ln803">      int64_t leader_term, const tablet::SnapshotOperationState&amp; state) {</a>
+<a name="ln804">    auto snapshot_id = VERIFY_RESULT(FullyDecodeTxnSnapshotId(state.request()-&gt;snapshot_id()));</a>
+<a name="ln805">    docdb::KeyValueWriteBatchPB write_batch;</a>
+<a name="ln806">    TabletSnapshotOperations operations;</a>
+<a name="ln807">    {</a>
+<a name="ln808">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln809">      SnapshotState&amp; snapshot = VERIFY_RESULT(FindSnapshot(snapshot_id));</a>
+<a name="ln810">      snapshot.SetInitialTabletsState(SysSnapshotEntryPB::DELETING);</a>
+<a name="ln811">      RETURN_NOT_OK(snapshot.StoreToWriteBatch(&amp;write_batch));</a>
+<a name="ln812">      if (leader_term &gt;= 0) {</a>
+<a name="ln813">        snapshot.PrepareOperations(&amp;operations);</a>
+<a name="ln814">      }</a>
+<a name="ln815">    }</a>
+<a name="ln816"> </a>
+<a name="ln817">    RETURN_NOT_OK(state.tablet()-&gt;ApplyOperationState(state, /* batch_idx= */ -1, write_batch));</a>
+<a name="ln818"> </a>
+<a name="ln819">    ExecuteOperations(operations);</a>
+<a name="ln820"> </a>
+<a name="ln821">    return Status::OK();</a>
+<a name="ln822">  }</a>
+<a name="ln823"> </a>
+<a name="ln824">  CHECKED_STATUS ListRestorations(</a>
+<a name="ln825">      const TxnSnapshotRestorationId&amp; restoration_id, const TxnSnapshotId&amp; snapshot_id,</a>
+<a name="ln826">      ListSnapshotRestorationsResponsePB* resp) {</a>
+<a name="ln827">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln828">    if (!restoration_id) {</a>
+<a name="ln829">      for (const auto&amp; p : restorations_) {</a>
+<a name="ln830">        if (!snapshot_id || p.second-&gt;snapshot_id() == snapshot_id) {</a>
+<a name="ln831">          RETURN_NOT_OK(p.second-&gt;ToPB(resp-&gt;add_restorations()));</a>
+<a name="ln832">        }</a>
+<a name="ln833">      }</a>
+<a name="ln834">      return Status::OK();</a>
+<a name="ln835">    }</a>
+<a name="ln836"> </a>
+<a name="ln837">    RestorationState&amp; restoration = VERIFY_RESULT(FindRestoration(restoration_id));</a>
+<a name="ln838">    return restoration.ToPB(resp-&gt;add_restorations());</a>
+<a name="ln839">  }</a>
+<a name="ln840"> </a>
+<a name="ln841">  Result&lt;TxnSnapshotRestorationId&gt; Restore(const TxnSnapshotId&amp; snapshot_id) {</a>
+<a name="ln842">    auto restoration_id = TxnSnapshotRestorationId::GenerateRandom();</a>
+<a name="ln843">    TabletInfos tablet_infos;</a>
+<a name="ln844">    {</a>
+<a name="ln845">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln846">      SnapshotState&amp; snapshot = VERIFY_RESULT(FindSnapshot(snapshot_id));</a>
+<a name="ln847">      if (!VERIFY_RESULT(snapshot.Complete())) {</a>
+<a name="ln848">        return STATUS(IllegalState, &quot;The snapshot state is not complete&quot;, snapshot_id.ToString(),</a>
+<a name="ln849">                      MasterError(MasterErrorPB::SNAPSHOT_IS_NOT_READY));</a>
+<a name="ln850">      }</a>
+<a name="ln851"> </a>
+<a name="ln852">      auto restoration = std::make_unique&lt;RestorationState&gt;(&amp;context_, restoration_id, &amp;snapshot);</a>
+<a name="ln853">      tablet_infos = restoration-&gt;PrepareOperations();</a>
+<a name="ln854">      restorations_.emplace(restoration_id, std::move(restoration));</a>
+<a name="ln855">    }</a>
+<a name="ln856"> </a>
+<a name="ln857">    auto snapshot_id_str = snapshot_id.AsSlice().ToBuffer();</a>
+<a name="ln858">    for (const auto&amp; tablet : tablet_infos) {</a>
+<a name="ln859">      context_.SendRestoreTabletSnapshotRequest(</a>
+<a name="ln860">          tablet, snapshot_id_str,</a>
+<a name="ln861">          MakeDoneCallback(&amp;mutex_, restorations_, restoration_id, tablet-&gt;tablet_id()));</a>
+<a name="ln862">    }</a>
+<a name="ln863"> </a>
+<a name="ln864">    return restoration_id;</a>
+<a name="ln865">  }</a>
+<a name="ln866"> </a>
+<a name="ln867">  void Start() {</a>
+<a name="ln868">    poller_.Start(&amp;context_.Scheduler(), FLAGS_snapshot_coordinator_poll_interval_ms * 1ms);</a>
+<a name="ln869">  }</a>
+<a name="ln870"> </a>
+<a name="ln871">  void Shutdown() {</a>
+<a name="ln872">    poller_.Shutdown();</a>
+<a name="ln873">  }</a>
+<a name="ln874"> </a>
+<a name="ln875"> private:</a>
+<a name="ln876">  CHECKED_STATUS LoadSnapshot(const Slice&amp; id, const Slice&amp; data) REQUIRES(mutex_) {</a>
+<a name="ln877">    VLOG(2) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; id.ToDebugString() &lt;&lt; &quot;, &quot; &lt;&lt; data.ToDebugString() &lt;&lt; &quot;)&quot;;</a>
+<a name="ln878"> </a>
+<a name="ln879">    auto snapshot_id = TryFullyDecodeTxnSnapshotId(id);</a>
+<a name="ln880">    if (!snapshot_id) {</a>
+<a name="ln881">      return Status::OK();</a>
+<a name="ln882">    }</a>
+<a name="ln883">    auto metadata = VERIFY_RESULT(pb_util::ParseFromSlice&lt;SysSnapshotEntryPB&gt;(data));</a>
+<a name="ln884">    return LoadSnapshot(snapshot_id, metadata);</a>
+<a name="ln885">  }</a>
+<a name="ln886"> </a>
+<a name="ln887">  CHECKED_STATUS LoadSnapshot(const TxnSnapshotId&amp; snapshot_id, const SysSnapshotEntryPB&amp; data)</a>
+<a name="ln888">      REQUIRES(mutex_) {</a>
+<a name="ln889">    VLOG(1) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; snapshot_id &lt;&lt; &quot;, &quot; &lt;&lt; data.ShortDebugString() &lt;&lt; &quot;)&quot;;</a>
+<a name="ln890"> </a>
+<a name="ln891">    auto snapshot = std::make_unique&lt;SnapshotState&gt;(&amp;context_, snapshot_id, data);</a>
+<a name="ln892"> </a>
+<a name="ln893">    auto it = snapshots_.find(snapshot_id);</a>
+<a name="ln894">    if (it == snapshots_.end()) {</a>
+<a name="ln895">      snapshots_.emplace(snapshot_id, std::move(snapshot));</a>
+<a name="ln896">    } else {</a>
+<a name="ln897">      // Backward compatibility mode</a>
+<a name="ln898">      if (snapshot-&gt;version() == 0) {</a>
+<a name="ln899">        snapshot-&gt;SetVersion(it-&gt;second-&gt;version() + 1);</a>
+<a name="ln900">      }</a>
+<a name="ln901">      if (it-&gt;second-&gt;version() &lt; snapshot-&gt;version()) {</a>
+<a name="ln902">        // If we have several updates for single snapshot, they are loaded in chronological order.</a>
+<a name="ln903">        // So latest update should be picked.</a>
+<a name="ln904">        it-&gt;second = std::move(snapshot);</a>
+<a name="ln905">      } else {</a>
+<a name="ln906">        LOG(INFO) &lt;&lt; __func__ &lt;&lt; &quot; ignore because of version check, existing: &quot;</a>
+<a name="ln907">                  &lt;&lt; it-&gt;second-&gt;ToString() &lt;&lt; &quot;, loaded: &quot; &lt;&lt; snapshot-&gt;ToString();</a>
+<a name="ln908">      }</a>
+<a name="ln909">    }</a>
+<a name="ln910"> </a>
+<a name="ln911">    return Status::OK();</a>
+<a name="ln912">  }</a>
+<a name="ln913"> </a>
+<a name="ln914">  Result&lt;SnapshotState&amp;&gt; FindSnapshot(const TxnSnapshotId&amp; snapshot_id) REQUIRES(mutex_) {</a>
+<a name="ln915">    auto it = snapshots_.find(snapshot_id);</a>
+<a name="ln916">    if (it == snapshots_.end()) {</a>
+<a name="ln917">      return STATUS(NotFound, &quot;Could not find snapshot&quot;, snapshot_id.ToString(),</a>
+<a name="ln918">                    MasterError(MasterErrorPB::SNAPSHOT_NOT_FOUND));</a>
+<a name="ln919">    }</a>
+<a name="ln920">    return *it-&gt;second;</a>
+<a name="ln921">  }</a>
+<a name="ln922"> </a>
+<a name="ln923">  Result&lt;RestorationState&amp;&gt; FindRestoration(</a>
+<a name="ln924">      const TxnSnapshotRestorationId&amp; restoration_id) REQUIRES(mutex_) {</a>
+<a name="ln925">    auto it = restorations_.find(restoration_id);</a>
+<a name="ln926">    if (it == restorations_.end()) {</a>
+<a name="ln927">      return STATUS(NotFound, &quot;Could not find restoration&quot;, restoration_id.ToString(),</a>
+<a name="ln928">                    MasterError(MasterErrorPB::OBJECT_NOT_FOUND));</a>
+<a name="ln929">    }</a>
+<a name="ln930">    return *it-&gt;second;</a>
+<a name="ln931">  }</a>
+<a name="ln932"> </a>
+<a name="ln933">  void ExecuteOperations(const TabletSnapshotOperations&amp; operations) {</a>
+<a name="ln934">    if (operations.empty()) {</a>
+<a name="ln935">      return;</a>
+<a name="ln936">    }</a>
+<a name="ln937">    VLOG(4) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; AsString(operations) &lt;&lt; &quot;)&quot;;</a>
+<a name="ln938"> </a>
+<a name="ln939">    size_t num_operations = operations.size();</a>
+<a name="ln940">    std::vector&lt;TabletId&gt; tablet_ids;</a>
+<a name="ln941">    tablet_ids.reserve(num_operations);</a>
+<a name="ln942">    for (const auto&amp; operation : operations) {</a>
+<a name="ln943">      tablet_ids.push_back(operation.tablet_id);</a>
+<a name="ln944">    }</a>
+<a name="ln945">    auto tablet_infos = context_.GetTabletInfos(tablet_ids);</a>
+<a name="ln946">    for (size_t i = 0; i != num_operations; ++i) {</a>
+<a name="ln947">      ExecuteOperation(operations[i], tablet_infos[i]);</a>
+<a name="ln948">    }</a>
+<a name="ln949">  }</a>
+<a name="ln950"> </a>
+<a name="ln951">  void ExecuteOperation(</a>
+<a name="ln952">      const TabletSnapshotOperation&amp; operation, const TabletInfoPtr&amp; tablet_info) {</a>
+<a name="ln953">    auto callback = MakeDoneCallback(</a>
+<a name="ln954">        &amp;mutex_, snapshots_, operation.snapshot_id, operation.tablet_id,</a>
+<a name="ln955">        SnapshotUpdater(&amp;context_));</a>
+<a name="ln956">    auto snapshot_id_str = operation.snapshot_id.AsSlice().ToBuffer();</a>
+<a name="ln957"> </a>
+<a name="ln958">    if (operation.state == SysSnapshotEntryPB::DELETING) {</a>
+<a name="ln959">      context_.SendDeleteTabletSnapshotRequest(</a>
+<a name="ln960">          tablet_info, snapshot_id_str, callback);</a>
+<a name="ln961">    } else if (operation.state == SysSnapshotEntryPB::CREATING) {</a>
+<a name="ln962">      context_.SendCreateTabletSnapshotRequest(</a>
+<a name="ln963">          tablet_info, snapshot_id_str, operation.snapshot_hybrid_time, callback);</a>
+<a name="ln964">    } else {</a>
+<a name="ln965">      LOG(DFATAL) &lt;&lt; &quot;Unsupported snapshot operation: &quot; &lt;&lt; operation.ToString();</a>
+<a name="ln966">    }</a>
+<a name="ln967">  }</a>
+<a name="ln968"> </a>
+<a name="ln969">  void Poll() {</a>
+<a name="ln970">    if (!context_.IsLeader()) {</a>
+<a name="ln971">      return;</a>
+<a name="ln972">    }</a>
+<a name="ln973">    VLOG(4) &lt;&lt; __func__ &lt;&lt; &quot;()&quot;;</a>
+<a name="ln974">    std::vector&lt;TxnSnapshotId&gt; cleanup_snapshots;</a>
+<a name="ln975">    TabletSnapshotOperations operations;</a>
+<a name="ln976">    {</a>
+<a name="ln977">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln978">      for (const auto&amp; p : snapshots_) {</a>
+<a name="ln979">        if (p.second-&gt;NeedCleanup()) {</a>
+<a name="ln980">          cleanup_snapshots.push_back(p.first);</a>
+<a name="ln981">        } else {</a>
+<a name="ln982">          p.second-&gt;PrepareOperations(&amp;operations);</a>
+<a name="ln983">        }</a>
+<a name="ln984">      }</a>
+<a name="ln985">    }</a>
+<a name="ln986">    for (const auto&amp; id : cleanup_snapshots) {</a>
+<a name="ln987">      DeleteSnapshot(id);</a>
+<a name="ln988">    }</a>
+<a name="ln989">    ExecuteOperations(operations);</a>
+<a name="ln990">  }</a>
+<a name="ln991"> </a>
+<a name="ln992">  void DeleteSnapshot(const TxnSnapshotId&amp; snapshot_id) {</a>
+<a name="ln993">    docdb::KeyValueWriteBatchPB write_batch;</a>
+<a name="ln994"> </a>
+<a name="ln995">    auto encoded_key = EncodedSnapshotKey(snapshot_id, &amp;context_);</a>
+<a name="ln996">    if (!encoded_key.ok()) {</a>
+<a name="ln997">      LOG(DFATAL) &lt;&lt; &quot;Failed to encode id for deletion: &quot; &lt;&lt; encoded_key.status();</a>
+<a name="ln998">      return;</a>
+<a name="ln999">    }</a>
+<a name="ln1000">    auto pair = write_batch.add_write_pairs();</a>
+<a name="ln1001">    pair-&gt;set_key(encoded_key-&gt;AsSlice().cdata(), encoded_key-&gt;size());</a>
+<a name="ln1002">    char value = { docdb::ValueTypeAsChar::kTombstone };</a>
+<a name="ln1003">    pair-&gt;set_value(&amp;value, 1);</a>
+<a name="ln1004"> </a>
+<a name="ln1005">    SubmitWrite(std::move(write_batch), &amp;context_);</a>
+<a name="ln1006">  }</a>
+<a name="ln1007"> </a>
+<a name="ln1008">  SnapshotCoordinatorContext&amp; context_;</a>
+<a name="ln1009">  std::mutex mutex_;</a>
+<a name="ln1010">  std::unordered_map&lt;TxnSnapshotId, std::unique_ptr&lt;SnapshotState&gt;,</a>
+<a name="ln1011">                     TxnSnapshotIdHash&gt; snapshots_ GUARDED_BY(mutex_);</a>
+<a name="ln1012">  std::unordered_map&lt;TxnSnapshotRestorationId, std::unique_ptr&lt;RestorationState&gt;,</a>
+<a name="ln1013">                     TxnSnapshotRestorationIdHash&gt; restorations_ GUARDED_BY(mutex_);</a>
+<a name="ln1014">  rpc::Poller poller_;</a>
+<a name="ln1015">};</a>
+<a name="ln1016"> </a>
+<a name="ln1017">MasterSnapshotCoordinator::MasterSnapshotCoordinator(SnapshotCoordinatorContext* context)</a>
+<a name="ln1018">    : impl_(new Impl(context)) {}</a>
+<a name="ln1019"> </a>
+<a name="ln1020">MasterSnapshotCoordinator::~MasterSnapshotCoordinator() {}</a>
+<a name="ln1021"> </a>
+<a name="ln1022">Result&lt;TxnSnapshotId&gt; MasterSnapshotCoordinator::Create(</a>
+<a name="ln1023">    const SysRowEntries&amp; entries, bool imported, HybridTime snapshot_hybrid_time,</a>
+<a name="ln1024">    CoarseTimePoint deadline) {</a>
+<a name="ln1025">  return impl_-&gt;Create(entries, imported, snapshot_hybrid_time, deadline);</a>
+<a name="ln1026">}</a>
+<a name="ln1027"> </a>
+<a name="ln1028">Status MasterSnapshotCoordinator::CreateReplicated(</a>
+<a name="ln1029">    int64_t leader_term, const tablet::SnapshotOperationState&amp; state) {</a>
+<a name="ln1030">  return impl_-&gt;CreateReplicated(leader_term, state);</a>
+<a name="ln1031">}</a>
+<a name="ln1032"> </a>
+<a name="ln1033">Status MasterSnapshotCoordinator::DeleteReplicated(</a>
+<a name="ln1034">    int64_t leader_term, const tablet::SnapshotOperationState&amp; state) {</a>
+<a name="ln1035">  return impl_-&gt;DeleteReplicated(leader_term, state);</a>
+<a name="ln1036">}</a>
+<a name="ln1037"> </a>
+<a name="ln1038">Status MasterSnapshotCoordinator::ListSnapshots(</a>
+<a name="ln1039">    const TxnSnapshotId&amp; snapshot_id, bool list_deleted, ListSnapshotsResponsePB* resp) {</a>
+<a name="ln1040">  return impl_-&gt;ListSnapshots(snapshot_id, list_deleted, resp);</a>
+<a name="ln1041">}</a>
+<a name="ln1042"> </a>
+<a name="ln1043">Status MasterSnapshotCoordinator::Delete(</a>
+<a name="ln1044">    const TxnSnapshotId&amp; snapshot_id, CoarseTimePoint deadline) {</a>
+<a name="ln1045">  return impl_-&gt;Delete(snapshot_id, deadline);</a>
+<a name="ln1046">}</a>
+<a name="ln1047"> </a>
+<a name="ln1048">Result&lt;TxnSnapshotRestorationId&gt; MasterSnapshotCoordinator::Restore(</a>
+<a name="ln1049">    const TxnSnapshotId&amp; snapshot_id) {</a>
+<a name="ln1050">  return impl_-&gt;Restore(snapshot_id);</a>
+<a name="ln1051">}</a>
+<a name="ln1052"> </a>
+<a name="ln1053">Status MasterSnapshotCoordinator::ListRestorations(</a>
+<a name="ln1054">    const TxnSnapshotRestorationId&amp; restoration_id, const TxnSnapshotId&amp; snapshot_id,</a>
+<a name="ln1055">    ListSnapshotRestorationsResponsePB* resp) {</a>
+<a name="ln1056">  return impl_-&gt;ListRestorations(restoration_id, snapshot_id, resp);</a>
+<a name="ln1057">}</a>
+<a name="ln1058"> </a>
+<a name="ln1059">Status MasterSnapshotCoordinator::Load(tablet::Tablet* tablet) {</a>
+<a name="ln1060">  return impl_-&gt;Load(tablet);</a>
+<a name="ln1061">}</a>
+<a name="ln1062"> </a>
+<a name="ln1063">void MasterSnapshotCoordinator::Start() {</a>
+<a name="ln1064">  impl_-&gt;Start();</a>
+<a name="ln1065">}</a>
+<a name="ln1066"> </a>
+<a name="ln1067">void MasterSnapshotCoordinator::Shutdown() {</a>
+<a name="ln1068">  impl_-&gt;Shutdown();</a>
+<a name="ln1069">}</a>
+<a name="ln1070"> </a>
+<a name="ln1071">Status MasterSnapshotCoordinator::ApplyWritePair(const Slice&amp; key, const Slice&amp; value) {</a>
+<a name="ln1072">  return impl_-&gt;ApplyWritePair(key, value);</a>
+<a name="ln1073">}</a>
+<a name="ln1074"> </a>
+<a name="ln1075">} // namespace master</a>
+<a name="ln1076">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="226"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="251"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="670"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="744"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="877"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="889"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="937"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="973"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

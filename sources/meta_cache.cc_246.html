@@ -1,0 +1,1653 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>meta_cache.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/client/meta_cache.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;shared_mutex&gt;</a>
+<a name="ln36">#include &lt;mutex&gt;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &lt;glog/logging.h&gt;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln41">#include &quot;yb/client/client_error.h&quot;</a>
+<a name="ln42">#include &quot;yb/client/client-internal.h&quot;</a>
+<a name="ln43">#include &quot;yb/client/table.h&quot;</a>
+<a name="ln44"> </a>
+<a name="ln45">#include &quot;yb/common/schema.h&quot;</a>
+<a name="ln46">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln47">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln48">#include &quot;yb/gutil/stl_util.h&quot;</a>
+<a name="ln49">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln50">#include &quot;yb/master/master.pb.h&quot;</a>
+<a name="ln51">#include &quot;yb/master/master.proxy.h&quot;</a>
+<a name="ln52">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln53">#include &quot;yb/rpc/rpc.h&quot;</a>
+<a name="ln54"> </a>
+<a name="ln55">#include &quot;yb/tserver/local_tablet_server.h&quot;</a>
+<a name="ln56">#include &quot;yb/tserver/tserver_service.proxy.h&quot;</a>
+<a name="ln57"> </a>
+<a name="ln58">#include &quot;yb/util/algorithm_util.h&quot;</a>
+<a name="ln59">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln60">#include &quot;yb/util/net/dns_resolver.h&quot;</a>
+<a name="ln61">#include &quot;yb/util/net/net_util.h&quot;</a>
+<a name="ln62">#include &quot;yb/util/scope_exit.h&quot;</a>
+<a name="ln63">#include &quot;yb/util/shared_lock.h&quot;</a>
+<a name="ln64"> </a>
+<a name="ln65">using std::string;</a>
+<a name="ln66">using std::map;</a>
+<a name="ln67">using std::shared_ptr;</a>
+<a name="ln68">using strings::Substitute;</a>
+<a name="ln69">using namespace std::literals;  // NOLINT</a>
+<a name="ln70"> </a>
+<a name="ln71">DEFINE_int32(max_concurrent_master_lookups, 500,</a>
+<a name="ln72">             &quot;Maximum number of concurrent tablet location lookups from YB client to master&quot;);</a>
+<a name="ln73"> </a>
+<a name="ln74">DEFINE_test_flag(bool, verify_all_replicas_alive, false,</a>
+<a name="ln75">                 &quot;If set, when a RemoteTablet object is destroyed, we will verify that all its &quot;</a>
+<a name="ln76">                 &quot;replicas are not marked as failed&quot;);</a>
+<a name="ln77"> </a>
+<a name="ln78">DEFINE_int32(retry_failed_replica_ms, 60 * 1000,</a>
+<a name="ln79">             &quot;Time in milliseconds to wait for before retrying a failed replica&quot;);</a>
+<a name="ln80"> </a>
+<a name="ln81">DEFINE_int64(meta_cache_lookup_throttling_step_ms, 5,</a>
+<a name="ln82">             &quot;Step to increment delay between calls during lookup throttling.&quot;);</a>
+<a name="ln83"> </a>
+<a name="ln84">DEFINE_int64(meta_cache_lookup_throttling_max_delay_ms, 1000,</a>
+<a name="ln85">             &quot;Max delay between calls during lookup throttling.&quot;);</a>
+<a name="ln86"> </a>
+<a name="ln87">METRIC_DEFINE_histogram(</a>
+<a name="ln88">  server, dns_resolve_latency_during_init_proxy,</a>
+<a name="ln89">  &quot;yb.client.MetaCache.InitProxy DNS Resolve&quot;,</a>
+<a name="ln90">  yb::MetricUnit::kMicroseconds,</a>
+<a name="ln91">  &quot;Microseconds spent resolving DNS requests during MetaCache::InitProxy&quot;,</a>
+<a name="ln92">  60000000LU, 2);</a>
+<a name="ln93"> </a>
+<a name="ln94">namespace yb {</a>
+<a name="ln95"> </a>
+<a name="ln96">using consensus::RaftPeerPB;</a>
+<a name="ln97">using master::GetTableLocationsRequestPB;</a>
+<a name="ln98">using master::GetTableLocationsResponsePB;</a>
+<a name="ln99">using master::MasterServiceProxy;</a>
+<a name="ln100">using master::TabletLocationsPB;</a>
+<a name="ln101">using master::TabletLocationsPB_ReplicaPB;</a>
+<a name="ln102">using master::TSInfoPB;</a>
+<a name="ln103">using rpc::Messenger;</a>
+<a name="ln104">using rpc::Rpc;</a>
+<a name="ln105">using tablet::RaftGroupStatePB;</a>
+<a name="ln106">using tserver::LocalTabletServer;</a>
+<a name="ln107">using tserver::TabletServerServiceProxy;</a>
+<a name="ln108"> </a>
+<a name="ln109">namespace client {</a>
+<a name="ln110"> </a>
+<a name="ln111">namespace internal {</a>
+<a name="ln112"> </a>
+<a name="ln113">namespace {</a>
+<a name="ln114"> </a>
+<a name="ln115">// We join tablet partitions to groups, so tablet state info in one group requested with single</a>
+<a name="ln116">// RPC call to master.</a>
+<a name="ln117">// kPartitionGroupSize defines size of this group.</a>
+<a name="ln118">#ifdef NDEBUG</a>
+<a name="ln119">const size_t kPartitionGroupSize = 64;</a>
+<a name="ln120">#else</a>
+<a name="ln121">const size_t kPartitionGroupSize = 4;</a>
+<a name="ln122">#endif</a>
+<a name="ln123"> </a>
+<a name="ln124">std::atomic&lt;int64_t&gt; lookup_serial_{1};</a>
+<a name="ln125"> </a>
+<a name="ln126">} // namespace</a>
+<a name="ln127"> </a>
+<a name="ln128">////////////////////////////////////////////////////////////</a>
+<a name="ln129"> </a>
+<a name="ln130">RemoteTabletServer::RemoteTabletServer(const master::TSInfoPB&amp; pb)</a>
+<a name="ln131">    : uuid_(pb.permanent_uuid()) {</a>
+<a name="ln132">  Update(pb);</a>
+<a name="ln133">}</a>
+<a name="ln134"> </a>
+<a name="ln135">RemoteTabletServer::RemoteTabletServer(const string&amp; uuid,</a>
+<a name="ln136">                                       const shared_ptr&lt;TabletServerServiceProxy&gt;&amp; proxy,</a>
+<a name="ln137">                                       const LocalTabletServer* local_tserver)</a>
+<a name="ln138">    : uuid_(uuid),</a>
+<a name="ln139">      proxy_(proxy),</a>
+<a name="ln140">      local_tserver_(local_tserver) {</a>
+<a name="ln141">  LOG_IF(DFATAL, proxy &amp;&amp; !IsLocal()) &lt;&lt; &quot;Local tserver has non-local proxy&quot;;</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144">Status RemoteTabletServer::InitProxy(YBClient* client) {</a>
+<a name="ln145">  {</a>
+<a name="ln146">    SharedLock&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln147"> </a>
+<a name="ln148">    if (proxy_) {</a>
+<a name="ln149">      // Already have a proxy created.</a>
+<a name="ln150">      return Status::OK();</a>
+<a name="ln151">    }</a>
+<a name="ln152">  }</a>
+<a name="ln153"> </a>
+<a name="ln154">  std::lock_guard&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln155"> </a>
+<a name="ln156">  if (proxy_) {</a>
+<a name="ln157">    // Already have a proxy created.</a>
+<a name="ln158">    return Status::OK();</a>
+<a name="ln159">  }</a>
+<a name="ln160"> </a>
+<a name="ln161">  if (!dns_resolve_histogram_) {</a>
+<a name="ln162">    auto metric_entity = client-&gt;metric_entity();</a>
+<a name="ln163">    if (metric_entity) {</a>
+<a name="ln164">      dns_resolve_histogram_ = METRIC_dns_resolve_latency_during_init_proxy.Instantiate(</a>
+<a name="ln165">          metric_entity);</a>
+<a name="ln166">    }</a>
+<a name="ln167">  }</a>
+<a name="ln168"> </a>
+<a name="ln169">  // TODO: if the TS advertises multiple host/ports, pick the right one</a>
+<a name="ln170">  // based on some kind of policy. For now just use the first always.</a>
+<a name="ln171">  auto hostport = HostPortFromPB(DesiredHostPort(</a>
+<a name="ln172">      public_rpc_hostports_, private_rpc_hostports_, cloud_info_pb_,</a>
+<a name="ln173">      client-&gt;data_-&gt;cloud_info_pb_));</a>
+<a name="ln174">  CHECK(!hostport.host().empty());</a>
+<a name="ln175">  ScopedDnsTracker dns_tracker(dns_resolve_histogram_.get());</a>
+<a name="ln176">  proxy_.reset(new TabletServerServiceProxy(client-&gt;data_-&gt;proxy_cache_.get(), hostport));</a>
+<a name="ln177">  proxy_endpoint_ = hostport;</a>
+<a name="ln178"> </a>
+<a name="ln179">  return Status::OK();</a>
+<a name="ln180">}</a>
+<a name="ln181"> </a>
+<a name="ln182">void RemoteTabletServer::Update(const master::TSInfoPB&amp; pb) {</a>
+<a name="ln183">  CHECK_EQ(pb.permanent_uuid(), uuid_);</a>
+<a name="ln184"> </a>
+<a name="ln185">  std::lock_guard&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln186">  private_rpc_hostports_ = pb.private_rpc_addresses();</a>
+<a name="ln187">  public_rpc_hostports_ = pb.broadcast_addresses();</a>
+<a name="ln188">  cloud_info_pb_ = pb.cloud_info();</a>
+<a name="ln189">  capabilities_.assign(pb.capabilities().begin(), pb.capabilities().end());</a>
+<a name="ln190">  std::sort(capabilities_.begin(), capabilities_.end());</a>
+<a name="ln191">}</a>
+<a name="ln192"> </a>
+<a name="ln193">bool RemoteTabletServer::IsLocal() const {</a>
+<a name="ln194">  return local_tserver_ != nullptr;</a>
+<a name="ln195">}</a>
+<a name="ln196"> </a>
+<a name="ln197">const std::string&amp; RemoteTabletServer::permanent_uuid() const {</a>
+<a name="ln198">  return uuid_;</a>
+<a name="ln199">}</a>
+<a name="ln200"> </a>
+<a name="ln201">const CloudInfoPB&amp; RemoteTabletServer::cloud_info() const {</a>
+<a name="ln202">  return cloud_info_pb_;</a>
+<a name="ln203">}</a>
+<a name="ln204"> </a>
+<a name="ln205">const google::protobuf::RepeatedPtrField&lt;HostPortPB&gt;&amp;</a>
+<a name="ln206">    RemoteTabletServer::public_rpc_hostports() const {</a>
+<a name="ln207">  return public_rpc_hostports_;</a>
+<a name="ln208">}</a>
+<a name="ln209"> </a>
+<a name="ln210">const google::protobuf::RepeatedPtrField&lt;HostPortPB&gt;&amp;</a>
+<a name="ln211">    RemoteTabletServer::private_rpc_hostports() const {</a>
+<a name="ln212">  return private_rpc_hostports_;</a>
+<a name="ln213">}</a>
+<a name="ln214"> </a>
+<a name="ln215">shared_ptr&lt;TabletServerServiceProxy&gt; RemoteTabletServer::proxy() const {</a>
+<a name="ln216">  SharedLock&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln217">  return proxy_;</a>
+<a name="ln218">}</a>
+<a name="ln219"> </a>
+<a name="ln220">::yb::HostPort RemoteTabletServer::ProxyEndpoint() const {</a>
+<a name="ln221">  std::shared_lock&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln222">  return proxy_endpoint_;</a>
+<a name="ln223">}</a>
+<a name="ln224"> </a>
+<a name="ln225">string RemoteTabletServer::ToString() const {</a>
+<a name="ln226">  string ret = &quot;{ uuid: &quot; + uuid_;</a>
+<a name="ln227">  SharedLock&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln228">  if (!private_rpc_hostports_.empty()) {</a>
+<a name="ln229">    ret += Format(&quot; private: $0&quot;, private_rpc_hostports_);</a>
+<a name="ln230">  }</a>
+<a name="ln231">  if (!public_rpc_hostports_.empty()) {</a>
+<a name="ln232">    ret += Format(&quot; public: $0&quot;, public_rpc_hostports_);</a>
+<a name="ln233">  }</a>
+<a name="ln234">  ret += Format(&quot; cloud_info: $0&quot;, cloud_info_pb_);</a>
+<a name="ln235">  return ret;</a>
+<a name="ln236">}</a>
+<a name="ln237"> </a>
+<a name="ln238">bool RemoteTabletServer::HasHostFrom(const std::unordered_set&lt;std::string&gt;&amp; hosts) const {</a>
+<a name="ln239">  SharedLock&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln240">  for (const auto&amp; hp : private_rpc_hostports_) {</a>
+<a name="ln241">    if (hosts.count(hp.host())) {</a>
+<a name="ln242">      return true;</a>
+<a name="ln243">    }</a>
+<a name="ln244">  }</a>
+<a name="ln245">  for (const auto&amp; hp : public_rpc_hostports_) {</a>
+<a name="ln246">    if (hosts.count(hp.host())) {</a>
+<a name="ln247">      return true;</a>
+<a name="ln248">    }</a>
+<a name="ln249">  }</a>
+<a name="ln250">  return false;</a>
+<a name="ln251">}</a>
+<a name="ln252"> </a>
+<a name="ln253">bool RemoteTabletServer::HasCapability(CapabilityId capability) const {</a>
+<a name="ln254">  SharedLock&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln255">  return std::binary_search(capabilities_.begin(), capabilities_.end(), capability);</a>
+<a name="ln256">}</a>
+<a name="ln257"> </a>
+<a name="ln258">////////////////////////////////////////////////////////////</a>
+<a name="ln259"> </a>
+<a name="ln260">RemoteTablet::~RemoteTablet() {</a>
+<a name="ln261">  if (PREDICT_FALSE(FLAGS_TEST_verify_all_replicas_alive)) {</a>
+<a name="ln262">    // Let's verify that none of the replicas are marked as failed. The test should always wait</a>
+<a name="ln263">    // enough time so that the lookup cache can be refreshed after force_lookup_cache_refresh_secs.</a>
+<a name="ln264">    for (const auto&amp; replica : replicas_) {</a>
+<a name="ln265">      if (replica.Failed()) {</a>
+<a name="ln266">        LOG_WITH_PREFIX(FATAL) &lt;&lt; &quot;Remote tablet server &quot; &lt;&lt; replica.ts-&gt;ToString()</a>
+<a name="ln267">                               &lt;&lt; &quot; with role &quot; &lt;&lt; consensus::RaftPeerPB::Role_Name(replica.role)</a>
+<a name="ln268">                               &lt;&lt; &quot; is marked as failed&quot;;</a>
+<a name="ln269">      }</a>
+<a name="ln270">    }</a>
+<a name="ln271">  }</a>
+<a name="ln272">}</a>
+<a name="ln273"> </a>
+<a name="ln274">void RemoteTablet::Refresh(</a>
+<a name="ln275">    const TabletServerMap&amp; tservers,</a>
+<a name="ln276">    const google::protobuf::RepeatedPtrField&lt;TabletLocationsPB_ReplicaPB&gt;&amp; replicas) {</a>
+<a name="ln277">  // Adopt the data from the successful response.</a>
+<a name="ln278">  std::lock_guard&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln279">  std::vector&lt;std::string&gt; old_uuids;</a>
+<a name="ln280">  old_uuids.reserve(replicas_.size());</a>
+<a name="ln281">  for (const auto&amp; replica : replicas_) {</a>
+<a name="ln282">    old_uuids.push_back(replica.ts-&gt;permanent_uuid());</a>
+<a name="ln283">  }</a>
+<a name="ln284">  std::sort(old_uuids.begin(), old_uuids.end());</a>
+<a name="ln285">  replicas_.clear();</a>
+<a name="ln286">  bool has_new_replica = false;</a>
+<a name="ln287">  for (const TabletLocationsPB_ReplicaPB&amp; r : replicas) {</a>
+<a name="ln288">    auto it = tservers.find(r.ts_info().permanent_uuid());</a>
+<a name="ln289">    CHECK(it != tservers.end());</a>
+<a name="ln290">    replicas_.emplace_back(it-&gt;second.get(), r.role());</a>
+<a name="ln291">    has_new_replica =</a>
+<a name="ln292">        has_new_replica ||</a>
+<a name="ln293">        !std::binary_search(old_uuids.begin(), old_uuids.end(), r.ts_info().permanent_uuid());</a>
+<a name="ln294">  }</a>
+<a name="ln295">  if (has_new_replica) {</a>
+<a name="ln296">    lookups_without_new_replicas_ = 0;</a>
+<a name="ln297">  } else {</a>
+<a name="ln298">    ++lookups_without_new_replicas_;</a>
+<a name="ln299">  }</a>
+<a name="ln300">  stale_ = false;</a>
+<a name="ln301">  refresh_time_.store(MonoTime::Now(), std::memory_order_release);</a>
+<a name="ln302">}</a>
+<a name="ln303"> </a>
+<a name="ln304">void RemoteTablet::MarkStale() {</a>
+<a name="ln305">  std::lock_guard&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln306">  stale_ = true;</a>
+<a name="ln307">}</a>
+<a name="ln308"> </a>
+<a name="ln309">bool RemoteTablet::stale() const {</a>
+<a name="ln310">  SharedLock&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln311">  return stale_;</a>
+<a name="ln312">}</a>
+<a name="ln313"> </a>
+<a name="ln314">void RemoteTablet::MarkAsSplit() {</a>
+<a name="ln315">  std::lock_guard&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln316">  is_split_ = true;</a>
+<a name="ln317">}</a>
+<a name="ln318"> </a>
+<a name="ln319">bool RemoteTablet::is_split() const {</a>
+<a name="ln320">  SharedLock&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln321">  return is_split_;</a>
+<a name="ln322">}</a>
+<a name="ln323"> </a>
+<a name="ln324">bool RemoteTablet::MarkReplicaFailed(RemoteTabletServer *ts, const Status&amp; status) {</a>
+<a name="ln325">  std::lock_guard&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln326">  VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Current remote replicas in meta cache: &quot;</a>
+<a name="ln327">                      &lt;&lt; ReplicasAsStringUnlocked() &lt;&lt; &quot;. Replica &quot; &lt;&lt; ts-&gt;ToString()</a>
+<a name="ln328">                      &lt;&lt; &quot; has failed: &quot; &lt;&lt; status.ToString();</a>
+<a name="ln329">  for (RemoteReplica&amp; rep : replicas_) {</a>
+<a name="ln330">    if (rep.ts == ts) {</a>
+<a name="ln331">      rep.MarkFailed();</a>
+<a name="ln332">      return true;</a>
+<a name="ln333">    }</a>
+<a name="ln334">  }</a>
+<a name="ln335">  return false;</a>
+<a name="ln336">}</a>
+<a name="ln337"> </a>
+<a name="ln338">int RemoteTablet::GetNumFailedReplicas() const {</a>
+<a name="ln339">  int failed = 0;</a>
+<a name="ln340">  SharedLock&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln341">  for (const RemoteReplica&amp; rep : replicas_) {</a>
+<a name="ln342">    if (rep.Failed()) {</a>
+<a name="ln343">      failed++;</a>
+<a name="ln344">    }</a>
+<a name="ln345">  }</a>
+<a name="ln346">  return failed;</a>
+<a name="ln347">}</a>
+<a name="ln348"> </a>
+<a name="ln349">RemoteTabletServer* RemoteTablet::LeaderTServer() const {</a>
+<a name="ln350">  SharedLock&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln351">  for (const RemoteReplica&amp; replica : replicas_) {</a>
+<a name="ln352">    if (!replica.Failed() &amp;&amp; replica.role == RaftPeerPB::LEADER) {</a>
+<a name="ln353">      return replica.ts;</a>
+<a name="ln354">    }</a>
+<a name="ln355">  }</a>
+<a name="ln356">  return nullptr;</a>
+<a name="ln357">}</a>
+<a name="ln358"> </a>
+<a name="ln359">bool RemoteTablet::HasLeader() const {</a>
+<a name="ln360">  return LeaderTServer() != nullptr;</a>
+<a name="ln361">}</a>
+<a name="ln362"> </a>
+<a name="ln363">void RemoteTablet::GetRemoteTabletServers(</a>
+<a name="ln364">    std::vector&lt;RemoteTabletServer*&gt;* servers, IncludeFailedReplicas include_failed_replicas) {</a>
+<a name="ln365">  DCHECK(servers-&gt;empty());</a>
+<a name="ln366">  struct ReplicaUpdate {</a>
+<a name="ln367">    RemoteReplica* replica;</a>
+<a name="ln368">    tablet::RaftGroupStatePB new_state;</a>
+<a name="ln369">    bool clear_failed;</a>
+<a name="ln370">  };</a>
+<a name="ln371">  std::vector&lt;ReplicaUpdate&gt; replica_updates;</a>
+<a name="ln372">  {</a>
+<a name="ln373">    SharedLock&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln374">    for (RemoteReplica&amp; replica : replicas_) {</a>
+<a name="ln375">      if (replica.Failed()) {</a>
+<a name="ln376">        if (include_failed_replicas) {</a>
+<a name="ln377">          servers-&gt;push_back(replica.ts);</a>
+<a name="ln378">          continue;</a>
+<a name="ln379">        }</a>
+<a name="ln380">        ReplicaUpdate replica_update = {&amp;replica, RaftGroupStatePB::UNKNOWN, false};</a>
+<a name="ln381">        VLOG_WITH_PREFIX(4)</a>
+<a name="ln382">            &lt;&lt; &quot;Replica &quot; &lt;&lt; replica.ts-&gt;ToString()</a>
+<a name="ln383">            &lt;&lt; &quot; failed, state: &quot; &lt;&lt; RaftGroupStatePB_Name(replica.state)</a>
+<a name="ln384">            &lt;&lt; &quot;, is local: &quot; &lt;&lt; replica.ts-&gt;IsLocal()</a>
+<a name="ln385">            &lt;&lt; &quot;, time since failure: &quot; &lt;&lt; (MonoTime::Now() - replica.last_failed_time);</a>
+<a name="ln386">        switch (replica.state) {</a>
+<a name="ln387">          case RaftGroupStatePB::UNKNOWN: FALLTHROUGH_INTENDED;</a>
+<a name="ln388">          case RaftGroupStatePB::NOT_STARTED: FALLTHROUGH_INTENDED;</a>
+<a name="ln389">          case RaftGroupStatePB::BOOTSTRAPPING: FALLTHROUGH_INTENDED;</a>
+<a name="ln390">          case RaftGroupStatePB::RUNNING:</a>
+<a name="ln391">            // These are non-terminal states that may retry. Check and update failed local replica's</a>
+<a name="ln392">            // current state. For remote replica, just wait for some time before retrying.</a>
+<a name="ln393">            if (replica.ts-&gt;IsLocal()) {</a>
+<a name="ln394">              tserver::GetTabletStatusRequestPB req;</a>
+<a name="ln395">              tserver::GetTabletStatusResponsePB resp;</a>
+<a name="ln396">              req.set_tablet_id(tablet_id_);</a>
+<a name="ln397">              const Status status =</a>
+<a name="ln398">                  CHECK_NOTNULL(replica.ts-&gt;local_tserver())-&gt;GetTabletStatus(&amp;req, &amp;resp);</a>
+<a name="ln399">              if (!status.ok() || resp.has_error()) {</a>
+<a name="ln400">                LOG_WITH_PREFIX(ERROR)</a>
+<a name="ln401">                    &lt;&lt; &quot;Received error from GetTabletStatus: &quot;</a>
+<a name="ln402">                    &lt;&lt; (!status.ok() ? status : StatusFromPB(resp.error().status()));</a>
+<a name="ln403">                continue;</a>
+<a name="ln404">              }</a>
+<a name="ln405"> </a>
+<a name="ln406">              DCHECK_EQ(resp.tablet_status().tablet_id(), tablet_id_);</a>
+<a name="ln407">              VLOG_WITH_PREFIX(3) &lt;&lt; &quot;GetTabletStatus returned status: &quot;</a>
+<a name="ln408">                                  &lt;&lt; tablet::RaftGroupStatePB_Name(resp.tablet_status().state())</a>
+<a name="ln409">                                  &lt;&lt; &quot; for replica &quot; &lt;&lt; replica.ts-&gt;ToString();</a>
+<a name="ln410">              replica_update.new_state = resp.tablet_status().state();</a>
+<a name="ln411">              if (replica_update.new_state != tablet::RaftGroupStatePB::RUNNING) {</a>
+<a name="ln412">                if (replica_update.new_state != replica.state) {</a>
+<a name="ln413">                  // Cannot update replica here directly because holding only shared lock on mutex.</a>
+<a name="ln414">                  replica_updates.push_back(replica_update); // Update only state</a>
+<a name="ln415">                }</a>
+<a name="ln416">                continue;</a>
+<a name="ln417">              }</a>
+<a name="ln418">              if (!replica.ts-&gt;local_tserver()-&gt;LeaderAndReady(</a>
+<a name="ln419">                      tablet_id_, /* allow_stale */ true)) {</a>
+<a name="ln420">                // Should continue here because otherwise failed state will be cleared.</a>
+<a name="ln421">                continue;</a>
+<a name="ln422">              }</a>
+<a name="ln423">            } else if ((MonoTime::Now() - replica.last_failed_time) &lt;</a>
+<a name="ln424">                       FLAGS_retry_failed_replica_ms * 1ms) {</a>
+<a name="ln425">              continue;</a>
+<a name="ln426">            }</a>
+<a name="ln427">            break;</a>
+<a name="ln428">          case RaftGroupStatePB::FAILED: FALLTHROUGH_INTENDED;</a>
+<a name="ln429">          case RaftGroupStatePB::QUIESCING: FALLTHROUGH_INTENDED;</a>
+<a name="ln430">          case RaftGroupStatePB::SHUTDOWN:</a>
+<a name="ln431">            // These are terminal states, so we won't retry.</a>
+<a name="ln432">            continue;</a>
+<a name="ln433">        }</a>
+<a name="ln434"> </a>
+<a name="ln435">        VLOG_WITH_PREFIX(3) &lt;&lt; &quot;Changing state of replica &quot; &lt;&lt; replica.ts-&gt;ToString()</a>
+<a name="ln436">                            &lt;&lt; &quot; from failed to not failed&quot;;</a>
+<a name="ln437">        replica_update.clear_failed = true;</a>
+<a name="ln438">        // Cannot update replica here directly because holding only shared lock on mutex.</a>
+<a name="ln439">        replica_updates.push_back(replica_update);</a>
+<a name="ln440">      }</a>
+<a name="ln441">      servers-&gt;push_back(replica.ts);</a>
+<a name="ln442">    }</a>
+<a name="ln443">  }</a>
+<a name="ln444">  if (!replica_updates.empty()) {</a>
+<a name="ln445">    std::lock_guard&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln446">    for (const auto&amp; update : replica_updates) {</a>
+<a name="ln447">      if (update.new_state != RaftGroupStatePB::UNKNOWN) {</a>
+<a name="ln448">        update.replica-&gt;state = update.new_state;</a>
+<a name="ln449">      }</a>
+<a name="ln450">      if (update.clear_failed) {</a>
+<a name="ln451">        update.replica-&gt;ClearFailed();</a>
+<a name="ln452">      }</a>
+<a name="ln453">    }</a>
+<a name="ln454">  }</a>
+<a name="ln455">}</a>
+<a name="ln456"> </a>
+<a name="ln457">bool RemoteTablet::MarkTServerAsLeader(const RemoteTabletServer* server) {</a>
+<a name="ln458">  bool found = false;</a>
+<a name="ln459">  std::lock_guard&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln460">  for (RemoteReplica&amp; replica : replicas_) {</a>
+<a name="ln461">    if (replica.ts == server) {</a>
+<a name="ln462">      replica.role = RaftPeerPB::LEADER;</a>
+<a name="ln463">      found = true;</a>
+<a name="ln464">    } else if (replica.role == RaftPeerPB::LEADER) {</a>
+<a name="ln465">      replica.role = RaftPeerPB::FOLLOWER;</a>
+<a name="ln466">    }</a>
+<a name="ln467">  }</a>
+<a name="ln468">  VLOG_WITH_PREFIX(3) &lt;&lt; &quot;Latest replicas: &quot; &lt;&lt; ReplicasAsStringUnlocked();</a>
+<a name="ln469">  VLOG_IF_WITH_PREFIX(3, !found) &lt;&lt; &quot;Specified server not found: &quot; &lt;&lt; server-&gt;ToString()</a>
+<a name="ln470">                                 &lt;&lt; &quot;. Replicas: &quot; &lt;&lt; ReplicasAsStringUnlocked();</a>
+<a name="ln471">  return found;</a>
+<a name="ln472">}</a>
+<a name="ln473"> </a>
+<a name="ln474">void RemoteTablet::MarkTServerAsFollower(const RemoteTabletServer* server) {</a>
+<a name="ln475">  bool found = false;</a>
+<a name="ln476">  std::lock_guard&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln477">  for (RemoteReplica&amp; replica : replicas_) {</a>
+<a name="ln478">    if (replica.ts == server) {</a>
+<a name="ln479">      replica.role = RaftPeerPB::FOLLOWER;</a>
+<a name="ln480">      found = true;</a>
+<a name="ln481">    }</a>
+<a name="ln482">  }</a>
+<a name="ln483">  VLOG_WITH_PREFIX(3) &lt;&lt; &quot;Latest replicas: &quot; &lt;&lt; ReplicasAsStringUnlocked();</a>
+<a name="ln484">  DCHECK(found) &lt;&lt; &quot;Tablet &quot; &lt;&lt; tablet_id_ &lt;&lt; &quot;: Specified server not found: &quot;</a>
+<a name="ln485">                &lt;&lt; server-&gt;ToString() &lt;&lt; &quot;. Replicas: &quot; &lt;&lt; ReplicasAsStringUnlocked();</a>
+<a name="ln486">}</a>
+<a name="ln487"> </a>
+<a name="ln488">std::string RemoteTablet::ReplicasAsString() const {</a>
+<a name="ln489">  SharedLock&lt;rw_spinlock&gt; lock(mutex_);</a>
+<a name="ln490">  return ReplicasAsStringUnlocked();</a>
+<a name="ln491">}</a>
+<a name="ln492"> </a>
+<a name="ln493">std::string RemoteTablet::ReplicasAsStringUnlocked() const {</a>
+<a name="ln494">  DCHECK(mutex_.is_locked());</a>
+<a name="ln495">  string replicas_str;</a>
+<a name="ln496">  for (const RemoteReplica&amp; rep : replicas_) {</a>
+<a name="ln497">    if (!replicas_str.empty()) replicas_str += &quot;, &quot;;</a>
+<a name="ln498">    replicas_str += rep.ToString();</a>
+<a name="ln499">  }</a>
+<a name="ln500">  return replicas_str;</a>
+<a name="ln501">}</a>
+<a name="ln502"> </a>
+<a name="ln503">std::string RemoteTablet::ToString() const {</a>
+<a name="ln504">  return YB_CLASS_TO_STRING(tablet_id, partition, split_depth);</a>
+<a name="ln505">}</a>
+<a name="ln506"> </a>
+<a name="ln507">////////////////////////////////////////////////////////////</a>
+<a name="ln508"> </a>
+<a name="ln509">MetaCache::MetaCache(YBClient* client)</a>
+<a name="ln510">  : client_(client),</a>
+<a name="ln511">    master_lookup_sem_(FLAGS_max_concurrent_master_lookups) {</a>
+<a name="ln512">}</a>
+<a name="ln513"> </a>
+<a name="ln514">MetaCache::~MetaCache() {</a>
+<a name="ln515">  Shutdown();</a>
+<a name="ln516">}</a>
+<a name="ln517"> </a>
+<a name="ln518">void MetaCache::Shutdown() {</a>
+<a name="ln519">  rpcs_.Shutdown();</a>
+<a name="ln520">}</a>
+<a name="ln521"> </a>
+<a name="ln522">void MetaCache::SetLocalTabletServer(const string&amp; permanent_uuid,</a>
+<a name="ln523">                                     const shared_ptr&lt;TabletServerServiceProxy&gt;&amp; proxy,</a>
+<a name="ln524">                                     const LocalTabletServer* local_tserver) {</a>
+<a name="ln525">  const auto entry = ts_cache_.emplace(permanent_uuid,</a>
+<a name="ln526">                                       std::make_unique&lt;RemoteTabletServer&gt;(permanent_uuid,</a>
+<a name="ln527">                                                                            proxy,</a>
+<a name="ln528">                                                                            local_tserver));</a>
+<a name="ln529">  CHECK(entry.second);</a>
+<a name="ln530">  local_tserver_ = entry.first-&gt;second.get();</a>
+<a name="ln531">}</a>
+<a name="ln532"> </a>
+<a name="ln533">void MetaCache::UpdateTabletServerUnlocked(const master::TSInfoPB&amp; pb) {</a>
+<a name="ln534">  const std::string&amp; permanent_uuid = pb.permanent_uuid();</a>
+<a name="ln535">  auto it = ts_cache_.find(permanent_uuid);</a>
+<a name="ln536">  if (it != ts_cache_.end()) {</a>
+<a name="ln537">    it-&gt;second-&gt;Update(pb);</a>
+<a name="ln538">    return;</a>
+<a name="ln539">  }</a>
+<a name="ln540"> </a>
+<a name="ln541">  VLOG(1) &lt;&lt; &quot;Client caching new TabletServer &quot; &lt;&lt; permanent_uuid;</a>
+<a name="ln542">  CHECK(ts_cache_.emplace(permanent_uuid, std::make_unique&lt;RemoteTabletServer&gt;(pb)).second);</a>
+<a name="ln543">}</a>
+<a name="ln544"> </a>
+<a name="ln545">// A (table, partition_key) --&gt; tablet lookup. May be in-flight to a master, or</a>
+<a name="ln546">// may be handled locally.</a>
+<a name="ln547">//</a>
+<a name="ln548">// Keeps a reference on the owning metacache while alive.</a>
+<a name="ln549">class LookupRpc : public Rpc {</a>
+<a name="ln550"> public:</a>
+<a name="ln551">  LookupRpc(const scoped_refptr&lt;MetaCache&gt;&amp; meta_cache,</a>
+<a name="ln552">            int64_t request_no,</a>
+<a name="ln553">            CoarseTimePoint deadline);</a>
+<a name="ln554"> </a>
+<a name="ln555">  virtual ~LookupRpc();</a>
+<a name="ln556"> </a>
+<a name="ln557">  void SendRpc() override;</a>
+<a name="ln558"> </a>
+<a name="ln559">  MetaCache* meta_cache() { return meta_cache_.get(); }</a>
+<a name="ln560">  YBClient* client() const { return meta_cache_-&gt;client_; }</a>
+<a name="ln561"> </a>
+<a name="ln562">  void ResetMasterLeaderAndRetry();</a>
+<a name="ln563"> </a>
+<a name="ln564">  virtual void NotifyFailure(const Status&amp; status) = 0;</a>
+<a name="ln565"> </a>
+<a name="ln566">  std::shared_ptr&lt;MasterServiceProxy&gt; master_proxy() const {</a>
+<a name="ln567">    return client()-&gt;data_-&gt;master_proxy();</a>
+<a name="ln568">  }</a>
+<a name="ln569"> </a>
+<a name="ln570">  template &lt;class Response&gt;</a>
+<a name="ln571">  void DoFinished(const Status&amp; status, const Response&amp; resp,</a>
+<a name="ln572">                  const std::string* partition_group_start);</a>
+<a name="ln573"> </a>
+<a name="ln574">  std::string LogPrefix() const {</a>
+<a name="ln575">    return yb::ToString(this) + &quot;: &quot;;</a>
+<a name="ln576">  }</a>
+<a name="ln577"> </a>
+<a name="ln578">  int64_t request_no() const {</a>
+<a name="ln579">    return request_no_;</a>
+<a name="ln580">  }</a>
+<a name="ln581"> </a>
+<a name="ln582">  rpc::Rpcs::Handle* RpcHandle() {</a>
+<a name="ln583">    return &amp;retained_self_;</a>
+<a name="ln584">  }</a>
+<a name="ln585"> </a>
+<a name="ln586"> private:</a>
+<a name="ln587">  virtual void DoSendRpc() = 0;</a>
+<a name="ln588"> </a>
+<a name="ln589">  void NewLeaderMasterDeterminedCb(const Status&amp; status);</a>
+<a name="ln590"> </a>
+<a name="ln591">  const int64_t request_no_;</a>
+<a name="ln592"> </a>
+<a name="ln593">  // Pointer back to the tablet cache. Populated with location information</a>
+<a name="ln594">  // if the lookup finishes successfully.</a>
+<a name="ln595">  //</a>
+<a name="ln596">  // When the RPC is destroyed, a master lookup permit is returned to the</a>
+<a name="ln597">  // cache if one was acquired in the first place.</a>
+<a name="ln598">  scoped_refptr&lt;MetaCache&gt; meta_cache_;</a>
+<a name="ln599"> </a>
+<a name="ln600">  // Whether this lookup has acquired a master lookup permit.</a>
+<a name="ln601">  bool has_permit_ = false;</a>
+<a name="ln602"> </a>
+<a name="ln603">  rpc::Rpcs::Handle retained_self_;</a>
+<a name="ln604">};</a>
+<a name="ln605"> </a>
+<a name="ln606">LookupRpc::LookupRpc(const scoped_refptr&lt;MetaCache&gt;&amp; meta_cache,</a>
+<a name="ln607">                     int64_t request_no,</a>
+<a name="ln608">                     CoarseTimePoint deadline)</a>
+<a name="ln609">    : Rpc(deadline, meta_cache-&gt;client_-&gt;messenger(), &amp;meta_cache-&gt;client_-&gt;proxy_cache()),</a>
+<a name="ln610">      request_no_(request_no),</a>
+<a name="ln611">      meta_cache_(meta_cache),</a>
+<a name="ln612">      retained_self_(meta_cache_-&gt;rpcs_.InvalidHandle()) {</a>
+<a name="ln613">  DCHECK(deadline != CoarseTimePoint());</a>
+<a name="ln614">}</a>
+<a name="ln615"> </a>
+<a name="ln616">LookupRpc::~LookupRpc() {</a>
+<a name="ln617">  if (has_permit_) {</a>
+<a name="ln618">    meta_cache_-&gt;ReleaseMasterLookupPermit();</a>
+<a name="ln619">  }</a>
+<a name="ln620">}</a>
+<a name="ln621"> </a>
+<a name="ln622">void LookupRpc::SendRpc() {</a>
+<a name="ln623">  if (!has_permit_) {</a>
+<a name="ln624">    has_permit_ = meta_cache_-&gt;AcquireMasterLookupPermit();</a>
+<a name="ln625">  }</a>
+<a name="ln626">  if (!has_permit_) {</a>
+<a name="ln627">    // Couldn't get a permit, try again in a little while.</a>
+<a name="ln628">    ScheduleRetry(STATUS(TryAgain, &quot;Client has too many outstanding requests to the master&quot;));</a>
+<a name="ln629">    return;</a>
+<a name="ln630">  }</a>
+<a name="ln631"> </a>
+<a name="ln632">  // See YBClient::Data::SyncLeaderMasterRpc().</a>
+<a name="ln633">  auto now = CoarseMonoClock::Now();</a>
+<a name="ln634">  if (retrier().deadline() &lt; now) {</a>
+<a name="ln635">    Finished(STATUS(TimedOut, &quot;timed out after deadline expired&quot;));</a>
+<a name="ln636">    return;</a>
+<a name="ln637">  }</a>
+<a name="ln638">  mutable_retrier()-&gt;PrepareController();</a>
+<a name="ln639"> </a>
+<a name="ln640">  DoSendRpc();</a>
+<a name="ln641">}</a>
+<a name="ln642"> </a>
+<a name="ln643">void LookupRpc::ResetMasterLeaderAndRetry() {</a>
+<a name="ln644">  client()-&gt;data_-&gt;SetMasterServerProxyAsync(</a>
+<a name="ln645">      retrier().deadline(),</a>
+<a name="ln646">      false /* skip_resolution */,</a>
+<a name="ln647">      true /* wait for leader election */,</a>
+<a name="ln648">      Bind(&amp;LookupRpc::NewLeaderMasterDeterminedCb,</a>
+<a name="ln649">           Unretained(this)));</a>
+<a name="ln650">}</a>
+<a name="ln651"> </a>
+<a name="ln652">void LookupRpc::NewLeaderMasterDeterminedCb(const Status&amp; status) {</a>
+<a name="ln653">  if (status.ok()) {</a>
+<a name="ln654">    mutable_retrier()-&gt;mutable_controller()-&gt;Reset();</a>
+<a name="ln655">    SendRpc();</a>
+<a name="ln656">  } else {</a>
+<a name="ln657">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Failed to determine new Master: &quot; &lt;&lt; status;</a>
+<a name="ln658">    ScheduleRetry(status);</a>
+<a name="ln659">  }</a>
+<a name="ln660">}</a>
+<a name="ln661"> </a>
+<a name="ln662">template &lt;class Response&gt;</a>
+<a name="ln663">void LookupRpc::DoFinished(</a>
+<a name="ln664">    const Status&amp; status, const Response&amp; resp, const std::string* partition_group_start) {</a>
+<a name="ln665">  VLOG_WITH_FUNC(4) &lt;&lt; &quot;partition_group_start: &quot;</a>
+<a name="ln666">                    &lt;&lt; (partition_group_start ? Slice(*partition_group_start).ToDebugHexString()</a>
+<a name="ln667">                                              : &quot;None&quot;);</a>
+<a name="ln668">  if (status.ok() &amp;&amp; resp.has_error()) {</a>
+<a name="ln669">    LOG_WITH_PREFIX(INFO)</a>
+<a name="ln670">        &lt;&lt; &quot;Failed, got resp error &quot; &lt;&lt; master::MasterErrorPB::Code_Name(resp.error().code());</a>
+<a name="ln671">  } else if (!status.ok()) {</a>
+<a name="ln672">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Failed: &quot; &lt;&lt; status;</a>
+<a name="ln673">  }</a>
+<a name="ln674"> </a>
+<a name="ln675">  // Prefer early failures over controller failures.</a>
+<a name="ln676">  Status new_status = status;</a>
+<a name="ln677">  if (new_status.ok() &amp;&amp;</a>
+<a name="ln678">      mutable_retrier()-&gt;HandleResponse(this, &amp;new_status, rpc::RetryWhenBusy::kFalse)) {</a>
+<a name="ln679">    return;</a>
+<a name="ln680">  }</a>
+<a name="ln681"> </a>
+<a name="ln682">  // Prefer controller failures over response failures.</a>
+<a name="ln683">  if (new_status.ok() &amp;&amp; resp.has_error()) {</a>
+<a name="ln684">    new_status = StatusFromPB(resp.error().status());</a>
+<a name="ln685">    if (resp.error().code() == master::MasterErrorPB::NOT_THE_LEADER ||</a>
+<a name="ln686">        resp.error().code() == master::MasterErrorPB::CATALOG_MANAGER_NOT_INITIALIZED) {</a>
+<a name="ln687">      if (client()-&gt;IsMultiMaster()) {</a>
+<a name="ln688">        YB_LOG_EVERY_N_SECS(WARNING, 1) &lt;&lt; &quot;Leader Master has changed, re-trying...&quot;;</a>
+<a name="ln689">        ResetMasterLeaderAndRetry();</a>
+<a name="ln690">      } else {</a>
+<a name="ln691">        ScheduleRetry(new_status);</a>
+<a name="ln692">      }</a>
+<a name="ln693">      return;</a>
+<a name="ln694">    }</a>
+<a name="ln695">  }</a>
+<a name="ln696"> </a>
+<a name="ln697">  if (new_status.IsTimedOut()) {</a>
+<a name="ln698">    if (CoarseMonoClock::Now() &lt; retrier().deadline()) {</a>
+<a name="ln699">      YB_LOG_EVERY_N_SECS(WARNING, 1) &lt;&lt; &quot;Leader Master timed out, re-trying...&quot;;</a>
+<a name="ln700">      ResetMasterLeaderAndRetry();</a>
+<a name="ln701">      return;</a>
+<a name="ln702">    } else {</a>
+<a name="ln703">      // Operation deadline expired during this latest RPC.</a>
+<a name="ln704">      new_status = new_status.CloneAndPrepend(&quot;timed out after deadline expired&quot;);</a>
+<a name="ln705">    }</a>
+<a name="ln706">  }</a>
+<a name="ln707"> </a>
+<a name="ln708">  if (new_status.IsNetworkError() || new_status.IsRemoteError()) {</a>
+<a name="ln709">    YB_LOG_EVERY_N_SECS(WARNING, 1) &lt;&lt; &quot;Encountered a error from the Master: &quot;</a>
+<a name="ln710">         &lt;&lt; new_status &lt;&lt; &quot;, retrying...&quot;;</a>
+<a name="ln711">    ResetMasterLeaderAndRetry();</a>
+<a name="ln712">    return;</a>
+<a name="ln713">  }</a>
+<a name="ln714"> </a>
+<a name="ln715">  // Prefer response failures over no tablets found.</a>
+<a name="ln716">  if (new_status.ok() &amp;&amp; resp.tablet_locations_size() == 0) {</a>
+<a name="ln717">    new_status = STATUS(NotFound, &quot;No such tablet found&quot;);</a>
+<a name="ln718">  }</a>
+<a name="ln719"> </a>
+<a name="ln720">  auto retained_self = meta_cache_-&gt;rpcs_.Unregister(&amp;retained_self_);</a>
+<a name="ln721"> </a>
+<a name="ln722">  if (new_status.ok()) {</a>
+<a name="ln723">    new_status = meta_cache_-&gt;ProcessTabletLocations(</a>
+<a name="ln724">        resp.tablet_locations(), partition_group_start, request_no());</a>
+<a name="ln725">  }</a>
+<a name="ln726">  if (!new_status.ok()) {</a>
+<a name="ln727">    YB_LOG_WITH_PREFIX_EVERY_N_SECS(WARNING, 1) &lt;&lt; new_status;</a>
+<a name="ln728">    new_status = new_status.CloneAndPrepend(Substitute(&quot;$0 failed&quot;, ToString()));</a>
+<a name="ln729">    NotifyFailure(new_status);</a>
+<a name="ln730">  }</a>
+<a name="ln731">}</a>
+<a name="ln732"> </a>
+<a name="ln733">namespace {</a>
+<a name="ln734"> </a>
+<a name="ln735">Status CheckTabletLocations(</a>
+<a name="ln736">    const google::protobuf::RepeatedPtrField&lt;master::TabletLocationsPB&gt;&amp; locations) {</a>
+<a name="ln737">  const std::string* prev_partition_end = nullptr;</a>
+<a name="ln738">  for (const TabletLocationsPB&amp; loc : locations) {</a>
+<a name="ln739">    if (prev_partition_end &amp;&amp; *prev_partition_end &gt; loc.partition().partition_key_start()) {</a>
+<a name="ln740">      LOG(DFATAL)</a>
+<a name="ln741">          &lt;&lt; &quot;There should be no overlaps in tablet partitions and they should be sorted &quot;</a>
+<a name="ln742">          &lt;&lt; &quot;by partition_key_start. Prev partition end: &quot;</a>
+<a name="ln743">          &lt;&lt; Slice(*prev_partition_end).ToDebugHexString() &lt;&lt; &quot;, current partition start: &quot;</a>
+<a name="ln744">          &lt;&lt; Slice(loc.partition().partition_key_start()).ToDebugHexString()</a>
+<a name="ln745">          &lt;&lt; &quot;. Tablet locations: &quot; &lt;&lt; AsString(locations);</a>
+<a name="ln746">      return STATUS(IllegalState, &quot;Wrong order or overlaps in partitions&quot;);</a>
+<a name="ln747">    }</a>
+<a name="ln748">    prev_partition_end = &amp;loc.partition().partition_key_end();</a>
+<a name="ln749">  }</a>
+<a name="ln750">  return Status::OK();</a>
+<a name="ln751">}</a>
+<a name="ln752"> </a>
+<a name="ln753">class TabletIdLookup : public ToStringable {</a>
+<a name="ln754"> public:</a>
+<a name="ln755">  explicit TabletIdLookup(const TabletId&amp; tablet_id) : tablet_id_(tablet_id) {}</a>
+<a name="ln756"> </a>
+<a name="ln757">  std::string ToString() const override {</a>
+<a name="ln758">    return Format(&quot;Tablet: $0&quot;, tablet_id_);</a>
+<a name="ln759">  }</a>
+<a name="ln760"> </a>
+<a name="ln761"> private:</a>
+<a name="ln762">  const TabletId&amp; tablet_id_;</a>
+<a name="ln763">};</a>
+<a name="ln764"> </a>
+<a name="ln765">class TablePartitionLookup : public ToStringable {</a>
+<a name="ln766"> public:</a>
+<a name="ln767">  explicit TablePartitionLookup(const TableId&amp; table_id, const std::string&amp; partition_group_start)</a>
+<a name="ln768">      : table_id_(table_id), partition_group_start_(partition_group_start) {}</a>
+<a name="ln769"> </a>
+<a name="ln770">  std::string ToString() const override {</a>
+<a name="ln771">    return Format(&quot;Table: $0, partition: $1&quot;,</a>
+<a name="ln772">                  table_id_, Slice(partition_group_start_).ToDebugHexString());</a>
+<a name="ln773">  }</a>
+<a name="ln774"> </a>
+<a name="ln775"> private:</a>
+<a name="ln776">  const TableId&amp; table_id_;</a>
+<a name="ln777">  const std::string&amp; partition_group_start_;</a>
+<a name="ln778">};</a>
+<a name="ln779"> </a>
+<a name="ln780">} // namespace</a>
+<a name="ln781"> </a>
+<a name="ln782">Status MetaCache::ProcessTabletLocations(</a>
+<a name="ln783">    const google::protobuf::RepeatedPtrField&lt;master::TabletLocationsPB&gt;&amp; locations,</a>
+<a name="ln784">    const std::string* partition_group_start,</a>
+<a name="ln785">    int64_t request_no) {</a>
+<a name="ln786">  if (VLOG_IS_ON(2)) {</a>
+<a name="ln787">    auto group_start =</a>
+<a name="ln788">        partition_group_start ? Slice(*partition_group_start).ToDebugHexString() : &quot;&lt;NULL&gt;&quot;;</a>
+<a name="ln789">    for (const auto&amp; loc : locations) {</a>
+<a name="ln790">      for (const auto&amp; table_id : loc.table_ids()) {</a>
+<a name="ln791">        VLOG_WITH_FUNC(2) &lt;&lt; loc.tablet_id() &lt;&lt; &quot;, &quot; &lt;&lt; table_id &lt;&lt; &quot;/&quot; &lt;&lt; group_start;</a>
+<a name="ln792">      }</a>
+<a name="ln793">    }</a>
+<a name="ln794">    VLOG_WITH_FUNC(4) &lt;&lt; AsString(locations) &lt;&lt; &quot;, &quot; &lt;&lt; group_start;</a>
+<a name="ln795">  }</a>
+<a name="ln796"> </a>
+<a name="ln797">  RETURN_NOT_OK(CheckTabletLocations(locations));</a>
+<a name="ln798"> </a>
+<a name="ln799">  std::vector&lt;std::pair&lt;LookupTabletCallback, internal::RemoteTabletPtr&gt;&gt; to_notify;</a>
+<a name="ln800">  {</a>
+<a name="ln801">    std::lock_guard&lt;decltype(mutex_)&gt; lock(mutex_);</a>
+<a name="ln802"> </a>
+<a name="ln803">    std::unordered_map&lt;TableId, std::unordered_map&lt;std::string, RemoteTabletPtr&gt;&gt; processed_tables;</a>
+<a name="ln804"> </a>
+<a name="ln805">    for (const TabletLocationsPB&amp; loc : locations) {</a>
+<a name="ln806">      const std::string&amp; tablet_id = loc.tablet_id();</a>
+<a name="ln807">      // Next, update the tablet caches.</a>
+<a name="ln808">      RemoteTabletPtr remote = FindPtrOrNull(tablets_by_id_, tablet_id);</a>
+<a name="ln809"> </a>
+<a name="ln810">      // First, update the tserver cache, needed for the Refresh calls below.</a>
+<a name="ln811">      for (const TabletLocationsPB_ReplicaPB&amp; r : loc.replicas()) {</a>
+<a name="ln812">        UpdateTabletServerUnlocked(r.ts_info());</a>
+<a name="ln813">      }</a>
+<a name="ln814"> </a>
+<a name="ln815">      for (const std::string&amp; table_id : loc.table_ids()) {</a>
+<a name="ln816">        auto&amp; processed_table = processed_tables[table_id];</a>
+<a name="ln817"> </a>
+<a name="ln818">        auto&amp; table_data = tables_[table_id];</a>
+<a name="ln819">        auto&amp; tablets_by_key = table_data.tablets_by_partition;</a>
+<a name="ln820"> </a>
+<a name="ln821">        if (remote) {</a>
+<a name="ln822">          // Partition should not have changed.</a>
+<a name="ln823">          DCHECK_EQ(loc.partition().partition_key_start(),</a>
+<a name="ln824">                    remote-&gt;partition().partition_key_start());</a>
+<a name="ln825">          DCHECK_EQ(loc.partition().partition_key_end(),</a>
+<a name="ln826">                    remote-&gt;partition().partition_key_end());</a>
+<a name="ln827"> </a>
+<a name="ln828">          // For colocated tables, RemoteTablet already exists because it was processed</a>
+<a name="ln829">          // in a previous iteration of the for loop (for loc.table_ids()).</a>
+<a name="ln830">          // We need to add this tablet to the current table's tablets_by_key map.</a>
+<a name="ln831">          tablets_by_key[remote-&gt;partition().partition_key_start()] = remote;</a>
+<a name="ln832"> </a>
+<a name="ln833">          VLOG(5) &lt;&lt; &quot;Refreshing tablet &quot; &lt;&lt; tablet_id &lt;&lt; &quot;: &quot; &lt;&lt; loc.ShortDebugString();</a>
+<a name="ln834">        } else {</a>
+<a name="ln835">          VLOG(5) &lt;&lt; &quot;Caching tablet &quot; &lt;&lt; tablet_id &lt;&lt; &quot;: &quot; &lt;&lt; loc.ShortDebugString();</a>
+<a name="ln836"> </a>
+<a name="ln837">          Partition partition;</a>
+<a name="ln838">          Partition::FromPB(loc.partition(), &amp;partition);</a>
+<a name="ln839">          remote = new RemoteTablet(tablet_id, partition, loc.split_depth());</a>
+<a name="ln840"> </a>
+<a name="ln841">          CHECK(tablets_by_id_.emplace(tablet_id, remote).second);</a>
+<a name="ln842">          auto emplace_result = tablets_by_key.emplace(partition.partition_key_start(), remote);</a>
+<a name="ln843">          if (!emplace_result.second) {</a>
+<a name="ln844">            const auto&amp; old_tablet = emplace_result.first-&gt;second;</a>
+<a name="ln845">            if (old_tablet-&gt;split_depth() &lt; remote-&gt;split_depth()) {</a>
+<a name="ln846">              // Only replace with tablet of higher split_depth.</a>
+<a name="ln847">              // TODO(tsplit): add cleanup for table_data.split_tablets, we don't need to keep</a>
+<a name="ln848">              // pre-split tablet info after it has been fully covered by post-split tablets</a>
+<a name="ln849">              // in meta cache.</a>
+<a name="ln850">              table_data.split_tablets[partition.partition_key_start()].push_back(old_tablet);</a>
+<a name="ln851">              emplace_result.first-&gt;second = remote;</a>
+<a name="ln852">            } else {</a>
+<a name="ln853">              // If split_depth is the same - it should be the same tablet.</a>
+<a name="ln854">              if (old_tablet-&gt;split_depth() == loc.split_depth()</a>
+<a name="ln855">                  &amp;&amp; old_tablet-&gt;tablet_id() != tablet_id) {</a>
+<a name="ln856">                const auto error_msg = Format(</a>
+<a name="ln857">                    &quot;Can't replace tablet $0 with $1 at partition_key_start $2, split_depth $3&quot;,</a>
+<a name="ln858">                    old_tablet-&gt;tablet_id(), tablet_id, loc.partition().partition_key_start(),</a>
+<a name="ln859">                    old_tablet-&gt;split_depth());</a>
+<a name="ln860">                LOG(DFATAL) &lt;&lt; error_msg;</a>
+<a name="ln861">                // Just skip updating this tablet for release build.</a>
+<a name="ln862">              }</a>
+<a name="ln863">            }</a>
+<a name="ln864">          }</a>
+<a name="ln865">          MaybeUpdateClientRequests(table_data, *remote);</a>
+<a name="ln866">        }</a>
+<a name="ln867">        remote-&gt;Refresh(ts_cache_, loc.replicas());</a>
+<a name="ln868"> </a>
+<a name="ln869">        if (partition_group_start) {</a>
+<a name="ln870">          processed_table.emplace(loc.partition().partition_key_start(), remote);</a>
+<a name="ln871">        }</a>
+<a name="ln872">      }</a>
+<a name="ln873"> </a>
+<a name="ln874">      auto it = tablet_lookups_by_id_.find(tablet_id);</a>
+<a name="ln875">      if (it != tablet_lookups_by_id_.end()) {</a>
+<a name="ln876">        while (auto* lookup = it-&gt;second.lookups.Pop()) {</a>
+<a name="ln877">          to_notify.emplace_back(std::move(lookup-&gt;callback), remote);</a>
+<a name="ln878">          delete lookup;</a>
+<a name="ln879">        }</a>
+<a name="ln880">        if (!partition_group_start) {</a>
+<a name="ln881">          it-&gt;second.Finished(request_no, TabletIdLookup(tablet_id));</a>
+<a name="ln882">        }</a>
+<a name="ln883">      }</a>
+<a name="ln884">    }</a>
+<a name="ln885"> </a>
+<a name="ln886">    if (partition_group_start) {</a>
+<a name="ln887">      for (const auto&amp; processed_table : processed_tables) {</a>
+<a name="ln888">        auto&amp; table_data = tables_[processed_table.first];</a>
+<a name="ln889">        const auto lookup_by_group_iter =</a>
+<a name="ln890">            table_data.tablet_lookups_by_group.find(*partition_group_start);</a>
+<a name="ln891">        if (lookup_by_group_iter != table_data.tablet_lookups_by_group.end()) {</a>
+<a name="ln892">          VLOG_WITH_FUNC(4) &lt;&lt; &quot;Checking tablet_lookups_by_group for partition_group_start: &quot;</a>
+<a name="ln893">                            &lt;&lt; Slice(*partition_group_start).ToDebugHexString();</a>
+<a name="ln894">          auto&amp; lookups_group = lookup_by_group_iter-&gt;second;</a>
+<a name="ln895">          while (auto* lookup = lookups_group.lookups.Pop()) {</a>
+<a name="ln896">            auto remote_it = processed_table.second.find(*lookup-&gt;partition_start);</a>
+<a name="ln897">            to_notify.emplace_back(</a>
+<a name="ln898">                std::move(lookup-&gt;callback),</a>
+<a name="ln899">                remote_it != processed_table.second.end() ? remote_it-&gt;second : nullptr);</a>
+<a name="ln900">            delete lookup;</a>
+<a name="ln901">          }</a>
+<a name="ln902">          lookups_group.Finished(</a>
+<a name="ln903">              request_no, TablePartitionLookup(processed_table.first, *partition_group_start),</a>
+<a name="ln904">              processed_tables.size() != 1);</a>
+<a name="ln905">        }</a>
+<a name="ln906">      }</a>
+<a name="ln907">    }</a>
+<a name="ln908">  }</a>
+<a name="ln909"> </a>
+<a name="ln910">  for (const auto&amp; callback_and_remote_tablet : to_notify) {</a>
+<a name="ln911">    if (callback_and_remote_tablet.second) {</a>
+<a name="ln912">      callback_and_remote_tablet.first(callback_and_remote_tablet.second);</a>
+<a name="ln913">    } else {</a>
+<a name="ln914">      static auto status = STATUS(TryAgain, &quot;Tablet for requested partition is not yet running&quot;);</a>
+<a name="ln915">      callback_and_remote_tablet.first(status);</a>
+<a name="ln916">    }</a>
+<a name="ln917">  }</a>
+<a name="ln918"> </a>
+<a name="ln919">  return Status::OK();</a>
+<a name="ln920">}</a>
+<a name="ln921"> </a>
+<a name="ln922">RemoteTabletPtr MetaCache::GetNearestSplitAncestorUnlocked(</a>
+<a name="ln923">    const TableData&amp; table_data, const RemoteTablet&amp; tablet) {</a>
+<a name="ln924">  VLOG_WITH_FUNC(3) &lt;&lt; Format(&quot;tablet: $0&quot;, tablet);</a>
+<a name="ln925">  if (tablet.split_depth() == 0) {</a>
+<a name="ln926">    // Tablet is not a result of another tablet split, it couldn't have split ancestor.</a>
+<a name="ln927">    return nullptr;</a>
+<a name="ln928">  }</a>
+<a name="ln929"> </a>
+<a name="ln930">  const auto&amp; partition = tablet.partition();</a>
+<a name="ln931">  const auto&amp; partition_key_start = partition.partition_key_start();</a>
+<a name="ln932"> </a>
+<a name="ln933">  VLOG_WITH_FUNC(4) &lt;&lt; &quot;table_data.tablets_by_partition: &quot;</a>
+<a name="ln934">                    &lt;&lt; AsString(table_data.tablets_by_partition);</a>
+<a name="ln935">  VLOG_WITH_FUNC(4) &lt;&lt; &quot;table_data.split_tablets: &quot; &lt;&lt; AsString(table_data.split_tablets);</a>
+<a name="ln936"> </a>
+<a name="ln937">  RemoteTabletPtr nearest_split_ancestor;</a>
+<a name="ln938"> </a>
+<a name="ln939">  {</a>
+<a name="ln940">    // Try to find the deepest tablet X in table_data.tablets_by_partition whose partition strictly</a>
+<a name="ln941">    // contains tablet's (T) partition.</a>
+<a name="ln942">    //</a>
+<a name="ln943">    // If such tablet X exists it will have the maximum possible X.partition_key_start &lt;=</a>
+<a name="ln944">    // T.partition_key_start.</a>
+<a name="ln945">    //</a>
+<a name="ln946">    // Proof: Lets assume there is another tablet Y != X in the map that strictly contains</a>
+<a name="ln947">    // T.partition, but it has Y.partition_key_start &lt; X.partition_key_start.</a>
+<a name="ln948">    // That means:</a>
+<a name="ln949">    // Y.partition_key_end &gt;= T.partition_key_end &gt; T.partition_key_start &gt;= X.partition_key_start</a>
+<a name="ln950">    //  =&gt; Y.partition_key_end &gt; X.partition_key_start</a>
+<a name="ln951">    // So, Y.partition overlaps with X.partition and Y.partition_key_start &lt; X.partition_key_start.</a>
+<a name="ln952">    // Due to the nature of tablet splitting, there could be no partial overlap of tablet partition</a>
+<a name="ln953">    // key ranges. Then Y should strictly contains X and that means Y is not the</a>
+<a name="ln954">    // deepest tablet available strictly containing T.partition.</a>
+<a name="ln955">    const auto it = GetLastLessOrEqual(table_data.tablets_by_partition, partition_key_start);</a>
+<a name="ln956">    if (it != table_data.tablets_by_partition.end()) {</a>
+<a name="ln957">      VLOG_WITH_FUNC(3) &lt;&lt; Format(</a>
+<a name="ln958">          &quot;Nearest_split_ancestor candidate: $0&quot;,</a>
+<a name="ln959">          it != table_data.tablets_by_partition.end() ? AsString(it-&gt;second) : &quot;None&quot;);</a>
+<a name="ln960">      if (it-&gt;second-&gt;partition().ContainsPartitionStrict(partition)) {</a>
+<a name="ln961">        nearest_split_ancestor = it-&gt;second;</a>
+<a name="ln962">        VLOG_WITH_FUNC(3) &lt;&lt; Format(</a>
+<a name="ln963">            &quot;Found nearest split ancestor tablet: $0&quot;, nearest_split_ancestor);</a>
+<a name="ln964">      }</a>
+<a name="ln965">    }</a>
+<a name="ln966">  }</a>
+<a name="ln967"> </a>
+<a name="ln968">  if (!nearest_split_ancestor) {</a>
+<a name="ln969">    // Nearest split ancestor could be already replaced and moved to table_data.split_tablets,</a>
+<a name="ln970">    // so try to find it there starting with largest depth.</a>
+<a name="ln971">    const auto it = GetLastLessOrEqual(table_data.split_tablets, partition_key_start);</a>
+<a name="ln972">    if (it != table_data.split_tablets.end()) {</a>
+<a name="ln973">      for (auto tablet_it = it-&gt;second.rbegin(); tablet_it != it-&gt;second.rend(); ++tablet_it) {</a>
+<a name="ln974">        VLOG_WITH_FUNC(3) &lt;&lt; Format(</a>
+<a name="ln975">            &quot;Nearest_split_ancestor candidate: $0&quot;, tablet_it-&gt;get());</a>
+<a name="ln976">        if (tablet_it-&gt;get()-&gt;partition().ContainsPartition(partition)) {</a>
+<a name="ln977">          nearest_split_ancestor = tablet_it-&gt;get();</a>
+<a name="ln978">          VLOG_WITH_FUNC(3) &lt;&lt; Format(</a>
+<a name="ln979">              &quot;Found nearest split ancestor tablet: $0&quot;, nearest_split_ancestor);</a>
+<a name="ln980">          break;</a>
+<a name="ln981">        }</a>
+<a name="ln982">      }</a>
+<a name="ln983">    }</a>
+<a name="ln984">  }</a>
+<a name="ln985"> </a>
+<a name="ln986">  if (!nearest_split_ancestor) {</a>
+<a name="ln987">    VLOG_WITH_FUNC(3) &lt;&lt; Format(&quot;No nearest split ancestor tablet for: $0&quot;, tablet);</a>
+<a name="ln988">    return nullptr;</a>
+<a name="ln989">  }</a>
+<a name="ln990"> </a>
+<a name="ln991">  if (nearest_split_ancestor-&gt;split_depth() &gt;= tablet.split_depth()) {</a>
+<a name="ln992">    LOG(DFATAL) &lt;&lt; Format(</a>
+<a name="ln993">        &quot;Nearest split ancestor $0 (split_depth: $1, partition: $2) should have smaller&quot;</a>
+<a name="ln994">        &quot; split depth than $3 (split_depth: $4, partition: $5)&quot;,</a>
+<a name="ln995">        nearest_split_ancestor-&gt;tablet_id(), nearest_split_ancestor-&gt;split_depth(),</a>
+<a name="ln996">        nearest_split_ancestor-&gt;partition(), tablet.tablet_id(), tablet.split_depth(),</a>
+<a name="ln997">        tablet.partition());</a>
+<a name="ln998">    return nullptr;</a>
+<a name="ln999">  }</a>
+<a name="ln1000"> </a>
+<a name="ln1001">  return nearest_split_ancestor;</a>
+<a name="ln1002">}</a>
+<a name="ln1003"> </a>
+<a name="ln1004">void MetaCache::MaybeUpdateClientRequests(const TableData&amp; table_data, const RemoteTablet&amp; tablet) {</a>
+<a name="ln1005">  const auto nearest_split_ancestor = GetNearestSplitAncestorUnlocked(table_data, tablet);</a>
+<a name="ln1006"> </a>
+<a name="ln1007">  if (!nearest_split_ancestor) {</a>
+<a name="ln1008">    return;</a>
+<a name="ln1009">  }</a>
+<a name="ln1010"> </a>
+<a name="ln1011">  // TODO: MetaCache is a friend of Client and tablet_requests_mutex_ with tablet_requests_ are</a>
+<a name="ln1012">  // public members of YBClient::Data. Consider refactoring that.</a>
+<a name="ln1013">  std::lock_guard&lt;simple_spinlock&gt; request_lock(client_-&gt;data_-&gt;tablet_requests_mutex_);</a>
+<a name="ln1014">  auto&amp; tablet_requests = client_-&gt;data_-&gt;tablet_requests_;</a>
+<a name="ln1015">  const auto requests_it = tablet_requests.find(nearest_split_ancestor-&gt;tablet_id());</a>
+<a name="ln1016">  if (requests_it == tablet_requests.end()) {</a>
+<a name="ln1017">    LOG(DFATAL) &lt;&lt; &quot;Not found tablet requests structure for tablet &quot;</a>
+<a name="ln1018">                &lt;&lt; nearest_split_ancestor-&gt;tablet_id();</a>
+<a name="ln1019">    return;</a>
+<a name="ln1020">  }</a>
+<a name="ln1021">  tablet_requests[tablet.tablet_id()].request_id_seq = requests_it-&gt;second.request_id_seq;</a>
+<a name="ln1022">}</a>
+<a name="ln1023"> </a>
+<a name="ln1024">void MetaCache::InvalidateTableCache(const TableId&amp; table_id) {</a>
+<a name="ln1025">  VLOG_WITH_FUNC(1) &lt;&lt; &quot;table: &quot; &lt;&lt; table_id;</a>
+<a name="ln1026"> </a>
+<a name="ln1027">  std::vector&lt;LookupTabletCallback&gt; to_notify;</a>
+<a name="ln1028"> </a>
+<a name="ln1029">  {</a>
+<a name="ln1030">    std::lock_guard&lt;decltype(mutex_)&gt; lock(mutex_);</a>
+<a name="ln1031">    auto it = tables_.find(table_id);</a>
+<a name="ln1032">    if (it != tables_.end()) {</a>
+<a name="ln1033">      auto&amp; table_data = it-&gt;second;</a>
+<a name="ln1034">      // Some partitions could be mapped to tablets that have been split and we need to re-fetch</a>
+<a name="ln1035">      // info about tablets serving partitions.</a>
+<a name="ln1036">      for (auto&amp; tablet : table_data.tablets_by_partition) {</a>
+<a name="ln1037">        tablet.second-&gt;MarkStale();</a>
+<a name="ln1038">      }</a>
+<a name="ln1039">      // TODO(tsplit): Optimize to retry only necessary lookups inside ProcessTabletLocations,</a>
+<a name="ln1040">      // detect which need to be retried by GetTableLocationsResponsePB.partitions_version.</a>
+<a name="ln1041">      for (auto&amp; group_lookups : table_data.tablet_lookups_by_group) {</a>
+<a name="ln1042">        while (auto* lookup = group_lookups.second.lookups.Pop()) {</a>
+<a name="ln1043">          to_notify.push_back(std::move(lookup-&gt;callback));</a>
+<a name="ln1044">          delete lookup;</a>
+<a name="ln1045">        }</a>
+<a name="ln1046">      }</a>
+<a name="ln1047">      table_data.tablet_lookups_by_group.clear();</a>
+<a name="ln1048">    }</a>
+<a name="ln1049">  }</a>
+<a name="ln1050">  for (const auto&amp; callback : to_notify) {</a>
+<a name="ln1051">    callback(STATUS_FORMAT(TryAgain, &quot;MetaCache for table $0 has been invalidated.&quot;, table_id));</a>
+<a name="ln1052">  }</a>
+<a name="ln1053">}</a>
+<a name="ln1054"> </a>
+<a name="ln1055">class MetaCache::CallbackNotifier {</a>
+<a name="ln1056"> public:</a>
+<a name="ln1057">  explicit CallbackNotifier(const Status&amp; status) : status_(status) {}</a>
+<a name="ln1058"> </a>
+<a name="ln1059">  void Add(LookupTabletCallback&amp;&amp; callback) {</a>
+<a name="ln1060">    callbacks_.push_back(std::move(callback));</a>
+<a name="ln1061">  }</a>
+<a name="ln1062"> </a>
+<a name="ln1063">  ~CallbackNotifier() {</a>
+<a name="ln1064">    for (const auto&amp; callback : callbacks_) {</a>
+<a name="ln1065">      callback(status_);</a>
+<a name="ln1066">    }</a>
+<a name="ln1067">  }</a>
+<a name="ln1068"> private:</a>
+<a name="ln1069">  std::vector&lt;LookupTabletCallback&gt; callbacks_;</a>
+<a name="ln1070">  Status status_;</a>
+<a name="ln1071">};</a>
+<a name="ln1072"> </a>
+<a name="ln1073">template &lt;class Key&gt;</a>
+<a name="ln1074">CoarseTimePoint MetaCache::LookupFailed(</a>
+<a name="ln1075">    const Key&amp; key, const Status&amp; status, int64_t request_no, const ToStringable&amp; lookup_id,</a>
+<a name="ln1076">    std::unordered_map&lt;Key, LookupDataGroup&gt;* key_to_group_lookup_data,</a>
+<a name="ln1077">    CallbackNotifier* notifier) {</a>
+<a name="ln1078">  auto key_to_group_lookup_data_iterator = key_to_group_lookup_data-&gt;find(key);</a>
+<a name="ln1079">  if (key_to_group_lookup_data_iterator == key_to_group_lookup_data-&gt;end()) {</a>
+<a name="ln1080">    return CoarseTimePoint();</a>
+<a name="ln1081">  }</a>
+<a name="ln1082">  auto&amp; lookup_data_group = key_to_group_lookup_data_iterator-&gt;second;</a>
+<a name="ln1083">  std::vector&lt;LookupData*&gt; retry;</a>
+<a name="ln1084">  auto now = CoarseMonoClock::Now();</a>
+<a name="ln1085">  CoarseTimePoint max_deadline;</a>
+<a name="ln1086"> </a>
+<a name="ln1087">  while (auto* lookup = lookup_data_group.lookups.Pop()) {</a>
+<a name="ln1088">    if (!status.IsTimedOut() || lookup-&gt;deadline &lt;= now) {</a>
+<a name="ln1089">      notifier-&gt;Add(std::move(lookup-&gt;callback));</a>
+<a name="ln1090">      delete lookup;</a>
+<a name="ln1091">    } else {</a>
+<a name="ln1092">      max_deadline = std::max(max_deadline, lookup-&gt;deadline);</a>
+<a name="ln1093">      retry.push_back(lookup);</a>
+<a name="ln1094">    }</a>
+<a name="ln1095">  }</a>
+<a name="ln1096"> </a>
+<a name="ln1097">  if (retry.empty()) {</a>
+<a name="ln1098">    lookup_data_group.Finished(request_no, lookup_id);</a>
+<a name="ln1099">  } else {</a>
+<a name="ln1100">    for (auto* lookup : retry) {</a>
+<a name="ln1101">      lookup_data_group.lookups.Push(lookup);</a>
+<a name="ln1102">    }</a>
+<a name="ln1103">  }</a>
+<a name="ln1104"> </a>
+<a name="ln1105">  return max_deadline;</a>
+<a name="ln1106">}</a>
+<a name="ln1107"> </a>
+<a name="ln1108">class LookupByIdRpc : public LookupRpc {</a>
+<a name="ln1109"> public:</a>
+<a name="ln1110">  LookupByIdRpc(const scoped_refptr&lt;MetaCache&gt;&amp; meta_cache,</a>
+<a name="ln1111">                const TabletId&amp; tablet_id,</a>
+<a name="ln1112">                int64_t request_no,</a>
+<a name="ln1113">                CoarseTimePoint deadline,</a>
+<a name="ln1114">                int64_t lookups_without_new_replicas)</a>
+<a name="ln1115">      : LookupRpc(meta_cache, request_no, deadline),</a>
+<a name="ln1116">        tablet_id_(tablet_id) {</a>
+<a name="ln1117">    if (lookups_without_new_replicas != 0) {</a>
+<a name="ln1118">      send_delay_ = std::min(</a>
+<a name="ln1119">          lookups_without_new_replicas * FLAGS_meta_cache_lookup_throttling_step_ms,</a>
+<a name="ln1120">          FLAGS_meta_cache_lookup_throttling_max_delay_ms) * 1ms;</a>
+<a name="ln1121">    }</a>
+<a name="ln1122">  }</a>
+<a name="ln1123"> </a>
+<a name="ln1124">  std::string ToString() const override {</a>
+<a name="ln1125">    return Format(&quot;LookupByIdRpc(tablet: $0, num_attempts: $1)&quot;, tablet_id_, num_attempts());</a>
+<a name="ln1126">  }</a>
+<a name="ln1127"> </a>
+<a name="ln1128">  void SendRpc() override {</a>
+<a name="ln1129">    if (send_delay_) {</a>
+<a name="ln1130">      auto delay = send_delay_;</a>
+<a name="ln1131">      send_delay_ = MonoDelta();</a>
+<a name="ln1132">      auto status = mutable_retrier()-&gt;DelayedRetry(this, Status::OK(), delay);</a>
+<a name="ln1133">      if (!status.ok()) {</a>
+<a name="ln1134">        Finished(status);</a>
+<a name="ln1135">      }</a>
+<a name="ln1136">      return;</a>
+<a name="ln1137">    }</a>
+<a name="ln1138"> </a>
+<a name="ln1139">    LookupRpc::SendRpc();</a>
+<a name="ln1140">  }</a>
+<a name="ln1141"> </a>
+<a name="ln1142">  void DoSendRpc() override {</a>
+<a name="ln1143">    // Fill out the request.</a>
+<a name="ln1144">    req_.clear_tablet_ids();</a>
+<a name="ln1145">    req_.add_tablet_ids(tablet_id_);</a>
+<a name="ln1146"> </a>
+<a name="ln1147">    master_proxy()-&gt;GetTabletLocationsAsync(</a>
+<a name="ln1148">        req_, &amp;resp_, mutable_retrier()-&gt;mutable_controller(),</a>
+<a name="ln1149">        std::bind(&amp;LookupByIdRpc::Finished, this, Status::OK()));</a>
+<a name="ln1150">  }</a>
+<a name="ln1151"> </a>
+<a name="ln1152"> private:</a>
+<a name="ln1153">  void Finished(const Status&amp; status) override {</a>
+<a name="ln1154">    DoFinished(status, resp_, nullptr /* partition_group_start */);</a>
+<a name="ln1155">  }</a>
+<a name="ln1156"> </a>
+<a name="ln1157">  void NotifyFailure(const Status&amp; status) override {</a>
+<a name="ln1158">    meta_cache()-&gt;LookupByIdFailed(tablet_id_, request_no(), status);</a>
+<a name="ln1159">  }</a>
+<a name="ln1160"> </a>
+<a name="ln1161">  // Tablet to lookup.</a>
+<a name="ln1162">  TabletId tablet_id_;</a>
+<a name="ln1163"> </a>
+<a name="ln1164">  // Request body.</a>
+<a name="ln1165">  master::GetTabletLocationsRequestPB req_;</a>
+<a name="ln1166"> </a>
+<a name="ln1167">  // Response body.</a>
+<a name="ln1168">  master::GetTabletLocationsResponsePB resp_;</a>
+<a name="ln1169"> </a>
+<a name="ln1170">  MonoDelta send_delay_;</a>
+<a name="ln1171">};</a>
+<a name="ln1172"> </a>
+<a name="ln1173">class LookupByKeyRpc : public LookupRpc {</a>
+<a name="ln1174"> public:</a>
+<a name="ln1175">  LookupByKeyRpc(const scoped_refptr&lt;MetaCache&gt;&amp; meta_cache,</a>
+<a name="ln1176">                 const YBTable* table,</a>
+<a name="ln1177">                 const MetaCache::PartitionGroupKey&amp; partition_group_start,</a>
+<a name="ln1178">                 int64_t request_no,</a>
+<a name="ln1179">                 CoarseTimePoint deadline)</a>
+<a name="ln1180">      : LookupRpc(meta_cache, request_no, deadline),</a>
+<a name="ln1181">        table_(table-&gt;shared_from_this()),</a>
+<a name="ln1182">        partition_group_start_(partition_group_start) {</a>
+<a name="ln1183">  }</a>
+<a name="ln1184"> </a>
+<a name="ln1185">  std::string ToString() const override {</a>
+<a name="ln1186">    return Format(&quot;GetTableLocations($0, $1, $2)&quot;,</a>
+<a name="ln1187">                  table_-&gt;name(),</a>
+<a name="ln1188">                  table_-&gt;partition_schema()</a>
+<a name="ln1189">                      .PartitionKeyDebugString(partition_group_start_,</a>
+<a name="ln1190">                                               internal::GetSchema(table_-&gt;schema())),</a>
+<a name="ln1191">                  num_attempts());</a>
+<a name="ln1192">  }</a>
+<a name="ln1193"> </a>
+<a name="ln1194">  const YBTableName&amp; table_name() const { return table_-&gt;name(); }</a>
+<a name="ln1195">  const string&amp; table_id() const { return table_-&gt;id(); }</a>
+<a name="ln1196"> </a>
+<a name="ln1197">  void DoSendRpc() override {</a>
+<a name="ln1198">    // Fill out the request.</a>
+<a name="ln1199">    req_.mutable_table()-&gt;set_table_id(table_-&gt;id());</a>
+<a name="ln1200">    req_.set_partition_key_start(partition_group_start_);</a>
+<a name="ln1201">    req_.set_max_returned_locations(kPartitionGroupSize);</a>
+<a name="ln1202"> </a>
+<a name="ln1203">    // The end partition key is left unset intentionally so that we'll prefetch</a>
+<a name="ln1204">    // some additional tablets.</a>
+<a name="ln1205">    master_proxy()-&gt;GetTableLocationsAsync(</a>
+<a name="ln1206">        req_, &amp;resp_, mutable_retrier()-&gt;mutable_controller(),</a>
+<a name="ln1207">        std::bind(&amp;LookupByKeyRpc::Finished, this, Status::OK()));</a>
+<a name="ln1208">  }</a>
+<a name="ln1209"> </a>
+<a name="ln1210"> private:</a>
+<a name="ln1211">  void Finished(const Status&amp; status) override {</a>
+<a name="ln1212">    const auto table_partitions_version = table_-&gt;GetPartitionsVersion();</a>
+<a name="ln1213">    VLOG_WITH_FUNC(4) &lt;&lt; Format(</a>
+<a name="ln1214">        &quot;Received table $0 partitions version: $1, ours is: $2&quot;, table_-&gt;id(),</a>
+<a name="ln1215">        resp_.partitions_version(), table_partitions_version);</a>
+<a name="ln1216">    if (resp_.partitions_version() != table_partitions_version) {</a>
+<a name="ln1217">      DoFinished(</a>
+<a name="ln1218">          STATUS_EC_FORMAT(</a>
+<a name="ln1219">              TryAgain,</a>
+<a name="ln1220">              ClientError(</a>
+<a name="ln1221">                  resp_.partitions_version() &gt; table_partitions_version</a>
+<a name="ln1222">                      ? ClientErrorCode::kTablePartitionsAreStale</a>
+<a name="ln1223">                      : ClientErrorCode::kGotOldTablePartitions),</a>
+<a name="ln1224">              &quot;Received table $0 partitions version: $1, ours is: $2&quot;, table_-&gt;id(),</a>
+<a name="ln1225">              resp_.partitions_version(), table_partitions_version),</a>
+<a name="ln1226">          resp_, &amp;partition_group_start_);</a>
+<a name="ln1227">      return;</a>
+<a name="ln1228">    }</a>
+<a name="ln1229">    DoFinished(status, resp_, &amp;partition_group_start_);</a>
+<a name="ln1230">  }</a>
+<a name="ln1231"> </a>
+<a name="ln1232">  void NotifyFailure(const Status&amp; status) override {</a>
+<a name="ln1233">    meta_cache()-&gt;LookupByKeyFailed(table_.get(), partition_group_start_, request_no(), status);</a>
+<a name="ln1234">  }</a>
+<a name="ln1235"> </a>
+<a name="ln1236">  // Table to lookup.</a>
+<a name="ln1237">  std::shared_ptr&lt;const YBTable&gt; table_;</a>
+<a name="ln1238"> </a>
+<a name="ln1239">  // Encoded partition key to lookup.</a>
+<a name="ln1240">  MetaCache::PartitionGroupKey partition_group_start_;</a>
+<a name="ln1241"> </a>
+<a name="ln1242">  // Request body.</a>
+<a name="ln1243">  GetTableLocationsRequestPB req_;</a>
+<a name="ln1244"> </a>
+<a name="ln1245">  // Response body.</a>
+<a name="ln1246">  GetTableLocationsResponsePB resp_;</a>
+<a name="ln1247">};</a>
+<a name="ln1248"> </a>
+<a name="ln1249">void MetaCache::LookupByKeyFailed(</a>
+<a name="ln1250">    const YBTable* table, const std::string&amp; partition_group_start, int64_t request_no,</a>
+<a name="ln1251">    const Status&amp; status) {</a>
+<a name="ln1252">  VLOG(1) &lt;&lt; &quot;Lookup for table &quot; &lt;&lt; table-&gt;id() &lt;&lt; &quot; and partition &quot;</a>
+<a name="ln1253">          &lt;&lt; Slice(partition_group_start).ToDebugHexString() &lt;&lt; &quot;, failed with: &quot; &lt;&lt; status;</a>
+<a name="ln1254"> </a>
+<a name="ln1255">  CallbackNotifier notifier(status);</a>
+<a name="ln1256">  CoarseTimePoint max_deadline;</a>
+<a name="ln1257">  {</a>
+<a name="ln1258">    std::lock_guard&lt;decltype(mutex_)&gt; lock(mutex_);</a>
+<a name="ln1259">    auto it = tables_.find(table-&gt;id());</a>
+<a name="ln1260">    if (it == tables_.end()) {</a>
+<a name="ln1261">      return;</a>
+<a name="ln1262">    }</a>
+<a name="ln1263"> </a>
+<a name="ln1264">    max_deadline = LookupFailed(</a>
+<a name="ln1265">        partition_group_start, status, request_no,</a>
+<a name="ln1266">        TablePartitionLookup(table-&gt;id(), partition_group_start),</a>
+<a name="ln1267">        &amp;it-&gt;second.tablet_lookups_by_group, &amp;notifier);</a>
+<a name="ln1268">  }</a>
+<a name="ln1269"> </a>
+<a name="ln1270">  if (max_deadline != CoarseTimePoint()) {</a>
+<a name="ln1271">    auto rpc = std::make_shared&lt;LookupByKeyRpc&gt;(</a>
+<a name="ln1272">        this, table, partition_group_start, request_no, max_deadline);</a>
+<a name="ln1273">    rpcs_.RegisterAndStart(rpc, rpc-&gt;RpcHandle());</a>
+<a name="ln1274">  }</a>
+<a name="ln1275">}</a>
+<a name="ln1276"> </a>
+<a name="ln1277">void MetaCache::LookupByIdFailed(</a>
+<a name="ln1278">    const TabletId&amp; tablet_id, int64_t request_no, const Status&amp; status) {</a>
+<a name="ln1279">  VLOG(1) &lt;&lt; &quot;Lookup for tablet &quot; &lt;&lt; tablet_id &lt;&lt; &quot;, failed with: &quot; &lt;&lt; status;</a>
+<a name="ln1280"> </a>
+<a name="ln1281">  CallbackNotifier notifier(status);</a>
+<a name="ln1282">  CoarseTimePoint max_deadline;</a>
+<a name="ln1283">  {</a>
+<a name="ln1284">    std::lock_guard&lt;decltype(mutex_)&gt; lock(mutex_);</a>
+<a name="ln1285">    max_deadline = LookupFailed(tablet_id, status, request_no, TabletIdLookup(tablet_id),</a>
+<a name="ln1286">                                &amp;tablet_lookups_by_id_, &amp;notifier);</a>
+<a name="ln1287">  }</a>
+<a name="ln1288"> </a>
+<a name="ln1289">  if (max_deadline != CoarseTimePoint()) {</a>
+<a name="ln1290">    auto rpc = std::make_shared&lt;LookupByIdRpc&gt;(this, tablet_id, request_no, max_deadline, 0);</a>
+<a name="ln1291">    rpcs_.RegisterAndStart(rpc, rpc-&gt;RpcHandle());</a>
+<a name="ln1292">  }</a>
+<a name="ln1293">}</a>
+<a name="ln1294"> </a>
+<a name="ln1295">RemoteTabletPtr MetaCache::LookupTabletByKeyFastPathUnlocked(const YBTable* table,</a>
+<a name="ln1296">                                                             const std::string&amp; partition_key) {</a>
+<a name="ln1297">  auto it = tables_.find(table-&gt;id());</a>
+<a name="ln1298">  if (PREDICT_FALSE(it == tables_.end())) {</a>
+<a name="ln1299">    // No cache available for this table.</a>
+<a name="ln1300">    return nullptr;</a>
+<a name="ln1301">  }</a>
+<a name="ln1302"> </a>
+<a name="ln1303">  DCHECK_EQ(partition_key, table-&gt;FindPartitionStart(partition_key));</a>
+<a name="ln1304">  auto tablet_it = it-&gt;second.tablets_by_partition.find(partition_key);</a>
+<a name="ln1305">  if (PREDICT_FALSE(tablet_it == it-&gt;second.tablets_by_partition.end())) {</a>
+<a name="ln1306">    // No tablets with a start partition key lower than 'partition_key'.</a>
+<a name="ln1307">    return nullptr;</a>
+<a name="ln1308">  }</a>
+<a name="ln1309"> </a>
+<a name="ln1310">  const auto&amp; result = tablet_it-&gt;second;</a>
+<a name="ln1311"> </a>
+<a name="ln1312">  // Stale entries must be re-fetched.</a>
+<a name="ln1313">  if (result-&gt;stale()) {</a>
+<a name="ln1314">    return nullptr;</a>
+<a name="ln1315">  }</a>
+<a name="ln1316"> </a>
+<a name="ln1317">  if (result-&gt;partition().partition_key_end().compare(partition_key) &gt; 0 ||</a>
+<a name="ln1318">      result-&gt;partition().partition_key_end().empty()) {</a>
+<a name="ln1319">    // partition_key &lt; partition.end OR tablet doesn't end.</a>
+<a name="ln1320">    return result;</a>
+<a name="ln1321">  }</a>
+<a name="ln1322"> </a>
+<a name="ln1323">  return nullptr;</a>
+<a name="ln1324">}</a>
+<a name="ln1325"> </a>
+<a name="ln1326">// We disable thread safety analysis in this function due to manual conditional locking.</a>
+<a name="ln1327">RemoteTabletPtr MetaCache::FastLookupTabletByKeyUnlocked(</a>
+<a name="ln1328">    const YBTable* table,</a>
+<a name="ln1329">    const std::string&amp; partition_start) {</a>
+<a name="ln1330">  // Fast path: lookup in the cache.</a>
+<a name="ln1331">  auto result = LookupTabletByKeyFastPathUnlocked(table, partition_start);</a>
+<a name="ln1332">  if (result &amp;&amp; result-&gt;HasLeader()) {</a>
+<a name="ln1333">    VLOG(4) &lt;&lt; &quot;Fast lookup: found tablet &quot; &lt;&lt; result-&gt;tablet_id();</a>
+<a name="ln1334">    return result;</a>
+<a name="ln1335">  }</a>
+<a name="ln1336"> </a>
+<a name="ln1337">  return nullptr;</a>
+<a name="ln1338">}</a>
+<a name="ln1339"> </a>
+<a name="ln1340">template &lt;class Mutex&gt;</a>
+<a name="ln1341">bool IsUniqueLock(std::lock_guard&lt;Mutex&gt;*) {</a>
+<a name="ln1342">  return true;</a>
+<a name="ln1343">}</a>
+<a name="ln1344"> </a>
+<a name="ln1345">template &lt;class Mutex&gt;</a>
+<a name="ln1346">bool IsUniqueLock(SharedLock&lt;Mutex&gt;*) {</a>
+<a name="ln1347">  return false;</a>
+<a name="ln1348">}</a>
+<a name="ln1349"> </a>
+<a name="ln1350">template &lt;class Lock&gt;</a>
+<a name="ln1351">bool MetaCache::DoLookupTabletByKey(</a>
+<a name="ln1352">    const YBTable* table, const std::string&amp; partition_start, CoarseTimePoint deadline,</a>
+<a name="ln1353">    LookupTabletCallback* callback, const std::string** partition_group_start) {</a>
+<a name="ln1354">  RemoteTabletPtr tablet;</a>
+<a name="ln1355">  auto scope_exit = ScopeExit([callback, &amp;tablet] {</a>
+<a name="ln1356">    if (tablet) {</a>
+<a name="ln1357">      (*callback)(tablet);</a>
+<a name="ln1358">    }</a>
+<a name="ln1359">  });</a>
+<a name="ln1360">  int64_t request_no;</a>
+<a name="ln1361">  {</a>
+<a name="ln1362">    Lock lock(mutex_);</a>
+<a name="ln1363">    tablet = FastLookupTabletByKeyUnlocked(table, partition_start);</a>
+<a name="ln1364">    if (tablet) {</a>
+<a name="ln1365">      return true;</a>
+<a name="ln1366">    }</a>
+<a name="ln1367"> </a>
+<a name="ln1368">    if (!*partition_group_start) {</a>
+<a name="ln1369">      *partition_group_start = &amp;table-&gt;FindPartitionStart(partition_start, kPartitionGroupSize);</a>
+<a name="ln1370">    }</a>
+<a name="ln1371"> </a>
+<a name="ln1372">    auto table_it = tables_.find(table-&gt;id());</a>
+<a name="ln1373">    if (table_it == tables_.end()) {</a>
+<a name="ln1374">      if (!IsUniqueLock(&amp;lock)) {</a>
+<a name="ln1375">        return false;</a>
+<a name="ln1376">      }</a>
+<a name="ln1377">      table_it = tables_.emplace(table-&gt;id(), TableData()).first;</a>
+<a name="ln1378">    }</a>
+<a name="ln1379">    auto&amp; tablet_lookups_by_group = table_it-&gt;second.tablet_lookups_by_group;</a>
+<a name="ln1380">    LookupDataGroup* lookups_group;</a>
+<a name="ln1381">    {</a>
+<a name="ln1382">      auto lookups_group_it = tablet_lookups_by_group.find(**partition_group_start);</a>
+<a name="ln1383">      if (lookups_group_it == tablet_lookups_by_group.end()) {</a>
+<a name="ln1384">        if (!IsUniqueLock(&amp;lock)) {</a>
+<a name="ln1385">          return false;</a>
+<a name="ln1386">        }</a>
+<a name="ln1387">        lookups_group = &amp;tablet_lookups_by_group[**partition_group_start];</a>
+<a name="ln1388">      } else {</a>
+<a name="ln1389">        lookups_group = &amp;lookups_group_it-&gt;second;</a>
+<a name="ln1390">      }</a>
+<a name="ln1391">    }</a>
+<a name="ln1392">    lookups_group-&gt;lookups.Push(new LookupData(callback, deadline, &amp;partition_start));</a>
+<a name="ln1393">    request_no = lookup_serial_.fetch_add(1, std::memory_order_acq_rel);</a>
+<a name="ln1394">    int64_t expected = 0;</a>
+<a name="ln1395">    if (!lookups_group-&gt;running_request_number.compare_exchange_strong(</a>
+<a name="ln1396">            expected, request_no, std::memory_order_acq_rel)) {</a>
+<a name="ln1397">      VLOG_WITH_FUNC(4)</a>
+<a name="ln1398">          &lt;&lt; &quot;Lookup is already running for table: &quot; &lt;&lt; table-&gt;ToString()</a>
+<a name="ln1399">          &lt;&lt; &quot;, partition_group_start: &quot; &lt;&lt; Slice(**partition_group_start).ToDebugHexString();</a>
+<a name="ln1400">      return true;</a>
+<a name="ln1401">    }</a>
+<a name="ln1402">  }</a>
+<a name="ln1403"> </a>
+<a name="ln1404">  VLOG_WITH_FUNC(4)</a>
+<a name="ln1405">      &lt;&lt; &quot;Start lookup for table: &quot; &lt;&lt; table-&gt;ToString()</a>
+<a name="ln1406">      &lt;&lt; &quot;, partition_group_start: &quot; &lt;&lt; Slice(**partition_group_start).ToDebugHexString();</a>
+<a name="ln1407"> </a>
+<a name="ln1408">  auto rpc = std::make_shared&lt;LookupByKeyRpc&gt;(</a>
+<a name="ln1409">      this, table, **partition_group_start, request_no, deadline);</a>
+<a name="ln1410">  rpcs_.RegisterAndStart(rpc, rpc-&gt;RpcHandle());</a>
+<a name="ln1411">  return true;</a>
+<a name="ln1412">}</a>
+<a name="ln1413"> </a>
+<a name="ln1414">// We disable thread safety analysis in this function due to manual conditional locking.</a>
+<a name="ln1415">void MetaCache::LookupTabletByKey(const YBTable* table,</a>
+<a name="ln1416">                                  const string&amp; partition_key,</a>
+<a name="ln1417">                                  CoarseTimePoint deadline,</a>
+<a name="ln1418">                                  LookupTabletCallback callback) {</a>
+<a name="ln1419">  const auto&amp; partition_start = table-&gt;FindPartitionStart(partition_key);</a>
+<a name="ln1420">  VLOG_WITH_FUNC(4) &lt;&lt; &quot;Table: &quot; &lt;&lt; table-&gt;ToString()</a>
+<a name="ln1421">                    &lt;&lt; &quot;, partition_key: &quot; &lt;&lt; Slice(partition_key).ToDebugHexString()</a>
+<a name="ln1422">                    &lt;&lt; &quot;, partition_start: &quot; &lt;&lt; Slice(partition_start).ToDebugHexString();</a>
+<a name="ln1423"> </a>
+<a name="ln1424">  const std::string* partition_group_start = nullptr;</a>
+<a name="ln1425">  if (DoLookupTabletByKey&lt;SharedLock&lt;boost::shared_mutex&gt;&gt;(</a>
+<a name="ln1426">          table, partition_start, deadline, &amp;callback, &amp;partition_group_start)) {</a>
+<a name="ln1427">    return;</a>
+<a name="ln1428">  }</a>
+<a name="ln1429"> </a>
+<a name="ln1430">  bool result = DoLookupTabletByKey&lt;std::lock_guard&lt;boost::shared_mutex&gt;&gt;(</a>
+<a name="ln1431">      table, partition_start, deadline, &amp;callback, &amp;partition_group_start);</a>
+<a name="ln1432">  LOG_IF(DFATAL, !result)</a>
+<a name="ln1433">      &lt;&lt; &quot;Lookup was not started for table &quot; &lt;&lt; table-&gt;ToString()</a>
+<a name="ln1434">      &lt;&lt; &quot;, partition_key: &quot; &lt;&lt; Slice(partition_key).ToDebugHexString();</a>
+<a name="ln1435">}</a>
+<a name="ln1436"> </a>
+<a name="ln1437">RemoteTabletPtr MetaCache::LookupTabletByIdFastPathUnlocked(const TabletId&amp; tablet_id) {</a>
+<a name="ln1438">  auto it = tablets_by_id_.find(tablet_id);</a>
+<a name="ln1439">  if (it != tablets_by_id_.end()) {</a>
+<a name="ln1440">    return it-&gt;second;</a>
+<a name="ln1441">  }</a>
+<a name="ln1442">  return nullptr;</a>
+<a name="ln1443">}</a>
+<a name="ln1444"> </a>
+<a name="ln1445">template &lt;class Lock&gt;</a>
+<a name="ln1446">bool MetaCache::DoLookupTabletById(</a>
+<a name="ln1447">    const TabletId&amp; tablet_id, CoarseTimePoint deadline, UseCache use_cache,</a>
+<a name="ln1448">    LookupTabletCallback* callback) {</a>
+<a name="ln1449">  RemoteTabletPtr tablet;</a>
+<a name="ln1450">  auto scope_exit = ScopeExit([callback, &amp;tablet] {</a>
+<a name="ln1451">    if (tablet) {</a>
+<a name="ln1452">      (*callback)(tablet);</a>
+<a name="ln1453">    }</a>
+<a name="ln1454">  });</a>
+<a name="ln1455">  int64_t request_no;</a>
+<a name="ln1456">  int64_t lookups_without_new_replicas = 0;</a>
+<a name="ln1457">  {</a>
+<a name="ln1458">    Lock lock(mutex_);</a>
+<a name="ln1459"> </a>
+<a name="ln1460">    // Fast path: lookup in the cache.</a>
+<a name="ln1461">    tablet = LookupTabletByIdFastPathUnlocked(tablet_id);</a>
+<a name="ln1462">    if (tablet) {</a>
+<a name="ln1463">      if (use_cache &amp;&amp; tablet-&gt;HasLeader()) {</a>
+<a name="ln1464">        VLOG(4) &lt;&lt; &quot;Fast lookup: found tablet &quot; &lt;&lt; tablet-&gt;tablet_id();</a>
+<a name="ln1465">        return true;</a>
+<a name="ln1466">      }</a>
+<a name="ln1467">      lookups_without_new_replicas = tablet-&gt;lookups_without_new_replicas();</a>
+<a name="ln1468">      tablet = nullptr;</a>
+<a name="ln1469">    }</a>
+<a name="ln1470"> </a>
+<a name="ln1471">    LookupDataGroup* lookup;</a>
+<a name="ln1472">    {</a>
+<a name="ln1473">      auto lookup_it = tablet_lookups_by_id_.find(tablet_id);</a>
+<a name="ln1474">      if (lookup_it == tablet_lookups_by_id_.end()) {</a>
+<a name="ln1475">        if (!IsUniqueLock(&amp;lock)) {</a>
+<a name="ln1476">          return false;</a>
+<a name="ln1477">        }</a>
+<a name="ln1478">        lookup = &amp;tablet_lookups_by_id_[tablet_id];</a>
+<a name="ln1479">      } else {</a>
+<a name="ln1480">        lookup = &amp;lookup_it-&gt;second;</a>
+<a name="ln1481">      }</a>
+<a name="ln1482">    }</a>
+<a name="ln1483">    lookup-&gt;lookups.Push(new LookupData(callback, deadline, nullptr));</a>
+<a name="ln1484">    request_no = lookup_serial_.fetch_add(1, std::memory_order_acq_rel);</a>
+<a name="ln1485">    int64_t expected = 0;</a>
+<a name="ln1486">    if (!lookup-&gt;running_request_number.compare_exchange_strong(</a>
+<a name="ln1487">            expected, request_no, std::memory_order_acq_rel)) {</a>
+<a name="ln1488">      VLOG_WITH_FUNC(4) &lt;&lt; &quot;Lookup already running for tablet: &quot; &lt;&lt; tablet_id;</a>
+<a name="ln1489">      return true;</a>
+<a name="ln1490">    }</a>
+<a name="ln1491">  }</a>
+<a name="ln1492"> </a>
+<a name="ln1493">  VLOG_WITH_FUNC(4) &lt;&lt; &quot;Start lookup for tablet &quot; &lt;&lt; tablet_id &lt;&lt; &quot;: &quot; &lt;&lt; request_no;</a>
+<a name="ln1494"> </a>
+<a name="ln1495">  auto rpc = std::make_shared&lt;LookupByIdRpc&gt;(</a>
+<a name="ln1496">      this, tablet_id, request_no, deadline, lookups_without_new_replicas);</a>
+<a name="ln1497">  rpcs_.RegisterAndStart(rpc, rpc-&gt;RpcHandle());</a>
+<a name="ln1498">  return true;</a>
+<a name="ln1499">}</a>
+<a name="ln1500"> </a>
+<a name="ln1501">void MetaCache::LookupTabletById(const TabletId&amp; tablet_id,</a>
+<a name="ln1502">                                 CoarseTimePoint deadline,</a>
+<a name="ln1503">                                 LookupTabletCallback callback,</a>
+<a name="ln1504">                                 UseCache use_cache) {</a>
+<a name="ln1505">  VLOG_WITH_FUNC(4) &lt;&lt; &quot;(&quot; &lt;&lt; tablet_id &lt;&lt; &quot;, &quot; &lt;&lt; use_cache &lt;&lt; &quot;)&quot;;</a>
+<a name="ln1506"> </a>
+<a name="ln1507">  if (DoLookupTabletById&lt;SharedLock&lt;decltype(mutex_)&gt;&gt;(</a>
+<a name="ln1508">          tablet_id, deadline, use_cache, &amp;callback)) {</a>
+<a name="ln1509">    return;</a>
+<a name="ln1510">  }</a>
+<a name="ln1511"> </a>
+<a name="ln1512">  auto result = DoLookupTabletById&lt;std::lock_guard&lt;decltype(mutex_)&gt;&gt;(</a>
+<a name="ln1513">      tablet_id, deadline, use_cache, &amp;callback);</a>
+<a name="ln1514">  LOG_IF(DFATAL, !result) &lt;&lt; &quot;Lookup was not started for tablet &quot; &lt;&lt; tablet_id;</a>
+<a name="ln1515">}</a>
+<a name="ln1516"> </a>
+<a name="ln1517">void MetaCache::MarkTSFailed(RemoteTabletServer* ts,</a>
+<a name="ln1518">                             const Status&amp; status) {</a>
+<a name="ln1519">  LOG(INFO) &lt;&lt; &quot;Marking tablet server &quot; &lt;&lt; ts-&gt;ToString() &lt;&lt; &quot; as failed.&quot;;</a>
+<a name="ln1520">  SharedLock&lt;decltype(mutex_)&gt; lock(mutex_);</a>
+<a name="ln1521"> </a>
+<a name="ln1522">  Status ts_status = status.CloneAndPrepend(&quot;TS failed&quot;);</a>
+<a name="ln1523"> </a>
+<a name="ln1524">  // TODO: replace with a ts-&gt;tablet multimap for faster lookup?</a>
+<a name="ln1525">  for (const auto&amp; tablet : tablets_by_id_) {</a>
+<a name="ln1526">    // We just loop on all tablets; if a tablet does not have a replica on this</a>
+<a name="ln1527">    // TS, MarkReplicaFailed() returns false and we ignore the return value.</a>
+<a name="ln1528">    tablet.second-&gt;MarkReplicaFailed(ts, ts_status);</a>
+<a name="ln1529">  }</a>
+<a name="ln1530">}</a>
+<a name="ln1531"> </a>
+<a name="ln1532">bool MetaCache::AcquireMasterLookupPermit() {</a>
+<a name="ln1533">  return master_lookup_sem_.TryAcquire();</a>
+<a name="ln1534">}</a>
+<a name="ln1535"> </a>
+<a name="ln1536">void MetaCache::ReleaseMasterLookupPermit() {</a>
+<a name="ln1537">  master_lookup_sem_.Release();</a>
+<a name="ln1538">}</a>
+<a name="ln1539"> </a>
+<a name="ln1540">void MetaCache::LookupDataGroup::Finished(</a>
+<a name="ln1541">    int64_t request_no, const ToStringable&amp; id, bool allow_absence) {</a>
+<a name="ln1542">  int64_t expected = request_no;</a>
+<a name="ln1543">  if (!running_request_number.compare_exchange_strong(expected, 0, std::memory_order_acq_rel)) {</a>
+<a name="ln1544">    if ((expected == 0 &amp;&amp; max_completed_request_number &lt;= request_no) &amp;&amp; !allow_absence) {</a>
+<a name="ln1545">      LOG(DFATAL) &lt;&lt; &quot;Lookup was not running for &quot; &lt;&lt; id.ToString() &lt;&lt; &quot;, expected: &quot; &lt;&lt; request_no;</a>
+<a name="ln1546">    } else {</a>
+<a name="ln1547">      LOG(INFO)</a>
+<a name="ln1548">          &lt;&lt; &quot;Finished lookup for &quot; &lt;&lt; id.ToString() &lt;&lt; &quot;: &quot; &lt;&lt; request_no &lt;&lt; &quot;, while &quot;</a>
+<a name="ln1549">          &lt;&lt; expected &lt;&lt; &quot; was running, could happen during tablet split&quot;;</a>
+<a name="ln1550">    }</a>
+<a name="ln1551">  } else {</a>
+<a name="ln1552">    max_completed_request_number = std::max(max_completed_request_number, request_no);</a>
+<a name="ln1553">    VLOG_WITH_FUNC(2) &lt;&lt; &quot;Finished lookup for &quot; &lt;&lt; id.ToString() &lt;&lt; &quot;, no: &quot; &lt;&lt; request_no;</a>
+<a name="ln1554">  }</a>
+<a name="ln1555">}</a>
+<a name="ln1556"> </a>
+<a name="ln1557">} // namespace internal</a>
+<a name="ln1558">} // namespace client</a>
+<a name="ln1559">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="141"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="174"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="289"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="326"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="365"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="381"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="387"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v556/" target="_blank">V556</a> The values of different enum types are compared: switch(ENUM_TYPE_A) { case ENUM_TYPE_B: ... }.</p></div>
+<div class="balloon" rel="407"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="435"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="447"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v556/" target="_blank">V556</a> The values of different enum types are compared.</p></div>
+<div class="balloon" rel="468"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="469"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="483"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="484"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="494"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="529"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="541"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="542"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="613"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="665"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="791"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="794"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="833"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="835"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="841"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="892"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="924"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="933"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="935"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="957"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="962"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="974"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="978"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="987"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1025"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1213"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1252"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1279"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1333"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1397"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1404"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1420"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1432"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1464"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1488"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1493"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1505"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1514"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1553"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

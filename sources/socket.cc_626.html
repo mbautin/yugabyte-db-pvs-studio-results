@@ -1,0 +1,686 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>socket.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/util/net/socket.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;errno.h&gt;</a>
+<a name="ln36">#include &lt;fcntl.h&gt;</a>
+<a name="ln37">#include &lt;netinet/in.h&gt;</a>
+<a name="ln38">#include &lt;netinet/tcp.h&gt;</a>
+<a name="ln39">#include &lt;sys/socket.h&gt;</a>
+<a name="ln40">#include &lt;sys/types.h&gt;</a>
+<a name="ln41">#include &lt;unistd.h&gt;</a>
+<a name="ln42"> </a>
+<a name="ln43">#include &lt;limits&gt;</a>
+<a name="ln44">#include &lt;numeric&gt;</a>
+<a name="ln45">#include &lt;string&gt;</a>
+<a name="ln46"> </a>
+<a name="ln47">#include &lt;glog/logging.h&gt;</a>
+<a name="ln48"> </a>
+<a name="ln49">#include &quot;yb/gutil/basictypes.h&quot;</a>
+<a name="ln50">#include &quot;yb/gutil/stringprintf.h&quot;</a>
+<a name="ln51">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln52">#include &quot;yb/util/debug/trace_event.h&quot;</a>
+<a name="ln53">#include &quot;yb/util/errno.h&quot;</a>
+<a name="ln54">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln55">#include &quot;yb/util/monotime.h&quot;</a>
+<a name="ln56">#include &quot;yb/util/net/net_util.h&quot;</a>
+<a name="ln57">#include &quot;yb/util/net/sockaddr.h&quot;</a>
+<a name="ln58">#include &quot;yb/util/random.h&quot;</a>
+<a name="ln59">#include &quot;yb/util/random_util.h&quot;</a>
+<a name="ln60">#include &quot;yb/util/subprocess.h&quot;</a>
+<a name="ln61"> </a>
+<a name="ln62">DEFINE_string(local_ip_for_outbound_sockets, &quot;&quot;,</a>
+<a name="ln63">              &quot;IP to bind to when making outgoing socket connections. &quot;</a>
+<a name="ln64">              &quot;This must be an IP address of the form A.B.C.D, not a hostname. &quot;</a>
+<a name="ln65">              &quot;Advanced parameter, subject to change.&quot;);</a>
+<a name="ln66">TAG_FLAG(local_ip_for_outbound_sockets, experimental);</a>
+<a name="ln67"> </a>
+<a name="ln68">DEFINE_bool(socket_inject_short_recvs, false,</a>
+<a name="ln69">            &quot;Inject short recv() responses which return less data than &quot;</a>
+<a name="ln70">            &quot;requested&quot;);</a>
+<a name="ln71">TAG_FLAG(socket_inject_short_recvs, hidden);</a>
+<a name="ln72">TAG_FLAG(socket_inject_short_recvs, unsafe);</a>
+<a name="ln73"> </a>
+<a name="ln74">namespace yb {</a>
+<a name="ln75"> </a>
+<a name="ln76">size_t IoVecsFullSize(const IoVecs&amp; io_vecs) {</a>
+<a name="ln77">  return std::accumulate(io_vecs.begin(), io_vecs.end(), 0ULL, [](size_t p, const iovec&amp; v) {</a>
+<a name="ln78">    return p + v.iov_len;</a>
+<a name="ln79">  });</a>
+<a name="ln80">}</a>
+<a name="ln81"> </a>
+<a name="ln82">void IoVecsToBuffer(const IoVecs&amp; io_vecs, size_t begin, size_t end, std::vector&lt;char&gt;* result) {</a>
+<a name="ln83">  result-&gt;clear();</a>
+<a name="ln84">  result-&gt;reserve(end - begin);</a>
+<a name="ln85">  for (const auto&amp; io_vec : io_vecs) {</a>
+<a name="ln86">    if (begin == end) {</a>
+<a name="ln87">      break;</a>
+<a name="ln88">    }</a>
+<a name="ln89">    if (io_vec.iov_len &gt; begin) {</a>
+<a name="ln90">      size_t clen = std::min(io_vec.iov_len, end) - begin;</a>
+<a name="ln91">      auto start = IoVecBegin(io_vec) + begin;</a>
+<a name="ln92">      result-&gt;insert(result-&gt;end(), start, start + clen);</a>
+<a name="ln93">      begin += clen;</a>
+<a name="ln94">    }</a>
+<a name="ln95">    begin -= io_vec.iov_len;</a>
+<a name="ln96">    end -= io_vec.iov_len;</a>
+<a name="ln97">  }</a>
+<a name="ln98">}</a>
+<a name="ln99"> </a>
+<a name="ln100">void IoVecsToBuffer(const IoVecs&amp; io_vecs, size_t begin, size_t end, char* result) {</a>
+<a name="ln101">  for (const auto&amp; io_vec : io_vecs) {</a>
+<a name="ln102">    if (begin == end) {</a>
+<a name="ln103">      break;</a>
+<a name="ln104">    }</a>
+<a name="ln105">    if (io_vec.iov_len &gt; begin) {</a>
+<a name="ln106">      size_t clen = std::min(io_vec.iov_len, end) - begin;</a>
+<a name="ln107">      auto start = IoVecBegin(io_vec) + begin;</a>
+<a name="ln108">      memcpy(result, start, clen);</a>
+<a name="ln109">      result += clen;</a>
+<a name="ln110">      begin += clen;</a>
+<a name="ln111">    }</a>
+<a name="ln112">    begin -= io_vec.iov_len;</a>
+<a name="ln113">    end -= io_vec.iov_len;</a>
+<a name="ln114">  }</a>
+<a name="ln115">}</a>
+<a name="ln116"> </a>
+<a name="ln117">Socket::Socket()</a>
+<a name="ln118">  : fd_(-1) {</a>
+<a name="ln119">}</a>
+<a name="ln120"> </a>
+<a name="ln121">Socket::Socket(int fd)</a>
+<a name="ln122">  : fd_(fd) {</a>
+<a name="ln123">}</a>
+<a name="ln124"> </a>
+<a name="ln125">void Socket::Reset(int fd) {</a>
+<a name="ln126">  ignore_result(Close());</a>
+<a name="ln127">  fd_ = fd;</a>
+<a name="ln128">}</a>
+<a name="ln129"> </a>
+<a name="ln130">int Socket::Release() {</a>
+<a name="ln131">  int fd = fd_;</a>
+<a name="ln132">  fd_ = -1;</a>
+<a name="ln133">  return fd;</a>
+<a name="ln134">}</a>
+<a name="ln135"> </a>
+<a name="ln136">Socket::~Socket() {</a>
+<a name="ln137">  auto status = Close();</a>
+<a name="ln138">  if (!status.ok()) {</a>
+<a name="ln139">    LOG(WARNING) &lt;&lt; &quot;Failed to close socket: &quot; &lt;&lt; status.ToString();</a>
+<a name="ln140">  }</a>
+<a name="ln141">}</a>
+<a name="ln142"> </a>
+<a name="ln143">Status Socket::Close() {</a>
+<a name="ln144">  if (fd_ &lt; 0)</a>
+<a name="ln145">    return Status::OK();</a>
+<a name="ln146">  int fd = fd_;</a>
+<a name="ln147">  fd_ = -1;</a>
+<a name="ln148">  if (::close(fd) &lt; 0) {</a>
+<a name="ln149">    return STATUS(NetworkError, &quot;Close error&quot;, Errno(errno));</a>
+<a name="ln150">  }</a>
+<a name="ln151">  return Status::OK();</a>
+<a name="ln152">}</a>
+<a name="ln153"> </a>
+<a name="ln154">Status Socket::Shutdown(bool shut_read, bool shut_write) {</a>
+<a name="ln155">  DCHECK_GE(fd_, 0);</a>
+<a name="ln156">  int flags = 0;</a>
+<a name="ln157">  if (shut_read &amp;&amp; shut_write) {</a>
+<a name="ln158">    flags |= SHUT_RDWR;</a>
+<a name="ln159">  } else if (shut_read) {</a>
+<a name="ln160">    flags |= SHUT_RD;</a>
+<a name="ln161">  } else if (shut_write) {</a>
+<a name="ln162">    flags |= SHUT_WR;</a>
+<a name="ln163">  }</a>
+<a name="ln164">  if (::shutdown(fd_, flags) &lt; 0) {</a>
+<a name="ln165">    return STATUS(NetworkError, &quot;Shutdown error&quot;, Errno(errno));</a>
+<a name="ln166">  }</a>
+<a name="ln167">  return Status::OK();</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170">int Socket::GetFd() const {</a>
+<a name="ln171">  return fd_;</a>
+<a name="ln172">}</a>
+<a name="ln173"> </a>
+<a name="ln174">bool Socket::IsTemporarySocketError(const Status&amp; status) {</a>
+<a name="ln175">  if (!status.IsNetworkError()) {</a>
+<a name="ln176">    return false;</a>
+<a name="ln177">  }</a>
+<a name="ln178">  auto err = Errno(status);</a>
+<a name="ln179">  return err == EAGAIN || err == EWOULDBLOCK || err == EINTR || err == EINPROGRESS;</a>
+<a name="ln180">}</a>
+<a name="ln181"> </a>
+<a name="ln182">#if defined(__linux__)</a>
+<a name="ln183"> </a>
+<a name="ln184">Status Socket::Init(int flags) {</a>
+<a name="ln185">  auto family = flags &amp; FLAG_IPV6 ? AF_INET6 : AF_INET;</a>
+<a name="ln186">  int nonblocking_flag = (flags &amp; FLAG_NONBLOCKING) ? SOCK_NONBLOCK : 0;</a>
+<a name="ln187">  Reset(::socket(family, SOCK_STREAM | SOCK_CLOEXEC | nonblocking_flag, 0));</a>
+<a name="ln188">  if (fd_ &lt; 0) {</a>
+<a name="ln189">    return STATUS(NetworkError, &quot;Error opening socket&quot;, Errno(errno));</a>
+<a name="ln190">  }</a>
+<a name="ln191"> </a>
+<a name="ln192">  return Status::OK();</a>
+<a name="ln193">}</a>
+<a name="ln194"> </a>
+<a name="ln195">#else</a>
+<a name="ln196"> </a>
+<a name="ln197">Status Socket::Init(int flags) {</a>
+<a name="ln198">  Reset(::socket(flags &amp; FLAG_IPV6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0));</a>
+<a name="ln199">  if (fd_ &lt; 0) {</a>
+<a name="ln200">    return STATUS(NetworkError, &quot;Error opening socket&quot;, Errno(errno));</a>
+<a name="ln201">  }</a>
+<a name="ln202">  RETURN_NOT_OK(SetNonBlocking(flags &amp; FLAG_NONBLOCKING));</a>
+<a name="ln203">  RETURN_NOT_OK(SetCloseOnExec());</a>
+<a name="ln204"> </a>
+<a name="ln205">  // Disable SIGPIPE.</a>
+<a name="ln206">  int set = 1;</a>
+<a name="ln207">  if (setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, &amp;set, sizeof(set)) == -1) {</a>
+<a name="ln208">    return STATUS(NetworkError, &quot;Failed to set SO_NOSIGPIPE&quot;, Errno(errno));</a>
+<a name="ln209">  }</a>
+<a name="ln210"> </a>
+<a name="ln211">  return Status::OK();</a>
+<a name="ln212">}</a>
+<a name="ln213"> </a>
+<a name="ln214">#endif // defined(__linux__)</a>
+<a name="ln215"> </a>
+<a name="ln216">Status Socket::SetNoDelay(bool enabled) {</a>
+<a name="ln217">  int flag = enabled ? 1 : 0;</a>
+<a name="ln218">  if (setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &amp;flag, sizeof(flag)) == -1) {</a>
+<a name="ln219">    return STATUS(NetworkError, &quot;Failed to set TCP_NODELAY&quot;, Errno(errno));</a>
+<a name="ln220">  }</a>
+<a name="ln221">  return Status::OK();</a>
+<a name="ln222">}</a>
+<a name="ln223"> </a>
+<a name="ln224">Status Socket::SetNonBlocking(bool enabled) {</a>
+<a name="ln225">  int curflags = ::fcntl(fd_, F_GETFL, 0);</a>
+<a name="ln226">  if (curflags == -1) {</a>
+<a name="ln227">    return STATUS(</a>
+<a name="ln228">        NetworkError, StringPrintf(&quot;Failed to get file status flags on fd %d&quot;, fd_),</a>
+<a name="ln229">        Errno(errno));</a>
+<a name="ln230">  }</a>
+<a name="ln231">  int newflags = (enabled) ? (curflags | O_NONBLOCK) : (curflags &amp; ~O_NONBLOCK);</a>
+<a name="ln232">  if (::fcntl(fd_, F_SETFL, newflags) == -1) {</a>
+<a name="ln233">    if (enabled) {</a>
+<a name="ln234">      return STATUS(</a>
+<a name="ln235">          NetworkError, StringPrintf(&quot;Failed to set O_NONBLOCK on fd %d&quot;, fd_), Errno(errno));</a>
+<a name="ln236">    } else {</a>
+<a name="ln237">      return STATUS(</a>
+<a name="ln238">          NetworkError, StringPrintf(&quot;Failed to clear O_NONBLOCK on fd %d&quot;, fd_), Errno(errno));</a>
+<a name="ln239">    }</a>
+<a name="ln240">  }</a>
+<a name="ln241">  return Status::OK();</a>
+<a name="ln242">}</a>
+<a name="ln243"> </a>
+<a name="ln244">Status Socket::IsNonBlocking(bool* is_nonblock) const {</a>
+<a name="ln245">  int curflags = ::fcntl(fd_, F_GETFL, 0);</a>
+<a name="ln246">  if (curflags == -1) {</a>
+<a name="ln247">    return STATUS(</a>
+<a name="ln248">        NetworkError, StringPrintf(&quot;Failed to get file status flags on fd %d&quot;, fd_), Errno(errno));</a>
+<a name="ln249">  }</a>
+<a name="ln250">  *is_nonblock = ((curflags &amp; O_NONBLOCK) != 0);</a>
+<a name="ln251">  return Status::OK();</a>
+<a name="ln252">}</a>
+<a name="ln253"> </a>
+<a name="ln254">Status Socket::SetCloseOnExec() {</a>
+<a name="ln255">  int curflags = fcntl(fd_, F_GETFD, 0);</a>
+<a name="ln256">  if (curflags == -1) {</a>
+<a name="ln257">    Reset(-1);</a>
+<a name="ln258">    return STATUS(NetworkError, &quot;fcntl(F_GETFD) error&quot;, Errno(errno));</a>
+<a name="ln259">  }</a>
+<a name="ln260">  if (fcntl(fd_, F_SETFD, curflags | FD_CLOEXEC) == -1) {</a>
+<a name="ln261">    Reset(-1);</a>
+<a name="ln262">    return STATUS(NetworkError, &quot;fcntl(F_SETFD) error&quot;, Errno(errno));</a>
+<a name="ln263">  }</a>
+<a name="ln264">  return Status::OK();</a>
+<a name="ln265">}</a>
+<a name="ln266"> </a>
+<a name="ln267">Status Socket::SetSendTimeout(const MonoDelta&amp; timeout) {</a>
+<a name="ln268">  return SetTimeout(SO_SNDTIMEO, &quot;SO_SNDTIMEO&quot;, timeout);</a>
+<a name="ln269">}</a>
+<a name="ln270"> </a>
+<a name="ln271">Status Socket::SetRecvTimeout(const MonoDelta&amp; timeout) {</a>
+<a name="ln272">  return SetTimeout(SO_RCVTIMEO, &quot;SO_RCVTIMEO&quot;, timeout);</a>
+<a name="ln273">}</a>
+<a name="ln274"> </a>
+<a name="ln275">Status Socket::SetReuseAddr(bool flag) {</a>
+<a name="ln276">  int int_flag = flag ? 1 : 0;</a>
+<a name="ln277">  if (setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &amp;int_flag, sizeof(int_flag)) == -1) {</a>
+<a name="ln278">    return STATUS(NetworkError, &quot;Failed to set SO_REUSEADDR&quot;, Errno(errno));</a>
+<a name="ln279">  }</a>
+<a name="ln280">  return Status::OK();</a>
+<a name="ln281">}</a>
+<a name="ln282"> </a>
+<a name="ln283">Status Socket::BindAndListen(const Endpoint&amp; sockaddr,</a>
+<a name="ln284">                             int listenQueueSize) {</a>
+<a name="ln285">  RETURN_NOT_OK(SetReuseAddr(true));</a>
+<a name="ln286">  RETURN_NOT_OK(Bind(sockaddr));</a>
+<a name="ln287">  RETURN_NOT_OK(Listen(listenQueueSize));</a>
+<a name="ln288">  return Status::OK();</a>
+<a name="ln289">}</a>
+<a name="ln290"> </a>
+<a name="ln291">Status Socket::Listen(int listen_queue_size) {</a>
+<a name="ln292">  if (listen(fd_, listen_queue_size)) {</a>
+<a name="ln293">    return STATUS(NetworkError, &quot;listen() error&quot;, Errno(errno));</a>
+<a name="ln294">  }</a>
+<a name="ln295">  return Status::OK();</a>
+<a name="ln296">}</a>
+<a name="ln297"> </a>
+<a name="ln298">namespace {</a>
+<a name="ln299"> </a>
+<a name="ln300">enum class EndpointType {</a>
+<a name="ln301">  REMOTE,</a>
+<a name="ln302">  LOCAL,</a>
+<a name="ln303">};</a>
+<a name="ln304"> </a>
+<a name="ln305">Status GetEndpoint(EndpointType type, int fd, Endpoint* out) {</a>
+<a name="ln306">  Endpoint temp;</a>
+<a name="ln307">  DCHECK_GE(fd, 0);</a>
+<a name="ln308">  socklen_t len = temp.capacity();</a>
+<a name="ln309">  auto result = type == EndpointType::LOCAL ? getsockname(fd, temp.data(), &amp;len)</a>
+<a name="ln310">                                            : getpeername(fd, temp.data(), &amp;len);</a>
+<a name="ln311">  if (result == -1) {</a>
+<a name="ln312">    const std::string prefix = type == EndpointType::LOCAL ? &quot;getsockname&quot; : &quot;getpeername&quot;;</a>
+<a name="ln313">    return STATUS(NetworkError, prefix + &quot; error&quot;, Errno(errno));</a>
+<a name="ln314">  }</a>
+<a name="ln315">  temp.resize(len);</a>
+<a name="ln316">  *out = temp;</a>
+<a name="ln317">  return Status::OK();</a>
+<a name="ln318">}</a>
+<a name="ln319"> </a>
+<a name="ln320">} // namespace</a>
+<a name="ln321"> </a>
+<a name="ln322">Status Socket::GetSocketAddress(Endpoint* out) const {</a>
+<a name="ln323">  return GetEndpoint(EndpointType::LOCAL, fd_, out);</a>
+<a name="ln324">}</a>
+<a name="ln325"> </a>
+<a name="ln326">Status Socket::GetPeerAddress(Endpoint* out) const {</a>
+<a name="ln327">  return GetEndpoint(EndpointType::REMOTE, fd_, out);</a>
+<a name="ln328">}</a>
+<a name="ln329"> </a>
+<a name="ln330">Status Socket::Bind(const Endpoint&amp; endpoint, bool explain_addr_in_use) {</a>
+<a name="ln331">  DCHECK_GE(fd_, 0);</a>
+<a name="ln332">  if (PREDICT_FALSE(::bind(fd_, endpoint.data(), endpoint.size()) != 0)) {</a>
+<a name="ln333">    Errno err(errno);</a>
+<a name="ln334">    Status s = STATUS(NetworkError, Format(&quot;Error binding socket to $0&quot;, endpoint), err);</a>
+<a name="ln335"> </a>
+<a name="ln336">    if (err == EADDRINUSE &amp;&amp; explain_addr_in_use &amp;&amp; endpoint.port() != 0) {</a>
+<a name="ln337">      TryRunLsof(endpoint);</a>
+<a name="ln338">    }</a>
+<a name="ln339">    return s;</a>
+<a name="ln340">  }</a>
+<a name="ln341"> </a>
+<a name="ln342">  return Status::OK();</a>
+<a name="ln343">}</a>
+<a name="ln344"> </a>
+<a name="ln345">Status Socket::Accept(Socket *new_conn, Endpoint* remote, int flags) {</a>
+<a name="ln346">  TRACE_EVENT0(&quot;net&quot;, &quot;Socket::Accept&quot;);</a>
+<a name="ln347">  Endpoint temp;</a>
+<a name="ln348">  socklen_t olen = temp.capacity();</a>
+<a name="ln349">  DCHECK_GE(fd_, 0);</a>
+<a name="ln350">#if defined(__linux__)</a>
+<a name="ln351">  int accept_flags = SOCK_CLOEXEC;</a>
+<a name="ln352">  if (flags &amp; FLAG_NONBLOCKING) {</a>
+<a name="ln353">    accept_flags |= SOCK_NONBLOCK;</a>
+<a name="ln354">  }</a>
+<a name="ln355">  new_conn-&gt;Reset(::accept4(fd_, temp.data(), &amp;olen, accept_flags));</a>
+<a name="ln356">  if (new_conn-&gt;GetFd() &lt; 0) {</a>
+<a name="ln357">    return STATUS(NetworkError, &quot;accept4(2) error&quot;, Errno(errno));</a>
+<a name="ln358">  }</a>
+<a name="ln359">#else</a>
+<a name="ln360">  new_conn-&gt;Reset(::accept(fd_, temp.data(), &amp;olen));</a>
+<a name="ln361">  if (new_conn-&gt;GetFd() &lt; 0) {</a>
+<a name="ln362">    return STATUS(NetworkError, &quot;accept(2) error&quot;, Errno(errno));</a>
+<a name="ln363">  }</a>
+<a name="ln364">  RETURN_NOT_OK(new_conn-&gt;SetNonBlocking(flags &amp; FLAG_NONBLOCKING));</a>
+<a name="ln365">  RETURN_NOT_OK(new_conn-&gt;SetCloseOnExec());</a>
+<a name="ln366">#endif // defined(__linux__)</a>
+<a name="ln367">  temp.resize(olen);</a>
+<a name="ln368"> </a>
+<a name="ln369">  *remote = temp;</a>
+<a name="ln370">  TRACE_EVENT_INSTANT1(&quot;net&quot;, &quot;Accepted&quot;, TRACE_EVENT_SCOPE_THREAD,</a>
+<a name="ln371">                       &quot;remote&quot;, ToString(*remote));</a>
+<a name="ln372">  return Status::OK();</a>
+<a name="ln373">}</a>
+<a name="ln374"> </a>
+<a name="ln375">Status Socket::BindForOutgoingConnection() {</a>
+<a name="ln376">  boost::system::error_code ec;</a>
+<a name="ln377">  auto bind_address = IpAddress::from_string(FLAGS_local_ip_for_outbound_sockets, ec);</a>
+<a name="ln378">  CHECK(!ec)</a>
+<a name="ln379">    &lt;&lt; &quot;Invalid local IP set for 'local_ip_for_outbound_sockets': '&quot;</a>
+<a name="ln380">    &lt;&lt; FLAGS_local_ip_for_outbound_sockets &lt;&lt; &quot;': &quot; &lt;&lt; ec;</a>
+<a name="ln381"> </a>
+<a name="ln382">  RETURN_NOT_OK(Bind(Endpoint(bind_address, 0)));</a>
+<a name="ln383">  return Status::OK();</a>
+<a name="ln384">}</a>
+<a name="ln385"> </a>
+<a name="ln386">Status Socket::Connect(const Endpoint&amp; remote) {</a>
+<a name="ln387">  TRACE_EVENT1(&quot;net&quot;, &quot;Socket::Connect&quot;, &quot;remote&quot;, ToString(remote));</a>
+<a name="ln388"> </a>
+<a name="ln389">  if (PREDICT_FALSE(!FLAGS_local_ip_for_outbound_sockets.empty())) {</a>
+<a name="ln390">    RETURN_NOT_OK(BindForOutgoingConnection());</a>
+<a name="ln391">  }</a>
+<a name="ln392"> </a>
+<a name="ln393">  DCHECK_GE(fd_, 0);</a>
+<a name="ln394">  if (::connect(fd_, remote.data(), remote.size()) &lt; 0) {</a>
+<a name="ln395">    return STATUS(NetworkError, &quot;connect(2) error&quot;, Errno(errno));</a>
+<a name="ln396">  }</a>
+<a name="ln397">  return Status::OK();</a>
+<a name="ln398">}</a>
+<a name="ln399"> </a>
+<a name="ln400">Status Socket::GetSockError() const {</a>
+<a name="ln401">  int val = 0, ret;</a>
+<a name="ln402">  socklen_t val_len = sizeof(val);</a>
+<a name="ln403">  DCHECK_GE(fd_, 0);</a>
+<a name="ln404">  ret = ::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &amp;val, &amp;val_len);</a>
+<a name="ln405">  if (ret) {</a>
+<a name="ln406">    return STATUS(NetworkError, &quot;getsockopt(SO_ERROR) failed&quot;, Errno(errno));</a>
+<a name="ln407">  }</a>
+<a name="ln408">  if (val != 0) {</a>
+<a name="ln409">    return STATUS(NetworkError, Errno(val));</a>
+<a name="ln410">  }</a>
+<a name="ln411">  return Status::OK();</a>
+<a name="ln412">}</a>
+<a name="ln413"> </a>
+<a name="ln414">Status Socket::Write(const uint8_t *buf, int32_t amt, int32_t *nwritten) {</a>
+<a name="ln415">  if (amt &lt;= 0) {</a>
+<a name="ln416">    return STATUS(</a>
+<a name="ln417">        NetworkError, StringPrintf(&quot;invalid send of %&quot; PRId32 &quot; bytes&quot;, amt), Errno(EINVAL));</a>
+<a name="ln418">  }</a>
+<a name="ln419">  DCHECK_GE(fd_, 0);</a>
+<a name="ln420">  int res = ::send(fd_, buf, amt, MSG_NOSIGNAL);</a>
+<a name="ln421">  if (res &lt; 0) {</a>
+<a name="ln422">    return STATUS(NetworkError, &quot;Write error&quot;, Errno(errno));</a>
+<a name="ln423">  }</a>
+<a name="ln424">  *nwritten = res;</a>
+<a name="ln425">  return Status::OK();</a>
+<a name="ln426">}</a>
+<a name="ln427"> </a>
+<a name="ln428">Status Socket::Writev(const struct ::iovec *iov, int iov_len,</a>
+<a name="ln429">                      int32_t *nwritten) {</a>
+<a name="ln430">  if (PREDICT_FALSE(iov_len &lt;= 0)) {</a>
+<a name="ln431">    return STATUS(NetworkError,</a>
+<a name="ln432">                  StringPrintf(&quot;Writev: invalid io vector length of %d&quot;, iov_len),</a>
+<a name="ln433">                  Slice() /* msg2 */, Errno(EINVAL));</a>
+<a name="ln434">  }</a>
+<a name="ln435">  DCHECK_GE(fd_, 0);</a>
+<a name="ln436"> </a>
+<a name="ln437">  struct msghdr msg;</a>
+<a name="ln438">  memset(&amp;msg, 0, sizeof(struct msghdr));</a>
+<a name="ln439">  msg.msg_iov = const_cast&lt;iovec *&gt;(iov);</a>
+<a name="ln440">  msg.msg_iovlen = iov_len;</a>
+<a name="ln441">  int res = ::sendmsg(fd_, &amp;msg, MSG_NOSIGNAL);</a>
+<a name="ln442">  if (PREDICT_FALSE(res &lt; 0)) {</a>
+<a name="ln443">    return STATUS(NetworkError, &quot;sendmsg error&quot;, Errno(errno));</a>
+<a name="ln444">  }</a>
+<a name="ln445"> </a>
+<a name="ln446">  *nwritten = res;</a>
+<a name="ln447">  return Status::OK();</a>
+<a name="ln448">}</a>
+<a name="ln449"> </a>
+<a name="ln450">// Mostly follows writen() from Stevens (2004) or Kerrisk (2010).</a>
+<a name="ln451">Status Socket::BlockingWrite(const uint8_t *buf, size_t buflen, size_t *nwritten,</a>
+<a name="ln452">    const MonoTime&amp; deadline) {</a>
+<a name="ln453">  DCHECK_LE(buflen, std::numeric_limits&lt;int32_t&gt;::max()) &lt;&lt; &quot;Writes &gt; INT32_MAX not supported&quot;;</a>
+<a name="ln454">  DCHECK(nwritten);</a>
+<a name="ln455"> </a>
+<a name="ln456">  size_t tot_written = 0;</a>
+<a name="ln457">  while (tot_written &lt; buflen) {</a>
+<a name="ln458">    int32_t inc_num_written = 0;</a>
+<a name="ln459">    int32_t num_to_write = buflen - tot_written;</a>
+<a name="ln460">    MonoDelta timeout = deadline.GetDeltaSince(MonoTime::Now());</a>
+<a name="ln461">    if (PREDICT_FALSE(timeout.ToNanoseconds() &lt;= 0)) {</a>
+<a name="ln462">      return STATUS(TimedOut, &quot;BlockingWrite timed out&quot;);</a>
+<a name="ln463">    }</a>
+<a name="ln464">    RETURN_NOT_OK(SetSendTimeout(timeout));</a>
+<a name="ln465">    Status s = Write(buf, num_to_write, &amp;inc_num_written);</a>
+<a name="ln466">    tot_written += inc_num_written;</a>
+<a name="ln467">    buf += inc_num_written;</a>
+<a name="ln468">    *nwritten = tot_written;</a>
+<a name="ln469"> </a>
+<a name="ln470">    if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln471">      Errno err(s);</a>
+<a name="ln472">      // Continue silently when the syscall is interrupted.</a>
+<a name="ln473">      if (err == EINTR) {</a>
+<a name="ln474">        continue;</a>
+<a name="ln475">      }</a>
+<a name="ln476">      if (err == EAGAIN) {</a>
+<a name="ln477">        return STATUS(TimedOut, &quot;&quot;);</a>
+<a name="ln478">      }</a>
+<a name="ln479">      return s.CloneAndPrepend(&quot;BlockingWrite error&quot;);</a>
+<a name="ln480">    }</a>
+<a name="ln481">    if (PREDICT_FALSE(inc_num_written == 0)) {</a>
+<a name="ln482">      // Shouldn't happen on Linux with a blocking socket. Maybe other Unices.</a>
+<a name="ln483">      break;</a>
+<a name="ln484">    }</a>
+<a name="ln485">  }</a>
+<a name="ln486"> </a>
+<a name="ln487">  if (tot_written &lt; buflen) {</a>
+<a name="ln488">    return STATUS(IOError, &quot;Wrote zero bytes on a BlockingWrite() call&quot;,</a>
+<a name="ln489">        StringPrintf(&quot;Transferred %zu of %zu bytes&quot;, tot_written, buflen));</a>
+<a name="ln490">  }</a>
+<a name="ln491">  return Status::OK();</a>
+<a name="ln492">}</a>
+<a name="ln493"> </a>
+<a name="ln494">Result&lt;int32_t&gt; Socket::Recv(uint8_t* buf, int32_t amt) {</a>
+<a name="ln495">  if (amt &lt;= 0) {</a>
+<a name="ln496">    return STATUS(</a>
+<a name="ln497">        NetworkError, StringPrintf(&quot;invalid recv of %d bytes&quot;, amt), Slice(), Errno(EINVAL));</a>
+<a name="ln498">  }</a>
+<a name="ln499"> </a>
+<a name="ln500">  // The recv() call can return fewer than the requested number of bytes.</a>
+<a name="ln501">  // Especially when 'amt' is small, this is very unlikely to happen in</a>
+<a name="ln502">  // the context of unit tests. So, we provide an injection hook which</a>
+<a name="ln503">  // simulates the same behavior.</a>
+<a name="ln504">  if (PREDICT_FALSE(FLAGS_socket_inject_short_recvs &amp;&amp; amt &gt; 1)) {</a>
+<a name="ln505">    Random r(GetRandomSeed32());</a>
+<a name="ln506">    amt = 1 + r.Uniform(amt - 1);</a>
+<a name="ln507">  }</a>
+<a name="ln508"> </a>
+<a name="ln509">  DCHECK_GE(fd_, 0);</a>
+<a name="ln510">  int res = ::recv(fd_, buf, amt, 0);</a>
+<a name="ln511">  if (res &lt;= 0) {</a>
+<a name="ln512">    if (res == 0) {</a>
+<a name="ln513">      return STATUS(NetworkError, &quot;Recv() got EOF from remote&quot;, Slice(), Errno(ESHUTDOWN));</a>
+<a name="ln514">    }</a>
+<a name="ln515">    return STATUS(NetworkError, &quot;Recv error&quot;, Errno(errno));</a>
+<a name="ln516">  }</a>
+<a name="ln517">  return res;</a>
+<a name="ln518">}</a>
+<a name="ln519"> </a>
+<a name="ln520">Result&lt;int32_t&gt; Socket::Recvv(IoVecs* vecs) {</a>
+<a name="ln521">  if (PREDICT_FALSE(vecs-&gt;empty())) {</a>
+<a name="ln522">    return STATUS(NetworkError, &quot;Recvv: receive to empty vecs&quot;);</a>
+<a name="ln523">  }</a>
+<a name="ln524">  if (fd_ &lt; 0) {</a>
+<a name="ln525">    return STATUS(NetworkError, &quot;Recvv on closed socket&quot;);</a>
+<a name="ln526">  }</a>
+<a name="ln527"> </a>
+<a name="ln528">  struct msghdr msg;</a>
+<a name="ln529">  memset(&amp;msg, 0, sizeof(struct msghdr));</a>
+<a name="ln530">  msg.msg_iov = vecs-&gt;data();</a>
+<a name="ln531">  msg.msg_iovlen = vecs-&gt;size();</a>
+<a name="ln532">  auto res = recvmsg(fd_, &amp;msg, MSG_NOSIGNAL);</a>
+<a name="ln533">  if (PREDICT_FALSE(res &lt;= 0)) {</a>
+<a name="ln534">    if (res == 0) {</a>
+<a name="ln535">      return STATUS(NetworkError, &quot;recvmsg got EOF from remote&quot;, Slice(), Errno(ESHUTDOWN));</a>
+<a name="ln536">    }</a>
+<a name="ln537">    return STATUS(NetworkError, &quot;recvmsg error&quot;, Errno(errno));</a>
+<a name="ln538">  }</a>
+<a name="ln539"> </a>
+<a name="ln540">  return res;</a>
+<a name="ln541">}</a>
+<a name="ln542"> </a>
+<a name="ln543">// Mostly follows readn() from Stevens (2004) or Kerrisk (2010).</a>
+<a name="ln544">// One place where we deviate: we consider EOF a failure if &lt; amt bytes are read.</a>
+<a name="ln545">Status Socket::BlockingRecv(uint8_t *buf, size_t amt, size_t *nread, const MonoTime&amp; deadline) {</a>
+<a name="ln546">  DCHECK_LE(amt, std::numeric_limits&lt;int32_t&gt;::max()) &lt;&lt; &quot;Reads &gt; INT32_MAX not supported&quot;;</a>
+<a name="ln547">  DCHECK(nread);</a>
+<a name="ln548">  size_t tot_read = 0;</a>
+<a name="ln549"> </a>
+<a name="ln550">  // We populate this with the full (initial) duration of the timeout on the first iteration of the</a>
+<a name="ln551">  // loop below.</a>
+<a name="ln552">  MonoDelta full_timeout;</a>
+<a name="ln553"> </a>
+<a name="ln554">  while (tot_read &lt; amt) {</a>
+<a name="ln555">    // Read at most the max value of int32_t bytes at a time.</a>
+<a name="ln556">    const int32_t num_to_read = std::min(amt - tot_read,</a>
+<a name="ln557">                                         static_cast&lt;size_t&gt;(std::numeric_limits&lt;int32_t&gt;::max()));</a>
+<a name="ln558">    const MonoDelta timeout = deadline.GetDeltaSince(MonoTime::Now());</a>
+<a name="ln559">    if (!full_timeout.Initialized()) {</a>
+<a name="ln560">      full_timeout = timeout;</a>
+<a name="ln561">    }</a>
+<a name="ln562">    if (PREDICT_FALSE(timeout.ToNanoseconds() &lt;= 0)) {</a>
+<a name="ln563">      VLOG(4) &lt;&lt; __func__ &lt;&lt; &quot; timed out in &quot; &lt;&lt; full_timeout.ToString();</a>
+<a name="ln564">      return STATUS(TimedOut, &quot;&quot;);</a>
+<a name="ln565">    }</a>
+<a name="ln566">    RETURN_NOT_OK(SetRecvTimeout(timeout));</a>
+<a name="ln567">    auto recv_res = Recv(buf, num_to_read);</a>
+<a name="ln568">    if (PREDICT_TRUE(recv_res.ok())) {</a>
+<a name="ln569">      auto inc_num_read = *recv_res;</a>
+<a name="ln570">      if (PREDICT_FALSE(inc_num_read == 0)) {</a>
+<a name="ln571">        // EOF.</a>
+<a name="ln572">        break;</a>
+<a name="ln573">      } else {</a>
+<a name="ln574">        tot_read += inc_num_read;</a>
+<a name="ln575">        buf += inc_num_read;</a>
+<a name="ln576">        *nread = tot_read;</a>
+<a name="ln577">      }</a>
+<a name="ln578">    } else {</a>
+<a name="ln579">      // Continue silently when the syscall is interrupted.</a>
+<a name="ln580">      //</a>
+<a name="ln581">      // We used to treat EAGAIN as a timeout, and the reason for that is not entirely clear</a>
+<a name="ln582">      // to me (mbautin). http://man7.org/linux/man-pages/man2/recv.2.html says that EAGAIN and</a>
+<a name="ln583">      // EWOULDBLOCK could be used interchangeably, and these could happen on a nonblocking socket</a>
+<a name="ln584">      // that no data is available on. I think we should just retry in that case.</a>
+<a name="ln585">      Errno err(recv_res.status());</a>
+<a name="ln586">      if (err == EINTR || err == EAGAIN) {</a>
+<a name="ln587">        continue;</a>
+<a name="ln588">      }</a>
+<a name="ln589">      return recv_res.status().CloneAndPrepend(&quot;BlockingRecv error&quot;);</a>
+<a name="ln590">    }</a>
+<a name="ln591">  }</a>
+<a name="ln592"> </a>
+<a name="ln593">  if (PREDICT_FALSE(tot_read &lt; amt)) {</a>
+<a name="ln594">    return STATUS(IOError, &quot;Read zero bytes on a blocking Recv() call&quot;,</a>
+<a name="ln595">        StringPrintf(&quot;Transferred %zu of %zu bytes&quot;, tot_read, amt));</a>
+<a name="ln596">  }</a>
+<a name="ln597">  return Status::OK();</a>
+<a name="ln598">}</a>
+<a name="ln599"> </a>
+<a name="ln600">Status Socket::SetTimeout(int opt, std::string optname, const MonoDelta&amp; timeout) {</a>
+<a name="ln601">  if (PREDICT_FALSE(timeout.ToNanoseconds() &lt; 0)) {</a>
+<a name="ln602">    return STATUS(InvalidArgument, &quot;Timeout specified as negative to SetTimeout&quot;,</a>
+<a name="ln603">                                   timeout.ToString());</a>
+<a name="ln604">  }</a>
+<a name="ln605">  struct timeval tv;</a>
+<a name="ln606">  timeout.ToTimeVal(&amp;tv);</a>
+<a name="ln607">  socklen_t optlen = sizeof(tv);</a>
+<a name="ln608">  if (::setsockopt(fd_, SOL_SOCKET, opt, &amp;tv, optlen) == -1) {</a>
+<a name="ln609">    return STATUS(</a>
+<a name="ln610">        NetworkError,</a>
+<a name="ln611">        StringPrintf(&quot;Failed to set %s to %s&quot;, optname.c_str(), timeout.ToString().c_str()),</a>
+<a name="ln612">        Errno(errno));</a>
+<a name="ln613">  }</a>
+<a name="ln614">  return Status::OK();</a>
+<a name="ln615">}</a>
+<a name="ln616"> </a>
+<a name="ln617">Result&lt;int32_t&gt; Socket::GetReceiveBufferSize() {</a>
+<a name="ln618">  int32_t val = 0;</a>
+<a name="ln619">  socklen_t val_len = sizeof(val);</a>
+<a name="ln620">  DCHECK_GE(fd_, 0);</a>
+<a name="ln621">  if (getsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &amp;val, &amp;val_len)) {</a>
+<a name="ln622">    return STATUS(NetworkError, &quot;Failed to get socket receive buffer&quot;, Errno(errno));</a>
+<a name="ln623">  }</a>
+<a name="ln624">  return val;</a>
+<a name="ln625">}</a>
+<a name="ln626"> </a>
+<a name="ln627">Status Socket::SetReceiveBufferSize(int32_t size) {</a>
+<a name="ln628">  int32_t val = size / 2; // Kernel will double this value</a>
+<a name="ln629">  DCHECK_GE(fd_, 0);</a>
+<a name="ln630">  if (setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &amp;val, sizeof(val))) {</a>
+<a name="ln631">    return STATUS(</a>
+<a name="ln632">        NetworkError, &quot;Failed to set socket receive buffer&quot;, Errno(errno));</a>
+<a name="ln633">  }</a>
+<a name="ln634">  return Status::OK();</a>
+<a name="ln635">}</a>
+<a name="ln636"> </a>
+<a name="ln637">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="378"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="454"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="547"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="563"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,168 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>pt_alter_role.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15">// Treenode definitions for ALTER TYPE statements.</a>
+<a name="ln16">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/yql/cql/ql/ptree/pt_alter_role.h&quot;</a>
+<a name="ln19">#include &quot;yb/yql/cql/ql/ptree/sem_context.h&quot;</a>
+<a name="ln20">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln21">#include &quot;yb/util/crypt.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">DECLARE_bool(use_cassandra_authentication);</a>
+<a name="ln24"> </a>
+<a name="ln25">namespace yb {</a>
+<a name="ln26">namespace ql {</a>
+<a name="ln27"> </a>
+<a name="ln28">using strings::Substitute;</a>
+<a name="ln29">using yb::util::bcrypt_hashpw;</a>
+<a name="ln30">using yb::util::kBcryptHashSize;</a>
+<a name="ln31"> </a>
+<a name="ln32">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln33">// Alter Role.</a>
+<a name="ln34"> </a>
+<a name="ln35">PTAlterRole::PTAlterRole(MemoryContext* memctx,</a>
+<a name="ln36">                         YBLocation::SharedPtr loc,</a>
+<a name="ln37">                         const MCSharedPtr&lt;MCString&gt;&amp; name,</a>
+<a name="ln38">                         const PTRoleOptionListNode::SharedPtr&amp; roleOptions)</a>
+<a name="ln39">    : TreeNode(memctx, loc),</a>
+<a name="ln40">      name_(name),</a>
+<a name="ln41">      roleOptions_(roleOptions) {</a>
+<a name="ln42">}</a>
+<a name="ln43"> </a>
+<a name="ln44">PTAlterRole::~PTAlterRole() {</a>
+<a name="ln45">}</a>
+<a name="ln46"> </a>
+<a name="ln47">CHECKED_STATUS PTAlterRole::Analyze(SemContext* sem_context) {</a>
+<a name="ln48">  SemState sem_state(sem_context);</a>
+<a name="ln49"> </a>
+<a name="ln50">  RETURN_NOT_AUTH_ENABLED(sem_context);</a>
+<a name="ln51">  RETURN_NOT_OK(sem_context-&gt;CheckHasRolePermission(loc(), PermissionType::ALTER_PERMISSION,</a>
+<a name="ln52">                                                    role_name()));</a>
+<a name="ln53"> </a>
+<a name="ln54">  // Save context state, and set &quot;this&quot; as current column in the context.</a>
+<a name="ln55">  SymbolEntry cached_entry = *sem_context-&gt;current_processing_id();</a>
+<a name="ln56">  if (roleOptions_!= nullptr) {</a>
+<a name="ln57">    RETURN_NOT_OK(roleOptions_-&gt;Analyze(sem_context));</a>
+<a name="ln58"> </a>
+<a name="ln59">    bool seen_password = false;</a>
+<a name="ln60">    bool seen_superuser = false;</a>
+<a name="ln61">    bool seen_login = false;</a>
+<a name="ln62"> </a>
+<a name="ln63">    for (auto&amp; roleOption : roleOptions_-&gt;node_list()) {</a>
+<a name="ln64">      switch (roleOption-&gt;option_type()) {</a>
+<a name="ln65">        case PTRoleOptionType::kLogin : {</a>
+<a name="ln66">          if (seen_login) {</a>
+<a name="ln67">            return sem_context-&gt;Error(roleOption, ErrorCode::INVALID_ROLE_DEFINITION);</a>
+<a name="ln68">          }</a>
+<a name="ln69">          PTRoleLogin *loginOpt = static_cast&lt;PTRoleLogin*&gt;(roleOption.get());</a>
+<a name="ln70">          login_ = loginOpt-&gt;login();</a>
+<a name="ln71">          seen_login = true;</a>
+<a name="ln72">          break;</a>
+<a name="ln73">        }</a>
+<a name="ln74">        case PTRoleOptionType::kPassword : {</a>
+<a name="ln75">          if (seen_password) {</a>
+<a name="ln76">            return sem_context-&gt;Error(roleOption, ErrorCode::INVALID_ROLE_DEFINITION);</a>
+<a name="ln77">          }</a>
+<a name="ln78">          PTRolePassword *passwordOpt = static_cast&lt;PTRolePassword*&gt;(roleOption.get());</a>
+<a name="ln79"> </a>
+<a name="ln80">          char hash[kBcryptHashSize];</a>
+<a name="ln81">          int ret = bcrypt_hashpw(passwordOpt-&gt;password(), hash);</a>
+<a name="ln82">          if (ret != 0) {</a>
+<a name="ln83">            return STATUS(IllegalState, Substitute(&quot;Could not hash password, reason: $0&quot;, ret));</a>
+<a name="ln84">          }</a>
+<a name="ln85">          salted_hash_ = MCMakeShared&lt;MCString&gt;(sem_context-&gt;PSemMem(), hash , kBcryptHashSize);</a>
+<a name="ln86">          seen_password = true;</a>
+<a name="ln87">          break;</a>
+<a name="ln88">        }</a>
+<a name="ln89">        case PTRoleOptionType::kSuperuser: {</a>
+<a name="ln90">          if (seen_superuser) {</a>
+<a name="ln91">            return sem_context-&gt;Error(roleOption, ErrorCode::INVALID_ROLE_DEFINITION);</a>
+<a name="ln92">          }</a>
+<a name="ln93">          PTRoleSuperuser *superuserOpt = static_cast&lt;PTRoleSuperuser*&gt;(roleOption.get());</a>
+<a name="ln94">          superuser_ = superuserOpt-&gt;superuser();</a>
+<a name="ln95">          seen_superuser = true;</a>
+<a name="ln96">          break;</a>
+<a name="ln97">        }</a>
+<a name="ln98">      }</a>
+<a name="ln99">    }</a>
+<a name="ln100"> </a>
+<a name="ln101">  }</a>
+<a name="ln102"> </a>
+<a name="ln103">  // Restore the context value as we are done with this table.</a>
+<a name="ln104">  sem_context-&gt;set_current_processing_id(cached_entry);</a>
+<a name="ln105">  if (VLOG_IS_ON(3)) {</a>
+<a name="ln106">    PrintSemanticAnalysisResult(sem_context);</a>
+<a name="ln107">  }</a>
+<a name="ln108"> </a>
+<a name="ln109">  return Status::OK();</a>
+<a name="ln110">}</a>
+<a name="ln111"> </a>
+<a name="ln112">void PTAlterRole::PrintSemanticAnalysisResult(SemContext* sem_context) {</a>
+<a name="ln113"> </a>
+<a name="ln114">  MCString sem_output(&quot;\tAlter Role &quot;, sem_context-&gt;PTempMem());</a>
+<a name="ln115">  sem_output = sem_output + &quot; role_name  &quot; + role_name() + &quot; salted_hash = &quot; + *salted_hash_;</a>
+<a name="ln116">  sem_output = sem_output + &quot; login = &quot; + (login() ? &quot;true&quot; : &quot;false&quot;);</a>
+<a name="ln117">  sem_output = sem_output + &quot; superuser = &quot; + (superuser() ? &quot;true&quot; : &quot;false&quot;);</a>
+<a name="ln118">  VLOG(3) &lt;&lt; &quot;SEMANTIC ANALYSIS RESULT (&quot; &lt;&lt; *loc_ &lt;&lt; &quot;):\n&quot; &lt;&lt; sem_output;</a>
+<a name="ln119">}</a>
+<a name="ln120"> </a>
+<a name="ln121">}  // namespace ql</a>
+<a name="ln122">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="118"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,450 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>leader_election.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/consensus/leader_election.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;mutex&gt;</a>
+<a name="ln36">#include &lt;functional&gt;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &quot;yb/consensus/consensus_meta.h&quot;</a>
+<a name="ln39">#include &quot;yb/consensus/consensus_peers.h&quot;</a>
+<a name="ln40">#include &quot;yb/consensus/metadata.pb.h&quot;</a>
+<a name="ln41">#include &quot;yb/consensus/opid_util.h&quot;</a>
+<a name="ln42">#include &quot;yb/gutil/bind.h&quot;</a>
+<a name="ln43">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln44">#include &quot;yb/gutil/port.h&quot;</a>
+<a name="ln45">#include &quot;yb/gutil/stl_util.h&quot;</a>
+<a name="ln46">#include &quot;yb/gutil/strings/join.h&quot;</a>
+<a name="ln47">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln48">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln49">#include &quot;yb/rpc/rpc_controller.h&quot;</a>
+<a name="ln50">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln51">#include &quot;yb/util/net/net_util.h&quot;</a>
+<a name="ln52">#include &quot;yb/util/status.h&quot;</a>
+<a name="ln53"> </a>
+<a name="ln54">using namespace std::literals;</a>
+<a name="ln55"> </a>
+<a name="ln56">namespace yb {</a>
+<a name="ln57">namespace consensus {</a>
+<a name="ln58"> </a>
+<a name="ln59">using std::string;</a>
+<a name="ln60">using strings::Substitute;</a>
+<a name="ln61"> </a>
+<a name="ln62">///////////////////////////////////////////////////</a>
+<a name="ln63">// VoteCounter</a>
+<a name="ln64">///////////////////////////////////////////////////</a>
+<a name="ln65"> </a>
+<a name="ln66">VoteCounter::VoteCounter(int num_voters, int majority_size)</a>
+<a name="ln67">  : num_voters_(num_voters),</a>
+<a name="ln68">    majority_size_(majority_size),</a>
+<a name="ln69">    yes_votes_(0),</a>
+<a name="ln70">    no_votes_(0) {</a>
+<a name="ln71">  CHECK_LE(majority_size, num_voters);</a>
+<a name="ln72">  CHECK_GT(num_voters_, 0);</a>
+<a name="ln73">  CHECK_GT(majority_size_, 0);</a>
+<a name="ln74">}</a>
+<a name="ln75"> </a>
+<a name="ln76">Status VoteCounter::RegisterVote(const std::string&amp; voter_uuid, ElectionVote vote,</a>
+<a name="ln77">                                 bool* is_duplicate) {</a>
+<a name="ln78">  // Handle repeated votes.</a>
+<a name="ln79">  if (PREDICT_FALSE(ContainsKey(votes_, voter_uuid))) {</a>
+<a name="ln80">    // Detect changed votes.</a>
+<a name="ln81">    ElectionVote prior_vote = votes_[voter_uuid];</a>
+<a name="ln82">    if (PREDICT_FALSE(prior_vote != vote)) {</a>
+<a name="ln83">      return STATUS_FORMAT(</a>
+<a name="ln84">          InvalidArgument,</a>
+<a name="ln85">          &quot;Peer $0 voted a different way twice in the same election. &quot;</a>
+<a name="ln86">          &quot;First vote: $1, second vote: $2.&quot;,</a>
+<a name="ln87">          voter_uuid, prior_vote, vote);</a>
+<a name="ln88">    }</a>
+<a name="ln89"> </a>
+<a name="ln90">    // This was just a duplicate. Allow the caller to log it but don't change</a>
+<a name="ln91">    // the voting record.</a>
+<a name="ln92">    *is_duplicate = true;</a>
+<a name="ln93">    return Status::OK();</a>
+<a name="ln94">  }</a>
+<a name="ln95"> </a>
+<a name="ln96">  // Sanity check to ensure we did not exceed the allowed number of voters.</a>
+<a name="ln97">  if (PREDICT_FALSE(yes_votes_ + no_votes_ == num_voters_)) {</a>
+<a name="ln98">    // More unique voters than allowed!</a>
+<a name="ln99">    return STATUS(InvalidArgument, Substitute(</a>
+<a name="ln100">        &quot;Vote from peer $0 would cause the number of votes to exceed the expected number of &quot;</a>
+<a name="ln101">        &quot;voters, which is $1. Votes already received from the following peers: {$2}&quot;,</a>
+<a name="ln102">        voter_uuid,</a>
+<a name="ln103">        num_voters_,</a>
+<a name="ln104">        JoinKeysIterator(votes_.begin(), votes_.end(), &quot;, &quot;)));</a>
+<a name="ln105">  }</a>
+<a name="ln106"> </a>
+<a name="ln107">  // This is a valid vote, so store it.</a>
+<a name="ln108">  InsertOrDie(&amp;votes_, voter_uuid, vote);</a>
+<a name="ln109">  switch (vote) {</a>
+<a name="ln110">    case ElectionVote::kGranted:</a>
+<a name="ln111">      ++yes_votes_;</a>
+<a name="ln112">      break;</a>
+<a name="ln113">    case ElectionVote::kDenied:</a>
+<a name="ln114">      ++no_votes_;</a>
+<a name="ln115">      break;</a>
+<a name="ln116">    case ElectionVote::kUnknown:</a>
+<a name="ln117">      return STATUS_FORMAT(InvalidArgument, &quot;Invalid vote: $0&quot;, vote);</a>
+<a name="ln118">  }</a>
+<a name="ln119">  *is_duplicate = false;</a>
+<a name="ln120">  return Status::OK();</a>
+<a name="ln121">}</a>
+<a name="ln122"> </a>
+<a name="ln123">ElectionVote VoteCounter::GetDecision() const {</a>
+<a name="ln124">  if (yes_votes_ &gt;= majority_size_) {</a>
+<a name="ln125">    return ElectionVote::kGranted;</a>
+<a name="ln126">  }</a>
+<a name="ln127">  if (no_votes_ &gt; num_voters_ - majority_size_) {</a>
+<a name="ln128">    return ElectionVote::kDenied;</a>
+<a name="ln129">  }</a>
+<a name="ln130">  return ElectionVote::kUnknown;</a>
+<a name="ln131">}</a>
+<a name="ln132"> </a>
+<a name="ln133">int VoteCounter::GetTotalVotesCounted() const {</a>
+<a name="ln134">  return yes_votes_ + no_votes_;</a>
+<a name="ln135">}</a>
+<a name="ln136"> </a>
+<a name="ln137">bool VoteCounter::AreAllVotesIn() const {</a>
+<a name="ln138">  return GetTotalVotesCounted() == num_voters_;</a>
+<a name="ln139">}</a>
+<a name="ln140"> </a>
+<a name="ln141">///////////////////////////////////////////////////</a>
+<a name="ln142">// LeaderElection</a>
+<a name="ln143">///////////////////////////////////////////////////</a>
+<a name="ln144"> </a>
+<a name="ln145">LeaderElection::LeaderElection(const RaftConfigPB&amp; config,</a>
+<a name="ln146">                               PeerProxyFactory* proxy_factory,</a>
+<a name="ln147">                               const VoteRequestPB&amp; request,</a>
+<a name="ln148">                               std::unique_ptr&lt;VoteCounter&gt; vote_counter,</a>
+<a name="ln149">                               MonoDelta timeout,</a>
+<a name="ln150">                               PreElection preelection,</a>
+<a name="ln151">                               TEST_SuppressVoteRequest suppress_vote_request,</a>
+<a name="ln152">                               ElectionDecisionCallback decision_callback)</a>
+<a name="ln153">    : request_(request),</a>
+<a name="ln154">      result_(preelection, request.candidate_term()),</a>
+<a name="ln155">      vote_counter_(std::move(vote_counter)),</a>
+<a name="ln156">      timeout_(timeout),</a>
+<a name="ln157">      suppress_vote_request_(suppress_vote_request),</a>
+<a name="ln158">      decision_callback_(std::move(decision_callback)) {</a>
+<a name="ln159">  for (const RaftPeerPB&amp; peer : config.peers()) {</a>
+<a name="ln160">    if (request.candidate_uuid() == peer.permanent_uuid()) continue;</a>
+<a name="ln161">    // Only peers with member_type == VOTER are allowed to vote.</a>
+<a name="ln162">    if (peer.member_type() != RaftPeerPB::VOTER) {</a>
+<a name="ln163">      LOG(INFO) &lt;&lt; &quot;Ignoring peer &quot; &lt;&lt; peer.permanent_uuid() &lt;&lt; &quot; vote because its member type is &quot;</a>
+<a name="ln164">                &lt;&lt; RaftPeerPB::MemberType_Name(peer.member_type());</a>
+<a name="ln165">      continue;</a>
+<a name="ln166">    }</a>
+<a name="ln167"> </a>
+<a name="ln168">    voting_follower_uuids_.push_back(peer.permanent_uuid());</a>
+<a name="ln169"> </a>
+<a name="ln170">    auto state = std::make_unique&lt;VoterState&gt;();</a>
+<a name="ln171">    state-&gt;proxy = proxy_factory-&gt;NewProxy(peer);</a>
+<a name="ln172">    CHECK(voter_state_.emplace(peer.permanent_uuid(), std::move(state)).second);</a>
+<a name="ln173">  }</a>
+<a name="ln174"> </a>
+<a name="ln175">  // Ensure that the candidate has already voted for itself.</a>
+<a name="ln176">  CHECK_EQ(1, vote_counter_-&gt;GetTotalVotesCounted()) &lt;&lt; &quot;Candidate must vote for itself first&quot;;</a>
+<a name="ln177"> </a>
+<a name="ln178">  // Ensure that existing votes + future votes add up to the expected total.</a>
+<a name="ln179">  CHECK_EQ(vote_counter_-&gt;GetTotalVotesCounted() + voting_follower_uuids_.size(),</a>
+<a name="ln180">           vote_counter_-&gt;GetTotalExpectedVotes())</a>
+<a name="ln181">      &lt;&lt; &quot;Expected different number of followers. Follower UUIDs: [&quot;</a>
+<a name="ln182">      &lt;&lt; yb::ToString(voting_follower_uuids_)</a>
+<a name="ln183">      &lt;&lt; &quot;]; RaftConfig: {&quot; &lt;&lt; config.ShortDebugString() &lt;&lt; &quot;}&quot;;</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186">LeaderElection::~LeaderElection() {</a>
+<a name="ln187">  std::lock_guard&lt;Lock&gt; guard(lock_);</a>
+<a name="ln188">  DCHECK(has_responded_); // We must always call the callback exactly once.</a>
+<a name="ln189">  voter_state_.clear();</a>
+<a name="ln190">}</a>
+<a name="ln191"> </a>
+<a name="ln192">void LeaderElection::Run() {</a>
+<a name="ln193">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Running leader election.&quot;;</a>
+<a name="ln194"> </a>
+<a name="ln195">  // Check if we have already won the election (relevant if this is a</a>
+<a name="ln196">  // single-node configuration, since we always pre-vote for ourselves).</a>
+<a name="ln197">  CheckForDecision();</a>
+<a name="ln198"> </a>
+<a name="ln199">  // The rest of the code below is for a typical multi-node configuration.</a>
+<a name="ln200">  for (const std::string&amp; voter_uuid : voting_follower_uuids_) {</a>
+<a name="ln201">    VoterState* state = nullptr;</a>
+<a name="ln202">    {</a>
+<a name="ln203">      std::lock_guard&lt;Lock&gt; guard(lock_);</a>
+<a name="ln204">      if (result_.decided()) { // Already have result.</a>
+<a name="ln205">        break;</a>
+<a name="ln206">      }</a>
+<a name="ln207">      auto it = voter_state_.find(voter_uuid);</a>
+<a name="ln208">      CHECK(it != voter_state_.end());</a>
+<a name="ln209">      state = it-&gt;second.get();</a>
+<a name="ln210">      // Safe to drop the lock because voter_state_ is not mutated outside of</a>
+<a name="ln211">      // the constructor / destructor. We do this to avoid deadlocks below.</a>
+<a name="ln212">    }</a>
+<a name="ln213"> </a>
+<a name="ln214">    // Send the RPC request.</a>
+<a name="ln215">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Requesting vote from peer &quot; &lt;&lt; voter_uuid;</a>
+<a name="ln216">    state-&gt;rpc.set_timeout(timeout_);</a>
+<a name="ln217"> </a>
+<a name="ln218">    state-&gt;request = request_;</a>
+<a name="ln219">    state-&gt;request.set_dest_uuid(voter_uuid);</a>
+<a name="ln220"> </a>
+<a name="ln221">    LeaderElectionPtr retained_self = this;</a>
+<a name="ln222">    if (!suppress_vote_request_) {</a>
+<a name="ln223">      state-&gt;rpc.set_invoke_callback_mode(rpc::InvokeCallbackMode::kThreadPoolHigh);</a>
+<a name="ln224">      state-&gt;proxy-&gt;RequestConsensusVoteAsync(</a>
+<a name="ln225">          &amp;state-&gt;request, &amp;state-&gt;response, &amp;state-&gt;rpc,</a>
+<a name="ln226">          std::bind(&amp;LeaderElection::VoteResponseRpcCallback, this, voter_uuid, retained_self));</a>
+<a name="ln227">    } else {</a>
+<a name="ln228">      state-&gt;response.set_responder_uuid(voter_uuid);</a>
+<a name="ln229">      VoteResponseRpcCallback(voter_uuid, retained_self);</a>
+<a name="ln230">    }</a>
+<a name="ln231">  }</a>
+<a name="ln232">}</a>
+<a name="ln233"> </a>
+<a name="ln234">void LeaderElection::CheckForDecision() {</a>
+<a name="ln235">  bool to_respond = false;</a>
+<a name="ln236">  {</a>
+<a name="ln237">    std::lock_guard&lt;Lock&gt; guard(lock_);</a>
+<a name="ln238">    // Check if the vote has been newly decided.</a>
+<a name="ln239">    auto decision = vote_counter_-&gt;GetDecision();</a>
+<a name="ln240">    if (!result_.decided() &amp;&amp; decision != ElectionVote::kUnknown) {</a>
+<a name="ln241">      LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Election decided. Result: candidate &quot;</a>
+<a name="ln242">                &lt;&lt; ((decision == ElectionVote::kGranted) ? &quot;won.&quot; : &quot;lost.&quot;);</a>
+<a name="ln243">      result_.decision = decision;</a>
+<a name="ln244">    }</a>
+<a name="ln245">    // Check whether to respond. This can happen as a result of either getting</a>
+<a name="ln246">    // a majority vote or of something invalidating the election, like</a>
+<a name="ln247">    // observing a higher term.</a>
+<a name="ln248">    if (result_.decided() &amp;&amp; !has_responded_) {</a>
+<a name="ln249">      has_responded_ = true;</a>
+<a name="ln250">      to_respond = true;</a>
+<a name="ln251">    }</a>
+<a name="ln252">  }</a>
+<a name="ln253"> </a>
+<a name="ln254">  // Respond outside of the lock.</a>
+<a name="ln255">  if (to_respond) {</a>
+<a name="ln256">    // This is thread-safe since result_ is write-once.</a>
+<a name="ln257">    decision_callback_(result_);</a>
+<a name="ln258">  }</a>
+<a name="ln259">}</a>
+<a name="ln260"> </a>
+<a name="ln261">void LeaderElection::VoteResponseRpcCallback(const std::string&amp; voter_uuid,</a>
+<a name="ln262">                                             const LeaderElectionPtr&amp; self) {</a>
+<a name="ln263">  {</a>
+<a name="ln264">    std::lock_guard&lt;Lock&gt; guard(lock_);</a>
+<a name="ln265"> </a>
+<a name="ln266">    if (has_responded_) {</a>
+<a name="ln267">      return;</a>
+<a name="ln268">    }</a>
+<a name="ln269"> </a>
+<a name="ln270">    auto it = voter_state_.find(voter_uuid);</a>
+<a name="ln271">    CHECK(it != voter_state_.end());</a>
+<a name="ln272">    VoterState* state = it-&gt;second.get();</a>
+<a name="ln273"> </a>
+<a name="ln274">    // Check for RPC errors.</a>
+<a name="ln275">    if (!state-&gt;rpc.status().ok()) {</a>
+<a name="ln276">      LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;RPC error from VoteRequest() call to peer &quot; &lt;&lt; voter_uuid</a>
+<a name="ln277">                  &lt;&lt; &quot;: &quot; &lt;&lt; state-&gt;rpc.status().ToString();</a>
+<a name="ln278">      RecordVoteUnlocked(voter_uuid, ElectionVote::kDenied);</a>
+<a name="ln279"> </a>
+<a name="ln280">    // Check for tablet errors.</a>
+<a name="ln281">    } else if (state-&gt;response.has_error()) {</a>
+<a name="ln282">      LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Tablet error from VoteRequest() call to peer &quot;</a>
+<a name="ln283">                   &lt;&lt; voter_uuid &lt;&lt; &quot;: &quot;</a>
+<a name="ln284">                   &lt;&lt; StatusFromPB(state-&gt;response.error().status()).ToString();</a>
+<a name="ln285">      RecordVoteUnlocked(voter_uuid, ElectionVote::kDenied);</a>
+<a name="ln286"> </a>
+<a name="ln287">    // If the peer changed their IP address, we shouldn't count this vote since</a>
+<a name="ln288">    // our knowledge of the configuration is in an inconsistent state.</a>
+<a name="ln289">    } else if (PREDICT_FALSE(voter_uuid != state-&gt;response.responder_uuid())) {</a>
+<a name="ln290">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Received vote response from peer we thought had UUID &quot;</a>
+<a name="ln291">                  &lt;&lt; voter_uuid &lt;&lt; &quot;, but its actual UUID is &quot; &lt;&lt; state-&gt;response.responder_uuid();</a>
+<a name="ln292">      RecordVoteUnlocked(voter_uuid, ElectionVote::kDenied);</a>
+<a name="ln293"> </a>
+<a name="ln294">    // Node does not support preelection</a>
+<a name="ln295">    } else if (result_.preelection &amp;&amp; !state-&gt;response.preelection()) {</a>
+<a name="ln296">      result_.preelections_not_supported_by_uuid = voter_uuid;</a>
+<a name="ln297">      HandleVoteDeniedUnlocked(voter_uuid, *state);</a>
+<a name="ln298"> </a>
+<a name="ln299">    // Count the granted votes.</a>
+<a name="ln300">    } else if (state-&gt;response.vote_granted()) {</a>
+<a name="ln301">      HandleVoteGrantedUnlocked(voter_uuid, *state);</a>
+<a name="ln302"> </a>
+<a name="ln303">    // Anything else is a denied vote.</a>
+<a name="ln304">    } else {</a>
+<a name="ln305">      HandleVoteDeniedUnlocked(voter_uuid, *state);</a>
+<a name="ln306">    }</a>
+<a name="ln307">  }</a>
+<a name="ln308"> </a>
+<a name="ln309">  // Check for a decision outside the lock.</a>
+<a name="ln310">  CheckForDecision();</a>
+<a name="ln311">}</a>
+<a name="ln312"> </a>
+<a name="ln313">void LeaderElection::RecordVoteUnlocked(const std::string&amp; voter_uuid, ElectionVote vote) {</a>
+<a name="ln314">  DCHECK(lock_.is_locked());</a>
+<a name="ln315"> </a>
+<a name="ln316">  // Record the vote.</a>
+<a name="ln317">  bool duplicate;</a>
+<a name="ln318">  Status s = vote_counter_-&gt;RegisterVote(voter_uuid, vote, &amp;duplicate);</a>
+<a name="ln319">  if (!s.ok()) {</a>
+<a name="ln320">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Error registering vote for peer &quot; &lt;&lt; voter_uuid</a>
+<a name="ln321">                 &lt;&lt; &quot;: &quot; &lt;&lt; s.ToString();</a>
+<a name="ln322">    return;</a>
+<a name="ln323">  }</a>
+<a name="ln324">  if (duplicate) {</a>
+<a name="ln325">    // Note: This is DFATAL because at the time of writing we do not support</a>
+<a name="ln326">    // retrying vote requests, so this should be impossible. It may be valid to</a>
+<a name="ln327">    // receive duplicate votes in the future if we implement retry.</a>
+<a name="ln328">    LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Duplicate vote received from peer &quot; &lt;&lt; voter_uuid;</a>
+<a name="ln329">  }</a>
+<a name="ln330">}</a>
+<a name="ln331"> </a>
+<a name="ln332">void LeaderElection::HandleHigherTermUnlocked(const string&amp; voter_uuid, const VoterState&amp; state) {</a>
+<a name="ln333">  DCHECK(lock_.is_locked());</a>
+<a name="ln334">  DCHECK_GT(state.response.responder_term(), consensus_term());</a>
+<a name="ln335"> </a>
+<a name="ln336">  string msg = Substitute(&quot;Vote denied by peer $0 with higher term. Message: $1&quot;,</a>
+<a name="ln337">                          state.response.responder_uuid(),</a>
+<a name="ln338">                          StatusFromPB(state.response.consensus_error().status()).ToString());</a>
+<a name="ln339">  LOG_WITH_PREFIX(WARNING) &lt;&lt; msg;</a>
+<a name="ln340"> </a>
+<a name="ln341">  if (!result_.decided()) {</a>
+<a name="ln342">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Cancelling election due to peer responding with higher term&quot;;</a>
+<a name="ln343">    result_.decision = ElectionVote::kDenied;</a>
+<a name="ln344">    result_.higher_term = state.response.responder_term();</a>
+<a name="ln345">    result_.message = msg;</a>
+<a name="ln346">  }</a>
+<a name="ln347">}</a>
+<a name="ln348"> </a>
+<a name="ln349">void LeaderElection::HandleVoteGrantedUnlocked(const string&amp; voter_uuid, const VoterState&amp; state) {</a>
+<a name="ln350">  DCHECK(lock_.is_locked());</a>
+<a name="ln351">  DCHECK_EQ(state.response.responder_term(), election_term());</a>
+<a name="ln352">  DCHECK(state.response.vote_granted());</a>
+<a name="ln353">  if (state.response.has_remaining_leader_lease_duration_ms()) {</a>
+<a name="ln354">    CoarseTimeLease lease(</a>
+<a name="ln355">        state.response.leader_lease_uuid(),</a>
+<a name="ln356">        CoarseMonoClock::Now() + state.response.remaining_leader_lease_duration_ms() * 1ms);</a>
+<a name="ln357">    result_.old_leader_lease.TryUpdate(lease);</a>
+<a name="ln358">  }</a>
+<a name="ln359"> </a>
+<a name="ln360">  if (state.response.has_leader_ht_lease_expiration()) {</a>
+<a name="ln361">    PhysicalComponentLease lease(</a>
+<a name="ln362">        state.response.leader_ht_lease_uuid(), state.response.leader_ht_lease_expiration());</a>
+<a name="ln363">    result_.old_leader_ht_lease.TryUpdate(lease);</a>
+<a name="ln364">  }</a>
+<a name="ln365"> </a>
+<a name="ln366">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Vote granted by peer &quot; &lt;&lt; voter_uuid;</a>
+<a name="ln367">  RecordVoteUnlocked(voter_uuid, ElectionVote::kGranted);</a>
+<a name="ln368">}</a>
+<a name="ln369"> </a>
+<a name="ln370">void LeaderElection::HandleVoteDeniedUnlocked(const string&amp; voter_uuid, const VoterState&amp; state) {</a>
+<a name="ln371">  DCHECK(lock_.is_locked());</a>
+<a name="ln372">  DCHECK(!state.response.vote_granted());</a>
+<a name="ln373"> </a>
+<a name="ln374">  // If one of the voters responds with a greater term than our own, and we</a>
+<a name="ln375">  // have not yet triggered the decision callback, it cancels the election.</a>
+<a name="ln376">  if (state.response.responder_term() &gt; consensus_term()) {</a>
+<a name="ln377">    return HandleHigherTermUnlocked(voter_uuid, state);</a>
+<a name="ln378">  }</a>
+<a name="ln379"> </a>
+<a name="ln380">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Vote denied by peer &quot; &lt;&lt; voter_uuid &lt;&lt; &quot;. Message: &quot;</a>
+<a name="ln381">            &lt;&lt; StatusFromPB(state.response.consensus_error().status()).ToString();</a>
+<a name="ln382">  RecordVoteUnlocked(voter_uuid, ElectionVote::kDenied);</a>
+<a name="ln383">}</a>
+<a name="ln384"> </a>
+<a name="ln385">std::string LeaderElection::LogPrefix() const {</a>
+<a name="ln386">  return Substitute(&quot;T $0 P $1 [CANDIDATE]: Term $2 $3election: &quot;,</a>
+<a name="ln387">                    request_.tablet_id(),</a>
+<a name="ln388">                    request_.candidate_uuid(),</a>
+<a name="ln389">                    request_.candidate_term(),</a>
+<a name="ln390">                    (result_.preelection ? &quot;pre-&quot; : &quot;&quot;));</a>
+<a name="ln391">}</a>
+<a name="ln392"> </a>
+<a name="ln393">} // namespace consensus</a>
+<a name="ln394">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="172"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="188"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="193"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="208"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="271"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="314"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="333"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="350"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="352"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="371"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="372"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

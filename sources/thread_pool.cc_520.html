@@ -1,0 +1,359 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>thread_pool.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/rpc/thread_pool.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;condition_variable&gt;</a>
+<a name="ln19">#include &lt;mutex&gt;</a>
+<a name="ln20">#include &lt;thread&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &lt;cds/container/basket_queue.h&gt;</a>
+<a name="ln23">#include &lt;cds/gc/dhp.h&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;yb/util/debug-util.h&quot;</a>
+<a name="ln26">#include &quot;yb/util/scope_exit.h&quot;</a>
+<a name="ln27">#include &quot;yb/util/thread.h&quot;</a>
+<a name="ln28"> </a>
+<a name="ln29">namespace yb {</a>
+<a name="ln30">namespace rpc {</a>
+<a name="ln31"> </a>
+<a name="ln32">namespace {</a>
+<a name="ln33"> </a>
+<a name="ln34">class Worker;</a>
+<a name="ln35"> </a>
+<a name="ln36">typedef cds::container::BasketQueue&lt;cds::gc::DHP, ThreadPoolTask*&gt; TaskQueue;</a>
+<a name="ln37">typedef cds::container::BasketQueue&lt;cds::gc::DHP, Worker*&gt; WaitingWorkers;</a>
+<a name="ln38"> </a>
+<a name="ln39">struct ThreadPoolShare {</a>
+<a name="ln40">  ThreadPoolOptions options;</a>
+<a name="ln41">  TaskQueue task_queue;</a>
+<a name="ln42">  WaitingWorkers waiting_workers;</a>
+<a name="ln43"> </a>
+<a name="ln44">  explicit ThreadPoolShare(ThreadPoolOptions o)</a>
+<a name="ln45">      : options(std::move(o)) {}</a>
+<a name="ln46">};</a>
+<a name="ln47"> </a>
+<a name="ln48">namespace {</a>
+<a name="ln49"> </a>
+<a name="ln50">const std::string kRpcThreadCategory = &quot;rpc_thread_pool&quot;;</a>
+<a name="ln51"> </a>
+<a name="ln52">} // namespace</a>
+<a name="ln53"> </a>
+<a name="ln54">class Worker {</a>
+<a name="ln55"> public:</a>
+<a name="ln56">  explicit Worker(ThreadPoolShare* share)</a>
+<a name="ln57">      : share_(share) {</a>
+<a name="ln58">  }</a>
+<a name="ln59"> </a>
+<a name="ln60">  CHECKED_STATUS Start(size_t index) {</a>
+<a name="ln61">    auto name = strings::Substitute(&quot;rpc_tp_$0_$1&quot;, share_-&gt;options.name, index);</a>
+<a name="ln62">    return yb::Thread::Create(kRpcThreadCategory, name, &amp;Worker::Execute, this, &amp;thread_);</a>
+<a name="ln63">  }</a>
+<a name="ln64"> </a>
+<a name="ln65">  ~Worker() {</a>
+<a name="ln66">    if (thread_) {</a>
+<a name="ln67">      thread_-&gt;Join();</a>
+<a name="ln68">    }</a>
+<a name="ln69">  }</a>
+<a name="ln70"> </a>
+<a name="ln71">  Worker(const Worker&amp; worker) = delete;</a>
+<a name="ln72">  void operator=(const Worker&amp; worker) = delete;</a>
+<a name="ln73"> </a>
+<a name="ln74">  void Stop() {</a>
+<a name="ln75">    stop_requested_ = true;</a>
+<a name="ln76">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln77">    cond_.notify_one();</a>
+<a name="ln78">  }</a>
+<a name="ln79"> </a>
+<a name="ln80">  bool Notify() {</a>
+<a name="ln81">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln82">    added_to_waiting_workers_ = false;</a>
+<a name="ln83">    // There could be cases when we popped task after adding ourselves to worker queue (see below).</a>
+<a name="ln84">    // So we are already processing task, but reside in worker queue.</a>
+<a name="ln85">    // To handle this case we use waiting_task_ flag.</a>
+<a name="ln86">    // If we don't wait task, we return false here, and next worker would be popped from queue</a>
+<a name="ln87">    // and notified.</a>
+<a name="ln88">    if (!waiting_task_) {</a>
+<a name="ln89">      return false;</a>
+<a name="ln90">    }</a>
+<a name="ln91">    cond_.notify_one();</a>
+<a name="ln92">    return true;</a>
+<a name="ln93">  }</a>
+<a name="ln94"> </a>
+<a name="ln95"> private:</a>
+<a name="ln96">  // Our main invariant is empty task queue or empty worker queue.</a>
+<a name="ln97">  // In other words, one of those queues should be empty.</a>
+<a name="ln98">  // Meaning that we does not have work (task queue empty) or</a>
+<a name="ln99">  // does not have free hands (worker queue empty)</a>
+<a name="ln100">  void Execute() {</a>
+<a name="ln101">    Thread::current_thread()-&gt;SetUserData(share_);</a>
+<a name="ln102">    while (!stop_requested_) {</a>
+<a name="ln103">      ThreadPoolTask* task = nullptr;</a>
+<a name="ln104">      if (PopTask(&amp;task)) {</a>
+<a name="ln105">        task-&gt;Run();</a>
+<a name="ln106">        task-&gt;Done(Status::OK());</a>
+<a name="ln107">      }</a>
+<a name="ln108">    }</a>
+<a name="ln109">  }</a>
+<a name="ln110"> </a>
+<a name="ln111">  bool PopTask(ThreadPoolTask** task) {</a>
+<a name="ln112">    // First of all we try to get already queued task, w/o locking.</a>
+<a name="ln113">    // If there is no task, so we could go to waiting state.</a>
+<a name="ln114">    if (share_-&gt;task_queue.pop(*task)) {</a>
+<a name="ln115">      return true;</a>
+<a name="ln116">    }</a>
+<a name="ln117">    std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln118">    waiting_task_ = true;</a>
+<a name="ln119">    auto se = ScopeExit([this] {</a>
+<a name="ln120">      waiting_task_ = false;</a>
+<a name="ln121">    });</a>
+<a name="ln122"> </a>
+<a name="ln123">    while (!stop_requested_) {</a>
+<a name="ln124">      AddToWaitingWorkers();</a>
+<a name="ln125"> </a>
+<a name="ln126">      // There could be situation, when task was queued before we added ourselves to</a>
+<a name="ln127">      // the worker queue. So worker queue could be empty in this case, and nobody was notified</a>
+<a name="ln128">      // about new task. So we check there for this case. This technique is similar to</a>
+<a name="ln129">      // double check.</a>
+<a name="ln130">      if (share_-&gt;task_queue.pop(*task)) {</a>
+<a name="ln131">        return true;</a>
+<a name="ln132">      }</a>
+<a name="ln133"> </a>
+<a name="ln134">      cond_.wait(lock);</a>
+<a name="ln135"> </a>
+<a name="ln136">      // Sometimes another worker could steal task before we wake up. In this case we will</a>
+<a name="ln137">      // just enqueue ourselves back.</a>
+<a name="ln138">      if (share_-&gt;task_queue.pop(*task)) {</a>
+<a name="ln139">        return true;</a>
+<a name="ln140">      }</a>
+<a name="ln141">    }</a>
+<a name="ln142">    return false;</a>
+<a name="ln143">  }</a>
+<a name="ln144"> </a>
+<a name="ln145">  void AddToWaitingWorkers() {</a>
+<a name="ln146">    if (!added_to_waiting_workers_) {</a>
+<a name="ln147">      auto pushed = share_-&gt;waiting_workers.push(this);</a>
+<a name="ln148">      DCHECK(pushed); // BasketQueue always succeed.</a>
+<a name="ln149">      added_to_waiting_workers_ = true;</a>
+<a name="ln150">    }</a>
+<a name="ln151">  }</a>
+<a name="ln152"> </a>
+<a name="ln153">  ThreadPoolShare* share_;</a>
+<a name="ln154">  scoped_refptr&lt;yb::Thread&gt; thread_;</a>
+<a name="ln155">  std::mutex mutex_;</a>
+<a name="ln156">  std::condition_variable cond_;</a>
+<a name="ln157">  std::atomic&lt;bool&gt; stop_requested_ = {false};</a>
+<a name="ln158">  bool waiting_task_ = false;</a>
+<a name="ln159">  bool added_to_waiting_workers_ = false;</a>
+<a name="ln160">};</a>
+<a name="ln161"> </a>
+<a name="ln162">} // namespace</a>
+<a name="ln163"> </a>
+<a name="ln164">class ThreadPool::Impl {</a>
+<a name="ln165"> public:</a>
+<a name="ln166">  explicit Impl(ThreadPoolOptions options)</a>
+<a name="ln167">      : share_(std::move(options)),</a>
+<a name="ln168">        queue_full_status_(STATUS_SUBSTITUTE(ServiceUnavailable,</a>
+<a name="ln169">                                             &quot;Queue is full, max items: $0&quot;,</a>
+<a name="ln170">                                             share_.options.queue_limit)) {</a>
+<a name="ln171">    LOG(INFO) &lt;&lt; &quot;Starting thread pool &quot; &lt;&lt; share_.options.ToString();</a>
+<a name="ln172">    workers_.reserve(share_.options.max_workers);</a>
+<a name="ln173">  }</a>
+<a name="ln174"> </a>
+<a name="ln175">  const ThreadPoolOptions&amp; options() const {</a>
+<a name="ln176">    return share_.options;</a>
+<a name="ln177">  }</a>
+<a name="ln178"> </a>
+<a name="ln179">  bool Enqueue(ThreadPoolTask* task) {</a>
+<a name="ln180">    ++adding_;</a>
+<a name="ln181">    if (closing_) {</a>
+<a name="ln182">      --adding_;</a>
+<a name="ln183">      task-&gt;Done(shutdown_status_);</a>
+<a name="ln184">      return false;</a>
+<a name="ln185">    }</a>
+<a name="ln186">    bool added = share_.task_queue.push(task);</a>
+<a name="ln187">    DCHECK(added); // BasketQueue always succeed.</a>
+<a name="ln188">    Worker* worker = nullptr;</a>
+<a name="ln189">    while (share_.waiting_workers.pop(worker)) {</a>
+<a name="ln190">      if (worker-&gt;Notify()) {</a>
+<a name="ln191">        --adding_;</a>
+<a name="ln192">        return true;</a>
+<a name="ln193">      }</a>
+<a name="ln194">    }</a>
+<a name="ln195">    --adding_;</a>
+<a name="ln196"> </a>
+<a name="ln197">    // We increment created_workers_ every time, the first max_worker increments would produce</a>
+<a name="ln198">    // a new worker. And after that, we will just increment it doing nothing after that.</a>
+<a name="ln199">    // So we could be lock free here.</a>
+<a name="ln200">    auto index = created_workers_++;</a>
+<a name="ln201">    if (index &lt; share_.options.max_workers) {</a>
+<a name="ln202">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln203">      if (!closing_) {</a>
+<a name="ln204">        auto new_worker = std::make_unique&lt;Worker&gt;(&amp;share_);</a>
+<a name="ln205">        auto status = new_worker-&gt;Start(workers_.size());</a>
+<a name="ln206">        if (status.ok()) {</a>
+<a name="ln207">          workers_.push_back(std::move(new_worker));</a>
+<a name="ln208">        } else if (workers_.empty()) {</a>
+<a name="ln209">          LOG(FATAL) &lt;&lt; &quot;Unable to start first worker: &quot; &lt;&lt; status;</a>
+<a name="ln210">        } else {</a>
+<a name="ln211">          LOG(WARNING) &lt;&lt; &quot;Unable to start worker: &quot; &lt;&lt; status;</a>
+<a name="ln212">        }</a>
+<a name="ln213">      }</a>
+<a name="ln214">    } else {</a>
+<a name="ln215">      --created_workers_;</a>
+<a name="ln216">    }</a>
+<a name="ln217">    return true;</a>
+<a name="ln218">  }</a>
+<a name="ln219"> </a>
+<a name="ln220">  void Shutdown() {</a>
+<a name="ln221">    // Block creating new workers.</a>
+<a name="ln222">    created_workers_ += share_.options.max_workers;</a>
+<a name="ln223">    {</a>
+<a name="ln224">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln225">      if (closing_) {</a>
+<a name="ln226">        CHECK(share_.task_queue.empty());</a>
+<a name="ln227">        CHECK(workers_.empty());</a>
+<a name="ln228">        return;</a>
+<a name="ln229">      }</a>
+<a name="ln230">      closing_ = true;</a>
+<a name="ln231">    }</a>
+<a name="ln232">    for (auto&amp; worker : workers_) {</a>
+<a name="ln233">      if (worker) {</a>
+<a name="ln234">        worker-&gt;Stop();</a>
+<a name="ln235">      }</a>
+<a name="ln236">    }</a>
+<a name="ln237">    // Shutdown is quite rare situation otherwise enqueue is quite frequent.</a>
+<a name="ln238">    // Because of this we use &quot;atomic lock&quot; in enqueue and busy wait in shutdown.</a>
+<a name="ln239">    // So we could process enqueue quickly, and stuck in shutdown for sometime.</a>
+<a name="ln240">    while (adding_ != 0) {</a>
+<a name="ln241">      std::this_thread::sleep_for(std::chrono::milliseconds(10));</a>
+<a name="ln242">    }</a>
+<a name="ln243">    workers_.clear();</a>
+<a name="ln244">    ThreadPoolTask* task = nullptr;</a>
+<a name="ln245">    while (share_.task_queue.pop(task)) {</a>
+<a name="ln246">      task-&gt;Done(shutdown_status_);</a>
+<a name="ln247">    }</a>
+<a name="ln248">  }</a>
+<a name="ln249"> </a>
+<a name="ln250">  bool Owns(Thread* thread) {</a>
+<a name="ln251">    return thread &amp;&amp; thread-&gt;user_data() == &amp;share_;</a>
+<a name="ln252">  }</a>
+<a name="ln253"> </a>
+<a name="ln254"> private:</a>
+<a name="ln255">  ThreadPoolShare share_;</a>
+<a name="ln256">  std::vector&lt;std::unique_ptr&lt;Worker&gt;&gt; workers_;</a>
+<a name="ln257">  std::atomic&lt;size_t&gt; created_workers_ = {0};</a>
+<a name="ln258">  std::mutex mutex_;</a>
+<a name="ln259">  std::atomic&lt;bool&gt; closing_ = {false};</a>
+<a name="ln260">  std::atomic&lt;size_t&gt; adding_ = {0};</a>
+<a name="ln261">  const Status shutdown_status_ = STATUS(Aborted, &quot;Service is shutting down&quot;);</a>
+<a name="ln262">  const Status queue_full_status_;</a>
+<a name="ln263">};</a>
+<a name="ln264"> </a>
+<a name="ln265">ThreadPool::ThreadPool(ThreadPoolOptions options)</a>
+<a name="ln266">    : impl_(new Impl(std::move(options))) {</a>
+<a name="ln267">}</a>
+<a name="ln268"> </a>
+<a name="ln269">ThreadPool::ThreadPool(ThreadPool&amp;&amp; rhs) noexcept</a>
+<a name="ln270">    : impl_(std::move(rhs.impl_)) {}</a>
+<a name="ln271"> </a>
+<a name="ln272">ThreadPool&amp; ThreadPool::operator=(ThreadPool&amp;&amp; rhs) noexcept {</a>
+<a name="ln273">  impl_-&gt;Shutdown();</a>
+<a name="ln274">  impl_ = std::move(rhs.impl_);</a>
+<a name="ln275">  return *this;</a>
+<a name="ln276">}</a>
+<a name="ln277"> </a>
+<a name="ln278">ThreadPool::~ThreadPool() {</a>
+<a name="ln279">  if (impl_) {</a>
+<a name="ln280">    impl_-&gt;Shutdown();</a>
+<a name="ln281">  }</a>
+<a name="ln282">}</a>
+<a name="ln283"> </a>
+<a name="ln284">bool ThreadPool::IsCurrentThreadRpcWorker() {</a>
+<a name="ln285">  const Thread* thread = Thread::current_thread();</a>
+<a name="ln286">  return thread != nullptr &amp;&amp; thread-&gt;category() == kRpcThreadCategory;</a>
+<a name="ln287">}</a>
+<a name="ln288"> </a>
+<a name="ln289">bool ThreadPool::Enqueue(ThreadPoolTask* task) {</a>
+<a name="ln290">  return impl_-&gt;Enqueue(task);</a>
+<a name="ln291">}</a>
+<a name="ln292"> </a>
+<a name="ln293">void ThreadPool::Shutdown() {</a>
+<a name="ln294">  impl_-&gt;Shutdown();</a>
+<a name="ln295">}</a>
+<a name="ln296"> </a>
+<a name="ln297">const ThreadPoolOptions&amp; ThreadPool::options() const {</a>
+<a name="ln298">  return impl_-&gt;options();</a>
+<a name="ln299">}</a>
+<a name="ln300"> </a>
+<a name="ln301">bool ThreadPool::Owns(Thread* thread) {</a>
+<a name="ln302">  return impl_-&gt;Owns(thread);</a>
+<a name="ln303">}</a>
+<a name="ln304"> </a>
+<a name="ln305">bool ThreadPool::OwnsThisThread() {</a>
+<a name="ln306">  return Owns(Thread::current_thread());</a>
+<a name="ln307">}</a>
+<a name="ln308"> </a>
+<a name="ln309">} // namespace rpc</a>
+<a name="ln310">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="148"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="187"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="226"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="227"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

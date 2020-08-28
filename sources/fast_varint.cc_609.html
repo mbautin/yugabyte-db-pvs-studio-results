@@ -1,0 +1,400 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>fast_varint.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/util/fast_varint.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/util/bytes_formatter.h&quot;</a>
+<a name="ln17">#include &quot;yb/util/debug/leakcheck_disabler.h&quot;</a>
+<a name="ln18">#include &quot;yb/util/cast.h&quot;</a>
+<a name="ln19">#include &quot;yb/util/debug-util.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">using std::string;</a>
+<a name="ln22"> </a>
+<a name="ln23">namespace yb {</a>
+<a name="ln24">namespace util {</a>
+<a name="ln25"> </a>
+<a name="ln26">namespace {</a>
+<a name="ln27"> </a>
+<a name="ln28">std::array&lt;uint8_t, 0x100&gt; MakeUnsignedVarIntSize() {</a>
+<a name="ln29">  std::array&lt;uint8_t, 0x100&gt; result;</a>
+<a name="ln30">  for (int i = 0; i &lt; 0x100; ++i) {</a>
+<a name="ln31">    // clz does not work when argument is zero, so we shift value and put 1 at the end.</a>
+<a name="ln32">    result[i] = __builtin_clz((i &lt;&lt; 1) ^ 0x1ff) - 23 + 1;</a>
+<a name="ln33">  }</a>
+<a name="ln34">  return result;</a>
+<a name="ln35">}</a>
+<a name="ln36"> </a>
+<a name="ln37">auto kUnsignedVarIntSize = MakeUnsignedVarIntSize();</a>
+<a name="ln38"> </a>
+<a name="ln39">Status NotEnoughEncodedBytes(size_t decoded_varint_size, size_t bytes_provided) {</a>
+<a name="ln40">  return STATUS_SUBSTITUTE(</a>
+<a name="ln41">      Corruption,</a>
+<a name="ln42">      &quot;Decoded VarInt size as $0 but only $1 bytes provided&quot;,</a>
+<a name="ln43">      decoded_varint_size, bytes_provided);</a>
+<a name="ln44">}</a>
+<a name="ln45"> </a>
+<a name="ln46">}  // anonymous namespace</a>
+<a name="ln47"> </a>
+<a name="ln48">int SignedPositiveVarIntLength(uint64_t v) {</a>
+<a name="ln49">  // Compute the number of bytes needed to represent this number.</a>
+<a name="ln50">  v &gt;&gt;= 6;</a>
+<a name="ln51">  int n = 1;</a>
+<a name="ln52">  while (v != 0) {</a>
+<a name="ln53">    v &gt;&gt;= 7;</a>
+<a name="ln54">    n += 1;</a>
+<a name="ln55">  }</a>
+<a name="ln56">  return n;</a>
+<a name="ln57">}</a>
+<a name="ln58"> </a>
+<a name="ln59">/*</a>
+<a name="ln60"> * - First bit is sign bit (0 for negative, 1 for positive)</a>
+<a name="ln61"> * - The rest is the unsigned representation of the absolute value, except for 2 differences:</a>
+<a name="ln62"> *    &gt; The size prefix is (|v|+1)/7 instead of |v|/7 (Where |v| is the bit length of v)</a>
+<a name="ln63"> *    &gt; For negative numbers, we have to complement everything (Note that we don't add 1, this</a>
+<a name="ln64"> *        is one's complement, not two's complement. So comp(v) = 2^|v|-1-v, not 2^|v|-v)</a>
+<a name="ln65"> *</a>
+<a name="ln66"> *    Bytes  Max Magnitude        Positives         Negatives</a>
+<a name="ln67"> *    -----  ---------            ---------         --------</a>
+<a name="ln68"> *    1      2^6-1 (63)           10[v]             01{-v}</a>
+<a name="ln69"> *    2      2^13-1 (8191)        110[v]            001{-v}</a>
+<a name="ln70"> *    3      2^20-1               1110[v]           0001{-v}</a>
+<a name="ln71"> *    4      2^27-1               11110[v]          00001{-v}</a>
+<a name="ln72"> *    5      2^34-1               111110[v]         000001{-v}</a>
+<a name="ln73"> *    6      2^41-1               1111110[v]        0000001{-v}</a>
+<a name="ln74"> *    7      2^48-1               11111110 [v]      00000001 {-v}</a>
+<a name="ln75"> *    8      2^55-1               11111111 0[v]     00000000 1{-v}</a>
+<a name="ln76"> *    9      2^62-1               11111111 10[v]    00000000 01{-v}</a>
+<a name="ln77"> *   10      2^69-1               11111111 110[v]   00000000 001{-v}</a>
+<a name="ln78"> */</a>
+<a name="ln79">void FastEncodeSignedVarInt(int64_t v, uint8_t *dest, size_t *size) {</a>
+<a name="ln80">  bool negative = v &lt; 0;</a>
+<a name="ln81"> </a>
+<a name="ln82">  uint64_t uv = static_cast&lt;uint64_t&gt;(v);</a>
+<a name="ln83">  if (negative) {</a>
+<a name="ln84">    uv = 1 + ~uv;</a>
+<a name="ln85">  }</a>
+<a name="ln86"> </a>
+<a name="ln87">  const int n = SignedPositiveVarIntLength(uv);</a>
+<a name="ln88">  *size = n;</a>
+<a name="ln89"> </a>
+<a name="ln90">  // For n = 1 we should get 128 (10000000) as the first byte.</a>
+<a name="ln91">  //   In this case we have 6 available bits to use in the first byte.</a>
+<a name="ln92">  //</a>
+<a name="ln93">  // For n = 2, we'll get ~63 = 192 (11000000) as the first byte.</a>
+<a name="ln94">  //   In this case we have 5 available bits in the first byte, and 8 in the second byte.</a>
+<a name="ln95">  //</a>
+<a name="ln96">  // For n = 3, we'll get ~31 = 224 (11100000) as the first byte.</a>
+<a name="ln97">  //   In this case we have 4 + 8 + 8 = 20 bits to use.</a>
+<a name="ln98">  // . . .</a>
+<a name="ln99">  //</a>
+<a name="ln100">  // For n = 8, we'll get 255 (11111111). Also, the next byte's highest bit is zero.</a>
+<a name="ln101">  //   In this case we have 7 available bits in the second byte and 8 in every byte afterwards,</a>
+<a name="ln102">  //   so 55 total available bits.</a>
+<a name="ln103">  //</a>
+<a name="ln104">  // For n = 9, we'll get 255 (11111111). Also, the next byte's two highest bits are 10.</a>
+<a name="ln105">  //   In this case we have 62 more bits to use.</a>
+<a name="ln106">  //</a>
+<a name="ln107">  // For n = 10, we'll get 255 (11111111). Also, the next byte's three highest bits are 110.</a>
+<a name="ln108">  //   In this case we have 69 (5 + 8 * 8) bits to use.</a>
+<a name="ln109"> </a>
+<a name="ln110">  int i;</a>
+<a name="ln111">  if (n == 10) {</a>
+<a name="ln112">    dest[0] = 0xff;</a>
+<a name="ln113">    // With a 10-byte encoding we are using 8 whole bytes to represent the number, which takes 63</a>
+<a name="ln114">    // bits or fewer, so no bits from the second byte are used, and it is always 11000000 (binary).</a>
+<a name="ln115">    dest[1] = 0xc0;</a>
+<a name="ln116">    i = 2;</a>
+<a name="ln117">  } else if (n == 9) {</a>
+<a name="ln118">    dest[0] = 0xff;</a>
+<a name="ln119">    // With 9-byte encoding bits 56-61 (6 bits) of the number go into the lower 6 bits of the second</a>
+<a name="ln120">    // byte, so it becomes 10xxxxxx where xxxxxx are the said 6 bits.</a>
+<a name="ln121">    dest[1] = 0x80 | (uv &gt;&gt; 56);</a>
+<a name="ln122">    i = 2;</a>
+<a name="ln123">  } else {</a>
+<a name="ln124">    // In these cases</a>
+<a name="ln125">    dest[0] = ~((1 &lt;&lt; (8 - n)) - 1) | (uv &gt;&gt; (8 * (n - 1)));</a>
+<a name="ln126">    i = 1;</a>
+<a name="ln127">  }</a>
+<a name="ln128">  for (; i &lt; n; ++i) {</a>
+<a name="ln129">    dest[i] = uv &gt;&gt; (8 * (n - 1 - i));</a>
+<a name="ln130">  }</a>
+<a name="ln131">  if (negative) {</a>
+<a name="ln132">    for (i = 0; i &lt; n; ++i) {</a>
+<a name="ln133">      dest[i] = ~dest[i];</a>
+<a name="ln134">    }</a>
+<a name="ln135">  }</a>
+<a name="ln136">}</a>
+<a name="ln137"> </a>
+<a name="ln138">std::string FastEncodeSignedVarIntToStr(int64_t v) {</a>
+<a name="ln139">  string s;</a>
+<a name="ln140">  FastAppendSignedVarIntToBuffer(v, &amp;s);</a>
+<a name="ln141">  return s;</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144">// Array of mask for decoding signed var int. Used to extract valuable bits from source.</a>
+<a name="ln145">// It is faster than calculating mask on the fly.</a>
+<a name="ln146">const uint64_t kVarIntMasks[] = {</a>
+<a name="ln147">                        0, // unused</a>
+<a name="ln148">                  0x3fULL,</a>
+<a name="ln149">                0x1fffULL,</a>
+<a name="ln150">               0xfffffULL,</a>
+<a name="ln151">             0x7ffffffULL,</a>
+<a name="ln152">           0x3ffffffffULL,</a>
+<a name="ln153">         0x1ffffffffffULL,</a>
+<a name="ln154">        0xffffffffffffULL,</a>
+<a name="ln155">      0x7fffffffffffffULL,</a>
+<a name="ln156">    0x3fffffffffffffffULL,</a>
+<a name="ln157">    0xffffffffffffffffULL,</a>
+<a name="ln158">};</a>
+<a name="ln159"> </a>
+<a name="ln160">Result&lt;std::pair&lt;int64_t, size_t&gt;&gt; FastDecodeSignedVarInt(const uint8_t* src, size_t src_size) {</a>
+<a name="ln161">  typedef std::pair&lt;int64_t, size_t&gt; ResultType;</a>
+<a name="ln162">  if (src_size == 0) {</a>
+<a name="ln163">    return STATUS(Corruption, &quot;Cannot decode a variable-length integer of zero size&quot;);</a>
+<a name="ln164">  }</a>
+<a name="ln165"> </a>
+<a name="ln166">  uint16_t header = src[0] &lt;&lt; 8 | (src_size &gt; 1 ? src[1] : 0);</a>
+<a name="ln167">  // When value is positive then negative = 0, otherwise it is 0xffffffffffffffff.</a>
+<a name="ln168">  uint64_t negative = -static_cast&lt;uint64_t&gt;((header &amp; 0x8000) == 0);</a>
+<a name="ln169">  header ^= negative;</a>
+<a name="ln170">  // We need to count ones, so invert the header. 0x7fff - mask when we count them.</a>
+<a name="ln171">  // 0x20 used to put one after end of range where we are interested in them.</a>
+<a name="ln172">  //</a>
+<a name="ln173">  // For example:</a>
+<a name="ln174">  // A positive number with a three-byte representation.</a>
+<a name="ln175">  // header                    : 1110???? ????????  (binary)</a>
+<a name="ln176">  // (~header &amp; 0x7fff) &amp; 0x20 : 0001???? ??1?????</a>
+<a name="ln177">  // Number of leading zeros   : 19 (considering the __builtin_clz argument is a 32-bit integer).</a>
+<a name="ln178">  // n_bytes                   : 3</a>
+<a name="ln179">  //</a>
+<a name="ln180">  // A negative number with a 10-byte representation.</a>
+<a name="ln181">  // header                    : 01111111 11??????  (binary)</a>
+<a name="ln182">  // (~header &amp; 0x7fff) &amp; 0x20 : 00000000 001?????</a>
+<a name="ln183">  // Number of leading zeros   : 26</a>
+<a name="ln184">  // n_bytes                   : 10</a>
+<a name="ln185">  //</a>
+<a name="ln186">  // Argument of __builtin_clz is always unsigned int.</a>
+<a name="ln187">  size_t n_bytes = __builtin_clz((~header &amp; 0x7fff) | 0x20) - 16;</a>
+<a name="ln188">  if (src_size &lt; n_bytes) {</a>
+<a name="ln189">    return NotEnoughEncodedBytes(n_bytes, src_size);</a>
+<a name="ln190">  }</a>
+<a name="ln191">  auto mask = kVarIntMasks[n_bytes];</a>
+<a name="ln192">#if defined(THREAD_SANITIZER) || defined(ADDRESS_SANITIZER)</a>
+<a name="ln193">  uint64_t temp = 0;</a>
+<a name="ln194">  for (const uint8_t* i = std::max(src - 8 + n_bytes, src); i != src + n_bytes; ++i) {</a>
+<a name="ln195">    temp = (temp &lt;&lt; 8) | *i;</a>
+<a name="ln196">  }</a>
+<a name="ln197">  return ResultType(((temp &amp; mask) | (~mask &amp; negative)) - negative, n_bytes);</a>
+<a name="ln198">#else</a>
+<a name="ln199">  // We are interested in range [src, src+n_bytes), so we use 64bit number that ends at src+n_bytes.</a>
+<a name="ln200">  // Then we use mask to drop header and bytes out of range.</a>
+<a name="ln201">  // Suppose we have negative number -a (where a &gt; 0). Then at this point we would have ~a &amp; mask.</a>
+<a name="ln202">  // To get -a, we should fill it with zeros to 64bits: &quot;| (~mask &amp; negative)&quot;.</a>
+<a name="ln203">  // And add one: &quot;- negative&quot;.</a>
+<a name="ln204">  // In case of non negative number, negative == 0.</a>
+<a name="ln205">  // So number will be unchanged by those manipulations.</a>
+<a name="ln206">  return ResultType(</a>
+<a name="ln207">        ((__builtin_bswap64(*reinterpret_cast&lt;const uint64_t*&gt;(src - 8 + n_bytes)) &amp; mask) |</a>
+<a name="ln208">            (~mask &amp; negative)) - negative,</a>
+<a name="ln209">        n_bytes);</a>
+<a name="ln210">#endif</a>
+<a name="ln211">}</a>
+<a name="ln212"> </a>
+<a name="ln213">Status FastDecodeSignedVarInt(</a>
+<a name="ln214">    const uint8_t* src, size_t src_size, int64_t* v, size_t* decoded_size) {</a>
+<a name="ln215">  auto temp = VERIFY_RESULT(FastDecodeSignedVarInt(src, src_size));</a>
+<a name="ln216">  *v = temp.first;</a>
+<a name="ln217">  *decoded_size = temp.second;</a>
+<a name="ln218">  return Status::OK();</a>
+<a name="ln219">}</a>
+<a name="ln220"> </a>
+<a name="ln221">Result&lt;int64_t&gt; FastDecodeSignedVarInt(Slice* slice) {</a>
+<a name="ln222">  auto temp = VERIFY_RESULT(FastDecodeSignedVarInt(slice-&gt;data(), slice-&gt;size()));</a>
+<a name="ln223">  slice-&gt;remove_prefix(temp.second);</a>
+<a name="ln224">  return temp.first;</a>
+<a name="ln225">}</a>
+<a name="ln226"> </a>
+<a name="ln227">Status FastDecodeSignedVarInt(const std::string&amp; encoded, int64_t* v, size_t* decoded_size) {</a>
+<a name="ln228">  return FastDecodeSignedVarInt(</a>
+<a name="ln229">      util::to_uchar_ptr(encoded.c_str()), encoded.size(), v, decoded_size);</a>
+<a name="ln230">}</a>
+<a name="ln231"> </a>
+<a name="ln232">Status FastDecodeDescendingSignedVarInt(yb::Slice *slice, int64_t *dest) {</a>
+<a name="ln233">  auto temp = VERIFY_RESULT(FastDecodeSignedVarInt(slice-&gt;data(), slice-&gt;size()));</a>
+<a name="ln234">  *dest = -temp.first;</a>
+<a name="ln235">  slice-&gt;remove_prefix(temp.second);</a>
+<a name="ln236">  return Status::OK();</a>
+<a name="ln237">}</a>
+<a name="ln238"> </a>
+<a name="ln239">Result&lt;int64_t&gt; FastDecodeDescendingSignedVarInt(Slice* slice) {</a>
+<a name="ln240">  auto temp = VERIFY_RESULT(FastDecodeSignedVarInt(slice-&gt;data(), slice-&gt;size()));</a>
+<a name="ln241">  slice-&gt;remove_prefix(temp.second);</a>
+<a name="ln242">  return -temp.first;</a>
+<a name="ln243">}</a>
+<a name="ln244"> </a>
+<a name="ln245">size_t UnsignedVarIntLength(uint64_t v) {</a>
+<a name="ln246">  size_t result = 1;</a>
+<a name="ln247">  v &gt;&gt;= 7;</a>
+<a name="ln248">  while (v != 0) {</a>
+<a name="ln249">    v &gt;&gt;= 7;</a>
+<a name="ln250">    ++result;</a>
+<a name="ln251">  }</a>
+<a name="ln252">  return result;</a>
+<a name="ln253">}</a>
+<a name="ln254"> </a>
+<a name="ln255">void FastAppendUnsignedVarIntToStr(uint64_t v, std::string* dest) {</a>
+<a name="ln256">  char buf[kMaxVarIntBufferSize];</a>
+<a name="ln257">  size_t len = 0;</a>
+<a name="ln258">  FastEncodeUnsignedVarInt(v, to_uchar_ptr(buf), &amp;len);</a>
+<a name="ln259">  DCHECK_LE(len, 10);</a>
+<a name="ln260">  dest-&gt;append(buf, len);</a>
+<a name="ln261">}</a>
+<a name="ln262"> </a>
+<a name="ln263">void FastEncodeUnsignedVarInt(uint64_t v, uint8_t *dest, size_t *size) {</a>
+<a name="ln264">  const size_t n = UnsignedVarIntLength(v);</a>
+<a name="ln265">  if (size)</a>
+<a name="ln266">    *size = n;</a>
+<a name="ln267"> </a>
+<a name="ln268">  size_t i;</a>
+<a name="ln269">  if (n == 10) {</a>
+<a name="ln270">    dest[0] = 0xff;</a>
+<a name="ln271">    // With a 10-byte encoding we are using 8 whole bytes to represent the number, which takes 63</a>
+<a name="ln272">    // bits or fewer, so no bits from the second byte are used, and it is always 11000000 (binary).</a>
+<a name="ln273">    dest[1] = 0x80;</a>
+<a name="ln274">    i = 2;</a>
+<a name="ln275">  } else if (n == 9) {</a>
+<a name="ln276">    dest[0] = 0xff;</a>
+<a name="ln277">    // With 9-byte encoding bits 56-61 (6 bits) of the number go into the lower 6 bits of the second</a>
+<a name="ln278">    // byte, so it becomes 10xxxxxx where xxxxxx are the said 6 bits.</a>
+<a name="ln279">    dest[1] = (v &gt;&gt; 56);</a>
+<a name="ln280">    i = 2;</a>
+<a name="ln281">  } else {</a>
+<a name="ln282">    // In these cases</a>
+<a name="ln283">    dest[0] = ~((1 &lt;&lt; (9 - n)) - 1) | (v &gt;&gt; (8 * (n - 1)));</a>
+<a name="ln284">    i = 1;</a>
+<a name="ln285">  }</a>
+<a name="ln286">  for (; i &lt; n; ++i) {</a>
+<a name="ln287">    dest[i] = v &gt;&gt; (8 * (n - 1 - i));</a>
+<a name="ln288">  }</a>
+<a name="ln289">}</a>
+<a name="ln290"> </a>
+<a name="ln291">CHECKED_STATUS FastDecodeUnsignedVarInt(</a>
+<a name="ln292">    const uint8_t* src, size_t src_size, uint64_t* v, size_t* decoded_size) {</a>
+<a name="ln293">  if (src_size == 0) {</a>
+<a name="ln294">    return STATUS(Corruption, &quot;Cannot decode a variable-length integer of zero size&quot;);</a>
+<a name="ln295">  }</a>
+<a name="ln296"> </a>
+<a name="ln297">  uint8_t first_byte = src[0];</a>
+<a name="ln298">  size_t n_bytes = kUnsignedVarIntSize[first_byte];</a>
+<a name="ln299">  if (src_size &lt; n_bytes) {</a>
+<a name="ln300">    return NotEnoughEncodedBytes(n_bytes, src_size);</a>
+<a name="ln301">  }</a>
+<a name="ln302">  if (n_bytes == 1) {</a>
+<a name="ln303">    // Fast path for single-byte decoding.</a>
+<a name="ln304">    *v = first_byte &amp; 0x7f;</a>
+<a name="ln305">    *decoded_size = 1;</a>
+<a name="ln306">    return Status::OK();</a>
+<a name="ln307">  }</a>
+<a name="ln308"> </a>
+<a name="ln309">  uint64_t result = 0;</a>
+<a name="ln310">  int i = 0;</a>
+<a name="ln311">  if (n_bytes == 9) {</a>
+<a name="ln312">    if (src[1] &amp; 0x80) {</a>
+<a name="ln313">      n_bytes = 10;</a>
+<a name="ln314">      result = src[1] &amp; 0x3f;</a>
+<a name="ln315">      i = 2;</a>
+<a name="ln316">    }</a>
+<a name="ln317">    if (src_size &lt; n_bytes) {</a>
+<a name="ln318">      return NotEnoughEncodedBytes(n_bytes, src_size);</a>
+<a name="ln319">    }</a>
+<a name="ln320">  } else {</a>
+<a name="ln321">    result = src[0] &amp; ((1 &lt;&lt; (8 - n_bytes)) - 1);</a>
+<a name="ln322">    i = 1;</a>
+<a name="ln323">  }</a>
+<a name="ln324"> </a>
+<a name="ln325">  for (; i &lt; n_bytes; ++i) {</a>
+<a name="ln326">    result = (result &lt;&lt; 8) | static_cast&lt;uint8_t&gt;(src[i]);</a>
+<a name="ln327">  }</a>
+<a name="ln328"> </a>
+<a name="ln329">  *v = result;</a>
+<a name="ln330">  *decoded_size = n_bytes;</a>
+<a name="ln331">  return Status::OK();</a>
+<a name="ln332">}</a>
+<a name="ln333"> </a>
+<a name="ln334">Result&lt;uint64_t&gt; FastDecodeUnsignedVarInt(Slice* slice) {</a>
+<a name="ln335">  size_t size = 0;</a>
+<a name="ln336">  uint64_t value = 0;</a>
+<a name="ln337">  auto status = FastDecodeUnsignedVarInt(slice-&gt;data(), slice-&gt;size(), &amp;value, &amp;size);</a>
+<a name="ln338">  if (!status.ok()) {</a>
+<a name="ln339">    return status;</a>
+<a name="ln340">  }</a>
+<a name="ln341">  slice-&gt;remove_prefix(size);</a>
+<a name="ln342">  return value;</a>
+<a name="ln343">}</a>
+<a name="ln344"> </a>
+<a name="ln345">Result&lt;uint64_t&gt; FastDecodeUnsignedVarInt(const Slice&amp; slice) {</a>
+<a name="ln346">  Slice s(slice);</a>
+<a name="ln347">  const auto result = VERIFY_RESULT(FastDecodeUnsignedVarInt(&amp;s));</a>
+<a name="ln348">  if (s.size() != 0)</a>
+<a name="ln349">    return STATUS(Corruption, &quot;Slice not fully decoded.&quot;);</a>
+<a name="ln350">  return result;</a>
+<a name="ln351">}</a>
+<a name="ln352"> </a>
+<a name="ln353">}  // namespace util</a>
+<a name="ln354">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="321"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v629/" target="_blank">V629</a> Consider inspecting the '1 << (8 - n_bytes)' expression. Bit shifting of the 32-bit value with a subsequent expansion to the 64-bit type.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

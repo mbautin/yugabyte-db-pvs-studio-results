@@ -1,0 +1,314 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>write_operation.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/tablet/operations/write_operation.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;algorithm&gt;</a>
+<a name="ln36">#include &lt;vector&gt;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &lt;boost/optional.hpp&gt;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln41">#include &quot;yb/consensus/consensus.h&quot;</a>
+<a name="ln42">#include &quot;yb/docdb/cql_operation.h&quot;</a>
+<a name="ln43">#include &quot;yb/docdb/pgsql_operation.h&quot;</a>
+<a name="ln44">#include &quot;yb/gutil/stl_util.h&quot;</a>
+<a name="ln45">#include &quot;yb/gutil/strings/numbers.h&quot;</a>
+<a name="ln46">#include &quot;yb/gutil/walltime.h&quot;</a>
+<a name="ln47">#include &quot;yb/rpc/rpc_context.h&quot;</a>
+<a name="ln48">#include &quot;yb/server/hybrid_clock.h&quot;</a>
+<a name="ln49">#include &quot;yb/tablet/tablet.h&quot;</a>
+<a name="ln50">#include &quot;yb/tablet/tablet_metrics.h&quot;</a>
+<a name="ln51">#include &quot;yb/tablet/tablet_peer.h&quot;</a>
+<a name="ln52">#include &quot;yb/tserver/tserver.pb.h&quot;</a>
+<a name="ln53">#include &quot;yb/util/debug/trace_event.h&quot;</a>
+<a name="ln54">#include &quot;yb/util/debug-util.h&quot;</a>
+<a name="ln55">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln56">#include &quot;yb/util/locks.h&quot;</a>
+<a name="ln57">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln58"> </a>
+<a name="ln59">DEFINE_test_flag(int32, tablet_inject_latency_on_apply_write_txn_ms, 0,</a>
+<a name="ln60">                 &quot;How much latency to inject when a write operation is applied.&quot;);</a>
+<a name="ln61">DEFINE_test_flag(bool, tablet_pause_apply_write_ops, false,</a>
+<a name="ln62">                 &quot;Pause applying of write operations.&quot;);</a>
+<a name="ln63">TAG_FLAG(TEST_tablet_inject_latency_on_apply_write_txn_ms, runtime);</a>
+<a name="ln64">TAG_FLAG(TEST_tablet_pause_apply_write_ops, runtime);</a>
+<a name="ln65"> </a>
+<a name="ln66">namespace yb {</a>
+<a name="ln67">namespace tablet {</a>
+<a name="ln68"> </a>
+<a name="ln69">using std::lock_guard;</a>
+<a name="ln70">using std::mutex;</a>
+<a name="ln71">using std::unique_ptr;</a>
+<a name="ln72">using consensus::ReplicateMsg;</a>
+<a name="ln73">using consensus::DriverType;</a>
+<a name="ln74">using consensus::WRITE_OP;</a>
+<a name="ln75">using tserver::TabletServerErrorPB;</a>
+<a name="ln76">using tserver::WriteRequestPB;</a>
+<a name="ln77">using tserver::WriteResponsePB;</a>
+<a name="ln78">using strings::Substitute;</a>
+<a name="ln79"> </a>
+<a name="ln80">WriteOperation::WriteOperation(</a>
+<a name="ln81">    std::unique_ptr&lt;WriteOperationState&gt; state, int64_t term,</a>
+<a name="ln82">    ScopedOperation preparing_token, CoarseTimePoint deadline,</a>
+<a name="ln83">    WriteOperationContext* context)</a>
+<a name="ln84">    : Operation(std::move(state), OperationType::kWrite),</a>
+<a name="ln85">      term_(term), preparing_token_(std::move(preparing_token)), deadline_(deadline),</a>
+<a name="ln86">      context_(context), start_time_(MonoTime::Now()) {</a>
+<a name="ln87">}</a>
+<a name="ln88"> </a>
+<a name="ln89">consensus::ReplicateMsgPtr WriteOperation::NewReplicateMsg() {</a>
+<a name="ln90">  auto result = std::make_shared&lt;ReplicateMsg&gt;();</a>
+<a name="ln91">  result-&gt;set_op_type(WRITE_OP);</a>
+<a name="ln92">  result-&gt;set_allocated_write_request(state()-&gt;mutable_request());</a>
+<a name="ln93">  return result;</a>
+<a name="ln94">}</a>
+<a name="ln95"> </a>
+<a name="ln96">Status WriteOperation::Prepare() {</a>
+<a name="ln97">  TRACE_EVENT0(&quot;txn&quot;, &quot;WriteOperation::Prepare&quot;);</a>
+<a name="ln98">  return Status::OK();</a>
+<a name="ln99">}</a>
+<a name="ln100"> </a>
+<a name="ln101">void WriteOperation::DoStart() {</a>
+<a name="ln102">  TRACE(&quot;Start()&quot;);</a>
+<a name="ln103">  state()-&gt;tablet()-&gt;StartOperation(state());</a>
+<a name="ln104">}</a>
+<a name="ln105"> </a>
+<a name="ln106">Status WriteOperation::DoAborted(const Status&amp; status) {</a>
+<a name="ln107">  TRACE(&quot;FINISH: aborting operation&quot;);</a>
+<a name="ln108">  state()-&gt;Abort();</a>
+<a name="ln109">  return status;</a>
+<a name="ln110">}</a>
+<a name="ln111"> </a>
+<a name="ln112">// FIXME: Since this is called as a void in a thread-pool callback,</a>
+<a name="ln113">// it seems pointless to return a Status!</a>
+<a name="ln114">Status WriteOperation::DoReplicated(int64_t leader_term, Status* complete_status) {</a>
+<a name="ln115">  TRACE_EVENT0(&quot;txn&quot;, &quot;WriteOperation::Complete&quot;);</a>
+<a name="ln116">  TRACE(&quot;APPLY: Starting&quot;);</a>
+<a name="ln117"> </a>
+<a name="ln118">  auto injected_latency = GetAtomicFlag(&amp;FLAGS_TEST_tablet_inject_latency_on_apply_write_txn_ms);</a>
+<a name="ln119">  if (PREDICT_FALSE(injected_latency) &gt; 0) {</a>
+<a name="ln120">      TRACE(&quot;Injecting $0ms of latency due to --TEST_tablet_inject_latency_on_apply_write_txn_ms&quot;,</a>
+<a name="ln121">            injected_latency);</a>
+<a name="ln122">      SleepFor(MonoDelta::FromMilliseconds(injected_latency));</a>
+<a name="ln123">  } else {</a>
+<a name="ln124">    TEST_PAUSE_IF_FLAG(TEST_tablet_pause_apply_write_ops);</a>
+<a name="ln125">  }</a>
+<a name="ln126"> </a>
+<a name="ln127">  *complete_status = state()-&gt;tablet()-&gt;ApplyRowOperations(state());</a>
+<a name="ln128">  // Failure is regular case, since could happen because transaction was aborted, while</a>
+<a name="ln129">  // replicating its intents.</a>
+<a name="ln130">  LOG_IF(INFO, !complete_status-&gt;ok()) &lt;&lt; &quot;Apply operation failed: &quot; &lt;&lt; *complete_status;</a>
+<a name="ln131"> </a>
+<a name="ln132">  // Now that all of the changes have been applied and the commit is durable</a>
+<a name="ln133">  // make the changes visible to readers.</a>
+<a name="ln134">  TRACE(&quot;FINISH: making edits visible&quot;);</a>
+<a name="ln135">  state()-&gt;Commit();</a>
+<a name="ln136"> </a>
+<a name="ln137">  TabletMetrics* metrics = tablet()-&gt;metrics();</a>
+<a name="ln138">  if (metrics &amp;&amp; state()-&gt;has_completion_callback()) {</a>
+<a name="ln139">    auto op_duration_usec = MonoTime::Now().GetDeltaSince(start_time_).ToMicroseconds();</a>
+<a name="ln140">    metrics-&gt;write_op_duration_client_propagated_consistency-&gt;Increment(op_duration_usec);</a>
+<a name="ln141">  }</a>
+<a name="ln142"> </a>
+<a name="ln143">  return Status::OK();</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146">string WriteOperation::ToString() const {</a>
+<a name="ln147">  MonoTime now(MonoTime::Now());</a>
+<a name="ln148">  MonoDelta d = now.GetDeltaSince(start_time_);</a>
+<a name="ln149">  WallTime abs_time = WallTime_Now() - d.ToSeconds();</a>
+<a name="ln150">  string abs_time_formatted;</a>
+<a name="ln151">  StringAppendStrftime(&amp;abs_time_formatted, &quot;%Y-%m-%d %H:%M:%S&quot;, (time_t)abs_time, true);</a>
+<a name="ln152">  return Substitute(&quot;WriteOperation { start_time: $0 state: $1 }&quot;,</a>
+<a name="ln153">                    abs_time_formatted, state()-&gt;ToString());</a>
+<a name="ln154">}</a>
+<a name="ln155"> </a>
+<a name="ln156">void WriteOperation::DoStartSynchronization(const Status&amp; status) {</a>
+<a name="ln157">  std::unique_ptr&lt;WriteOperation&gt; self(this);</a>
+<a name="ln158">  // Move submit_token_ so it is released after this function.</a>
+<a name="ln159">  ScopedRWOperation submit_token(std::move(submit_token_));</a>
+<a name="ln160">  // If a restart read is required, then we return this fact to caller and don't perform the write</a>
+<a name="ln161">  // operation.</a>
+<a name="ln162">  if (restart_read_ht_.is_valid()) {</a>
+<a name="ln163">    auto restart_time = state()-&gt;response()-&gt;mutable_restart_read_time();</a>
+<a name="ln164">    restart_time-&gt;set_read_ht(restart_read_ht_.ToUint64());</a>
+<a name="ln165">    auto local_limit = context_-&gt;ReportReadRestart();</a>
+<a name="ln166">    restart_time-&gt;set_local_limit_ht(local_limit.ToUint64());</a>
+<a name="ln167">    // Global limit is ignored by caller, so we don't set it.</a>
+<a name="ln168">    state()-&gt;CompleteWithStatus(Status::OK());</a>
+<a name="ln169">    return;</a>
+<a name="ln170">  }</a>
+<a name="ln171"> </a>
+<a name="ln172">  if (!status.ok()) {</a>
+<a name="ln173">    state()-&gt;CompleteWithStatus(status);</a>
+<a name="ln174">    return;</a>
+<a name="ln175">  }</a>
+<a name="ln176"> </a>
+<a name="ln177">  context_-&gt;Submit(std::move(self), term_);</a>
+<a name="ln178">}</a>
+<a name="ln179"> </a>
+<a name="ln180">WriteOperationState::WriteOperationState(Tablet* tablet,</a>
+<a name="ln181">                                         const tserver::WriteRequestPB *request,</a>
+<a name="ln182">                                         tserver::WriteResponsePB *response,</a>
+<a name="ln183">                                         docdb::OperationKind kind)</a>
+<a name="ln184">    : OperationState(tablet),</a>
+<a name="ln185">      // We need to copy over the request from the RPC layer, as we're modifying it in the tablet</a>
+<a name="ln186">      // layer.</a>
+<a name="ln187">      request_(request ? new WriteRequestPB(*request) : nullptr),</a>
+<a name="ln188">      response_(response),</a>
+<a name="ln189">      kind_(kind) {</a>
+<a name="ln190">}</a>
+<a name="ln191"> </a>
+<a name="ln192">void WriteOperationState::Abort() {</a>
+<a name="ln193">  if (hybrid_time_.is_valid()) {</a>
+<a name="ln194">    tablet()-&gt;mvcc_manager()-&gt;Aborted(hybrid_time_);</a>
+<a name="ln195">  }</a>
+<a name="ln196"> </a>
+<a name="ln197">  ReleaseDocDbLocks();</a>
+<a name="ln198"> </a>
+<a name="ln199">  // After aborting, we may respond to the RPC and delete the</a>
+<a name="ln200">  // original request, so null them out here.</a>
+<a name="ln201">  ResetRpcFields();</a>
+<a name="ln202">}</a>
+<a name="ln203"> </a>
+<a name="ln204">void WriteOperationState::UpdateRequestFromConsensusRound() {</a>
+<a name="ln205">  request_ = consensus_round()-&gt;replicate_msg()-&gt;mutable_write_request();</a>
+<a name="ln206">}</a>
+<a name="ln207"> </a>
+<a name="ln208">void WriteOperationState::Commit() {</a>
+<a name="ln209">  tablet()-&gt;mvcc_manager()-&gt;Replicated(hybrid_time_);</a>
+<a name="ln210">  ReleaseDocDbLocks();</a>
+<a name="ln211"> </a>
+<a name="ln212">  // After committing, we may respond to the RPC and delete the</a>
+<a name="ln213">  // original request, so null them out here.</a>
+<a name="ln214">  ResetRpcFields();</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217">void WriteOperationState::ReleaseDocDbLocks() {</a>
+<a name="ln218">  // Free DocDB multi-level locks.</a>
+<a name="ln219">  docdb_locks_.Reset();</a>
+<a name="ln220">}</a>
+<a name="ln221"> </a>
+<a name="ln222">WriteOperationState::~WriteOperationState() {</a>
+<a name="ln223">  Reset();</a>
+<a name="ln224">  // Ownership is with the Round object, if one exists, else with us.</a>
+<a name="ln225">  if (!consensus_round() &amp;&amp; request_ != nullptr) {</a>
+<a name="ln226">    delete request_;</a>
+<a name="ln227">  }</a>
+<a name="ln228">}</a>
+<a name="ln229"> </a>
+<a name="ln230">void WriteOperationState::Reset() {</a>
+<a name="ln231">  hybrid_time_ = HybridTime::kInvalid;</a>
+<a name="ln232">}</a>
+<a name="ln233"> </a>
+<a name="ln234">void WriteOperationState::ResetRpcFields() {</a>
+<a name="ln235">  std::lock_guard&lt;simple_spinlock&gt; l(mutex_);</a>
+<a name="ln236">  response_ = nullptr;</a>
+<a name="ln237">}</a>
+<a name="ln238"> </a>
+<a name="ln239">string WriteOperationState::ToString() const {</a>
+<a name="ln240">  string ts_str;</a>
+<a name="ln241">  if (has_hybrid_time()) {</a>
+<a name="ln242">    ts_str = hybrid_time().ToString();</a>
+<a name="ln243">  } else {</a>
+<a name="ln244">    ts_str = &quot;&lt;unassigned&gt;&quot;;</a>
+<a name="ln245">  }</a>
+<a name="ln246"> </a>
+<a name="ln247">  return Substitute(&quot;WriteOperationState $0 [op_id=($1), ts=$2]&quot;,</a>
+<a name="ln248">                    this,</a>
+<a name="ln249">                    op_id().ShortDebugString(),</a>
+<a name="ln250">                    ts_str);</a>
+<a name="ln251">}</a>
+<a name="ln252"> </a>
+<a name="ln253">HybridTime WriteOperationState::WriteHybridTime() const {</a>
+<a name="ln254">  if (request_-&gt;has_external_hybrid_time()) {</a>
+<a name="ln255">    return HybridTime(request_-&gt;external_hybrid_time());</a>
+<a name="ln256">  }</a>
+<a name="ln257">  return OperationState::WriteHybridTime();</a>
+<a name="ln258">}</a>
+<a name="ln259"> </a>
+<a name="ln260">void WriteOperationState::SetTablet(Tablet* tablet) {</a>
+<a name="ln261">  OperationState::SetTablet(tablet);</a>
+<a name="ln262">  if (!request_-&gt;has_tablet_id()) {</a>
+<a name="ln263">    request_-&gt;set_tablet_id(tablet-&gt;tablet_id());</a>
+<a name="ln264">  }</a>
+<a name="ln265">}</a>
+<a name="ln266"> </a>
+<a name="ln267">}  // namespace tablet</a>
+<a name="ln268">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="130"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

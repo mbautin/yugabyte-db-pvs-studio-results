@@ -1,0 +1,261 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>periodic.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/rpc/periodic.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &lt;algorithm&gt;</a>
+<a name="ln21">#include &lt;memory&gt;</a>
+<a name="ln22">#include &lt;mutex&gt;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;boost/function.hpp&gt;</a>
+<a name="ln25">#include &lt;glog/logging.h&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln28">#include &quot;yb/util/monotime.h&quot;</a>
+<a name="ln29">#include &quot;yb/util/random.h&quot;</a>
+<a name="ln30">#include &quot;yb/util/random_util.h&quot;</a>
+<a name="ln31">#include &quot;yb/util/status.h&quot;</a>
+<a name="ln32"> </a>
+<a name="ln33">using std::shared_ptr;</a>
+<a name="ln34">using std::weak_ptr;</a>
+<a name="ln35"> </a>
+<a name="ln36">namespace yb {</a>
+<a name="ln37">namespace rpc {</a>
+<a name="ln38"> </a>
+<a name="ln39">PeriodicTimer::Options::Options()</a>
+<a name="ln40">    : jitter_pct(0.25),</a>
+<a name="ln41">      one_shot(false) {</a>
+<a name="ln42">}</a>
+<a name="ln43"> </a>
+<a name="ln44">shared_ptr&lt;PeriodicTimer&gt; PeriodicTimer::Create(</a>
+<a name="ln45">    Messenger* messenger,</a>
+<a name="ln46">    RunTaskFunctor functor,</a>
+<a name="ln47">    MonoDelta period,</a>
+<a name="ln48">    Options options) {</a>
+<a name="ln49">  return std::make_shared&lt;PeriodicTimer&gt;(messenger, std::move(functor), period, options);</a>
+<a name="ln50">}</a>
+<a name="ln51"> </a>
+<a name="ln52">PeriodicTimer::PeriodicTimer(</a>
+<a name="ln53">    Messenger* messenger,</a>
+<a name="ln54">    RunTaskFunctor functor,</a>
+<a name="ln55">    MonoDelta period,</a>
+<a name="ln56">    Options options)</a>
+<a name="ln57">    : messenger_(messenger),</a>
+<a name="ln58">      functor_(std::move(functor)),</a>
+<a name="ln59">      period_(period),</a>
+<a name="ln60">      options_(std::move(options)),</a>
+<a name="ln61">      rng_(GetRandomSeed32()),</a>
+<a name="ln62">      current_callback_generation_(0),</a>
+<a name="ln63">      num_callbacks_for_tests_(0),</a>
+<a name="ln64">      started_(false) {</a>
+<a name="ln65">  DCHECK_GE(options_.jitter_pct, 0);</a>
+<a name="ln66">  DCHECK_LE(options_.jitter_pct, 1);</a>
+<a name="ln67">}</a>
+<a name="ln68"> </a>
+<a name="ln69">PeriodicTimer::~PeriodicTimer() {</a>
+<a name="ln70">  Stop();</a>
+<a name="ln71">}</a>
+<a name="ln72"> </a>
+<a name="ln73">void PeriodicTimer::Start(MonoDelta next_task_delta) {</a>
+<a name="ln74">  std::unique_lock&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln75">  if (!started_) {</a>
+<a name="ln76">    started_ = true;</a>
+<a name="ln77">    SnoozeUnlocked(next_task_delta);</a>
+<a name="ln78">    int new_callback_generation = ++current_callback_generation_;</a>
+<a name="ln79"> </a>
+<a name="ln80">    // Invoke Callback() with the lock released.</a>
+<a name="ln81">    l.unlock();</a>
+<a name="ln82">    Callback(new_callback_generation);</a>
+<a name="ln83">  }</a>
+<a name="ln84">}</a>
+<a name="ln85"> </a>
+<a name="ln86">void PeriodicTimer::Stop() {</a>
+<a name="ln87">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln88">  StopUnlocked();</a>
+<a name="ln89">}</a>
+<a name="ln90"> </a>
+<a name="ln91">void PeriodicTimer::StopUnlocked() {</a>
+<a name="ln92">  DCHECK(lock_.is_locked());</a>
+<a name="ln93">  started_ = false;</a>
+<a name="ln94">}</a>
+<a name="ln95"> </a>
+<a name="ln96">void PeriodicTimer::Snooze(MonoDelta next_task_delta) {</a>
+<a name="ln97">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln98">  SnoozeUnlocked(next_task_delta);</a>
+<a name="ln99">}</a>
+<a name="ln100"> </a>
+<a name="ln101">void PeriodicTimer::SnoozeUnlocked(MonoDelta next_task_delta) {</a>
+<a name="ln102">  DCHECK(lock_.is_locked());</a>
+<a name="ln103">  if (!started_) {</a>
+<a name="ln104">    return;</a>
+<a name="ln105">  }</a>
+<a name="ln106"> </a>
+<a name="ln107">  if (!next_task_delta) {</a>
+<a name="ln108">    // Given jitter percentage J and period P, this yields a delay somewhere</a>
+<a name="ln109">    // between (1-J)*P and (1+J)*P.</a>
+<a name="ln110">    next_task_delta = MonoDelta::FromMilliseconds(</a>
+<a name="ln111">        GetMinimumPeriod().ToMilliseconds() +</a>
+<a name="ln112">        rng_.NextDoubleFraction() *</a>
+<a name="ln113">        options_.jitter_pct *</a>
+<a name="ln114">        (2 * period_.ToMilliseconds()));</a>
+<a name="ln115">  }</a>
+<a name="ln116">  next_task_time_ = MonoTime::Now() + next_task_delta;</a>
+<a name="ln117">}</a>
+<a name="ln118"> </a>
+<a name="ln119">MonoDelta PeriodicTimer::GetMinimumPeriod() {</a>
+<a name="ln120">  // Given jitter percentage J and period P, this returns (1-J)*P, which is</a>
+<a name="ln121">  // the lowest possible jittered value.</a>
+<a name="ln122">  return MonoDelta::FromMilliseconds((1.0 - options_.jitter_pct) *</a>
+<a name="ln123">                                     period_.ToMilliseconds());</a>
+<a name="ln124">}</a>
+<a name="ln125"> </a>
+<a name="ln126">int64_t PeriodicTimer::NumCallbacksForTests() const {</a>
+<a name="ln127">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln128">  return num_callbacks_for_tests_;</a>
+<a name="ln129">}</a>
+<a name="ln130"> </a>
+<a name="ln131">void PeriodicTimer::Callback(int64_t my_callback_generation) {</a>
+<a name="ln132">  // To simplify the implementation, a timer may have only one outstanding</a>
+<a name="ln133">  // callback scheduled at a time. This means that once the callback is</a>
+<a name="ln134">  // scheduled, the timer's task cannot run any earlier than whenever the</a>
+<a name="ln135">  // callback runs. Thus, the delay used when scheduling the callback dictates</a>
+<a name="ln136">  // the lowest possible value of 'next_task_delta' that Snooze() can honor.</a>
+<a name="ln137">  //</a>
+<a name="ln138">  // If the callback's delay is very low, Snooze() can honor a low</a>
+<a name="ln139">  // 'next_task_delta', but the callback will run often and burn more CPU</a>
+<a name="ln140">  // cycles. If the delay is very high, the timer will be more efficient but</a>
+<a name="ln141">  // the granularity for 'next_task_delta' will rise accordingly.</a>
+<a name="ln142">  //</a>
+<a name="ln143">  // As a &quot;happy medium&quot; we use GetMinimumPeriod() as the delay. This ensures</a>
+<a name="ln144">  // that a no-arg Snooze() on a jittered timer will always be honored, and as</a>
+<a name="ln145">  // long as the caller passes a value of at least GetMinimumPeriod() to</a>
+<a name="ln146">  // Snooze(), that too will be honored.</a>
+<a name="ln147">  MonoDelta delay = GetMinimumPeriod();</a>
+<a name="ln148">  bool run_task = false;</a>
+<a name="ln149">  {</a>
+<a name="ln150">    std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln151">    num_callbacks_for_tests_++;</a>
+<a name="ln152"> </a>
+<a name="ln153">    // If the timer was stopped, exit.</a>
+<a name="ln154">    if (!started_) {</a>
+<a name="ln155">      return;</a>
+<a name="ln156">    }</a>
+<a name="ln157"> </a>
+<a name="ln158">    // If there's a new callback loop in town, exit.</a>
+<a name="ln159">    //</a>
+<a name="ln160">    // We could check again just before calling Messenger::ScheduleOnReactor()</a>
+<a name="ln161">    // (in case someone else restarted the timer while the functor ran, or in</a>
+<a name="ln162">    // case the functor itself restarted the timer), but there's no real reason</a>
+<a name="ln163">    // to do so: the very next iteration of this callback loop will wind up here</a>
+<a name="ln164">    // and exit.</a>
+<a name="ln165">    if (current_callback_generation_ &gt; my_callback_generation) {</a>
+<a name="ln166">      return;</a>
+<a name="ln167">    }</a>
+<a name="ln168"> </a>
+<a name="ln169">    MonoTime now = MonoTime::Now();</a>
+<a name="ln170">    if (now &lt; next_task_time_) {</a>
+<a name="ln171">      // It's not yet time to run the task. Reduce the scheduled delay if</a>
+<a name="ln172">      // enough time has elapsed, but don't increase it.</a>
+<a name="ln173">      delay = std::min(delay, next_task_time_ - now);</a>
+<a name="ln174">    } else {</a>
+<a name="ln175">      // It's time to run the task. Although the next task time is reset now,</a>
+<a name="ln176">      // it may be reset again by virtue of running the task itself.</a>
+<a name="ln177">      run_task = true;</a>
+<a name="ln178"> </a>
+<a name="ln179">      if (options_.one_shot) {</a>
+<a name="ln180">        // Stop the timer first, in case the task wants to restart it.</a>
+<a name="ln181">        StopUnlocked();</a>
+<a name="ln182">      }</a>
+<a name="ln183">      SnoozeUnlocked();</a>
+<a name="ln184">      delay = next_task_time_ - now;</a>
+<a name="ln185">    }</a>
+<a name="ln186">  }</a>
+<a name="ln187"> </a>
+<a name="ln188">  if (run_task) {</a>
+<a name="ln189">    functor_();</a>
+<a name="ln190"> </a>
+<a name="ln191">    if (options_.one_shot) {</a>
+<a name="ln192">      // The task was run; exit the loop. Even if the task restarted the timer,</a>
+<a name="ln193">      // that will have started a new callback loop, so exiting here is always</a>
+<a name="ln194">      // the correct thing to do.</a>
+<a name="ln195">      return;</a>
+<a name="ln196">    }</a>
+<a name="ln197">  }</a>
+<a name="ln198"> </a>
+<a name="ln199">  // Capture a weak_ptr reference into the submitted functor so that we can</a>
+<a name="ln200">  // safely handle the functor outliving its timer.</a>
+<a name="ln201">  weak_ptr&lt;PeriodicTimer&gt; w = shared_from_this();</a>
+<a name="ln202">  messenger_-&gt;scheduler().Schedule([w, my_callback_generation](const Status&amp; s) {</a>
+<a name="ln203">    if (!s.ok()) {</a>
+<a name="ln204">      // The reactor was shut down.</a>
+<a name="ln205">      return;</a>
+<a name="ln206">    }</a>
+<a name="ln207">    if (auto timer = w.lock()) {</a>
+<a name="ln208">      timer-&gt;Callback(my_callback_generation);</a>
+<a name="ln209">    }</a>
+<a name="ln210">  }, delay.ToSteadyDuration());</a>
+<a name="ln211">}</a>
+<a name="ln212"> </a>
+<a name="ln213">} // namespace rpc</a>
+<a name="ln214">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="92"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="102"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

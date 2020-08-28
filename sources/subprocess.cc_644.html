@@ -1,0 +1,618 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>subprocess.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/util/subprocess.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;dirent.h&gt;</a>
+<a name="ln36">#include &lt;fcntl.h&gt;</a>
+<a name="ln37">#include &lt;signal.h&gt;</a>
+<a name="ln38">#include &lt;sys/types.h&gt;</a>
+<a name="ln39">#include &lt;sys/wait.h&gt;</a>
+<a name="ln40">#include &lt;unistd.h&gt;</a>
+<a name="ln41"> </a>
+<a name="ln42">#include &lt;vector&gt;</a>
+<a name="ln43">#include &lt;mutex&gt;</a>
+<a name="ln44">#include &lt;memory&gt;</a>
+<a name="ln45">#include &lt;string&gt;</a>
+<a name="ln46"> </a>
+<a name="ln47">#include &lt;glog/logging.h&gt;</a>
+<a name="ln48"> </a>
+<a name="ln49">#if defined(__linux__)</a>
+<a name="ln50">#include &lt;sys/prctl.h&gt;</a>
+<a name="ln51">#endif</a>
+<a name="ln52"> </a>
+<a name="ln53">#include &quot;yb/gutil/once.h&quot;</a>
+<a name="ln54">#include &quot;yb/gutil/port.h&quot;</a>
+<a name="ln55">#include &quot;yb/gutil/strings/join.h&quot;</a>
+<a name="ln56">#include &quot;yb/gutil/strings/numbers.h&quot;</a>
+<a name="ln57">#include &quot;yb/gutil/strings/split.h&quot;</a>
+<a name="ln58">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln59">#include &quot;yb/util/debug-util.h&quot;</a>
+<a name="ln60">#include &quot;yb/util/errno.h&quot;</a>
+<a name="ln61">#include &quot;yb/util/status.h&quot;</a>
+<a name="ln62"> </a>
+<a name="ln63">using std::shared_ptr;</a>
+<a name="ln64">using std::string;</a>
+<a name="ln65">using std::vector;</a>
+<a name="ln66">using std::mutex;</a>
+<a name="ln67">using std::unique_lock;</a>
+<a name="ln68">using strings::Split;</a>
+<a name="ln69">using strings::Substitute;</a>
+<a name="ln70"> </a>
+<a name="ln71">namespace yb {</a>
+<a name="ln72"> </a>
+<a name="ln73">namespace {</a>
+<a name="ln74"> </a>
+<a name="ln75">static const char* kProcSelfFd =</a>
+<a name="ln76">#if defined(__APPLE__)</a>
+<a name="ln77">  &quot;/dev/fd&quot;;</a>
+<a name="ln78">#else</a>
+<a name="ln79">  &quot;/proc/self/fd&quot;;</a>
+<a name="ln80">#endif // defined(__APPLE__)</a>
+<a name="ln81"> </a>
+<a name="ln82">#if defined(__linux__)</a>
+<a name="ln83">#define READDIR readdir64</a>
+<a name="ln84">#define DIRENT dirent64</a>
+<a name="ln85">#else</a>
+<a name="ln86">#define READDIR readdir</a>
+<a name="ln87">#define DIRENT dirent</a>
+<a name="ln88">#endif</a>
+<a name="ln89"> </a>
+<a name="ln90">void DisableSigPipe() {</a>
+<a name="ln91">  struct sigaction act;</a>
+<a name="ln92"> </a>
+<a name="ln93">  act.sa_handler = SIG_IGN;</a>
+<a name="ln94">  sigemptyset(&amp;act.sa_mask);</a>
+<a name="ln95">  act.sa_flags = 0;</a>
+<a name="ln96">  PCHECK(sigaction(SIGPIPE, &amp;act, nullptr) == 0);</a>
+<a name="ln97">}</a>
+<a name="ln98"> </a>
+<a name="ln99">void EnsureSigPipeDisabled() {</a>
+<a name="ln100">  static GoogleOnceType once = GOOGLE_ONCE_INIT;</a>
+<a name="ln101">  GoogleOnceInit(&amp;once, &amp;DisableSigPipe);</a>
+<a name="ln102">}</a>
+<a name="ln103"> </a>
+<a name="ln104">// Since opendir() calls malloc(), this must be called before fork().</a>
+<a name="ln105">// This function is not async-signal-safe.</a>
+<a name="ln106">Status OpenProcFdDir(DIR** dir) {</a>
+<a name="ln107">  *dir = opendir(kProcSelfFd);</a>
+<a name="ln108">  if (PREDICT_FALSE(dir == nullptr)) {</a>
+<a name="ln109">    return STATUS(IOError, Substitute(&quot;opendir(\&quot;$0\&quot;) failed&quot;, kProcSelfFd), Errno(errno));</a>
+<a name="ln110">  }</a>
+<a name="ln111">  return Status::OK();</a>
+<a name="ln112">}</a>
+<a name="ln113"> </a>
+<a name="ln114">// Close the directory stream opened by OpenProcFdDir().</a>
+<a name="ln115">// This function is not async-signal-safe.</a>
+<a name="ln116">void CloseProcFdDir(DIR* dir) {</a>
+<a name="ln117">  if (PREDICT_FALSE(closedir(dir) == -1)) {</a>
+<a name="ln118">    LOG(WARNING)</a>
+<a name="ln119">        &lt;&lt; &quot;Unable to close fd dir: &quot;</a>
+<a name="ln120">        &lt;&lt; STATUS(IOError, Substitute(&quot;closedir(\&quot;$0\&quot;) failed&quot;, kProcSelfFd), Errno(errno));</a>
+<a name="ln121">  }</a>
+<a name="ln122">}</a>
+<a name="ln123"> </a>
+<a name="ln124">// Close all open file descriptors other than stdin, stderr, stdout.</a>
+<a name="ln125">// Expects a directory stream created by OpenProdFdDir() as a parameter.</a>
+<a name="ln126">// This function is called after fork() and must not call malloc().</a>
+<a name="ln127">// The rule of thumb is to only call async-signal-safe functions in such cases</a>
+<a name="ln128">// if at all possible.</a>
+<a name="ln129">void CloseNonStandardFDs(DIR* fd_dir, const std::unordered_set&lt;int&gt;&amp; excluding) {</a>
+<a name="ln130">  // This is implemented by iterating over the open file descriptors</a>
+<a name="ln131">  // rather than using sysconf(SC_OPEN_MAX) -- the latter is error prone</a>
+<a name="ln132">  // since it may not represent the highest open fd if the fd soft limit</a>
+<a name="ln133">  // has changed since the process started. This should also be faster</a>
+<a name="ln134">  // since iterating over all possible fds is likely to cause 64k+ syscalls</a>
+<a name="ln135">  // in typical configurations.</a>
+<a name="ln136">  //</a>
+<a name="ln137">  // Note also that this doesn't use any of the Env utility functions, to</a>
+<a name="ln138">  // make it as lean and mean as possible -- this runs in the subprocess</a>
+<a name="ln139">  // after a fork, so there's some possibility that various global locks</a>
+<a name="ln140">  // inside malloc() might be held, so allocating memory is a no-no.</a>
+<a name="ln141">  PCHECK(fd_dir != nullptr);</a>
+<a name="ln142">  int dir_fd = dirfd(fd_dir);</a>
+<a name="ln143"> </a>
+<a name="ln144">  struct DIRENT* ent;</a>
+<a name="ln145">  // readdir64() is not reentrant (it uses a static buffer) and it also</a>
+<a name="ln146">  // locks fd_dir-&gt;lock, so it must not be called in a multi-threaded</a>
+<a name="ln147">  // environment and is certainly not async-signal-safe.</a>
+<a name="ln148">  // However, it appears to be safe to call right after fork(), since only one</a>
+<a name="ln149">  // thread exists in the child process at that time. It also does not call</a>
+<a name="ln150">  // malloc() or free(). We could use readdir64_r() instead, but all that</a>
+<a name="ln151">  // buys us is reentrancy, and not async-signal-safety, due to the use of</a>
+<a name="ln152">  // dir-&gt;lock, so seems not worth the added complexity in lifecycle &amp; plumbing.</a>
+<a name="ln153">  while ((ent = READDIR(fd_dir)) != nullptr) {</a>
+<a name="ln154">    uint32_t fd;</a>
+<a name="ln155">    if (!safe_strtou32(ent-&gt;d_name, &amp;fd)) continue;</a>
+<a name="ln156">    if (!(fd == STDIN_FILENO  ||</a>
+<a name="ln157">          fd == STDOUT_FILENO ||</a>
+<a name="ln158">          fd == STDERR_FILENO ||</a>
+<a name="ln159">          fd == dir_fd ||</a>
+<a name="ln160">          excluding.count(fd))) {</a>
+<a name="ln161">      close(fd);</a>
+<a name="ln162">    }</a>
+<a name="ln163">  }</a>
+<a name="ln164">}</a>
+<a name="ln165"> </a>
+<a name="ln166">} // anonymous namespace</a>
+<a name="ln167"> </a>
+<a name="ln168">Subprocess::Subprocess(string program, vector&lt;string&gt; argv)</a>
+<a name="ln169">    : program_(std::move(program)),</a>
+<a name="ln170">      argv_(std::move(argv)),</a>
+<a name="ln171">      state_(kNotStarted),</a>
+<a name="ln172">      child_pid_(0),</a>
+<a name="ln173">      fd_state_(),</a>
+<a name="ln174">      child_fds_() {</a>
+<a name="ln175">  fd_state_[STDIN_FILENO]   = PIPED;</a>
+<a name="ln176">  fd_state_[STDOUT_FILENO]  = SHARED;</a>
+<a name="ln177">  fd_state_[STDERR_FILENO]  = SHARED;</a>
+<a name="ln178">  child_fds_[STDIN_FILENO]  = -1;</a>
+<a name="ln179">  child_fds_[STDOUT_FILENO] = -1;</a>
+<a name="ln180">  child_fds_[STDERR_FILENO] = -1;</a>
+<a name="ln181">}</a>
+<a name="ln182"> </a>
+<a name="ln183">Subprocess::~Subprocess() {</a>
+<a name="ln184">  if (state() == kRunning) {</a>
+<a name="ln185">    LOG(WARNING) &lt;&lt; &quot;Child process &quot; &lt;&lt; child_pid_</a>
+<a name="ln186">                 &lt;&lt; &quot;(&quot; &lt;&lt; JoinStrings(argv_, &quot; &quot;) &lt;&lt; &quot;) &quot;</a>
+<a name="ln187">                 &lt;&lt; &quot; was orphaned. Sending SIGKILL...&quot;;</a>
+<a name="ln188">    WARN_NOT_OK(Kill(SIGKILL), &quot;Failed to send SIGKILL&quot;);</a>
+<a name="ln189">    int junk = 0;</a>
+<a name="ln190">    WARN_NOT_OK(Wait(&amp;junk), &quot;Failed to Wait()&quot;);</a>
+<a name="ln191">  }</a>
+<a name="ln192"> </a>
+<a name="ln193">  for (int i = 0; i &lt; 3; ++i) {</a>
+<a name="ln194">    if (fd_state_[i] == PIPED &amp;&amp; child_fds_[i] &gt;= 0) {</a>
+<a name="ln195">      close(child_fds_[i]);</a>
+<a name="ln196">    }</a>
+<a name="ln197">  }</a>
+<a name="ln198">}</a>
+<a name="ln199"> </a>
+<a name="ln200">void Subprocess::SetEnv(const std::string&amp; key, const std::string&amp; value) {</a>
+<a name="ln201">  CHECK_EQ(state_, kNotStarted);</a>
+<a name="ln202">  env_[key] = value;</a>
+<a name="ln203">}</a>
+<a name="ln204"> </a>
+<a name="ln205">void Subprocess::SetFdShared(int stdfd, bool share) {</a>
+<a name="ln206">  unique_lock&lt;mutex&gt; l(state_lock_);</a>
+<a name="ln207">  CHECK_EQ(state_, kNotStarted);</a>
+<a name="ln208">  CHECK_NE(fd_state_[stdfd], DISABLED);</a>
+<a name="ln209">  fd_state_[stdfd] = share? SHARED : PIPED;</a>
+<a name="ln210">}</a>
+<a name="ln211"> </a>
+<a name="ln212">void Subprocess::InheritNonstandardFd(int fd) {</a>
+<a name="ln213">  ns_fds_inherited_.insert(fd);</a>
+<a name="ln214">}</a>
+<a name="ln215"> </a>
+<a name="ln216">void Subprocess::DisableStderr() {</a>
+<a name="ln217">  unique_lock&lt;mutex&gt; l(state_lock_);</a>
+<a name="ln218">  CHECK_EQ(state_, kNotStarted);</a>
+<a name="ln219">  fd_state_[STDERR_FILENO] = DISABLED;</a>
+<a name="ln220">}</a>
+<a name="ln221"> </a>
+<a name="ln222">void Subprocess::DisableStdout() {</a>
+<a name="ln223">  unique_lock&lt;mutex&gt; l(state_lock_);</a>
+<a name="ln224">  CHECK_EQ(state_, kNotStarted);</a>
+<a name="ln225">  fd_state_[STDOUT_FILENO] = DISABLED;</a>
+<a name="ln226">}</a>
+<a name="ln227"> </a>
+<a name="ln228">static void RedirectToDevNull(int fd) {</a>
+<a name="ln229">  // We must not close stderr or stdout, because then when a new file descriptor</a>
+<a name="ln230">  // gets opened, it might get that fd number.  (We always allocate the lowest</a>
+<a name="ln231">  // available file descriptor number.)  Instead, we reopen that fd as</a>
+<a name="ln232">  // /dev/null.</a>
+<a name="ln233">  int dev_null = open(&quot;/dev/null&quot;, O_WRONLY);</a>
+<a name="ln234">  if (dev_null &lt; 0) {</a>
+<a name="ln235">    PLOG(WARNING) &lt;&lt; &quot;failed to open /dev/null&quot;;</a>
+<a name="ln236">  } else {</a>
+<a name="ln237">    PCHECK(dup2(dev_null, fd));</a>
+<a name="ln238">  }</a>
+<a name="ln239">}</a>
+<a name="ln240"> </a>
+<a name="ln241">#if defined(__APPLE__)</a>
+<a name="ln242">static int pipe2(int pipefd[2], int flags) {</a>
+<a name="ln243">  DCHECK_EQ(O_CLOEXEC, flags);</a>
+<a name="ln244"> </a>
+<a name="ln245">  int new_fds[2] = { 0, 0 };</a>
+<a name="ln246">  if (pipe(new_fds) == -1) {</a>
+<a name="ln247">    return -1;</a>
+<a name="ln248">  }</a>
+<a name="ln249">  if (fcntl(new_fds[0], F_SETFD, O_CLOEXEC) == -1) {</a>
+<a name="ln250">    close(new_fds[0]);</a>
+<a name="ln251">    close(new_fds[1]);</a>
+<a name="ln252">    return -1;</a>
+<a name="ln253">  }</a>
+<a name="ln254">  if (fcntl(new_fds[1], F_SETFD, O_CLOEXEC) == -1) {</a>
+<a name="ln255">    close(new_fds[0]);</a>
+<a name="ln256">    close(new_fds[1]);</a>
+<a name="ln257">    return -1;</a>
+<a name="ln258">  }</a>
+<a name="ln259">  pipefd[0] = new_fds[0];</a>
+<a name="ln260">  pipefd[1] = new_fds[1];</a>
+<a name="ln261">  return 0;</a>
+<a name="ln262">}</a>
+<a name="ln263">#endif</a>
+<a name="ln264"> </a>
+<a name="ln265">Status Subprocess::Start() {</a>
+<a name="ln266">  unique_lock&lt;mutex&gt; l(state_lock_);</a>
+<a name="ln267">  CHECK_EQ(state_, kNotStarted);</a>
+<a name="ln268">  EnsureSigPipeDisabled();</a>
+<a name="ln269"> </a>
+<a name="ln270">  if (argv_.size() &lt; 1) {</a>
+<a name="ln271">    return STATUS(InvalidArgument, &quot;argv must have at least one elem&quot;);</a>
+<a name="ln272">  }</a>
+<a name="ln273"> </a>
+<a name="ln274">  vector&lt;char*&gt; argv_ptrs;</a>
+<a name="ln275">  for (const string&amp; arg : argv_) {</a>
+<a name="ln276">    argv_ptrs.push_back(const_cast&lt;char*&gt;(arg.c_str()));</a>
+<a name="ln277">  }</a>
+<a name="ln278">  argv_ptrs.push_back(nullptr);</a>
+<a name="ln279"> </a>
+<a name="ln280">  // Pipe from caller process to child's stdin</a>
+<a name="ln281">  // [0] = stdin for child, [1] = how parent writes to it</a>
+<a name="ln282">  int child_stdin[2] = {-1, -1};</a>
+<a name="ln283">  if (fd_state_[STDIN_FILENO] == PIPED) {</a>
+<a name="ln284">    PCHECK(pipe2(child_stdin, O_CLOEXEC) == 0);</a>
+<a name="ln285">  }</a>
+<a name="ln286">  // Pipe from child's stdout back to caller process</a>
+<a name="ln287">  // [0] = how parent reads from child's stdout, [1] = how child writes to it</a>
+<a name="ln288">  int child_stdout[2] = {-1, -1};</a>
+<a name="ln289">  if (fd_state_[STDOUT_FILENO] == PIPED) {</a>
+<a name="ln290">    PCHECK(pipe2(child_stdout, O_CLOEXEC) == 0);</a>
+<a name="ln291">  }</a>
+<a name="ln292">  // Pipe from child's stderr back to caller process</a>
+<a name="ln293">  // [0] = how parent reads from child's stderr, [1] = how child writes to it</a>
+<a name="ln294">  int child_stderr[2] = {-1, -1};</a>
+<a name="ln295">  if (fd_state_[STDERR_FILENO] == PIPED) {</a>
+<a name="ln296">    PCHECK(pipe2(child_stderr, O_CLOEXEC) == 0);</a>
+<a name="ln297">  }</a>
+<a name="ln298"> </a>
+<a name="ln299">  DIR* fd_dir = nullptr;</a>
+<a name="ln300">  RETURN_NOT_OK_PREPEND(OpenProcFdDir(&amp;fd_dir), &quot;Unable to open fd dir&quot;);</a>
+<a name="ln301">  shared_ptr&lt;DIR&gt; fd_dir_closer(fd_dir, CloseProcFdDir);</a>
+<a name="ln302"> </a>
+<a name="ln303">  int ret = fork();</a>
+<a name="ln304">  if (ret == -1) {</a>
+<a name="ln305">    return STATUS(RuntimeError, &quot;Unable to fork&quot;, Errno(errno));</a>
+<a name="ln306">  }</a>
+<a name="ln307">  if (ret == 0) { // We are the child</a>
+<a name="ln308">    // Send the child a SIGTERM when the parent dies. This is done as early</a>
+<a name="ln309">    // as possible in the child's life to prevent any orphaning whatsoever</a>
+<a name="ln310">    // (e.g. from KUDU-402).</a>
+<a name="ln311">#if defined(__linux__)</a>
+<a name="ln312">    // TODO: prctl(PR_SET_PDEATHSIG) is Linux-specific, look into portable ways</a>
+<a name="ln313">    // to prevent orphans when parent is killed.</a>
+<a name="ln314">    prctl(PR_SET_PDEATHSIG, pdeath_signal_);</a>
+<a name="ln315">#endif</a>
+<a name="ln316"> </a>
+<a name="ln317">    // stdin</a>
+<a name="ln318">    if (fd_state_[STDIN_FILENO] == PIPED) {</a>
+<a name="ln319">      PCHECK(dup2(child_stdin[0], STDIN_FILENO) == STDIN_FILENO);</a>
+<a name="ln320">    }</a>
+<a name="ln321">    // stdout</a>
+<a name="ln322">    switch (fd_state_[STDOUT_FILENO]) {</a>
+<a name="ln323">    case PIPED: {</a>
+<a name="ln324">      PCHECK(dup2(child_stdout[1], STDOUT_FILENO) == STDOUT_FILENO);</a>
+<a name="ln325">      break;</a>
+<a name="ln326">    }</a>
+<a name="ln327">    case DISABLED: {</a>
+<a name="ln328">      RedirectToDevNull(STDOUT_FILENO);</a>
+<a name="ln329">      break;</a>
+<a name="ln330">    }</a>
+<a name="ln331">    default: break;</a>
+<a name="ln332">    }</a>
+<a name="ln333">    // stderr</a>
+<a name="ln334">    switch (fd_state_[STDERR_FILENO]) {</a>
+<a name="ln335">    case PIPED: {</a>
+<a name="ln336">      PCHECK(dup2(child_stderr[1], STDERR_FILENO) == STDERR_FILENO);</a>
+<a name="ln337">      break;</a>
+<a name="ln338">    }</a>
+<a name="ln339">    case DISABLED: {</a>
+<a name="ln340">      RedirectToDevNull(STDERR_FILENO);</a>
+<a name="ln341">      break;</a>
+<a name="ln342">    }</a>
+<a name="ln343">    default: break;</a>
+<a name="ln344">    }</a>
+<a name="ln345"> </a>
+<a name="ln346">    CloseNonStandardFDs(fd_dir, ns_fds_inherited_);</a>
+<a name="ln347"> </a>
+<a name="ln348">    for (const auto&amp; env_kv : env_) {</a>
+<a name="ln349">      setenv(env_kv.first.c_str(), env_kv.second.c_str(), /* replace */ true);</a>
+<a name="ln350">    }</a>
+<a name="ln351"> </a>
+<a name="ln352">    execvp(program_.c_str(), &amp;argv_ptrs[0]);</a>
+<a name="ln353">    PLOG(WARNING) &lt;&lt; &quot;Couldn't exec &quot; &lt;&lt; program_;</a>
+<a name="ln354">    _exit(errno);</a>
+<a name="ln355">  } else {</a>
+<a name="ln356">    // We are the parent</a>
+<a name="ln357">    child_pid_ = ret;</a>
+<a name="ln358">    // Close child's side of the pipes</a>
+<a name="ln359">    if (fd_state_[STDIN_FILENO]  == PIPED) close(child_stdin[0]);</a>
+<a name="ln360">    if (fd_state_[STDOUT_FILENO] == PIPED) close(child_stdout[1]);</a>
+<a name="ln361">    if (fd_state_[STDERR_FILENO] == PIPED) close(child_stderr[1]);</a>
+<a name="ln362">    // Keep parent's side of the pipes</a>
+<a name="ln363">    child_fds_[STDIN_FILENO]  = child_stdin[1];</a>
+<a name="ln364">    child_fds_[STDOUT_FILENO] = child_stdout[0];</a>
+<a name="ln365">    child_fds_[STDERR_FILENO] = child_stderr[0];</a>
+<a name="ln366">  }</a>
+<a name="ln367"> </a>
+<a name="ln368">  state_ = kRunning;</a>
+<a name="ln369">  return Status::OK();</a>
+<a name="ln370">}</a>
+<a name="ln371"> </a>
+<a name="ln372">Status Subprocess::Wait(int* ret) {</a>
+<a name="ln373">  return DoWait(ret, 0);</a>
+<a name="ln374">}</a>
+<a name="ln375"> </a>
+<a name="ln376">Result&lt;int&gt; Subprocess::Wait() {</a>
+<a name="ln377">  int ret = 0;</a>
+<a name="ln378">  RETURN_NOT_OK(Wait(&amp;ret));</a>
+<a name="ln379">  return ret;</a>
+<a name="ln380">}</a>
+<a name="ln381"> </a>
+<a name="ln382">Status Subprocess::DoWait(int* ret, int options) {</a>
+<a name="ln383">  if (!ret) {</a>
+<a name="ln384">    return STATUS(InvalidArgument, &quot;ret is NULL&quot;);</a>
+<a name="ln385">  }</a>
+<a name="ln386">  *ret = 0;</a>
+<a name="ln387"> </a>
+<a name="ln388">  pid_t child_pid = 0;</a>
+<a name="ln389">  {</a>
+<a name="ln390">    unique_lock&lt;mutex&gt; l(state_lock_);</a>
+<a name="ln391">    if (state_ == kExited) {</a>
+<a name="ln392">      *ret = cached_rc_;</a>
+<a name="ln393">      return Status::OK();</a>
+<a name="ln394">    }</a>
+<a name="ln395">    if (state_ != kRunning) {</a>
+<a name="ln396">      return STATUS(IllegalState, &quot;DoWait called on a process that is not running&quot;);</a>
+<a name="ln397">    }</a>
+<a name="ln398">    child_pid = child_pid_;</a>
+<a name="ln399">  }</a>
+<a name="ln400"> </a>
+<a name="ln401">  CHECK_NE(child_pid, 0);</a>
+<a name="ln402"> </a>
+<a name="ln403">  int waitpid_ret_val = waitpid(child_pid, ret, options);</a>
+<a name="ln404">  if (waitpid_ret_val == -1) {</a>
+<a name="ln405">    return STATUS(RuntimeError, &quot;Unable to wait on child&quot;, Errno(errno));</a>
+<a name="ln406">  }</a>
+<a name="ln407">  if ((options &amp; WNOHANG) &amp;&amp; waitpid_ret_val == 0) {</a>
+<a name="ln408">    return STATUS(TimedOut, &quot;&quot;);</a>
+<a name="ln409">  }</a>
+<a name="ln410"> </a>
+<a name="ln411">  unique_lock&lt;mutex&gt; l(state_lock_);</a>
+<a name="ln412">  CHECK_EQ(waitpid_ret_val, child_pid_);</a>
+<a name="ln413">  child_pid_ = 0;</a>
+<a name="ln414">  cached_rc_ = *ret;</a>
+<a name="ln415">  state_ = kExited;</a>
+<a name="ln416">  return Status::OK();</a>
+<a name="ln417">}</a>
+<a name="ln418"> </a>
+<a name="ln419">Status Subprocess::Kill(int signal) {</a>
+<a name="ln420">  return KillInternal(signal, /* must_be_running = */ true);</a>
+<a name="ln421">}</a>
+<a name="ln422"> </a>
+<a name="ln423">Status Subprocess::KillNoCheckIfRunning(int signal) {</a>
+<a name="ln424">  return KillInternal(signal, /* must_be_running = */ false);</a>
+<a name="ln425">}</a>
+<a name="ln426"> </a>
+<a name="ln427">Status Subprocess::KillInternal(int signal, bool must_be_running) {</a>
+<a name="ln428">  unique_lock&lt;mutex&gt; l(state_lock_);</a>
+<a name="ln429"> </a>
+<a name="ln430">  if (must_be_running) {</a>
+<a name="ln431">    CHECK_EQ(state_, kRunning);</a>
+<a name="ln432">  } else if (state_ == kNotStarted) {</a>
+<a name="ln433">    return STATUS(IllegalState, &quot;Child process has not been started, cannot send signal&quot;);</a>
+<a name="ln434">  } else if (state_ == kExited) {</a>
+<a name="ln435">    return STATUS(IllegalState, &quot;Child process has exited, cannot send signal&quot;);</a>
+<a name="ln436">  }</a>
+<a name="ln437">  CHECK_NE(child_pid_, 0);</a>
+<a name="ln438"> </a>
+<a name="ln439">  if (kill(child_pid_, signal) != 0) {</a>
+<a name="ln440">    return STATUS(RuntimeError, &quot;Unable to kill&quot;, Errno(errno));</a>
+<a name="ln441">  }</a>
+<a name="ln442">  return Status::OK();</a>
+<a name="ln443">}</a>
+<a name="ln444"> </a>
+<a name="ln445">bool Subprocess::IsRunning() const {</a>
+<a name="ln446">  unique_lock&lt;mutex&gt; l(state_lock_);</a>
+<a name="ln447">  if (state_ == kRunning) {</a>
+<a name="ln448">    CHECK_NE(child_pid_, 0);</a>
+<a name="ln449">    return kill(child_pid_, 0) == 0;</a>
+<a name="ln450">  }</a>
+<a name="ln451">  return false;</a>
+<a name="ln452">}</a>
+<a name="ln453"> </a>
+<a name="ln454">Status Subprocess::Call(const string&amp; arg_str) {</a>
+<a name="ln455">  VLOG(2) &lt;&lt; &quot;Invoking command: &quot; &lt;&lt; arg_str;</a>
+<a name="ln456">  vector&lt;string&gt; argv = Split(arg_str, &quot; &quot;);</a>
+<a name="ln457">  return Call(argv);</a>
+<a name="ln458">}</a>
+<a name="ln459"> </a>
+<a name="ln460">Status Subprocess::Call(const vector&lt;string&gt;&amp; argv) {</a>
+<a name="ln461">  Subprocess proc(argv[0], argv);</a>
+<a name="ln462">  RETURN_NOT_OK(proc.Start());</a>
+<a name="ln463">  int retcode;</a>
+<a name="ln464">  RETURN_NOT_OK(proc.Wait(&amp;retcode));</a>
+<a name="ln465"> </a>
+<a name="ln466">  if (retcode == 0) {</a>
+<a name="ln467">    return Status::OK();</a>
+<a name="ln468">  } else {</a>
+<a name="ln469">    return STATUS(RuntimeError, Substitute(</a>
+<a name="ln470">        &quot;Subprocess '$0' terminated with non-zero exit status $1&quot;,</a>
+<a name="ln471">        argv[0],</a>
+<a name="ln472">        retcode));</a>
+<a name="ln473">  }</a>
+<a name="ln474">}</a>
+<a name="ln475"> </a>
+<a name="ln476">Status Subprocess::Call(const vector&lt;string&gt;&amp; argv, string* output, bool read_stderr) {</a>
+<a name="ln477">  Subprocess p(argv[0], argv);</a>
+<a name="ln478">  return p.Call(output, read_stderr);</a>
+<a name="ln479">}</a>
+<a name="ln480"> </a>
+<a name="ln481">Status Subprocess::Call(string* output, bool read_stderr) {</a>
+<a name="ln482">  if (read_stderr) {</a>
+<a name="ln483">    ShareParentStderr(false);</a>
+<a name="ln484">  } else {</a>
+<a name="ln485">    ShareParentStdout(false);</a>
+<a name="ln486">  }</a>
+<a name="ln487"> </a>
+<a name="ln488">  RETURN_NOT_OK_PREPEND(Start(), &quot;Unable to fork &quot; + argv_[0]);</a>
+<a name="ln489">  const int err = close(ReleaseChildStdinFd());</a>
+<a name="ln490">  if (PREDICT_FALSE(err != 0)) {</a>
+<a name="ln491">    return STATUS(IOError, &quot;Unable to close child process stdin&quot;, Errno(errno));</a>
+<a name="ln492">  }</a>
+<a name="ln493"> </a>
+<a name="ln494">  output-&gt;clear();</a>
+<a name="ln495">  char buf[1024];</a>
+<a name="ln496">  int fd = -1;</a>
+<a name="ln497">  if (read_stderr) {</a>
+<a name="ln498">    fd = from_child_stderr_fd();</a>
+<a name="ln499">  } else {</a>
+<a name="ln500">    fd = from_child_stdout_fd();</a>
+<a name="ln501">  }</a>
+<a name="ln502"> </a>
+<a name="ln503">  while (true) {</a>
+<a name="ln504">    ssize_t n = read(fd, buf, arraysize(buf));</a>
+<a name="ln505">    if (n == 0) {</a>
+<a name="ln506">      // EOF</a>
+<a name="ln507">      break;</a>
+<a name="ln508">    }</a>
+<a name="ln509">    if (n &lt; 0) {</a>
+<a name="ln510">      if (errno == EINTR) continue;</a>
+<a name="ln511">      return STATUS(IOError, &quot;IO error reading from &quot; + argv_[0], Errno(errno));</a>
+<a name="ln512">    }</a>
+<a name="ln513"> </a>
+<a name="ln514">    output-&gt;append(buf, n);</a>
+<a name="ln515">  }</a>
+<a name="ln516"> </a>
+<a name="ln517">  int retcode = 0;</a>
+<a name="ln518">  RETURN_NOT_OK_PREPEND(Wait(&amp;retcode), &quot;Unable to wait() for &quot; + argv_[0]);</a>
+<a name="ln519"> </a>
+<a name="ln520">  if (PREDICT_FALSE(retcode != 0)) {</a>
+<a name="ln521">    return STATUS(RuntimeError, Substitute(</a>
+<a name="ln522">        &quot;Subprocess '$0' terminated with non-zero exit status $1&quot;,</a>
+<a name="ln523">        argv_[0],</a>
+<a name="ln524">        retcode));</a>
+<a name="ln525">  }</a>
+<a name="ln526">  return Status::OK();</a>
+<a name="ln527">}</a>
+<a name="ln528"> </a>
+<a name="ln529">int Subprocess::CheckAndOffer(int stdfd) const {</a>
+<a name="ln530">  unique_lock&lt;mutex&gt; l(state_lock_);</a>
+<a name="ln531">  CHECK_EQ(state_, kRunning);</a>
+<a name="ln532">  CHECK_EQ(fd_state_[stdfd], PIPED);</a>
+<a name="ln533">  return child_fds_[stdfd];</a>
+<a name="ln534">}</a>
+<a name="ln535"> </a>
+<a name="ln536">int Subprocess::ReleaseChildFd(int stdfd) {</a>
+<a name="ln537">  unique_lock&lt;mutex&gt; l(state_lock_);</a>
+<a name="ln538">  CHECK_EQ(state_, kRunning);</a>
+<a name="ln539">  CHECK_GE(child_fds_[stdfd], 0);</a>
+<a name="ln540">  CHECK_EQ(fd_state_[stdfd], PIPED);</a>
+<a name="ln541">  int ret = child_fds_[stdfd];</a>
+<a name="ln542">  child_fds_[stdfd] = -1;</a>
+<a name="ln543">  return ret;</a>
+<a name="ln544">}</a>
+<a name="ln545"> </a>
+<a name="ln546">void Subprocess::SetParentDeathSignal(int signal) {</a>
+<a name="ln547">  pdeath_signal_ = signal;</a>
+<a name="ln548">}</a>
+<a name="ln549"> </a>
+<a name="ln550">pid_t Subprocess::pid() const {</a>
+<a name="ln551">  unique_lock&lt;mutex&gt; l(state_lock_);</a>
+<a name="ln552">  CHECK_EQ(state_, kRunning);</a>
+<a name="ln553">  return child_pid_;</a>
+<a name="ln554">}</a>
+<a name="ln555"> </a>
+<a name="ln556">Subprocess::State Subprocess::state() const {</a>
+<a name="ln557">  unique_lock&lt;mutex&gt; l(state_lock_);</a>
+<a name="ln558">  return state_;</a>
+<a name="ln559">}</a>
+<a name="ln560"> </a>
+<a name="ln561">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="96"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="107"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v595/" target="_blank">V595</a> The 'dir' pointer was utilized before it was verified against nullptr. Check lines: 107, 108.</p></div>
+<div class="balloon" rel="141"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="237"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="284"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="290"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="296"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="319"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="324"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="336"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="455"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="168"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: cached_rc_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

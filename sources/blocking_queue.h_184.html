@@ -1,0 +1,307 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>blocking_queue.h</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32">#ifndef YB_UTIL_BLOCKING_QUEUE_H</a>
+<a name="ln33">#define YB_UTIL_BLOCKING_QUEUE_H</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;unistd.h&gt;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &lt;list&gt;</a>
+<a name="ln38">#include &lt;string&gt;</a>
+<a name="ln39">#include &lt;type_traits&gt;</a>
+<a name="ln40">#include &lt;vector&gt;</a>
+<a name="ln41"> </a>
+<a name="ln42">#include &quot;yb/gutil/basictypes.h&quot;</a>
+<a name="ln43">#include &quot;yb/gutil/gscoped_ptr.h&quot;</a>
+<a name="ln44">#include &quot;yb/util/condition_variable.h&quot;</a>
+<a name="ln45">#include &quot;yb/util/mutex.h&quot;</a>
+<a name="ln46"> </a>
+<a name="ln47">namespace yb {</a>
+<a name="ln48"> </a>
+<a name="ln49">// Return values for BlockingQueue::Put()</a>
+<a name="ln50">enum QueueStatus {</a>
+<a name="ln51">  QUEUE_SUCCESS = 0,</a>
+<a name="ln52">  QUEUE_SHUTDOWN = 1,</a>
+<a name="ln53">  QUEUE_FULL = 2</a>
+<a name="ln54">};</a>
+<a name="ln55"> </a>
+<a name="ln56">// Default logical length implementation: always returns 1.</a>
+<a name="ln57">struct DefaultLogicalSize {</a>
+<a name="ln58">  template&lt;typename T&gt;</a>
+<a name="ln59">  static size_t logical_size(const T&amp; /* unused */) {</a>
+<a name="ln60">    return 1;</a>
+<a name="ln61">  }</a>
+<a name="ln62">};</a>
+<a name="ln63"> </a>
+<a name="ln64">template &lt;typename T, class LOGICAL_SIZE = DefaultLogicalSize&gt;</a>
+<a name="ln65">class BlockingQueue {</a>
+<a name="ln66"> public:</a>
+<a name="ln67">  // If T is a pointer, this will be the base type.  If T is not a pointer, you</a>
+<a name="ln68">  // can ignore this and the functions which make use of it.</a>
+<a name="ln69">  // Template substitution failure is not an error.</a>
+<a name="ln70">  typedef typename std::remove_pointer&lt;T&gt;::type T_VAL;</a>
+<a name="ln71"> </a>
+<a name="ln72">  explicit BlockingQueue(size_t max_size)</a>
+<a name="ln73">    : shutdown_(false),</a>
+<a name="ln74">      size_(0),</a>
+<a name="ln75">      max_size_(max_size),</a>
+<a name="ln76">      not_empty_(&amp;lock_),</a>
+<a name="ln77">      not_full_(&amp;lock_) {</a>
+<a name="ln78">  }</a>
+<a name="ln79"> </a>
+<a name="ln80">  // If the queue holds a bare pointer, it must be empty on destruction, since</a>
+<a name="ln81">  // it may have ownership of the pointer.</a>
+<a name="ln82">  ~BlockingQueue() {</a>
+<a name="ln83">    DCHECK(list_.empty() || !std::is_pointer&lt;T&gt;::value)</a>
+<a name="ln84">        &lt;&lt; &quot;BlockingQueue holds bare pointers at destruction time&quot;;</a>
+<a name="ln85">  }</a>
+<a name="ln86"> </a>
+<a name="ln87">  // Get an element from the queue. Returns false if we were shut down prior to</a>
+<a name="ln88">  // getting the element.</a>
+<a name="ln89">  bool BlockingGet(T *out) {</a>
+<a name="ln90">    MutexLock l(lock_);</a>
+<a name="ln91">    while (true) {</a>
+<a name="ln92">      if (!list_.empty()) {</a>
+<a name="ln93">        *out = list_.front();</a>
+<a name="ln94">        list_.pop_front();</a>
+<a name="ln95">        decrement_size_unlocked(*out);</a>
+<a name="ln96">        not_full_.Signal();</a>
+<a name="ln97">        return true;</a>
+<a name="ln98">      }</a>
+<a name="ln99">      if (shutdown_) {</a>
+<a name="ln100">        return false;</a>
+<a name="ln101">      }</a>
+<a name="ln102">      not_empty_.Wait();</a>
+<a name="ln103">    }</a>
+<a name="ln104">  }</a>
+<a name="ln105"> </a>
+<a name="ln106">  // Get an element from the queue. Returns false if the queue is empty and</a>
+<a name="ln107">  // we were shut down prior to getting the element.</a>
+<a name="ln108">  bool BlockingGet(gscoped_ptr&lt;T_VAL&gt; *out) {</a>
+<a name="ln109">    T t = NULL;</a>
+<a name="ln110">    bool got_element = BlockingGet(&amp;t);</a>
+<a name="ln111">    if (!got_element) {</a>
+<a name="ln112">      return false;</a>
+<a name="ln113">    }</a>
+<a name="ln114">    out-&gt;reset(t);</a>
+<a name="ln115">    return true;</a>
+<a name="ln116">  }</a>
+<a name="ln117"> </a>
+<a name="ln118">  // Get all elements from the queue and append them to a</a>
+<a name="ln119">  // vector. Returns false if shutdown prior to getting the elements.</a>
+<a name="ln120">  bool BlockingDrainTo(std::vector&lt;T&gt;* out) {</a>
+<a name="ln121">    return BlockingDrainTo(out, MonoTime::kMax);</a>
+<a name="ln122">  }</a>
+<a name="ln123"> </a>
+<a name="ln124">  bool BlockingDrainTo(std::vector&lt;T&gt;* out, const MonoTime&amp; wait_timeout_deadline) {</a>
+<a name="ln125">    MutexLock l(lock_);</a>
+<a name="ln126">    while (true) {</a>
+<a name="ln127">      if (!list_.empty()) {</a>
+<a name="ln128">        out-&gt;reserve(list_.size());</a>
+<a name="ln129">        for (const T&amp; elt : list_) {</a>
+<a name="ln130">          out-&gt;push_back(elt);</a>
+<a name="ln131">          decrement_size_unlocked(elt);</a>
+<a name="ln132">        }</a>
+<a name="ln133">        list_.clear();</a>
+<a name="ln134">        not_full_.Signal();</a>
+<a name="ln135">        return true;</a>
+<a name="ln136">      }</a>
+<a name="ln137">      if (shutdown_) {</a>
+<a name="ln138">        return false;</a>
+<a name="ln139">      }</a>
+<a name="ln140">      if (!not_empty_.WaitUntil(wait_timeout_deadline)) {</a>
+<a name="ln141">        return true;</a>
+<a name="ln142">      }</a>
+<a name="ln143">    }</a>
+<a name="ln144">  }</a>
+<a name="ln145"> </a>
+<a name="ln146">  // Attempts to put the given value in the queue.</a>
+<a name="ln147">  // Returns:</a>
+<a name="ln148">  //   QUEUE_SUCCESS: if successfully inserted</a>
+<a name="ln149">  //   QUEUE_FULL: if the queue has reached max_size</a>
+<a name="ln150">  //   QUEUE_SHUTDOWN: if someone has already called Shutdown()</a>
+<a name="ln151">  QueueStatus Put(const T &amp;val) {</a>
+<a name="ln152">    MutexLock l(lock_);</a>
+<a name="ln153">    if (size_ &gt;= max_size_) {</a>
+<a name="ln154">      return QUEUE_FULL;</a>
+<a name="ln155">    }</a>
+<a name="ln156">    if (shutdown_) {</a>
+<a name="ln157">      return QUEUE_SHUTDOWN;</a>
+<a name="ln158">    }</a>
+<a name="ln159">    list_.push_back(val);</a>
+<a name="ln160">    increment_size_unlocked(val);</a>
+<a name="ln161">    l.Unlock();</a>
+<a name="ln162">    not_empty_.Signal();</a>
+<a name="ln163">    return QUEUE_SUCCESS;</a>
+<a name="ln164">  }</a>
+<a name="ln165"> </a>
+<a name="ln166">  // Returns the same as the other Put() overload above.</a>
+<a name="ln167">  // If the element was inserted, the gscoped_ptr releases its contents.</a>
+<a name="ln168">  QueueStatus Put(gscoped_ptr&lt;T_VAL&gt; *val) {</a>
+<a name="ln169">    QueueStatus s = Put(val-&gt;get());</a>
+<a name="ln170">    if (s == QUEUE_SUCCESS) {</a>
+<a name="ln171">      ignore_result&lt;&gt;(val-&gt;release());</a>
+<a name="ln172">    }</a>
+<a name="ln173">    return s;</a>
+<a name="ln174">  }</a>
+<a name="ln175"> </a>
+<a name="ln176">  // Gets an element for the queue; if the queue is full, blocks until</a>
+<a name="ln177">  // space becomes available. Returns false if we were shutdown prior</a>
+<a name="ln178">  // to enqueueing the element.</a>
+<a name="ln179">  bool BlockingPut(const T&amp; val) {</a>
+<a name="ln180">    MutexLock l(lock_);</a>
+<a name="ln181">    while (true) {</a>
+<a name="ln182">      if (shutdown_) {</a>
+<a name="ln183">        return false;</a>
+<a name="ln184">      }</a>
+<a name="ln185">      if (size_ &lt; max_size_) {</a>
+<a name="ln186">        list_.push_back(val);</a>
+<a name="ln187">        increment_size_unlocked(val);</a>
+<a name="ln188">        l.Unlock();</a>
+<a name="ln189">        not_empty_.Signal();</a>
+<a name="ln190">        return true;</a>
+<a name="ln191">      }</a>
+<a name="ln192">      not_full_.Wait();</a>
+<a name="ln193">    }</a>
+<a name="ln194">  }</a>
+<a name="ln195"> </a>
+<a name="ln196">  // Same as other BlockingPut() overload above. If the element was</a>
+<a name="ln197">  // enqueued, gscoped_ptr releases its contents.</a>
+<a name="ln198">  bool BlockingPut(gscoped_ptr&lt;T_VAL&gt;* val) {</a>
+<a name="ln199">    bool ret = Put(val-&gt;get());</a>
+<a name="ln200">    if (ret) {</a>
+<a name="ln201">      ignore_result(val-&gt;release());</a>
+<a name="ln202">    }</a>
+<a name="ln203">    return ret;</a>
+<a name="ln204">  }</a>
+<a name="ln205"> </a>
+<a name="ln206">  // Shut down the queue.</a>
+<a name="ln207">  // When a blocking queue is shut down, no more elements can be added to it,</a>
+<a name="ln208">  // and Put() will return QUEUE_SHUTDOWN.</a>
+<a name="ln209">  // Existing elements will drain out of it, and then BlockingGet will start</a>
+<a name="ln210">  // returning false.</a>
+<a name="ln211">  void Shutdown() {</a>
+<a name="ln212">    MutexLock l(lock_);</a>
+<a name="ln213">    shutdown_ = true;</a>
+<a name="ln214">    not_full_.Broadcast();</a>
+<a name="ln215">    not_empty_.Broadcast();</a>
+<a name="ln216">  }</a>
+<a name="ln217"> </a>
+<a name="ln218">  bool empty() const {</a>
+<a name="ln219">    MutexLock l(lock_);</a>
+<a name="ln220">    return list_.empty();</a>
+<a name="ln221">  }</a>
+<a name="ln222"> </a>
+<a name="ln223">  size_t max_size() const {</a>
+<a name="ln224">    return max_size_;</a>
+<a name="ln225">  }</a>
+<a name="ln226"> </a>
+<a name="ln227">  std::string ToString() const {</a>
+<a name="ln228">    std::string ret;</a>
+<a name="ln229"> </a>
+<a name="ln230">    MutexLock l(lock_);</a>
+<a name="ln231">    for (const T&amp; t : list_) {</a>
+<a name="ln232">      ret.append(t-&gt;ToString());</a>
+<a name="ln233">      ret.append(&quot;\n&quot;);</a>
+<a name="ln234">    }</a>
+<a name="ln235">    return ret;</a>
+<a name="ln236">  }</a>
+<a name="ln237"> </a>
+<a name="ln238"> private:</a>
+<a name="ln239"> </a>
+<a name="ln240">  // Increments queue size. Must be called when 'lock_' is held.</a>
+<a name="ln241">  void increment_size_unlocked(const T&amp; t) {</a>
+<a name="ln242">    size_ += LOGICAL_SIZE::logical_size(t);</a>
+<a name="ln243">  }</a>
+<a name="ln244"> </a>
+<a name="ln245">  // Decrements queue size. Must be called when 'lock_' is held.</a>
+<a name="ln246">  void decrement_size_unlocked(const T&amp; t) {</a>
+<a name="ln247">    size_ -= LOGICAL_SIZE::logical_size(t);</a>
+<a name="ln248">  }</a>
+<a name="ln249"> </a>
+<a name="ln250">  bool shutdown_;</a>
+<a name="ln251">  size_t size_;</a>
+<a name="ln252">  size_t max_size_;</a>
+<a name="ln253">  mutable Mutex lock_;</a>
+<a name="ln254">  ConditionVariable not_empty_;</a>
+<a name="ln255">  ConditionVariable not_full_;</a>
+<a name="ln256">  std::list&lt;T&gt; list_;</a>
+<a name="ln257">};</a>
+<a name="ln258"> </a>
+<a name="ln259">} // namespace yb</a>
+<a name="ln260"> </a>
+<a name="ln261">#endif  // YB_UTIL_BLOCKING_QUEUE_H</a>
+
+</code></pre>
+<div class="balloon" rel="83"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

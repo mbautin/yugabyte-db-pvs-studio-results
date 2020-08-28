@@ -1,0 +1,704 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>outbound_call.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &lt;algorithm&gt;</a>
+<a name="ln34">#include &lt;string&gt;</a>
+<a name="ln35">#include &lt;mutex&gt;</a>
+<a name="ln36">#include &lt;vector&gt;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &lt;boost/functional/hash.hpp&gt;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln41"> </a>
+<a name="ln42">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln43">#include &quot;yb/gutil/walltime.h&quot;</a>
+<a name="ln44"> </a>
+<a name="ln45">#include &quot;yb/rpc/connection.h&quot;</a>
+<a name="ln46">#include &quot;yb/rpc/constants.h&quot;</a>
+<a name="ln47">#include &quot;yb/rpc/outbound_call.h&quot;</a>
+<a name="ln48">#include &quot;yb/rpc/rpc_controller.h&quot;</a>
+<a name="ln49">#include &quot;yb/rpc/rpc_introspection.pb.h&quot;</a>
+<a name="ln50">#include &quot;yb/rpc/rpc_metrics.h&quot;</a>
+<a name="ln51">#include &quot;yb/rpc/serialization.h&quot;</a>
+<a name="ln52"> </a>
+<a name="ln53">#include &quot;yb/util/concurrent_value.h&quot;</a>
+<a name="ln54">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln55">#include &quot;yb/util/memory/memory.h&quot;</a>
+<a name="ln56">#include &quot;yb/util/pb_util.h&quot;</a>
+<a name="ln57">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln58">#include &quot;yb/util/tsan_util.h&quot;</a>
+<a name="ln59"> </a>
+<a name="ln60">METRIC_DEFINE_histogram(</a>
+<a name="ln61">    server, handler_latency_outbound_call_queue_time, &quot;Time taken to queue the request &quot;,</a>
+<a name="ln62">    yb::MetricUnit::kMicroseconds, &quot;Microseconds spent to queue the request to the reactor&quot;,</a>
+<a name="ln63">    60000000LU, 2);</a>
+<a name="ln64">METRIC_DEFINE_histogram(</a>
+<a name="ln65">    server, handler_latency_outbound_call_send_time, &quot;Time taken to send the request &quot;,</a>
+<a name="ln66">    yb::MetricUnit::kMicroseconds, &quot;Microseconds spent to queue and write the request to the wire&quot;,</a>
+<a name="ln67">    60000000LU, 2);</a>
+<a name="ln68">METRIC_DEFINE_histogram(</a>
+<a name="ln69">    server, handler_latency_outbound_call_time_to_response, &quot;Time taken to get the response &quot;,</a>
+<a name="ln70">    yb::MetricUnit::kMicroseconds,</a>
+<a name="ln71">    &quot;Microseconds spent to send the request and get a response on the wire&quot;, 60000000LU, 2);</a>
+<a name="ln72"> </a>
+<a name="ln73">// 100M cycles should be about 50ms on a 2Ghz box. This should be high</a>
+<a name="ln74">// enough that involuntary context switches don't trigger it, but low enough</a>
+<a name="ln75">// that any serious blocking behavior on the reactor would.</a>
+<a name="ln76">DEFINE_int64(</a>
+<a name="ln77">    rpc_callback_max_cycles, 100 * 1000 * 1000 * yb::kTimeMultiplier,</a>
+<a name="ln78">    &quot;The maximum number of cycles for which an RPC callback &quot;</a>
+<a name="ln79">    &quot;should be allowed to run without emitting a warning.&quot;</a>
+<a name="ln80">    &quot; (Advanced debugging option)&quot;);</a>
+<a name="ln81">TAG_FLAG(rpc_callback_max_cycles, advanced);</a>
+<a name="ln82">TAG_FLAG(rpc_callback_max_cycles, runtime);</a>
+<a name="ln83">DECLARE_bool(rpc_dump_all_traces);</a>
+<a name="ln84"> </a>
+<a name="ln85">namespace yb {</a>
+<a name="ln86">namespace rpc {</a>
+<a name="ln87"> </a>
+<a name="ln88">using strings::Substitute;</a>
+<a name="ln89">using google::protobuf::Message;</a>
+<a name="ln90">using google::protobuf::io::CodedOutputStream;</a>
+<a name="ln91"> </a>
+<a name="ln92">OutboundCallMetrics::OutboundCallMetrics(const scoped_refptr&lt;MetricEntity&gt;&amp; entity)</a>
+<a name="ln93">    : queue_time(METRIC_handler_latency_outbound_call_queue_time.Instantiate(entity)),</a>
+<a name="ln94">      send_time(METRIC_handler_latency_outbound_call_send_time.Instantiate(entity)),</a>
+<a name="ln95">      time_to_response(METRIC_handler_latency_outbound_call_time_to_response.Instantiate(entity)) {</a>
+<a name="ln96">}</a>
+<a name="ln97"> </a>
+<a name="ln98">namespace {</a>
+<a name="ln99"> </a>
+<a name="ln100">std::atomic&lt;int32_t&gt; call_id_ = {0};</a>
+<a name="ln101"> </a>
+<a name="ln102">int32_t NextCallId() {</a>
+<a name="ln103">  for (;;) {</a>
+<a name="ln104">    auto result = call_id_.fetch_add(1, std::memory_order_acquire);</a>
+<a name="ln105">    ++result;</a>
+<a name="ln106">    if (result &gt; 0) {</a>
+<a name="ln107">      return result;</a>
+<a name="ln108">    }</a>
+<a name="ln109">    // When call id overflows, we reset it to zero.</a>
+<a name="ln110">    call_id_.compare_exchange_weak(result, 0);</a>
+<a name="ln111">  }</a>
+<a name="ln112">}</a>
+<a name="ln113"> </a>
+<a name="ln114">class RemoteMethodsCache {</a>
+<a name="ln115"> public:</a>
+<a name="ln116">  RemoteMethodPool* Find(const RemoteMethod&amp; method) {</a>
+<a name="ln117">    {</a>
+<a name="ln118">      auto cache = concurrent_cache_.get();</a>
+<a name="ln119">      auto it = cache-&gt;find(method);</a>
+<a name="ln120">      if (it != cache-&gt;end()) {</a>
+<a name="ln121">        return it-&gt;second;</a>
+<a name="ln122">      }</a>
+<a name="ln123">    }</a>
+<a name="ln124">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln125">    auto it = cache_.find(method);</a>
+<a name="ln126">    if (it == cache_.end()) {</a>
+<a name="ln127">      auto result = std::make_shared&lt;RemoteMethodPool&gt;([method]() -&gt; RemoteMethodPB* {</a>
+<a name="ln128">        auto remote_method = new RemoteMethodPB();</a>
+<a name="ln129">        method.ToPB(remote_method);</a>
+<a name="ln130">        return remote_method;</a>
+<a name="ln131">      });</a>
+<a name="ln132">      cache_.emplace(method, result);</a>
+<a name="ln133">      PtrCache new_ptr_cache;</a>
+<a name="ln134">      for (const auto&amp; p : cache_) {</a>
+<a name="ln135">        new_ptr_cache.emplace(p.first, p.second.get());</a>
+<a name="ln136">      }</a>
+<a name="ln137">      concurrent_cache_.Set(std::move(new_ptr_cache));</a>
+<a name="ln138">      return result.get();</a>
+<a name="ln139">    }</a>
+<a name="ln140"> </a>
+<a name="ln141">    return it-&gt;second.get();</a>
+<a name="ln142">  }</a>
+<a name="ln143"> </a>
+<a name="ln144">  static RemoteMethodsCache&amp; Instance() {</a>
+<a name="ln145">    static RemoteMethodsCache instance;</a>
+<a name="ln146">    return instance;</a>
+<a name="ln147">  }</a>
+<a name="ln148"> </a>
+<a name="ln149"> private:</a>
+<a name="ln150">  typedef std::unordered_map&lt;</a>
+<a name="ln151">      RemoteMethod, std::shared_ptr&lt;RemoteMethodPool&gt;, RemoteMethodHash&gt; Cache;</a>
+<a name="ln152">  typedef std::unordered_map&lt;RemoteMethod, RemoteMethodPool*, RemoteMethodHash&gt; PtrCache;</a>
+<a name="ln153">  std::mutex mutex_;</a>
+<a name="ln154">  Cache cache_;</a>
+<a name="ln155">  ConcurrentValue&lt;PtrCache&gt; concurrent_cache_;</a>
+<a name="ln156">};</a>
+<a name="ln157"> </a>
+<a name="ln158">const std::string kEmptyString;</a>
+<a name="ln159"> </a>
+<a name="ln160">} // namespace</a>
+<a name="ln161"> </a>
+<a name="ln162">void InvokeCallbackTask::Run() {</a>
+<a name="ln163">  CHECK_NOTNULL(call_.get());</a>
+<a name="ln164">  call_-&gt;InvokeCallbackSync();</a>
+<a name="ln165">}</a>
+<a name="ln166"> </a>
+<a name="ln167">void InvokeCallbackTask::Done(const Status&amp; status) {</a>
+<a name="ln168">  CHECK_NOTNULL(call_.get());</a>
+<a name="ln169">  if (!status.ok()) {</a>
+<a name="ln170">    LOG(WARNING) &lt;&lt; Format(</a>
+<a name="ln171">        &quot;Failed to schedule invoking callback on response for request $0 to $1: $2&quot;,</a>
+<a name="ln172">        call_-&gt;remote_method(), call_-&gt;hostname(), status);</a>
+<a name="ln173">    call_-&gt;InvokeCallbackSync();</a>
+<a name="ln174">  }</a>
+<a name="ln175">  // Clear the call, since it holds OutboundCall object.</a>
+<a name="ln176">  call_ = nullptr;</a>
+<a name="ln177">}</a>
+<a name="ln178"> </a>
+<a name="ln179">///</a>
+<a name="ln180">/// OutboundCall</a>
+<a name="ln181">///</a>
+<a name="ln182"> </a>
+<a name="ln183">OutboundCall::OutboundCall(const RemoteMethod* remote_method,</a>
+<a name="ln184">                           const std::shared_ptr&lt;OutboundCallMetrics&gt;&amp; outbound_call_metrics,</a>
+<a name="ln185">                           google::protobuf::Message* response_storage,</a>
+<a name="ln186">                           RpcController* controller,</a>
+<a name="ln187">                           RpcMetrics* rpc_metrics,</a>
+<a name="ln188">                           ResponseCallback callback,</a>
+<a name="ln189">                           ThreadPool* callback_thread_pool)</a>
+<a name="ln190">    : hostname_(&amp;kEmptyString),</a>
+<a name="ln191">      start_(MonoTime::Now()),</a>
+<a name="ln192">      controller_(DCHECK_NOTNULL(controller)),</a>
+<a name="ln193">      response_(DCHECK_NOTNULL(response_storage)),</a>
+<a name="ln194">      call_id_(NextCallId()),</a>
+<a name="ln195">      remote_method_(remote_method),</a>
+<a name="ln196">      callback_(std::move(callback)),</a>
+<a name="ln197">      callback_thread_pool_(callback_thread_pool),</a>
+<a name="ln198">      trace_(new Trace),</a>
+<a name="ln199">      outbound_call_metrics_(outbound_call_metrics),</a>
+<a name="ln200">      remote_method_pool_(RemoteMethodsCache::Instance().Find(*remote_method_)),</a>
+<a name="ln201">      rpc_metrics_(rpc_metrics) {</a>
+<a name="ln202">  // Avoid expensive conn_id.ToString() in production.</a>
+<a name="ln203">  TRACE_TO_WITH_TIME(trace_, start_, &quot;Outbound Call initiated.&quot;);</a>
+<a name="ln204"> </a>
+<a name="ln205">  if (Trace::CurrentTrace()) {</a>
+<a name="ln206">    Trace::CurrentTrace()-&gt;AddChildTrace(trace_.get());</a>
+<a name="ln207">  }</a>
+<a name="ln208"> </a>
+<a name="ln209">  DVLOG(4) &lt;&lt; &quot;OutboundCall &quot; &lt;&lt; this &lt;&lt; &quot; constructed with state_: &quot; &lt;&lt; StateName(state_)</a>
+<a name="ln210">           &lt;&lt; &quot; and RPC timeout: &quot;</a>
+<a name="ln211">           &lt;&lt; (controller_-&gt;timeout().Initialized() ? controller_-&gt;timeout().ToString() : &quot;none&quot;);</a>
+<a name="ln212"> </a>
+<a name="ln213">  IncrementCounter(rpc_metrics_-&gt;outbound_calls_created);</a>
+<a name="ln214">  IncrementGauge(rpc_metrics_-&gt;outbound_calls_alive);</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217">OutboundCall::~OutboundCall() {</a>
+<a name="ln218">  DCHECK(IsFinished());</a>
+<a name="ln219">  DVLOG(4) &lt;&lt; &quot;OutboundCall &quot; &lt;&lt; this &lt;&lt; &quot; destroyed with state_: &quot; &lt;&lt; StateName(state_);</a>
+<a name="ln220"> </a>
+<a name="ln221">  if (PREDICT_FALSE(FLAGS_rpc_dump_all_traces)) {</a>
+<a name="ln222">    LOG(INFO) &lt;&lt; ToString() &lt;&lt; &quot; took &quot;</a>
+<a name="ln223">              &lt;&lt; MonoTime::Now().GetDeltaSince(start_).ToMicroseconds()</a>
+<a name="ln224">              &lt;&lt; &quot;us. Trace:&quot;;</a>
+<a name="ln225">    trace_-&gt;Dump(&amp;LOG(INFO), true);</a>
+<a name="ln226">  }</a>
+<a name="ln227"> </a>
+<a name="ln228">  DecrementGauge(rpc_metrics_-&gt;outbound_calls_alive);</a>
+<a name="ln229">}</a>
+<a name="ln230"> </a>
+<a name="ln231">void OutboundCall::NotifyTransferred(const Status&amp; status, Connection* conn) {</a>
+<a name="ln232">  if (status.ok()) {</a>
+<a name="ln233">    // Even when call is already finished (timed out) we should notify connection that it was sent</a>
+<a name="ln234">    // because it should expect response with appropriate id.</a>
+<a name="ln235">    conn-&gt;CallSent(shared_from(this));</a>
+<a name="ln236">  }</a>
+<a name="ln237"> </a>
+<a name="ln238">  if (IsFinished()) {</a>
+<a name="ln239">    LOG_IF_WITH_PREFIX(DFATAL, !IsTimedOut())</a>
+<a name="ln240">        &lt;&lt; &quot;Transferred call is in wrong state: &quot; &lt;&lt; state_.load(std::memory_order_acquire);</a>
+<a name="ln241">  } else if (status.ok()) {</a>
+<a name="ln242">    SetSent();</a>
+<a name="ln243">  } else {</a>
+<a name="ln244">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Connection torn down: &quot; &lt;&lt; status;</a>
+<a name="ln245">    SetFailed(status);</a>
+<a name="ln246">  }</a>
+<a name="ln247">}</a>
+<a name="ln248"> </a>
+<a name="ln249">void OutboundCall::Serialize(boost::container::small_vector_base&lt;RefCntBuffer&gt;* output) {</a>
+<a name="ln250">  output-&gt;push_back(std::move(buffer_));</a>
+<a name="ln251">  buffer_consumption_ = ScopedTrackedConsumption();</a>
+<a name="ln252">}</a>
+<a name="ln253"> </a>
+<a name="ln254">Status OutboundCall::SetRequestParam(</a>
+<a name="ln255">    const Message&amp; message, const MemTrackerPtr&amp; mem_tracker) {</a>
+<a name="ln256">  using serialization::SerializeHeader;</a>
+<a name="ln257">  using serialization::SerializeMessage;</a>
+<a name="ln258"> </a>
+<a name="ln259">  size_t message_size = 0;</a>
+<a name="ln260">  auto status = SerializeMessage(message,</a>
+<a name="ln261">                                 /* param_buf */ nullptr,</a>
+<a name="ln262">                                 /* additional_size */ 0,</a>
+<a name="ln263">                                 /* use_cached_size */ false,</a>
+<a name="ln264">                                 /* offset */ 0,</a>
+<a name="ln265">                                 &amp;message_size);</a>
+<a name="ln266">  if (!status.ok()) {</a>
+<a name="ln267">    return status;</a>
+<a name="ln268">  }</a>
+<a name="ln269">  size_t header_size = 0;</a>
+<a name="ln270"> </a>
+<a name="ln271">  RequestHeader header;</a>
+<a name="ln272">  InitHeader(&amp;header);</a>
+<a name="ln273">  status = SerializeHeader(header, message_size, &amp;buffer_, message_size, &amp;header_size);</a>
+<a name="ln274">  remote_method_pool_-&gt;Release(header.release_remote_method());</a>
+<a name="ln275">  if (!status.ok()) {</a>
+<a name="ln276">    return status;</a>
+<a name="ln277">  }</a>
+<a name="ln278"> </a>
+<a name="ln279">  if (mem_tracker) {</a>
+<a name="ln280">    buffer_consumption_ = ScopedTrackedConsumption(mem_tracker, buffer_.size());</a>
+<a name="ln281">  }</a>
+<a name="ln282"> </a>
+<a name="ln283">  return SerializeMessage(message,</a>
+<a name="ln284">                          &amp;buffer_,</a>
+<a name="ln285">                          /* additional_size */ 0,</a>
+<a name="ln286">                          /* use_cached_size */ true,</a>
+<a name="ln287">                          header_size);</a>
+<a name="ln288">}</a>
+<a name="ln289"> </a>
+<a name="ln290">Status OutboundCall::status() const {</a>
+<a name="ln291">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln292">  return status_;</a>
+<a name="ln293">}</a>
+<a name="ln294"> </a>
+<a name="ln295">const ErrorStatusPB* OutboundCall::error_pb() const {</a>
+<a name="ln296">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln297">  return error_pb_.get();</a>
+<a name="ln298">}</a>
+<a name="ln299"> </a>
+<a name="ln300"> </a>
+<a name="ln301">string OutboundCall::StateName(State state) {</a>
+<a name="ln302">  return RpcCallState_Name(state);</a>
+<a name="ln303">}</a>
+<a name="ln304"> </a>
+<a name="ln305">OutboundCall::State OutboundCall::state() const {</a>
+<a name="ln306">  return state_.load(std::memory_order_acquire);</a>
+<a name="ln307">}</a>
+<a name="ln308"> </a>
+<a name="ln309">bool FinishedState(RpcCallState state) {</a>
+<a name="ln310">  switch (state) {</a>
+<a name="ln311">    case READY:</a>
+<a name="ln312">    case ON_OUTBOUND_QUEUE:</a>
+<a name="ln313">    case SENT:</a>
+<a name="ln314">      return false;</a>
+<a name="ln315">    case TIMED_OUT:</a>
+<a name="ln316">    case FINISHED_ERROR:</a>
+<a name="ln317">    case FINISHED_SUCCESS:</a>
+<a name="ln318">      return true;</a>
+<a name="ln319">  }</a>
+<a name="ln320">  LOG(FATAL) &lt;&lt; &quot;Unknown call state: &quot; &lt;&lt; state;</a>
+<a name="ln321">  return false;</a>
+<a name="ln322">}</a>
+<a name="ln323"> </a>
+<a name="ln324">bool ValidStateTransition(RpcCallState old_state, RpcCallState new_state) {</a>
+<a name="ln325">  switch (new_state) {</a>
+<a name="ln326">    case ON_OUTBOUND_QUEUE:</a>
+<a name="ln327">      return old_state == READY;</a>
+<a name="ln328">    case SENT:</a>
+<a name="ln329">      return old_state == ON_OUTBOUND_QUEUE;</a>
+<a name="ln330">    case TIMED_OUT:</a>
+<a name="ln331">      return old_state == SENT || old_state == ON_OUTBOUND_QUEUE;</a>
+<a name="ln332">    case FINISHED_SUCCESS:</a>
+<a name="ln333">      return old_state == SENT;</a>
+<a name="ln334">    case FINISHED_ERROR:</a>
+<a name="ln335">      return old_state == SENT || old_state == ON_OUTBOUND_QUEUE || old_state == READY;</a>
+<a name="ln336">    default:</a>
+<a name="ln337">      // No sanity checks for others.</a>
+<a name="ln338">      return true;</a>
+<a name="ln339">  }</a>
+<a name="ln340">}</a>
+<a name="ln341"> </a>
+<a name="ln342">bool OutboundCall::SetState(State new_state) {</a>
+<a name="ln343">  auto old_state = state_.load(std::memory_order_acquire);</a>
+<a name="ln344">  // Sanity check state transitions.</a>
+<a name="ln345">  DVLOG(3) &lt;&lt; &quot;OutboundCall &quot; &lt;&lt; this &lt;&lt; &quot; (&quot; &lt;&lt; ToString() &lt;&lt; &quot;) switching from &quot; &lt;&lt;</a>
+<a name="ln346">    StateName(old_state) &lt;&lt; &quot; to &quot; &lt;&lt; StateName(new_state);</a>
+<a name="ln347">  for (;;) {</a>
+<a name="ln348">    if (FinishedState(old_state)) {</a>
+<a name="ln349">      VLOG(1) &lt;&lt; &quot;Call already finished: &quot; &lt;&lt; RpcCallState_Name(old_state) &lt;&lt; &quot;, new state: &quot;</a>
+<a name="ln350">              &lt;&lt; RpcCallState_Name(new_state);</a>
+<a name="ln351">      return false;</a>
+<a name="ln352">    }</a>
+<a name="ln353">    if (!ValidStateTransition(old_state, new_state)) {</a>
+<a name="ln354">      LOG(DFATAL)</a>
+<a name="ln355">          &lt;&lt; &quot;Invalid call state transition: &quot; &lt;&lt; RpcCallState_Name(old_state) &lt;&lt; &quot; =&gt; &quot;</a>
+<a name="ln356">          &lt;&lt; RpcCallState_Name(new_state);</a>
+<a name="ln357">      return false;</a>
+<a name="ln358">    }</a>
+<a name="ln359">    if (state_.compare_exchange_weak(old_state, new_state, std::memory_order_acq_rel)) {</a>
+<a name="ln360">      return true;</a>
+<a name="ln361">    }</a>
+<a name="ln362">  }</a>
+<a name="ln363">}</a>
+<a name="ln364"> </a>
+<a name="ln365">void OutboundCall::InvokeCallback() {</a>
+<a name="ln366">  if (callback_thread_pool_) {</a>
+<a name="ln367">    callback_task_.SetOutboundCall(shared_from(this));</a>
+<a name="ln368">    callback_thread_pool_-&gt;Enqueue(&amp;callback_task_);</a>
+<a name="ln369">    TRACE_TO(trace_, &quot;Callback called asynchronously.&quot;);</a>
+<a name="ln370">  } else {</a>
+<a name="ln371">    InvokeCallbackSync();</a>
+<a name="ln372">    TRACE_TO(trace_, &quot;Callback called.&quot;);</a>
+<a name="ln373">  }</a>
+<a name="ln374">}</a>
+<a name="ln375"> </a>
+<a name="ln376">void OutboundCall::InvokeCallbackSync() {</a>
+<a name="ln377">  if (!callback_) {</a>
+<a name="ln378">    LOG(DFATAL) &lt;&lt; &quot;Callback has been already invoked.&quot;;</a>
+<a name="ln379">    return;</a>
+<a name="ln380">  }</a>
+<a name="ln381"> </a>
+<a name="ln382">  int64_t start_cycles = CycleClock::Now();</a>
+<a name="ln383">  callback_();</a>
+<a name="ln384">  // Clear the callback, since it may be holding onto reference counts</a>
+<a name="ln385">  // via bound parameters. We do this inside the timer because it's possible</a>
+<a name="ln386">  // the user has naughty destructors that block, and we want to account for that</a>
+<a name="ln387">  // time here if they happen to run on this thread.</a>
+<a name="ln388">  callback_ = nullptr;</a>
+<a name="ln389">  int64_t end_cycles = CycleClock::Now();</a>
+<a name="ln390">  int64_t wait_cycles = end_cycles - start_cycles;</a>
+<a name="ln391">  if (PREDICT_FALSE(wait_cycles &gt; FLAGS_rpc_callback_max_cycles)) {</a>
+<a name="ln392">    auto time_spent = MonoDelta::FromSeconds(</a>
+<a name="ln393">        static_cast&lt;double&gt;(wait_cycles) / base::CyclesPerSecond());</a>
+<a name="ln394"> </a>
+<a name="ln395">    LOG(WARNING) &lt;&lt; &quot;RPC callback for &quot; &lt;&lt; ToString() &lt;&lt; &quot; took &quot; &lt;&lt; time_spent;</a>
+<a name="ln396">  }</a>
+<a name="ln397"> </a>
+<a name="ln398">  // Could be destroyed during callback. So reset it.</a>
+<a name="ln399">  controller_ = nullptr;</a>
+<a name="ln400">  response_ = nullptr;</a>
+<a name="ln401">}</a>
+<a name="ln402"> </a>
+<a name="ln403">void OutboundCall::SetResponse(CallResponse&amp;&amp; resp) {</a>
+<a name="ln404">  DCHECK(!IsFinished());</a>
+<a name="ln405"> </a>
+<a name="ln406">  auto now = MonoTime::Now();</a>
+<a name="ln407">  TRACE_TO_WITH_TIME(trace_, now, &quot;Response received.&quot;);</a>
+<a name="ln408">  // Track time taken to be responded.</a>
+<a name="ln409"> </a>
+<a name="ln410">  if (outbound_call_metrics_) {</a>
+<a name="ln411">    outbound_call_metrics_-&gt;time_to_response-&gt;Increment(now.GetDeltaSince(start_).ToMicroseconds());</a>
+<a name="ln412">  }</a>
+<a name="ln413">  call_response_ = std::move(resp);</a>
+<a name="ln414">  Slice r(call_response_.serialized_response());</a>
+<a name="ln415"> </a>
+<a name="ln416">  if (call_response_.is_success()) {</a>
+<a name="ln417">    // TODO: here we're deserializing the call response within the reactor thread,</a>
+<a name="ln418">    // which isn't great, since it would block processing of other RPCs in parallel.</a>
+<a name="ln419">    // Should look into a way to avoid this.</a>
+<a name="ln420">    if (!pb_util::ParseFromArray(response_, r.data(), r.size()).IsOk()) {</a>
+<a name="ln421">      SetFailed(STATUS(IOError, &quot;Invalid response, missing fields&quot;,</a>
+<a name="ln422">                                response_-&gt;InitializationErrorString()));</a>
+<a name="ln423">      return;</a>
+<a name="ln424">    }</a>
+<a name="ln425">    if (SetState(FINISHED_SUCCESS)) {</a>
+<a name="ln426">      InvokeCallback();</a>
+<a name="ln427">    } else {</a>
+<a name="ln428">      LOG(DFATAL) &lt;&lt; &quot;Success of already finished call: &quot;</a>
+<a name="ln429">                  &lt;&lt; RpcCallState_Name(state_.load(std::memory_order_acquire));</a>
+<a name="ln430">    }</a>
+<a name="ln431">  } else {</a>
+<a name="ln432">    // Error</a>
+<a name="ln433">    auto err = std::make_unique&lt;ErrorStatusPB&gt;();</a>
+<a name="ln434">    if (!pb_util::ParseFromArray(err.get(), r.data(), r.size()).IsOk()) {</a>
+<a name="ln435">      SetFailed(STATUS(IOError, &quot;Was an RPC error but could not parse error response&quot;,</a>
+<a name="ln436">                                err-&gt;InitializationErrorString()));</a>
+<a name="ln437">      return;</a>
+<a name="ln438">    }</a>
+<a name="ln439">    auto status = STATUS(RemoteError, err-&gt;message());</a>
+<a name="ln440">    SetFailed(status, std::move(err));</a>
+<a name="ln441">  }</a>
+<a name="ln442">}</a>
+<a name="ln443"> </a>
+<a name="ln444">void OutboundCall::SetQueued() {</a>
+<a name="ln445">  auto end_time = MonoTime::Now();</a>
+<a name="ln446">  // Track time taken to be queued.</a>
+<a name="ln447">  if (outbound_call_metrics_) {</a>
+<a name="ln448">    outbound_call_metrics_-&gt;queue_time-&gt;Increment(end_time.GetDeltaSince(start_).ToMicroseconds());</a>
+<a name="ln449">  }</a>
+<a name="ln450">  SetState(ON_OUTBOUND_QUEUE);</a>
+<a name="ln451">  TRACE_TO_WITH_TIME(trace_, end_time, &quot;Queued.&quot;);</a>
+<a name="ln452">}</a>
+<a name="ln453"> </a>
+<a name="ln454">void OutboundCall::SetSent() {</a>
+<a name="ln455">  auto end_time = MonoTime::Now();</a>
+<a name="ln456">  // Track time taken to be sent</a>
+<a name="ln457">  if (outbound_call_metrics_) {</a>
+<a name="ln458">    outbound_call_metrics_-&gt;send_time-&gt;Increment(end_time.GetDeltaSince(start_).ToMicroseconds());</a>
+<a name="ln459">  }</a>
+<a name="ln460">  SetState(SENT);</a>
+<a name="ln461">  TRACE_TO_WITH_TIME(trace_, end_time, &quot;Call Sent.&quot;);</a>
+<a name="ln462">}</a>
+<a name="ln463"> </a>
+<a name="ln464">void OutboundCall::SetFinished() {</a>
+<a name="ln465">  DCHECK(!IsFinished());</a>
+<a name="ln466"> </a>
+<a name="ln467">  // Track time taken to be responded.</a>
+<a name="ln468">  if (outbound_call_metrics_) {</a>
+<a name="ln469">    outbound_call_metrics_-&gt;time_to_response-&gt;Increment(</a>
+<a name="ln470">        MonoTime::Now().GetDeltaSince(start_).ToMicroseconds());</a>
+<a name="ln471">  }</a>
+<a name="ln472">  if (SetState(FINISHED_SUCCESS)) {</a>
+<a name="ln473">    InvokeCallback();</a>
+<a name="ln474">  }</a>
+<a name="ln475">  TRACE_TO(trace_, &quot;Callback called.&quot;);</a>
+<a name="ln476">}</a>
+<a name="ln477"> </a>
+<a name="ln478">void OutboundCall::SetFailed(const Status &amp;status, std::unique_ptr&lt;ErrorStatusPB&gt; err_pb) {</a>
+<a name="ln479">  DCHECK(!IsFinished());</a>
+<a name="ln480"> </a>
+<a name="ln481">  TRACE_TO(trace_, &quot;Call Failed.&quot;);</a>
+<a name="ln482">  bool invoke_callback;</a>
+<a name="ln483">  {</a>
+<a name="ln484">    std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln485">    status_ = status;</a>
+<a name="ln486">    if (status_.IsRemoteError()) {</a>
+<a name="ln487">      CHECK(err_pb);</a>
+<a name="ln488">      error_pb_ = std::move(err_pb);</a>
+<a name="ln489">    } else {</a>
+<a name="ln490">      CHECK(!err_pb);</a>
+<a name="ln491">    }</a>
+<a name="ln492">    invoke_callback = SetState(FINISHED_ERROR);</a>
+<a name="ln493">  }</a>
+<a name="ln494">  if (invoke_callback) {</a>
+<a name="ln495">    InvokeCallback();</a>
+<a name="ln496">  }</a>
+<a name="ln497">}</a>
+<a name="ln498"> </a>
+<a name="ln499">void OutboundCall::SetTimedOut() {</a>
+<a name="ln500">  DCHECK(!IsFinished());</a>
+<a name="ln501"> </a>
+<a name="ln502">  TRACE_TO(trace_, &quot;Call TimedOut.&quot;);</a>
+<a name="ln503">  bool invoke_callback;</a>
+<a name="ln504">  {</a>
+<a name="ln505">    auto status = STATUS_FORMAT(</a>
+<a name="ln506">        TimedOut,</a>
+<a name="ln507">        &quot;$0 RPC (request call id $3) to $1 timed out after $2&quot;,</a>
+<a name="ln508">        remote_method_-&gt;method_name(),</a>
+<a name="ln509">        conn_id_.remote(),</a>
+<a name="ln510">        controller_-&gt;timeout(),</a>
+<a name="ln511">        call_id_);</a>
+<a name="ln512">    std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln513">    status_ = std::move(status);</a>
+<a name="ln514">    invoke_callback = SetState(TIMED_OUT);</a>
+<a name="ln515">  }</a>
+<a name="ln516">  if (invoke_callback) {</a>
+<a name="ln517">    InvokeCallback();</a>
+<a name="ln518">  }</a>
+<a name="ln519">}</a>
+<a name="ln520"> </a>
+<a name="ln521">bool OutboundCall::IsTimedOut() const {</a>
+<a name="ln522">  return state_.load(std::memory_order_acquire) == TIMED_OUT;</a>
+<a name="ln523">}</a>
+<a name="ln524"> </a>
+<a name="ln525">bool OutboundCall::IsFinished() const {</a>
+<a name="ln526">  return FinishedState(state_.load(std::memory_order_acquire));</a>
+<a name="ln527">}</a>
+<a name="ln528"> </a>
+<a name="ln529">Result&lt;Slice&gt; OutboundCall::GetSidecar(int idx) const {</a>
+<a name="ln530">  return call_response_.GetSidecar(idx);</a>
+<a name="ln531">}</a>
+<a name="ln532"> </a>
+<a name="ln533">string OutboundCall::ToString() const {</a>
+<a name="ln534">  return Format(&quot;RPC call $0 -&gt; $1 , state=$2.&quot;, *remote_method_, conn_id_, StateName(state_));</a>
+<a name="ln535">}</a>
+<a name="ln536"> </a>
+<a name="ln537">bool OutboundCall::DumpPB(const DumpRunningRpcsRequestPB&amp; req,</a>
+<a name="ln538">                          RpcCallInProgressPB* resp) {</a>
+<a name="ln539">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln540">  auto state_value = state();</a>
+<a name="ln541">  if (!req.dump_timed_out() &amp;&amp; state_value == RpcCallState::TIMED_OUT) {</a>
+<a name="ln542">    return false;</a>
+<a name="ln543">  }</a>
+<a name="ln544">  InitHeader(resp-&gt;mutable_header());</a>
+<a name="ln545">  resp-&gt;set_elapsed_millis(MonoTime::Now().GetDeltaSince(start_).ToMilliseconds());</a>
+<a name="ln546">  resp-&gt;set_state(state_value);</a>
+<a name="ln547">  if (req.include_traces() &amp;&amp; trace_) {</a>
+<a name="ln548">    resp-&gt;set_trace_buffer(trace_-&gt;DumpToString(true));</a>
+<a name="ln549">  }</a>
+<a name="ln550">  return true;</a>
+<a name="ln551">}</a>
+<a name="ln552"> </a>
+<a name="ln553">std::string OutboundCall::LogPrefix() const {</a>
+<a name="ln554">  return Format(&quot;{ OutboundCall@$0 } &quot;, this);</a>
+<a name="ln555">}</a>
+<a name="ln556"> </a>
+<a name="ln557">void OutboundCall::InitHeader(RequestHeader* header) {</a>
+<a name="ln558">  header-&gt;set_call_id(call_id_);</a>
+<a name="ln559"> </a>
+<a name="ln560">  if (!IsFinished()) {</a>
+<a name="ln561">    MonoDelta timeout = controller_-&gt;timeout();</a>
+<a name="ln562">    if (timeout.Initialized()) {</a>
+<a name="ln563">      header-&gt;set_timeout_millis(timeout.ToMilliseconds());</a>
+<a name="ln564">    }</a>
+<a name="ln565">  }</a>
+<a name="ln566">  header-&gt;set_allocated_remote_method(remote_method_pool_-&gt;Take());</a>
+<a name="ln567">}</a>
+<a name="ln568"> </a>
+<a name="ln569">///</a>
+<a name="ln570">/// ConnectionId</a>
+<a name="ln571">///</a>
+<a name="ln572"> </a>
+<a name="ln573">string ConnectionId::ToString() const {</a>
+<a name="ln574">  return Format(&quot;{ remote: $0 idx: $1 protocol: $2 }&quot;, remote_, idx_, protocol_);</a>
+<a name="ln575">}</a>
+<a name="ln576"> </a>
+<a name="ln577">size_t ConnectionId::HashCode() const {</a>
+<a name="ln578">  size_t seed = 0;</a>
+<a name="ln579">  boost::hash_combine(seed, hash_value(remote_));</a>
+<a name="ln580">  boost::hash_combine(seed, idx_);</a>
+<a name="ln581">  boost::hash_combine(seed, protocol_);</a>
+<a name="ln582">  return seed;</a>
+<a name="ln583">}</a>
+<a name="ln584"> </a>
+<a name="ln585">size_t ConnectionIdHash::operator() (const ConnectionId&amp; conn_id) const {</a>
+<a name="ln586">  return conn_id.HashCode();</a>
+<a name="ln587">}</a>
+<a name="ln588"> </a>
+<a name="ln589">///</a>
+<a name="ln590">/// CallResponse</a>
+<a name="ln591">///</a>
+<a name="ln592"> </a>
+<a name="ln593">CallResponse::CallResponse()</a>
+<a name="ln594">    : parsed_(false) {</a>
+<a name="ln595">}</a>
+<a name="ln596"> </a>
+<a name="ln597">Result&lt;Slice&gt; CallResponse::GetSidecar(int idx) const {</a>
+<a name="ln598">  DCHECK(parsed_);</a>
+<a name="ln599">  if (idx &lt; 0 || idx + 1 &gt;= sidecar_bounds_.size()) {</a>
+<a name="ln600">    return STATUS_FORMAT(InvalidArgument,</a>
+<a name="ln601">        &quot;Index $0 does not reference a valid sidecar&quot;, idx);</a>
+<a name="ln602">  }</a>
+<a name="ln603">  return Slice(sidecar_bounds_[idx], sidecar_bounds_[idx + 1]);</a>
+<a name="ln604">}</a>
+<a name="ln605"> </a>
+<a name="ln606">Status CallResponse::ParseFrom(CallData* call_data) {</a>
+<a name="ln607">  CHECK(!parsed_);</a>
+<a name="ln608">  Slice entire_message;</a>
+<a name="ln609"> </a>
+<a name="ln610">  response_data_ = std::move(*call_data);</a>
+<a name="ln611">  Slice source(response_data_.data(), response_data_.size());</a>
+<a name="ln612">  RETURN_NOT_OK(serialization::ParseYBMessage(source, &amp;header_, &amp;entire_message));</a>
+<a name="ln613"> </a>
+<a name="ln614">  // Use information from header to extract the payload slices.</a>
+<a name="ln615">  const size_t sidecars = header_.sidecar_offsets_size();</a>
+<a name="ln616"> </a>
+<a name="ln617">  if (sidecars &gt; 0) {</a>
+<a name="ln618">    serialized_response_ = Slice(entire_message.data(),</a>
+<a name="ln619">                                 header_.sidecar_offsets(0));</a>
+<a name="ln620">    sidecar_bounds_.reserve(sidecars + 1);</a>
+<a name="ln621"> </a>
+<a name="ln622">    uint32_t prev_offset = 0;</a>
+<a name="ln623">    for (auto offset : header_.sidecar_offsets()) {</a>
+<a name="ln624">      if (offset &gt; entire_message.size() || offset &lt; prev_offset) {</a>
+<a name="ln625">        return STATUS_FORMAT(</a>
+<a name="ln626">            Corruption,</a>
+<a name="ln627">            &quot;Invalid sidecar offsets; sidecar apparently starts at $0,&quot;</a>
+<a name="ln628">            &quot; ends at $1, but the entire message has length $2&quot;,</a>
+<a name="ln629">            prev_offset, offset, entire_message.size());</a>
+<a name="ln630">      }</a>
+<a name="ln631">      sidecar_bounds_.push_back(entire_message.data() + offset);</a>
+<a name="ln632">      prev_offset = offset;</a>
+<a name="ln633">    }</a>
+<a name="ln634">    sidecar_bounds_.emplace_back(entire_message.end());</a>
+<a name="ln635">  } else {</a>
+<a name="ln636">    serialized_response_ = entire_message;</a>
+<a name="ln637">  }</a>
+<a name="ln638"> </a>
+<a name="ln639">  parsed_ = true;</a>
+<a name="ln640">  return Status::OK();</a>
+<a name="ln641">}</a>
+<a name="ln642"> </a>
+<a name="ln643">}  // namespace rpc</a>
+<a name="ln644">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="209"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="218"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="219"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="239"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="244"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="345"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="349"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="404"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="465"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="479"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="487"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="490"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="500"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="598"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="607"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,379 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>sys_catalog_initialization.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/master/sys_catalog_initialization.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/util/countdown_latch.h&quot;</a>
+<a name="ln17">#include &quot;yb/util/pb_util.h&quot;</a>
+<a name="ln18">#include &quot;yb/util/env_util.h&quot;</a>
+<a name="ln19">#include &quot;yb/util/path_util.h&quot;</a>
+<a name="ln20">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/master/sys_catalog_constants.h&quot;</a>
+<a name="ln23">#include &quot;yb/master/catalog_entity_info.h&quot;</a>
+<a name="ln24">#include &quot;yb/master/sys_catalog.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/tablet/tablet.h&quot;</a>
+<a name="ln27">#include &quot;yb/tablet/tablet_peer.h&quot;</a>
+<a name="ln28">#include &quot;yb/tablet/tablet_snapshots.h&quot;</a>
+<a name="ln29">#include &quot;yb/tablet/operations/operation.h&quot;</a>
+<a name="ln30">#include &quot;yb/tablet/operations/snapshot_operation.h&quot;</a>
+<a name="ln31">#include &quot;yb/tablet/operations/change_metadata_operation.h&quot;</a>
+<a name="ln32"> </a>
+<a name="ln33">DEFINE_string(initial_sys_catalog_snapshot_path, &quot;&quot;,</a>
+<a name="ln34">    &quot;If this is specified, system catalog RocksDB is checkpointed at this location after initdb &quot;</a>
+<a name="ln35">    &quot;is done.&quot;);</a>
+<a name="ln36"> </a>
+<a name="ln37">DEFINE_bool(use_initial_sys_catalog_snapshot, false,</a>
+<a name="ln38">    &quot;DEPRECATED: use --enable_ysql instead. &quot;</a>
+<a name="ln39">    &quot;Initialize sys catalog tablet from a pre-existing snapshot instead of running initdb. &quot;</a>
+<a name="ln40">    &quot;Only takes effect if --initial_sys_catalog_snapshot_path is specified or can be &quot;</a>
+<a name="ln41">    &quot;auto-detected.&quot;);</a>
+<a name="ln42"> </a>
+<a name="ln43">DEFINE_bool(enable_ysql, true,</a>
+<a name="ln44">    &quot;Enable YSQL on cluster. This will initialize sys catalog tablet from a pre-existing snapshot &quot;</a>
+<a name="ln45">    &quot;and start YSQL proxy. &quot;</a>
+<a name="ln46">    &quot;Only takes effect if --initial_sys_catalog_snapshot_path is specified or can be auto-detected.&quot;</a>
+<a name="ln47">    );</a>
+<a name="ln48"> </a>
+<a name="ln49">DEFINE_bool(create_initial_sys_catalog_snapshot, false,</a>
+<a name="ln50">    &quot;Run initdb and create an initial sys catalog data snapshot&quot;);</a>
+<a name="ln51"> </a>
+<a name="ln52">DEFINE_bool(</a>
+<a name="ln53">    // TODO: switch the default to true after updating all external callers (yb-ctl, YugaWare)</a>
+<a name="ln54">    // and unit tests.</a>
+<a name="ln55">    master_auto_run_initdb, false,</a>
+<a name="ln56">    &quot;Automatically run initdb on master leader initialization&quot;);</a>
+<a name="ln57"> </a>
+<a name="ln58">TAG_FLAG(create_initial_sys_catalog_snapshot, advanced);</a>
+<a name="ln59">TAG_FLAG(create_initial_sys_catalog_snapshot, hidden);</a>
+<a name="ln60"> </a>
+<a name="ln61">using yb::CountDownLatch;</a>
+<a name="ln62">using yb::tserver::TabletSnapshotOpRequestPB;</a>
+<a name="ln63">using yb::tserver::TabletSnapshotOpResponsePB;</a>
+<a name="ln64">using yb::tablet::SnapshotOperationState;</a>
+<a name="ln65">using yb::pb_util::ReadPBContainerFromPath;</a>
+<a name="ln66"> </a>
+<a name="ln67">namespace yb {</a>
+<a name="ln68">namespace master {</a>
+<a name="ln69"> </a>
+<a name="ln70">namespace {</a>
+<a name="ln71"> </a>
+<a name="ln72">const char* kDefaultInitialSysCatalogSnapshotDir = &quot;initial_sys_catalog_snapshot&quot;;</a>
+<a name="ln73">const char* kSysCatalogSnapshotRocksDbSubDir = &quot;rocksdb&quot;;</a>
+<a name="ln74">const char* kSysCatalogSnapshotTabletMetadataChangesFile =</a>
+<a name="ln75">    &quot;exported_tablet_metadata_changes&quot;;</a>
+<a name="ln76">const char* kUseInitialSysCatalogSnapshotEnvVar = &quot;YB_USE_INITIAL_SYS_CATALOG_SNAPSHOT&quot;;</a>
+<a name="ln77">}  // anonymous namespace</a>
+<a name="ln78"> </a>
+<a name="ln79">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln80">// InitialSysCatalogSnapshotWriter</a>
+<a name="ln81">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln82"> </a>
+<a name="ln83">void InitialSysCatalogSnapshotWriter::AddMetadataChange(</a>
+<a name="ln84">    tserver::ChangeMetadataRequestPB metadata_change) {</a>
+<a name="ln85">  initdb_metadata_changes_.push_back(std::move(metadata_change));</a>
+<a name="ln86">}</a>
+<a name="ln87"> </a>
+<a name="ln88">Status InitialSysCatalogSnapshotWriter::WriteSnapshot(</a>
+<a name="ln89">    tablet::Tablet* sys_catalog_tablet,</a>
+<a name="ln90">    const std::string&amp; dest_path) {</a>
+<a name="ln91">  RETURN_NOT_OK(sys_catalog_tablet-&gt;Flush(yb::tablet::FlushMode::kSync));</a>
+<a name="ln92">  RETURN_NOT_OK(Env::Default()-&gt;CreateDir(dest_path));</a>
+<a name="ln93">  RETURN_NOT_OK(sys_catalog_tablet-&gt;snapshots().CreateCheckpoint(</a>
+<a name="ln94">      JoinPathSegments(dest_path, kSysCatalogSnapshotRocksDbSubDir)));</a>
+<a name="ln95"> </a>
+<a name="ln96">  tserver::ExportedTabletMetadataChanges exported_tablet_metadata_changes;</a>
+<a name="ln97">  for (int i = 0; i &lt; initdb_metadata_changes_.size(); ++i) {</a>
+<a name="ln98">    *exported_tablet_metadata_changes.add_metadata_changes() = std::move(</a>
+<a name="ln99">        initdb_metadata_changes_[i]);</a>
+<a name="ln100">  }</a>
+<a name="ln101"> </a>
+<a name="ln102">  const string metadata_changes_file = JoinPathSegments(</a>
+<a name="ln103">      dest_path,</a>
+<a name="ln104">      kSysCatalogSnapshotTabletMetadataChangesFile);</a>
+<a name="ln105">  RETURN_NOT_OK(WritePBContainerToPath(</a>
+<a name="ln106">      Env::Default(),</a>
+<a name="ln107">      metadata_changes_file,</a>
+<a name="ln108">      exported_tablet_metadata_changes,</a>
+<a name="ln109">      pb_util::CreateMode::NO_OVERWRITE,</a>
+<a name="ln110">      pb_util::SyncMode::NO_SYNC));</a>
+<a name="ln111">  LOG(INFO) &lt;&lt; &quot;Wrote &quot; &lt;&lt; initdb_metadata_changes_.size() &lt;&lt; &quot; tablet metadata changes to file &quot;</a>
+<a name="ln112">            &lt;&lt; metadata_changes_file;</a>
+<a name="ln113"> </a>
+<a name="ln114">  LOG(INFO) &lt;&lt; &quot;Created initial sys catalog snapshot at &quot; &lt;&lt; dest_path;</a>
+<a name="ln115">  return Status::OK();</a>
+<a name="ln116">}</a>
+<a name="ln117"> </a>
+<a name="ln118">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln119">// End of InitialSysCatalogSnapshotWriter</a>
+<a name="ln120">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln121"> </a>
+<a name="ln122">Status RestoreInitialSysCatalogSnapshot(</a>
+<a name="ln123">    const std::string&amp; initial_snapshot_path,</a>
+<a name="ln124">    tablet::TabletPeer* sys_catalog_tablet_peer,</a>
+<a name="ln125">    int64_t term) {</a>
+<a name="ln126">  TabletSnapshotOpRequestPB tablet_snapshot_req;</a>
+<a name="ln127">  tablet_snapshot_req.set_operation(yb::tserver::TabletSnapshotOpRequestPB::RESTORE);</a>
+<a name="ln128">  tablet_snapshot_req.add_tablet_id(kSysCatalogTabletId);</a>
+<a name="ln129">  tablet_snapshot_req.set_snapshot_dir_override(</a>
+<a name="ln130">      JoinPathSegments(initial_snapshot_path, kSysCatalogSnapshotRocksDbSubDir));</a>
+<a name="ln131"> </a>
+<a name="ln132">  TabletSnapshotOpResponsePB tablet_snapshot_resp;</a>
+<a name="ln133">  auto tx_state = std::make_unique&lt;SnapshotOperationState&gt;(</a>
+<a name="ln134">      sys_catalog_tablet_peer-&gt;tablet(), &amp;tablet_snapshot_req);</a>
+<a name="ln135"> </a>
+<a name="ln136">  CountDownLatch latch(1);</a>
+<a name="ln137">  tx_state-&gt;set_completion_callback(</a>
+<a name="ln138">      tablet::MakeLatchOperationCompletionCallback(&amp;latch, &amp;tablet_snapshot_resp));</a>
+<a name="ln139"> </a>
+<a name="ln140">  sys_catalog_tablet_peer-&gt;Submit(</a>
+<a name="ln141">      std::make_unique&lt;tablet::SnapshotOperation&gt;(std::move(tx_state)),</a>
+<a name="ln142">      term);</a>
+<a name="ln143"> </a>
+<a name="ln144">  // Now restore tablet metadata.</a>
+<a name="ln145">  tserver::ExportedTabletMetadataChanges tablet_metadata_changes;</a>
+<a name="ln146">  RETURN_NOT_OK(ReadPBContainerFromPath(</a>
+<a name="ln147">      Env::Default(),</a>
+<a name="ln148">      JoinPathSegments(initial_snapshot_path, kSysCatalogSnapshotTabletMetadataChangesFile),</a>
+<a name="ln149">      &amp;tablet_metadata_changes));</a>
+<a name="ln150">  for (const tserver::ChangeMetadataRequestPB&amp; change_metadata_req :</a>
+<a name="ln151">          tablet_metadata_changes.metadata_changes()) {</a>
+<a name="ln152">    RETURN_NOT_OK(tablet::SyncReplicateChangeMetadataOperation(</a>
+<a name="ln153">        &amp;change_metadata_req,</a>
+<a name="ln154">        sys_catalog_tablet_peer,</a>
+<a name="ln155">        term));</a>
+<a name="ln156">  }</a>
+<a name="ln157">  LOG(INFO) &lt;&lt; &quot;Imported &quot; &lt;&lt; tablet_metadata_changes.metadata_changes_size()</a>
+<a name="ln158">            &lt;&lt; &quot; tablet metadata changes&quot;;</a>
+<a name="ln159"> </a>
+<a name="ln160">  latch.Wait();</a>
+<a name="ln161">  return Status::OK();</a>
+<a name="ln162">}</a>
+<a name="ln163"> </a>
+<a name="ln164">void SetDefaultInitialSysCatalogSnapshotFlags() {</a>
+<a name="ln165">  // Allowing to turn off the use of initial catalog snapshot with an env variable -- useful in</a>
+<a name="ln166">  // tests.</a>
+<a name="ln167">  const char* env_var_value = getenv(kUseInitialSysCatalogSnapshotEnvVar);</a>
+<a name="ln168">  if (env_var_value &amp;&amp; strcmp(env_var_value, &quot;0&quot;) == 0) {</a>
+<a name="ln169">    LOG(INFO) &lt;&lt; &quot;Disabling the use of initial sys catalog snapshot: env var &quot;</a>
+<a name="ln170">              &lt;&lt; kUseInitialSysCatalogSnapshotEnvVar &lt;&lt; &quot; is set to 0&quot;;</a>
+<a name="ln171">    FLAGS_use_initial_sys_catalog_snapshot = 0;</a>
+<a name="ln172">    FLAGS_enable_ysql = 0;</a>
+<a name="ln173">  }</a>
+<a name="ln174"> </a>
+<a name="ln175">  if (FLAGS_initial_sys_catalog_snapshot_path.empty() &amp;&amp;</a>
+<a name="ln176">      !FLAGS_create_initial_sys_catalog_snapshot &amp;&amp;</a>
+<a name="ln177">      (FLAGS_use_initial_sys_catalog_snapshot || FLAGS_enable_ysql)) {</a>
+<a name="ln178">    const char* kStaticDataParentDir = &quot;share&quot;;</a>
+<a name="ln179">    const std::string search_for_dir = JoinPathSegments(</a>
+<a name="ln180">        kStaticDataParentDir, kDefaultInitialSysCatalogSnapshotDir,</a>
+<a name="ln181">        kSysCatalogSnapshotRocksDbSubDir);</a>
+<a name="ln182">    VLOG(1) &lt;&lt; &quot;Searching for directory containing subdirectory &quot; &lt;&lt; search_for_dir;</a>
+<a name="ln183">    const string candidate_dir =</a>
+<a name="ln184">        JoinPathSegments(</a>
+<a name="ln185">            env_util::GetRootDir(search_for_dir),</a>
+<a name="ln186">            kStaticDataParentDir,</a>
+<a name="ln187">            kDefaultInitialSysCatalogSnapshotDir);</a>
+<a name="ln188">    VLOG(1) &lt;&lt; &quot;candidate_dir=&quot; &lt;&lt; candidate_dir;</a>
+<a name="ln189"> </a>
+<a name="ln190">    // The metadata changes file is written last, so its presence indicates that the snapshot</a>
+<a name="ln191">    // was successful.</a>
+<a name="ln192">    const string candidate_metadata_changes_path =</a>
+<a name="ln193">        JoinPathSegments(candidate_dir, kSysCatalogSnapshotTabletMetadataChangesFile);</a>
+<a name="ln194">    VLOG(1) &lt;&lt; &quot;candidate_metadata_changes_path=&quot; &lt;&lt; candidate_metadata_changes_path;</a>
+<a name="ln195"> </a>
+<a name="ln196">    if (Env::Default()-&gt;FileExists(candidate_metadata_changes_path)) {</a>
+<a name="ln197">      VLOG(1) &lt;&lt; &quot;Found initial sys catalog snapshot directory: &quot; &lt;&lt; candidate_dir;</a>
+<a name="ln198">      FLAGS_initial_sys_catalog_snapshot_path = candidate_dir;</a>
+<a name="ln199">      return;</a>
+<a name="ln200">    } else {</a>
+<a name="ln201">      VLOG(1) &lt;&lt; &quot;File &quot; &lt;&lt; candidate_metadata_changes_path &lt;&lt; &quot; does not exist&quot;;</a>
+<a name="ln202">    }</a>
+<a name="ln203">  } else {</a>
+<a name="ln204">    VLOG(1)</a>
+<a name="ln205">        &lt;&lt; &quot;Not attempting initial sys catalog snapshot auto-detection: &quot;</a>
+<a name="ln206">        &lt;&lt; &quot;FLAGS_initial_sys_catalog_snapshot_path=&quot;</a>
+<a name="ln207">        &lt;&lt; FLAGS_initial_sys_catalog_snapshot_path &lt;&lt; &quot;, &quot;</a>
+<a name="ln208">        &lt;&lt; &quot;FLAGS_create_initial_sys_catalog_snapshot=&quot;</a>
+<a name="ln209">        &lt;&lt; FLAGS_create_initial_sys_catalog_snapshot &lt;&lt; &quot;, &quot;</a>
+<a name="ln210">        &lt;&lt; &quot;FLAGS_use_initial_sys_catalog_snapshot=&quot;</a>
+<a name="ln211">        &lt;&lt; FLAGS_use_initial_sys_catalog_snapshot &lt;&lt; &quot;, &quot;</a>
+<a name="ln212">        &lt;&lt; &quot;FLAGS_enable_ysql=&quot;</a>
+<a name="ln213">        &lt;&lt; FLAGS_enable_ysql;</a>
+<a name="ln214">  }</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217">bool ShouldAutoRunInitDb(SysConfigInfo* ysql_catalog_config, bool pg_proc_exists) {</a>
+<a name="ln218">  if (pg_proc_exists) {</a>
+<a name="ln219">    LOG(INFO) &lt;&lt; &quot;Table pg_proc exists, assuming initdb has already been run&quot;;</a>
+<a name="ln220">    return false;</a>
+<a name="ln221">  }</a>
+<a name="ln222"> </a>
+<a name="ln223">  if (!FLAGS_master_auto_run_initdb) {</a>
+<a name="ln224">    LOG(INFO) &lt;&lt; &quot;--master_auto_run_initdb is set to false, not running initdb&quot;;</a>
+<a name="ln225">    return false;</a>
+<a name="ln226">  }</a>
+<a name="ln227"> </a>
+<a name="ln228">  {</a>
+<a name="ln229">    auto l = ysql_catalog_config-&gt;LockForRead();</a>
+<a name="ln230">    if (l-&gt;data().pb.ysql_catalog_config().initdb_done()) {</a>
+<a name="ln231">      LOG(INFO) &lt;&lt; &quot;Cluster configuration indicates that initdb has already completed&quot;;</a>
+<a name="ln232">      return false;</a>
+<a name="ln233">    }</a>
+<a name="ln234">  }</a>
+<a name="ln235"> </a>
+<a name="ln236">  LOG(INFO) &lt;&lt; &quot;initdb has never been run on this cluster, running it&quot;;</a>
+<a name="ln237">  return true;</a>
+<a name="ln238">}</a>
+<a name="ln239"> </a>
+<a name="ln240">Status MakeYsqlSysCatalogTablesTransactional(</a>
+<a name="ln241">    TableInfoMap* table_ids_map,</a>
+<a name="ln242">    SysCatalogTable* sys_catalog,</a>
+<a name="ln243">    SysConfigInfo* ysql_catalog_config,</a>
+<a name="ln244">    int64_t term) {</a>
+<a name="ln245">  {</a>
+<a name="ln246">    auto ysql_catalog_config_lock = ysql_catalog_config-&gt;LockForRead();</a>
+<a name="ln247">    const auto&amp; ysql_catalog_config_pb = ysql_catalog_config_lock-&gt;data().pb.ysql_catalog_config();</a>
+<a name="ln248">    if (ysql_catalog_config_pb.transactional_sys_catalog_enabled()) {</a>
+<a name="ln249">      LOG(INFO) &lt;&lt; &quot;YSQL catalog tables are already transactional&quot;;</a>
+<a name="ln250">      return Status::OK();</a>
+<a name="ln251">    }</a>
+<a name="ln252">  }</a>
+<a name="ln253"> </a>
+<a name="ln254">  int num_updated_tables = 0;</a>
+<a name="ln255">  for (const auto&amp; iter : *table_ids_map) {</a>
+<a name="ln256">    const auto&amp; table_id = iter.first;</a>
+<a name="ln257">    auto&amp; table_info = *iter.second;</a>
+<a name="ln258"> </a>
+<a name="ln259">    if (!IsPgsqlId(table_id)) {</a>
+<a name="ln260">      continue;</a>
+<a name="ln261">    }</a>
+<a name="ln262"> </a>
+<a name="ln263">    {</a>
+<a name="ln264">      TabletInfos tablet_infos;</a>
+<a name="ln265">      table_info.GetAllTablets(&amp;tablet_infos);</a>
+<a name="ln266">      if (tablet_infos.size() != 1 || tablet_infos.front()-&gt;tablet_id() != kSysCatalogTabletId) {</a>
+<a name="ln267">        continue;</a>
+<a name="ln268">      }</a>
+<a name="ln269">     }</a>
+<a name="ln270"> </a>
+<a name="ln271">    auto table_lock = table_info.LockForWrite();</a>
+<a name="ln272">    auto&amp; schema = *table_lock-&gt;mutable_data()-&gt;mutable_schema();</a>
+<a name="ln273">    auto&amp; table_properties = *schema.mutable_table_properties();</a>
+<a name="ln274"> </a>
+<a name="ln275">    bool should_modify = false;</a>
+<a name="ln276">    if (!table_properties.is_ysql_catalog_table()) {</a>
+<a name="ln277">      table_properties.set_is_ysql_catalog_table(true);</a>
+<a name="ln278">      should_modify = true;</a>
+<a name="ln279">    }</a>
+<a name="ln280">    if (!table_properties.is_transactional()) {</a>
+<a name="ln281">      table_properties.set_is_transactional(true);</a>
+<a name="ln282">      should_modify = true;</a>
+<a name="ln283">    }</a>
+<a name="ln284">    if (!should_modify) {</a>
+<a name="ln285">      continue;</a>
+<a name="ln286">    }</a>
+<a name="ln287"> </a>
+<a name="ln288">    num_updated_tables++;</a>
+<a name="ln289">    LOG(INFO) &lt;&lt; &quot;Making YSQL system catalog table transactional: &quot; &lt;&lt; table_info.ToString();</a>
+<a name="ln290"> </a>
+<a name="ln291">    // Change table properties in tablet metadata.</a>
+<a name="ln292">    tserver::ChangeMetadataRequestPB change_req;</a>
+<a name="ln293">    change_req.set_tablet_id(kSysCatalogTabletId);</a>
+<a name="ln294">    auto&amp; add_table = *change_req.mutable_add_table();</a>
+<a name="ln295">    VERIFY_RESULT(sys_catalog-&gt;tablet_peer()-&gt;tablet_metadata()-&gt;GetTableInfo(table_id))-&gt;ToPB(</a>
+<a name="ln296">        &amp;add_table);</a>
+<a name="ln297">    auto&amp; metadata_table_properties = *add_table.mutable_schema()-&gt;mutable_table_properties();</a>
+<a name="ln298">    metadata_table_properties.set_is_ysql_catalog_table(true);</a>
+<a name="ln299">    metadata_table_properties.set_is_transactional(true);</a>
+<a name="ln300"> </a>
+<a name="ln301">    RETURN_NOT_OK(tablet::SyncReplicateChangeMetadataOperation(</a>
+<a name="ln302">        &amp;change_req, sys_catalog-&gt;tablet_peer().get(), term));</a>
+<a name="ln303"> </a>
+<a name="ln304">    // Change table properties in the sys catalog. We do this after updating tablet metadata, so</a>
+<a name="ln305">    // that if a restart happens before this step succeeds, we'll retry updating both next time.</a>
+<a name="ln306">    RETURN_NOT_OK(sys_catalog-&gt;UpdateItem(&amp;table_info, term));</a>
+<a name="ln307">    table_lock-&gt;Commit();</a>
+<a name="ln308">  }</a>
+<a name="ln309"> </a>
+<a name="ln310">  if (num_updated_tables &gt; 0) {</a>
+<a name="ln311">    LOG(INFO) &lt;&lt; &quot;Made &quot; &lt;&lt; num_updated_tables &lt;&lt; &quot; YSQL sys catalog tables transactional&quot;;</a>
+<a name="ln312">  }</a>
+<a name="ln313"> </a>
+<a name="ln314">  LOG(INFO) &lt;&lt; &quot;Marking YSQL system catalog as transactional in YSQL catalog config&quot;;</a>
+<a name="ln315">  {</a>
+<a name="ln316">    auto ysql_catalog_lock = ysql_catalog_config-&gt;LockForWrite();</a>
+<a name="ln317">    auto* ysql_catalog_config_pb =</a>
+<a name="ln318">        ysql_catalog_lock-&gt;mutable_data()-&gt;pb.mutable_ysql_catalog_config();</a>
+<a name="ln319">    ysql_catalog_config_pb-&gt;set_transactional_sys_catalog_enabled(true);</a>
+<a name="ln320">    RETURN_NOT_OK(sys_catalog-&gt;UpdateItem(ysql_catalog_config, term));</a>
+<a name="ln321">    ysql_catalog_lock-&gt;Commit();</a>
+<a name="ln322">  }</a>
+<a name="ln323"> </a>
+<a name="ln324">  return Status::OK();</a>
+<a name="ln325">}</a>
+<a name="ln326"> </a>
+<a name="ln327">}  // namespace master</a>
+<a name="ln328">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="182"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="188"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="194"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="197"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="201"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="204"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

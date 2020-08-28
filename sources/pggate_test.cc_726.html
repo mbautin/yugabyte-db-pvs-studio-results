@@ -1,0 +1,341 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>pggate_test.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/yql/pggate/test/pggate_test.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/yql/pggate/pg_session.h&quot;</a>
+<a name="ln21">#include &quot;yb/yql/pggate/pg_memctx.h&quot;</a>
+<a name="ln22">#include &quot;yb/yql/pggate/pggate_flags.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">DECLARE_string(pggate_master_addresses);</a>
+<a name="ln25">DECLARE_string(test_leave_files);</a>
+<a name="ln26"> </a>
+<a name="ln27">namespace yb {</a>
+<a name="ln28">namespace pggate {</a>
+<a name="ln29">namespace {</a>
+<a name="ln30"> </a>
+<a name="ln31">extern &quot;C&quot; void FetchUniqueConstraintName(PgOid relation_id, char* dest, size_t max_size) {</a>
+<a name="ln32">  CHECK(false) &lt;&lt; &quot;Not implemented&quot;;</a>
+<a name="ln33">}</a>
+<a name="ln34"> </a>
+<a name="ln35">} // namespace</a>
+<a name="ln36"> </a>
+<a name="ln37">YBCPgMemctx test_memctx = nullptr;</a>
+<a name="ln38">static YBCPgMemctx TestGetCurrentYbMemctx() {</a>
+<a name="ln39">  if (!test_memctx) {</a>
+<a name="ln40">    test_memctx = YBCPgCreateMemctx();</a>
+<a name="ln41">  }</a>
+<a name="ln42">  return test_memctx;</a>
+<a name="ln43">}</a>
+<a name="ln44"> </a>
+<a name="ln45">PggateTest::PggateTest() {</a>
+<a name="ln46">}</a>
+<a name="ln47"> </a>
+<a name="ln48">PggateTest::~PggateTest() {</a>
+<a name="ln49">  CHECK_YBC_STATUS(YBCPgDestroyMemctx(test_memctx));</a>
+<a name="ln50">}</a>
+<a name="ln51"> </a>
+<a name="ln52">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln53">// Error handling routines.</a>
+<a name="ln54">void PggateTest::CheckYBCStatus(YBCStatus status, const char* file_name, int line_number) {</a>
+<a name="ln55">  CHECK_OK(Status(status, AddRef::kTrue));</a>
+<a name="ln56">}</a>
+<a name="ln57"> </a>
+<a name="ln58">void *PggateTestAlloc(size_t bytes) {</a>
+<a name="ln59">  static MemoryContext memctx;</a>
+<a name="ln60">  return static_cast&lt;void*&gt;(memctx.AllocateBytes(bytes));</a>
+<a name="ln61">}</a>
+<a name="ln62"> </a>
+<a name="ln63">// This implementation is different from what PostgreSQL's cstring_to_text_with_len function does.</a>
+<a name="ln64">// Here we just copy the given string and add a terminating zero. This is what our test expects.</a>
+<a name="ln65">struct varlena* PggateTestCStringToTextWithLen(const char* c, int size) {</a>
+<a name="ln66">  static MemoryContext memctx;</a>
+<a name="ln67">  CHECK_GE(size, 0);</a>
+<a name="ln68">  CHECK_LE(size, 1024ll * 1024 * 1024 - 4);</a>
+<a name="ln69"> </a>
+<a name="ln70">  char* buf = static_cast&lt;char*&gt;(memctx.AllocateBytes(size + 1));</a>
+<a name="ln71">  memcpy(buf, c, size);</a>
+<a name="ln72">  buf[size] = 0;</a>
+<a name="ln73">  return reinterpret_cast&lt;struct varlena*&gt;(buf);</a>
+<a name="ln74">}</a>
+<a name="ln75"> </a>
+<a name="ln76">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln77">// Starting and ending routines.</a>
+<a name="ln78"> </a>
+<a name="ln79">void PggateTest::SetUp() {</a>
+<a name="ln80">  FLAGS_test_leave_files = &quot;always&quot;;</a>
+<a name="ln81">  YBTest::SetUp();</a>
+<a name="ln82">}</a>
+<a name="ln83"> </a>
+<a name="ln84">void PggateTest::TearDown() {</a>
+<a name="ln85">  // Destroy the client before shutting down servers.</a>
+<a name="ln86">  YBCDestroyPgGate();</a>
+<a name="ln87"> </a>
+<a name="ln88">  // Destroy all servers.</a>
+<a name="ln89">  if (cluster_ != nullptr) {</a>
+<a name="ln90">    cluster_-&gt;Shutdown();</a>
+<a name="ln91">    cluster_ = nullptr;</a>
+<a name="ln92">  }</a>
+<a name="ln93">  YBTest::TearDown();</a>
+<a name="ln94">}</a>
+<a name="ln95"> </a>
+<a name="ln96">Status PggateTest::Init(const char *test_name, int num_tablet_servers) {</a>
+<a name="ln97">  // Create cluster before setting client API.</a>
+<a name="ln98">  RETURN_NOT_OK(CreateCluster(num_tablet_servers));</a>
+<a name="ln99"> </a>
+<a name="ln100">  // Init PgGate API.</a>
+<a name="ln101">  CHECK_YBC_STATUS(YBCInit(test_name, PggateTestAlloc, PggateTestCStringToTextWithLen));</a>
+<a name="ln102"> </a>
+<a name="ln103">  const YBCPgTypeEntity *type_table = nullptr;</a>
+<a name="ln104">  int count = 0;</a>
+<a name="ln105">  YBCTestGetTypeTable(&amp;type_table, &amp;count);</a>
+<a name="ln106">  YBCPgCallbacks callbacks;</a>
+<a name="ln107">  callbacks.FetchUniqueConstraintName = &amp;FetchUniqueConstraintName;</a>
+<a name="ln108">  callbacks.GetCurrentYbMemctx = &amp;TestGetCurrentYbMemctx;</a>
+<a name="ln109">  YBCInitPgGate(type_table, count, callbacks);</a>
+<a name="ln110"> </a>
+<a name="ln111">  // Don't try to connect to tserver shared memory in pggate tests.</a>
+<a name="ln112">  FLAGS_TEST_pggate_ignore_tserver_shm = true;</a>
+<a name="ln113"> </a>
+<a name="ln114">  // Setup session.</a>
+<a name="ln115">  CHECK_YBC_STATUS(YBCPgInitSession(nullptr /* pg_env */, nullptr /* database_name */));</a>
+<a name="ln116"> </a>
+<a name="ln117">  // Setup database</a>
+<a name="ln118">  SetupDB();</a>
+<a name="ln119">  return Status::OK();</a>
+<a name="ln120">}</a>
+<a name="ln121"> </a>
+<a name="ln122">Status PggateTest::CreateCluster(int num_tablet_servers) {</a>
+<a name="ln123">  // Start mini-cluster with given number of tservers (default: 3).</a>
+<a name="ln124">  ExternalMiniClusterOptions opts;</a>
+<a name="ln125">  opts.num_tablet_servers = num_tablet_servers;</a>
+<a name="ln126">  opts.data_root_counter = 0;</a>
+<a name="ln127">  cluster_ = std::make_shared&lt;ExternalMiniCluster&gt;(opts);</a>
+<a name="ln128">  CHECK_OK(cluster_-&gt;Start());</a>
+<a name="ln129"> </a>
+<a name="ln130">  // Setup master address to construct YBClient.</a>
+<a name="ln131">  FLAGS_pggate_master_addresses = cluster_-&gt;GetMasterAddresses();</a>
+<a name="ln132"> </a>
+<a name="ln133">  // Sleep to make sure the cluster is ready before accepting client messages.</a>
+<a name="ln134">  sleep(1);</a>
+<a name="ln135">  return Status::OK();</a>
+<a name="ln136">}</a>
+<a name="ln137"> </a>
+<a name="ln138">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln139"> </a>
+<a name="ln140">void PggateTest::SetupDB(const string&amp; db_name, const YBCPgOid db_oid) {</a>
+<a name="ln141">  CreateDB(db_name, db_oid);</a>
+<a name="ln142">  ConnectDB(db_name);</a>
+<a name="ln143">}</a>
+<a name="ln144"> </a>
+<a name="ln145">void PggateTest::CreateDB(const string&amp; db_name, const YBCPgOid db_oid) {</a>
+<a name="ln146">  YBCPgStatement pg_stmt;</a>
+<a name="ln147">  CHECK_YBC_STATUS(YBCPgNewCreateDatabase(</a>
+<a name="ln148">      db_name.c_str(), db_oid, 0 /* source_database_oid */, 0 /* next_oid */, false /* colocated */,</a>
+<a name="ln149">      &amp;pg_stmt));</a>
+<a name="ln150">  CHECK_YBC_STATUS(YBCPgExecCreateDatabase(pg_stmt));</a>
+<a name="ln151">}</a>
+<a name="ln152"> </a>
+<a name="ln153">void PggateTest::ConnectDB(const string&amp; db_name) {</a>
+<a name="ln154">  CHECK_YBC_STATUS(YBCPgConnectDatabase(db_name.c_str()));</a>
+<a name="ln155">}</a>
+<a name="ln156"> </a>
+<a name="ln157">void PggateTest::CommitTransaction() {</a>
+<a name="ln158">  CHECK_YBC_STATUS(YBCPgCommitTransaction());</a>
+<a name="ln159">}</a>
+<a name="ln160"> </a>
+<a name="ln161">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln162">// Make sure that DataType in common.proto matches the YBCPgDataType enum</a>
+<a name="ln163">// TODO: find a better way to generate these enums.</a>
+<a name="ln164"> </a>
+<a name="ln165">static_assert(static_cast&lt;int&gt;(DataType::UNKNOWN_DATA) ==</a>
+<a name="ln166">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_UNKNOWN_DATA),</a>
+<a name="ln167">              &quot;DataType::UNKNOWN_DATA does not match YBCPgDataType::UNKNOWN_DATA&quot;);</a>
+<a name="ln168"> </a>
+<a name="ln169">static_assert(static_cast&lt;int&gt;(DataType::NULL_VALUE_TYPE) ==</a>
+<a name="ln170">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_NULL_VALUE_TYPE),</a>
+<a name="ln171">              &quot;DataType::NULL_VALUE_TYPE does not match YBCPgDataType::NULL_VALUE_TYPE&quot;);</a>
+<a name="ln172"> </a>
+<a name="ln173">static_assert(static_cast&lt;int&gt;(DataType::INT8) ==</a>
+<a name="ln174">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_INT8),</a>
+<a name="ln175">              &quot;DataType::INT8 does not match YBCPgDataType::INT8&quot;);</a>
+<a name="ln176"> </a>
+<a name="ln177">static_assert(static_cast&lt;int&gt;(DataType::INT16) ==</a>
+<a name="ln178">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_INT16),</a>
+<a name="ln179">              &quot;DataType::INT16 does not match YBCPgDataType::INT16&quot;);</a>
+<a name="ln180"> </a>
+<a name="ln181">static_assert(static_cast&lt;int&gt;(DataType::INT32) ==</a>
+<a name="ln182">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_INT32),</a>
+<a name="ln183">              &quot;DataType::INT32 does not match YBCPgDataType::INT32&quot;);</a>
+<a name="ln184"> </a>
+<a name="ln185">static_assert(static_cast&lt;int&gt;(DataType::INT64) ==</a>
+<a name="ln186">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_INT64),</a>
+<a name="ln187">              &quot;DataType::INT64 does not match YBCPgDataType::INT64&quot;);</a>
+<a name="ln188"> </a>
+<a name="ln189">static_assert(static_cast&lt;int&gt;(DataType::STRING) ==</a>
+<a name="ln190">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_STRING),</a>
+<a name="ln191">              &quot;DataType::STRING does not match YBCPgDataType::STRING&quot;);</a>
+<a name="ln192"> </a>
+<a name="ln193">static_assert(static_cast&lt;int&gt;(DataType::BOOL) ==</a>
+<a name="ln194">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_BOOL),</a>
+<a name="ln195">              &quot;DataType::BOOL does not match YBCPgDataType::BOOL&quot;);</a>
+<a name="ln196"> </a>
+<a name="ln197">static_assert(static_cast&lt;int&gt;(DataType::FLOAT) ==</a>
+<a name="ln198">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_FLOAT),</a>
+<a name="ln199">              &quot;DataType::FLOAT does not match YBCPgDataType::FLOAT&quot;);</a>
+<a name="ln200"> </a>
+<a name="ln201">static_assert(static_cast&lt;int&gt;(DataType::DOUBLE) ==</a>
+<a name="ln202">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_DOUBLE),</a>
+<a name="ln203">              &quot;DataType::DOUBLE does not match YBCPgDataType::DOUBLE&quot;);</a>
+<a name="ln204"> </a>
+<a name="ln205">static_assert(static_cast&lt;int&gt;(DataType::BINARY) ==</a>
+<a name="ln206">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_BINARY),</a>
+<a name="ln207">              &quot;DataType::BINARY does not match YBCPgDataType::BINARY&quot;);</a>
+<a name="ln208"> </a>
+<a name="ln209">static_assert(static_cast&lt;int&gt;(DataType::TIMESTAMP) ==</a>
+<a name="ln210">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_TIMESTAMP),</a>
+<a name="ln211">              &quot;DataType::TIMESTAMP does not match YBCPgDataType::TIMESTAMP&quot;);</a>
+<a name="ln212"> </a>
+<a name="ln213">static_assert(static_cast&lt;int&gt;(DataType::DECIMAL) ==</a>
+<a name="ln214">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_DECIMAL),</a>
+<a name="ln215">              &quot;DataType::DECIMAL does not match YBCPgDataType::DECIMAL&quot;);</a>
+<a name="ln216"> </a>
+<a name="ln217">static_assert(static_cast&lt;int&gt;(DataType::VARINT) ==</a>
+<a name="ln218">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_VARINT),</a>
+<a name="ln219">              &quot;DataType::VARINT does not match YBCPgDataType::VARINT&quot;);</a>
+<a name="ln220"> </a>
+<a name="ln221">static_assert(static_cast&lt;int&gt;(DataType::INET) ==</a>
+<a name="ln222">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_INET),</a>
+<a name="ln223">              &quot;DataType::INET does not match YBCPgDataType::INET&quot;);</a>
+<a name="ln224"> </a>
+<a name="ln225">static_assert(static_cast&lt;int&gt;(DataType::LIST) ==</a>
+<a name="ln226">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_LIST),</a>
+<a name="ln227">              &quot;DataType::LIST does not match YBCPgDataType::LIST&quot;);</a>
+<a name="ln228"> </a>
+<a name="ln229">static_assert(static_cast&lt;int&gt;(DataType::MAP) ==</a>
+<a name="ln230">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_MAP),</a>
+<a name="ln231">              &quot;DataType::MAP does not match YBCPgDataType::MAP&quot;);</a>
+<a name="ln232"> </a>
+<a name="ln233">static_assert(static_cast&lt;int&gt;(DataType::SET) ==</a>
+<a name="ln234">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_SET),</a>
+<a name="ln235">              &quot;DataType::SET does not match YBCPgDataType::SET&quot;);</a>
+<a name="ln236"> </a>
+<a name="ln237">static_assert(static_cast&lt;int&gt;(DataType::UUID) ==</a>
+<a name="ln238">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_UUID),</a>
+<a name="ln239">              &quot;DataType::UUID does not match YBCPgDataType::UUID&quot;);</a>
+<a name="ln240"> </a>
+<a name="ln241">static_assert(static_cast&lt;int&gt;(DataType::TIMEUUID) ==</a>
+<a name="ln242">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_TIMEUUID),</a>
+<a name="ln243">              &quot;DataType::TIMEUUID does not match YBCPgDataType::TIMEUUID&quot;);</a>
+<a name="ln244"> </a>
+<a name="ln245">static_assert(static_cast&lt;int&gt;(DataType::TUPLE) ==</a>
+<a name="ln246">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_TUPLE),</a>
+<a name="ln247">              &quot;DataType::TUPLE does not match YBCPgDataType::TUPLE&quot;);</a>
+<a name="ln248"> </a>
+<a name="ln249">static_assert(static_cast&lt;int&gt;(DataType::TYPEARGS) ==</a>
+<a name="ln250">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_TYPEARGS),</a>
+<a name="ln251">              &quot;DataType::TYPEARGS does not match YBCPgDataType::TYPEARGS&quot;);</a>
+<a name="ln252"> </a>
+<a name="ln253">static_assert(static_cast&lt;int&gt;(DataType::USER_DEFINED_TYPE) ==</a>
+<a name="ln254">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_USER_DEFINED_TYPE),</a>
+<a name="ln255">              &quot;DataType::USER_DEFINED_TYPE does not match YBCPgDataType::USER_DEFINED_TYPE&quot;);</a>
+<a name="ln256"> </a>
+<a name="ln257">static_assert(static_cast&lt;int&gt;(DataType::FROZEN) ==</a>
+<a name="ln258">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_FROZEN),</a>
+<a name="ln259">              &quot;DataType::FROZEN does not match YBCPgDataType::FROZEN&quot;);</a>
+<a name="ln260"> </a>
+<a name="ln261">static_assert(static_cast&lt;int&gt;(DataType::DATE) ==</a>
+<a name="ln262">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_DATE),</a>
+<a name="ln263">              &quot;DataType::DATE does not match YBCPgDataType::DATE&quot;);</a>
+<a name="ln264"> </a>
+<a name="ln265">static_assert(static_cast&lt;int&gt;(DataType::TIME) ==</a>
+<a name="ln266">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_TIME),</a>
+<a name="ln267">              &quot;DataType::TIME does not match YBCPgDataType::TIME&quot;);</a>
+<a name="ln268"> </a>
+<a name="ln269">static_assert(static_cast&lt;int&gt;(DataType::JSONB) ==</a>
+<a name="ln270">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_JSONB),</a>
+<a name="ln271">              &quot;DataType::JSONB does not match YBCPgDataType::JSONB&quot;);</a>
+<a name="ln272"> </a>
+<a name="ln273">static_assert(static_cast&lt;int&gt;(DataType::UINT8) ==</a>
+<a name="ln274">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_UINT8),</a>
+<a name="ln275">              &quot;DataType::UINT8 does not match YBCPgDataType::UINT8&quot;);</a>
+<a name="ln276"> </a>
+<a name="ln277">static_assert(static_cast&lt;int&gt;(DataType::UINT16) ==</a>
+<a name="ln278">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_UINT16),</a>
+<a name="ln279">              &quot;DataType::UINT16 does not match YBCPgDataType::UINT16&quot;);</a>
+<a name="ln280"> </a>
+<a name="ln281">static_assert(static_cast&lt;int&gt;(DataType::UINT32) ==</a>
+<a name="ln282">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_UINT32),</a>
+<a name="ln283">              &quot;DataType::UINT32 does not match YBCPgDataType::UINT32&quot;);</a>
+<a name="ln284"> </a>
+<a name="ln285">static_assert(static_cast&lt;int&gt;(DataType::UINT64) ==</a>
+<a name="ln286">                  static_cast&lt;int&gt;(YBCPgDataType::YB_YQL_DATA_TYPE_UINT64),</a>
+<a name="ln287">              &quot;DataType::UINT64 does not match YBCPgDataType::UINT64&quot;);</a>
+<a name="ln288"> </a>
+<a name="ln289">// End of data type enum consistency checking</a>
+<a name="ln290">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln291"> </a>
+<a name="ln292">} // namespace pggate</a>
+<a name="ln293">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="32"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="55"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="128"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

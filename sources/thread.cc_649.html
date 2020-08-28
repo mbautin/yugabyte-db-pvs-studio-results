@@ -1,0 +1,852 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>thread.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/util/thread.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;sys/resource.h&gt;</a>
+<a name="ln36">#include &lt;sys/syscall.h&gt;</a>
+<a name="ln37">#include &lt;sys/time.h&gt;</a>
+<a name="ln38">#include &lt;sys/types.h&gt;</a>
+<a name="ln39">#include &lt;unistd.h&gt;</a>
+<a name="ln40"> </a>
+<a name="ln41">#if defined(__linux__)</a>
+<a name="ln42">#include &lt;sys/prctl.h&gt;</a>
+<a name="ln43">#endif // defined(__linux__)</a>
+<a name="ln44"> </a>
+<a name="ln45">#include &lt;algorithm&gt;</a>
+<a name="ln46">#include &lt;functional&gt;</a>
+<a name="ln47">#include &lt;map&gt;</a>
+<a name="ln48">#include &lt;memory&gt;</a>
+<a name="ln49">#include &lt;set&gt;</a>
+<a name="ln50">#include &lt;vector&gt;</a>
+<a name="ln51"> </a>
+<a name="ln52">#include &lt;cds/init.h&gt;</a>
+<a name="ln53">#include &lt;cds/gc/dhp.h&gt;</a>
+<a name="ln54"> </a>
+<a name="ln55">#include &quot;yb/gutil/atomicops.h&quot;</a>
+<a name="ln56">#include &quot;yb/gutil/dynamic_annotations.h&quot;</a>
+<a name="ln57">#include &quot;yb/gutil/mathlimits.h&quot;</a>
+<a name="ln58">#include &quot;yb/gutil/once.h&quot;</a>
+<a name="ln59">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln60">#include &quot;yb/util/debug-util.h&quot;</a>
+<a name="ln61">#include &quot;yb/util/errno.h&quot;</a>
+<a name="ln62">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln63">#include &quot;yb/util/metrics.h&quot;</a>
+<a name="ln64">#include &quot;yb/util/mutex.h&quot;</a>
+<a name="ln65">#include &quot;yb/util/os-util.h&quot;</a>
+<a name="ln66">#include &quot;yb/util/stopwatch.h&quot;</a>
+<a name="ln67">#include &quot;yb/util/url-coding.h&quot;</a>
+<a name="ln68">#include &quot;yb/util/web_callback_registry.h&quot;</a>
+<a name="ln69"> </a>
+<a name="ln70">METRIC_DEFINE_gauge_uint64(server, threads_started,</a>
+<a name="ln71">                           &quot;Threads Started&quot;,</a>
+<a name="ln72">                           yb::MetricUnit::kThreads,</a>
+<a name="ln73">                           &quot;Total number of threads started on this server&quot;,</a>
+<a name="ln74">                           yb::EXPOSE_AS_COUNTER);</a>
+<a name="ln75"> </a>
+<a name="ln76">METRIC_DEFINE_gauge_uint64(server, threads_running,</a>
+<a name="ln77">                           &quot;Threads Running&quot;,</a>
+<a name="ln78">                           yb::MetricUnit::kThreads,</a>
+<a name="ln79">                           &quot;Current number of running threads&quot;);</a>
+<a name="ln80"> </a>
+<a name="ln81">METRIC_DEFINE_gauge_uint64(server, cpu_utime,</a>
+<a name="ln82">                           &quot;User CPU Time&quot;,</a>
+<a name="ln83">                           yb::MetricUnit::kMilliseconds,</a>
+<a name="ln84">                           &quot;Total user CPU time of the process&quot;,</a>
+<a name="ln85">                           yb::EXPOSE_AS_COUNTER);</a>
+<a name="ln86"> </a>
+<a name="ln87">METRIC_DEFINE_gauge_uint64(server, cpu_stime,</a>
+<a name="ln88">                           &quot;System CPU Time&quot;,</a>
+<a name="ln89">                           yb::MetricUnit::kMilliseconds,</a>
+<a name="ln90">                           &quot;Total system CPU time of the process&quot;,</a>
+<a name="ln91">                           yb::EXPOSE_AS_COUNTER);</a>
+<a name="ln92"> </a>
+<a name="ln93">METRIC_DEFINE_gauge_uint64(server, voluntary_context_switches,</a>
+<a name="ln94">                           &quot;Voluntary Context Switches&quot;,</a>
+<a name="ln95">                           yb::MetricUnit::kContextSwitches,</a>
+<a name="ln96">                           &quot;Total voluntary context switches&quot;,</a>
+<a name="ln97">                           yb::EXPOSE_AS_COUNTER);</a>
+<a name="ln98"> </a>
+<a name="ln99">METRIC_DEFINE_gauge_uint64(server, involuntary_context_switches,</a>
+<a name="ln100">                           &quot;Involuntary Context Switches&quot;,</a>
+<a name="ln101">                           yb::MetricUnit::kContextSwitches,</a>
+<a name="ln102">                           &quot;Total involuntary context switches&quot;,</a>
+<a name="ln103">                           yb::EXPOSE_AS_COUNTER);</a>
+<a name="ln104"> </a>
+<a name="ln105">namespace yb {</a>
+<a name="ln106"> </a>
+<a name="ln107">using std::endl;</a>
+<a name="ln108">using std::map;</a>
+<a name="ln109">using std::shared_ptr;</a>
+<a name="ln110">using std::stringstream;</a>
+<a name="ln111">using strings::Substitute;</a>
+<a name="ln112"> </a>
+<a name="ln113">using namespace std::placeholders;</a>
+<a name="ln114"> </a>
+<a name="ln115">namespace {</a>
+<a name="ln116"> </a>
+<a name="ln117">uint64_t GetCpuUTime() {</a>
+<a name="ln118">  rusage ru;</a>
+<a name="ln119">  CHECK_ERR(getrusage(RUSAGE_SELF, &amp;ru));</a>
+<a name="ln120">  return ru.ru_utime.tv_sec * 1000UL + ru.ru_utime.tv_usec / 1000UL;</a>
+<a name="ln121">}</a>
+<a name="ln122"> </a>
+<a name="ln123">uint64_t GetCpuSTime() {</a>
+<a name="ln124">  rusage ru;</a>
+<a name="ln125">  CHECK_ERR(getrusage(RUSAGE_SELF, &amp;ru));</a>
+<a name="ln126">  return ru.ru_stime.tv_sec * 1000UL + ru.ru_stime.tv_usec / 1000UL;</a>
+<a name="ln127">}</a>
+<a name="ln128"> </a>
+<a name="ln129">uint64_t GetVoluntaryContextSwitches() {</a>
+<a name="ln130">  rusage ru;</a>
+<a name="ln131">  CHECK_ERR(getrusage(RUSAGE_SELF, &amp;ru));</a>
+<a name="ln132">  return ru.ru_nvcsw;;</a>
+<a name="ln133">}</a>
+<a name="ln134"> </a>
+<a name="ln135">uint64_t GetInVoluntaryContextSwitches() {</a>
+<a name="ln136">  rusage ru;</a>
+<a name="ln137">  CHECK_ERR(getrusage(RUSAGE_SELF, &amp;ru));</a>
+<a name="ln138">  return ru.ru_nivcsw;</a>
+<a name="ln139">}</a>
+<a name="ln140"> </a>
+<a name="ln141">class ThreadCategoryTracker {</a>
+<a name="ln142"> public:</a>
+<a name="ln143">  ThreadCategoryTracker(const string&amp; name, const scoped_refptr&lt;MetricEntity&gt; &amp;metrics) :</a>
+<a name="ln144">      name_(name), metrics_(metrics) {}</a>
+<a name="ln145"> </a>
+<a name="ln146">  void IncrementCategory(const string&amp; category);</a>
+<a name="ln147">  void DecrementCategory(const string&amp; category);</a>
+<a name="ln148"> </a>
+<a name="ln149">  scoped_refptr&lt;AtomicGauge&lt;uint64&gt;&gt; FindOrCreateGauge(const string&amp; category);</a>
+<a name="ln150"> </a>
+<a name="ln151"> private:</a>
+<a name="ln152">  string name_;</a>
+<a name="ln153">  scoped_refptr&lt;MetricEntity&gt; metrics_;</a>
+<a name="ln154">  map&lt;string, scoped_refptr&lt;AtomicGauge&lt;uint64&gt;&gt;&gt; gauges_;</a>
+<a name="ln155">};</a>
+<a name="ln156"> </a>
+<a name="ln157">void ThreadCategoryTracker::IncrementCategory(const string&amp; category) {</a>
+<a name="ln158">  auto gauge = FindOrCreateGauge(category);</a>
+<a name="ln159">  gauge-&gt;Increment();</a>
+<a name="ln160">}</a>
+<a name="ln161"> </a>
+<a name="ln162">void ThreadCategoryTracker::DecrementCategory(const string&amp; category) {</a>
+<a name="ln163">  auto gauge = FindOrCreateGauge(category);</a>
+<a name="ln164">  gauge-&gt;Decrement();</a>
+<a name="ln165">}</a>
+<a name="ln166"> </a>
+<a name="ln167">scoped_refptr&lt;AtomicGauge&lt;uint64&gt;&gt; ThreadCategoryTracker::FindOrCreateGauge(</a>
+<a name="ln168">    const string&amp; category) {</a>
+<a name="ln169">  if (gauges_.find(category) == gauges_.end()) {</a>
+<a name="ln170">    string id = name_ + &quot;_&quot; + category;</a>
+<a name="ln171">    EscapeMetricNameForPrometheus(&amp;id);</a>
+<a name="ln172">    const string description = id + &quot; metric in ThreadCategoryTracker&quot;;</a>
+<a name="ln173">    std::unique_ptr&lt;GaugePrototype&lt;uint64&gt;&gt; gauge = std::make_unique&lt;OwningGaugePrototype&lt;uint64&gt;&gt;(</a>
+<a name="ln174">        &quot;server&quot;, id, description, yb::MetricUnit::kThreads, description,</a>
+<a name="ln175">        yb::MetricLevel::kInfo, yb::EXPOSE_AS_COUNTER);</a>
+<a name="ln176">    gauges_[category] =</a>
+<a name="ln177">        metrics_-&gt;FindOrCreateGauge(std::move(gauge), static_cast&lt;uint64&gt;(0) /* initial_value */);</a>
+<a name="ln178">  }</a>
+<a name="ln179">  return gauges_[category];</a>
+<a name="ln180">}</a>
+<a name="ln181"> </a>
+<a name="ln182">// A singleton class that tracks all live threads, and groups them together for easy</a>
+<a name="ln183">// auditing. Used only by Thread.</a>
+<a name="ln184">class ThreadMgr {</a>
+<a name="ln185"> public:</a>
+<a name="ln186">  ThreadMgr()</a>
+<a name="ln187">      : metrics_enabled_(false),</a>
+<a name="ln188">        threads_started_metric_(0),</a>
+<a name="ln189">        threads_running_metric_(0) {</a>
+<a name="ln190">    cds::Initialize();</a>
+<a name="ln191">    cds::gc::dhp::GarbageCollector::construct();</a>
+<a name="ln192">    cds::threading::Manager::attachThread();</a>
+<a name="ln193">  }</a>
+<a name="ln194"> </a>
+<a name="ln195">  ~ThreadMgr() {</a>
+<a name="ln196">    cds::Terminate();</a>
+<a name="ln197">    MutexLock l(lock_);</a>
+<a name="ln198">    thread_categories_.clear();</a>
+<a name="ln199">  }</a>
+<a name="ln200"> </a>
+<a name="ln201">  static void SetThreadName(const std::string&amp; name, int64 tid);</a>
+<a name="ln202"> </a>
+<a name="ln203">  Status StartInstrumentation(const scoped_refptr&lt;MetricEntity&gt;&amp; metrics, WebCallbackRegistry* web);</a>
+<a name="ln204"> </a>
+<a name="ln205">  // Registers a thread to the supplied category. The key is a pthread_t,</a>
+<a name="ln206">  // not the system TID, since pthread_t is less prone to being recycled.</a>
+<a name="ln207">  void AddThread(const pthread_t&amp; pthread_id, const string&amp; name, const string&amp; category,</a>
+<a name="ln208">      int64_t tid);</a>
+<a name="ln209"> </a>
+<a name="ln210">  // Removes a thread from the supplied category. If the thread has</a>
+<a name="ln211">  // already been removed, this is a no-op.</a>
+<a name="ln212">  void RemoveThread(const pthread_t&amp; pthread_id, const string&amp; category);</a>
+<a name="ln213"> </a>
+<a name="ln214"> private:</a>
+<a name="ln215">  // Container class for any details we want to capture about a thread</a>
+<a name="ln216">  // TODO: Add start-time.</a>
+<a name="ln217">  // TODO: Track fragment ID.</a>
+<a name="ln218">  class ThreadDescriptor {</a>
+<a name="ln219">   public:</a>
+<a name="ln220">    ThreadDescriptor() { }</a>
+<a name="ln221">    ThreadDescriptor(string category, string name, int64_t thread_id)</a>
+<a name="ln222">        : name_(std::move(name)),</a>
+<a name="ln223">          category_(std::move(category)),</a>
+<a name="ln224">          thread_id_(thread_id) {}</a>
+<a name="ln225"> </a>
+<a name="ln226">    const string&amp; name() const { return name_; }</a>
+<a name="ln227">    const string&amp; category() const { return category_; }</a>
+<a name="ln228">    int64_t thread_id() const { return thread_id_; }</a>
+<a name="ln229"> </a>
+<a name="ln230">   private:</a>
+<a name="ln231">    string name_;</a>
+<a name="ln232">    string category_;</a>
+<a name="ln233">    int64_t thread_id_;</a>
+<a name="ln234">  };</a>
+<a name="ln235"> </a>
+<a name="ln236">  // A ThreadCategory is a set of threads that are logically related.</a>
+<a name="ln237">  // TODO: unordered_map is incompatible with pthread_t, but would be more</a>
+<a name="ln238">  // efficient here.</a>
+<a name="ln239">  typedef map&lt;const pthread_t, ThreadDescriptor&gt; ThreadCategory;</a>
+<a name="ln240"> </a>
+<a name="ln241">  // All thread categorys, keyed on the category name.</a>
+<a name="ln242">  typedef map&lt;string, ThreadCategory&gt; ThreadCategoryMap;</a>
+<a name="ln243"> </a>
+<a name="ln244">  // Protects thread_categories_ and metrics_enabled_</a>
+<a name="ln245">  Mutex lock_;</a>
+<a name="ln246"> </a>
+<a name="ln247">  // All thread categorys that ever contained a thread, even if empty</a>
+<a name="ln248">  ThreadCategoryMap thread_categories_;</a>
+<a name="ln249"> </a>
+<a name="ln250">  // True after StartInstrumentation(..) returns</a>
+<a name="ln251">  bool metrics_enabled_;</a>
+<a name="ln252"> </a>
+<a name="ln253">  // Counters to track all-time total number of threads, and the</a>
+<a name="ln254">  // current number of running threads.</a>
+<a name="ln255">  uint64_t threads_started_metric_;</a>
+<a name="ln256">  uint64_t threads_running_metric_;</a>
+<a name="ln257"> </a>
+<a name="ln258">  // Tracker to track the number of started threads and the number of running threads for each</a>
+<a name="ln259">  // category.</a>
+<a name="ln260">  std::unique_ptr&lt;ThreadCategoryTracker&gt; started_category_tracker_;</a>
+<a name="ln261">  std::unique_ptr&lt;ThreadCategoryTracker&gt; running_category_tracker_;</a>
+<a name="ln262"> </a>
+<a name="ln263">  // Metric callbacks.</a>
+<a name="ln264">  uint64_t ReadThreadsStarted();</a>
+<a name="ln265">  uint64_t ReadThreadsRunning();</a>
+<a name="ln266"> </a>
+<a name="ln267">  // Webpage callback; prints all threads by category</a>
+<a name="ln268">  void ThreadPathHandler(const WebCallbackRegistry::WebRequest&amp; args,</a>
+<a name="ln269">                                WebCallbackRegistry::WebResponse* resp);</a>
+<a name="ln270">  void RenderThreadCategoryRows(const ThreadCategory&amp; category, std::string* output);</a>
+<a name="ln271">};</a>
+<a name="ln272"> </a>
+<a name="ln273">void ThreadMgr::SetThreadName(const string&amp; name, int64 tid) {</a>
+<a name="ln274">  // On linux we can get the thread names to show up in the debugger by setting</a>
+<a name="ln275">  // the process name for the LWP.  We don't want to do this for the main</a>
+<a name="ln276">  // thread because that would rename the process, causing tools like killall</a>
+<a name="ln277">  // to stop working.</a>
+<a name="ln278">  if (tid == getpid()) {</a>
+<a name="ln279">    return;</a>
+<a name="ln280">  }</a>
+<a name="ln281"> </a>
+<a name="ln282">  yb::SetThreadName(name);</a>
+<a name="ln283">}</a>
+<a name="ln284"> </a>
+<a name="ln285">Status ThreadMgr::StartInstrumentation(const scoped_refptr&lt;MetricEntity&gt;&amp; metrics,</a>
+<a name="ln286">                                       WebCallbackRegistry* web) {</a>
+<a name="ln287">  MutexLock l(lock_);</a>
+<a name="ln288">  metrics_enabled_ = true;</a>
+<a name="ln289">  started_category_tracker_ = std::make_unique&lt;ThreadCategoryTracker&gt;(&quot;threads_started&quot;, metrics);</a>
+<a name="ln290">  running_category_tracker_ = std::make_unique&lt;ThreadCategoryTracker&gt;(&quot;threads_running&quot;, metrics);</a>
+<a name="ln291"> </a>
+<a name="ln292">  // Use function gauges here so that we can register a unique copy of these metrics in</a>
+<a name="ln293">  // multiple tservers, even though the ThreadMgr is itself a singleton.</a>
+<a name="ln294">  metrics-&gt;NeverRetire(</a>
+<a name="ln295">      METRIC_threads_started.InstantiateFunctionGauge(metrics,</a>
+<a name="ln296">        Bind(&amp;ThreadMgr::ReadThreadsStarted, Unretained(this))));</a>
+<a name="ln297">  metrics-&gt;NeverRetire(</a>
+<a name="ln298">      METRIC_threads_running.InstantiateFunctionGauge(metrics,</a>
+<a name="ln299">        Bind(&amp;ThreadMgr::ReadThreadsRunning, Unretained(this))));</a>
+<a name="ln300">  metrics-&gt;NeverRetire(</a>
+<a name="ln301">      METRIC_cpu_utime.InstantiateFunctionGauge(metrics,</a>
+<a name="ln302">        Bind(&amp;GetCpuUTime)));</a>
+<a name="ln303">  metrics-&gt;NeverRetire(</a>
+<a name="ln304">      METRIC_cpu_stime.InstantiateFunctionGauge(metrics,</a>
+<a name="ln305">        Bind(&amp;GetCpuSTime)));</a>
+<a name="ln306">  metrics-&gt;NeverRetire(</a>
+<a name="ln307">      METRIC_voluntary_context_switches.InstantiateFunctionGauge(metrics,</a>
+<a name="ln308">        Bind(&amp;GetVoluntaryContextSwitches)));</a>
+<a name="ln309">  metrics-&gt;NeverRetire(</a>
+<a name="ln310">      METRIC_involuntary_context_switches.InstantiateFunctionGauge(metrics,</a>
+<a name="ln311">        Bind(&amp;GetInVoluntaryContextSwitches)));</a>
+<a name="ln312"> </a>
+<a name="ln313">  WebCallbackRegistry::PathHandlerCallback thread_callback =</a>
+<a name="ln314">      std::bind(&amp;ThreadMgr::ThreadPathHandler, this, _1, _2);</a>
+<a name="ln315">  DCHECK_NOTNULL(web)-&gt;RegisterPathHandler(&quot;/threadz&quot;, &quot;Threads&quot;, thread_callback, true, false);</a>
+<a name="ln316">  return Status::OK();</a>
+<a name="ln317">}</a>
+<a name="ln318"> </a>
+<a name="ln319">uint64_t ThreadMgr::ReadThreadsStarted() {</a>
+<a name="ln320">  MutexLock l(lock_);</a>
+<a name="ln321">  return threads_started_metric_;</a>
+<a name="ln322">}</a>
+<a name="ln323"> </a>
+<a name="ln324">uint64_t ThreadMgr::ReadThreadsRunning() {</a>
+<a name="ln325">  MutexLock l(lock_);</a>
+<a name="ln326">  return threads_running_metric_;</a>
+<a name="ln327">}</a>
+<a name="ln328"> </a>
+<a name="ln329">void ThreadMgr::AddThread(const pthread_t&amp; pthread_id, const string&amp; name,</a>
+<a name="ln330">    const string&amp; category, int64_t tid) {</a>
+<a name="ln331">  // These annotations cause TSAN to ignore the synchronization on lock_</a>
+<a name="ln332">  // without causing the subsequent mutations to be treated as data races</a>
+<a name="ln333">  // in and of themselves (that's what IGNORE_READS_AND_WRITES does).</a>
+<a name="ln334">  //</a>
+<a name="ln335">  // Why do we need them here and in SuperviseThread()? TSAN operates by</a>
+<a name="ln336">  // observing synchronization events and using them to establish &quot;happens</a>
+<a name="ln337">  // before&quot; relationships between threads. Where these relationships are</a>
+<a name="ln338">  // not built, shared state access constitutes a data race. The</a>
+<a name="ln339">  // synchronization events here, in RemoveThread(), and in</a>
+<a name="ln340">  // SuperviseThread() may cause TSAN to establish a &quot;happens before&quot;</a>
+<a name="ln341">  // relationship between thread functors, ignoring potential data races.</a>
+<a name="ln342">  // The annotations prevent this from happening.</a>
+<a name="ln343">  ANNOTATE_IGNORE_SYNC_BEGIN();</a>
+<a name="ln344">  ANNOTATE_IGNORE_READS_AND_WRITES_BEGIN();</a>
+<a name="ln345">  {</a>
+<a name="ln346">    MutexLock l(lock_);</a>
+<a name="ln347">    thread_categories_[category][pthread_id] = ThreadDescriptor(category, name, tid);</a>
+<a name="ln348">    if (metrics_enabled_) {</a>
+<a name="ln349">      threads_running_metric_++;</a>
+<a name="ln350">      threads_started_metric_++;</a>
+<a name="ln351">      started_category_tracker_-&gt;IncrementCategory(category);</a>
+<a name="ln352">      running_category_tracker_-&gt;IncrementCategory(category);</a>
+<a name="ln353">    }</a>
+<a name="ln354">  }</a>
+<a name="ln355">  ANNOTATE_IGNORE_SYNC_END();</a>
+<a name="ln356">  ANNOTATE_IGNORE_READS_AND_WRITES_END();</a>
+<a name="ln357">}</a>
+<a name="ln358"> </a>
+<a name="ln359">void ThreadMgr::RemoveThread(const pthread_t&amp; pthread_id, const string&amp; category) {</a>
+<a name="ln360">  ANNOTATE_IGNORE_SYNC_BEGIN();</a>
+<a name="ln361">  ANNOTATE_IGNORE_READS_AND_WRITES_BEGIN();</a>
+<a name="ln362">  {</a>
+<a name="ln363">    MutexLock l(lock_);</a>
+<a name="ln364">    auto category_it = thread_categories_.find(category);</a>
+<a name="ln365">    DCHECK(category_it != thread_categories_.end());</a>
+<a name="ln366">    category_it-&gt;second.erase(pthread_id);</a>
+<a name="ln367">    if (metrics_enabled_) {</a>
+<a name="ln368">      threads_running_metric_--;</a>
+<a name="ln369">      running_category_tracker_-&gt;DecrementCategory(category);</a>
+<a name="ln370">    }</a>
+<a name="ln371">  }</a>
+<a name="ln372">  ANNOTATE_IGNORE_SYNC_END();</a>
+<a name="ln373">  ANNOTATE_IGNORE_READS_AND_WRITES_END();</a>
+<a name="ln374">}</a>
+<a name="ln375"> </a>
+<a name="ln376">int Compare(const Result&lt;StackTrace&gt;&amp; lhs, const Result&lt;StackTrace&gt;&amp; rhs) {</a>
+<a name="ln377">  if (lhs.ok()) {</a>
+<a name="ln378">    if (!rhs.ok()) {</a>
+<a name="ln379">      return -1;</a>
+<a name="ln380">    }</a>
+<a name="ln381">    return lhs-&gt;compare(*rhs);</a>
+<a name="ln382">  }</a>
+<a name="ln383">  if (rhs.ok()) {</a>
+<a name="ln384">    return 1;</a>
+<a name="ln385">  }</a>
+<a name="ln386">  return lhs.status().message().compare(rhs.status().message());</a>
+<a name="ln387"> </a>
+<a name="ln388">}</a>
+<a name="ln389"> </a>
+<a name="ln390">void ThreadMgr::RenderThreadCategoryRows(const ThreadCategory&amp; category, std::string* output) {</a>
+<a name="ln391">  struct ThreadData {</a>
+<a name="ln392">    int64_t tid;</a>
+<a name="ln393">    ThreadIdForStack tid_for_stack;</a>
+<a name="ln394">    const std::string* name;</a>
+<a name="ln395">    ThreadStats stats;</a>
+<a name="ln396">    Result&lt;StackTrace&gt; stack_trace = StackTrace();</a>
+<a name="ln397">    int rowspan = -1;</a>
+<a name="ln398">  };</a>
+<a name="ln399">  std::vector&lt;ThreadData&gt; threads;</a>
+<a name="ln400">  std::vector&lt;ThreadIdForStack&gt; thread_ids;</a>
+<a name="ln401">  threads.resize(category.size());</a>
+<a name="ln402">  thread_ids.reserve(category.size());</a>
+<a name="ln403">  {</a>
+<a name="ln404">    auto* data = threads.data();</a>
+<a name="ln405">    for (const ThreadCategory::value_type&amp; thread : category) {</a>
+<a name="ln406">      data-&gt;name = &amp;thread.second.name();</a>
+<a name="ln407">      data-&gt;tid = thread.second.thread_id();</a>
+<a name="ln408">#if defined(__linux__)</a>
+<a name="ln409">      data-&gt;tid_for_stack = data-&gt;tid;</a>
+<a name="ln410">#else</a>
+<a name="ln411">      data-&gt;tid_for_stack = thread.first;</a>
+<a name="ln412">#endif</a>
+<a name="ln413">      Status status = GetThreadStats(data-&gt;tid, &amp;data-&gt;stats);</a>
+<a name="ln414">      if (!status.ok()) {</a>
+<a name="ln415">        YB_LOG_EVERY_N(INFO, 100) &lt;&lt; &quot;Could not get per-thread statistics: &quot;</a>
+<a name="ln416">                                  &lt;&lt; status.ToString();</a>
+<a name="ln417">      }</a>
+<a name="ln418">      thread_ids.push_back(data-&gt;tid_for_stack);</a>
+<a name="ln419">      ++data;</a>
+<a name="ln420">    }</a>
+<a name="ln421">  }</a>
+<a name="ln422"> </a>
+<a name="ln423">  if (threads.empty()) {</a>
+<a name="ln424">    return;</a>
+<a name="ln425">  }</a>
+<a name="ln426"> </a>
+<a name="ln427">  std::sort(thread_ids.begin(), thread_ids.end());</a>
+<a name="ln428">  auto stacks = ThreadStacks(thread_ids);</a>
+<a name="ln429"> </a>
+<a name="ln430">  for (ThreadData&amp; data : threads) {</a>
+<a name="ln431">    auto it = std::lower_bound(thread_ids.begin(), thread_ids.end(), data.tid_for_stack);</a>
+<a name="ln432">    DCHECK(it != thread_ids.end() &amp;&amp; *it == data.tid_for_stack);</a>
+<a name="ln433">    data.stack_trace = stacks[it - thread_ids.begin()];</a>
+<a name="ln434">  }</a>
+<a name="ln435"> </a>
+<a name="ln436">  std::sort(threads.begin(), threads.end(), [](const ThreadData&amp; lhs, const ThreadData&amp; rhs) {</a>
+<a name="ln437">    return Compare(lhs.stack_trace, rhs.stack_trace) &lt; 0;</a>
+<a name="ln438">  });</a>
+<a name="ln439"> </a>
+<a name="ln440">  auto it = threads.begin();</a>
+<a name="ln441">  auto first = it;</a>
+<a name="ln442">  first-&gt;rowspan = 1;</a>
+<a name="ln443">  while (++it != threads.end()) {</a>
+<a name="ln444">    if (Compare(it-&gt;stack_trace, first-&gt;stack_trace) != 0) {</a>
+<a name="ln445">      first = it;</a>
+<a name="ln446">      first-&gt;rowspan = 1;</a>
+<a name="ln447">    } else {</a>
+<a name="ln448">      ++first-&gt;rowspan;</a>
+<a name="ln449">    }</a>
+<a name="ln450">  }</a>
+<a name="ln451"> </a>
+<a name="ln452">  std::string* active_out = output;</a>
+<a name="ln453">  for (const auto&amp; thread : threads) {</a>
+<a name="ln454">    std::string symbolized;</a>
+<a name="ln455">    if (thread.rowspan &gt; 0) {</a>
+<a name="ln456">      StackTraceGroup group = StackTraceGroup::kActive;</a>
+<a name="ln457">      if (thread.stack_trace.ok()) {</a>
+<a name="ln458">        symbolized = thread.stack_trace-&gt;Symbolize(StackTraceLineFormat::DEFAULT, &amp;group);</a>
+<a name="ln459">      } else {</a>
+<a name="ln460">        symbolized = thread.stack_trace.status().message().ToBuffer();</a>
+<a name="ln461">      }</a>
+<a name="ln462">      active_out = output + to_underlying(group);</a>
+<a name="ln463">    }</a>
+<a name="ln464"> </a>
+<a name="ln465">    *active_out += Format(</a>
+<a name="ln466">         &quot;&lt;tr&gt;&lt;td&gt;$0&lt;/td&gt;&lt;td&gt;$1&lt;/td&gt;&lt;td&gt;$2&lt;/td&gt;&lt;td&gt;$3&lt;/td&gt;&quot;,</a>
+<a name="ln467">         *thread.name, MonoDelta::FromNanoseconds(thread.stats.user_ns),</a>
+<a name="ln468">         MonoDelta::FromNanoseconds(thread.stats.kernel_ns / 1e9),</a>
+<a name="ln469">         MonoDelta::FromNanoseconds(thread.stats.iowait_ns / 1e9));</a>
+<a name="ln470">    if (thread.rowspan &gt; 0) {</a>
+<a name="ln471">      *active_out += Format(&quot;&lt;td rowspan=\&quot;$0\&quot;&gt;&lt;pre&gt;$1\nTotal number of threads: $0&lt;/pre&gt;&lt;/td&gt;&quot;,</a>
+<a name="ln472">                            thread.rowspan, symbolized);</a>
+<a name="ln473">    }</a>
+<a name="ln474">    *active_out += &quot;&lt;/tr&gt;\n&quot;;</a>
+<a name="ln475">  }</a>
+<a name="ln476">}</a>
+<a name="ln477"> </a>
+<a name="ln478">void ThreadMgr::ThreadPathHandler(const WebCallbackRegistry::WebRequest&amp; req,</a>
+<a name="ln479">    WebCallbackRegistry::WebResponse* resp) {</a>
+<a name="ln480">  std::stringstream *output = &amp;resp-&gt;output;</a>
+<a name="ln481">  MutexLock l(lock_);</a>
+<a name="ln482">  vector&lt;const ThreadCategory*&gt; categories_to_print;</a>
+<a name="ln483">  auto category_name = req.parsed_args.find(&quot;group&quot;);</a>
+<a name="ln484">  if (category_name != req.parsed_args.end()) {</a>
+<a name="ln485">    string group = EscapeForHtmlToString(category_name-&gt;second);</a>
+<a name="ln486">    (*output) &lt;&lt; &quot;&lt;h2&gt;Thread Group: &quot; &lt;&lt; group &lt;&lt; &quot;&lt;/h2&gt;&quot; &lt;&lt; endl;</a>
+<a name="ln487">    if (group != &quot;all&quot;) {</a>
+<a name="ln488">      ThreadCategoryMap::const_iterator category = thread_categories_.find(group);</a>
+<a name="ln489">      if (category == thread_categories_.end()) {</a>
+<a name="ln490">        (*output) &lt;&lt; &quot;Thread group '&quot; &lt;&lt; group &lt;&lt; &quot;' not found&quot; &lt;&lt; endl;</a>
+<a name="ln491">        return;</a>
+<a name="ln492">      }</a>
+<a name="ln493">      categories_to_print.push_back(&amp;category-&gt;second);</a>
+<a name="ln494">      (*output) &lt;&lt; &quot;&lt;h3&gt;&quot; &lt;&lt; category-&gt;first &lt;&lt; &quot; : &quot; &lt;&lt; category-&gt;second.size()</a>
+<a name="ln495">                &lt;&lt; &quot;&lt;/h3&gt;&quot;;</a>
+<a name="ln496">    } else {</a>
+<a name="ln497">      for (const ThreadCategoryMap::value_type&amp; category : thread_categories_) {</a>
+<a name="ln498">        categories_to_print.push_back(&amp;category.second);</a>
+<a name="ln499">      }</a>
+<a name="ln500">      (*output) &lt;&lt; &quot;&lt;h3&gt;All Threads : &lt;/h3&gt;&quot;;</a>
+<a name="ln501">    }</a>
+<a name="ln502"> </a>
+<a name="ln503">    (*output) &lt;&lt; &quot;&lt;table class='table table-hover table-border'&gt;&quot;;</a>
+<a name="ln504">    (*output) &lt;&lt; &quot;&lt;tr&gt;&lt;th&gt;Thread name&lt;/th&gt;&lt;th&gt;Cumulative User CPU(s)&lt;/th&gt;&quot;</a>
+<a name="ln505">              &lt;&lt; &quot;&lt;th&gt;Cumulative Kernel CPU(s)&lt;/th&gt;&quot;</a>
+<a name="ln506">              &lt;&lt; &quot;&lt;th&gt;Cumulative IO-wait(s)&lt;/th&gt;&lt;/tr&gt;&quot;;</a>
+<a name="ln507"> </a>
+<a name="ln508">    std::array&lt;std::string, kStackTraceGroupMapSize&gt; groups;</a>
+<a name="ln509"> </a>
+<a name="ln510">    for (const ThreadCategory* category : categories_to_print) {</a>
+<a name="ln511">      RenderThreadCategoryRows(*category, groups.data());</a>
+<a name="ln512">    }</a>
+<a name="ln513"> </a>
+<a name="ln514">    for (auto g : kStackTraceGroupList) {</a>
+<a name="ln515">      *output &lt;&lt; groups[to_underlying(g)];</a>
+<a name="ln516">    }</a>
+<a name="ln517">    (*output) &lt;&lt; &quot;&lt;/table&gt;&quot;;</a>
+<a name="ln518">  } else {</a>
+<a name="ln519">    (*output) &lt;&lt; &quot;&lt;h2&gt;Thread Groups&lt;/h2&gt;&quot;;</a>
+<a name="ln520">    if (metrics_enabled_) {</a>
+<a name="ln521">      (*output) &lt;&lt; &quot;&lt;h4&gt;&quot; &lt;&lt; threads_running_metric_ &lt;&lt; &quot; thread(s) running&quot;;</a>
+<a name="ln522">    }</a>
+<a name="ln523">    (*output) &lt;&lt; &quot;&lt;a href='/threadz?group=all'&gt;&lt;h3&gt;All Threads&lt;/h3&gt;&quot;;</a>
+<a name="ln524"> </a>
+<a name="ln525">    for (const ThreadCategoryMap::value_type&amp; category : thread_categories_) {</a>
+<a name="ln526">      string category_arg;</a>
+<a name="ln527">      UrlEncode(category.first, &amp;category_arg);</a>
+<a name="ln528">      (*output) &lt;&lt; &quot;&lt;a href='/threadz?group=&quot; &lt;&lt; category_arg &lt;&lt; &quot;'&gt;&lt;h3&gt;&quot;</a>
+<a name="ln529">                &lt;&lt; category.first &lt;&lt; &quot; : &quot; &lt;&lt; category.second.size() &lt;&lt; &quot;&lt;/h3&gt;&lt;/a&gt;&quot;;</a>
+<a name="ln530">    }</a>
+<a name="ln531">  }</a>
+<a name="ln532">}</a>
+<a name="ln533"> </a>
+<a name="ln534">// Singleton instance of ThreadMgr. Only visible in this file, used only by Thread.</a>
+<a name="ln535">// The Thread class adds a reference to thread_manager while it is supervising a thread so</a>
+<a name="ln536">// that a race between the end of the process's main thread (and therefore the destruction</a>
+<a name="ln537">// of thread_manager) and the end of a thread that tries to remove itself from the</a>
+<a name="ln538">// manager after the destruction can be avoided.</a>
+<a name="ln539">shared_ptr&lt;ThreadMgr&gt; thread_manager;</a>
+<a name="ln540"> </a>
+<a name="ln541">// Controls the single (lazy) initialization of thread_manager.</a>
+<a name="ln542">std::once_flag init_threading_internal_once_flag;</a>
+<a name="ln543"> </a>
+<a name="ln544">void InitThreadingInternal() {</a>
+<a name="ln545">  // Warm up the stack trace library. This avoids a race in libunwind initialization</a>
+<a name="ln546">  // by making sure we initialize it before we start any other threads.</a>
+<a name="ln547">  ignore_result(GetStackTraceHex());</a>
+<a name="ln548">  thread_manager = std::make_shared&lt;ThreadMgr&gt;();</a>
+<a name="ln549">}</a>
+<a name="ln550"> </a>
+<a name="ln551">} // anonymous namespace</a>
+<a name="ln552"> </a>
+<a name="ln553">void SetThreadName(const std::string&amp; name) {</a>
+<a name="ln554">#if defined(__linux__)</a>
+<a name="ln555">  // http://0pointer.de/blog/projects/name-your-threads.html</a>
+<a name="ln556">  // Set the name for the LWP (which gets truncated to 15 characters).</a>
+<a name="ln557">  // Note that glibc also has a 'pthread_setname_np' api, but it may not be</a>
+<a name="ln558">  // available everywhere and it's only benefit over using prctl directly is</a>
+<a name="ln559">  // that it can set the name of threads other than the current thread.</a>
+<a name="ln560">  int err = prctl(PR_SET_NAME, name.c_str());</a>
+<a name="ln561">#else</a>
+<a name="ln562">  int err = pthread_setname_np(name.c_str());</a>
+<a name="ln563">#endif // defined(__linux__)</a>
+<a name="ln564">  // We expect EPERM failures in sandboxed processes, just ignore those.</a>
+<a name="ln565">  if (err &lt; 0 &amp;&amp; errno != EPERM) {</a>
+<a name="ln566">    PLOG(ERROR) &lt;&lt; &quot;SetThreadName&quot;;</a>
+<a name="ln567">  }</a>
+<a name="ln568">}</a>
+<a name="ln569"> </a>
+<a name="ln570">void InitThreading() {</a>
+<a name="ln571">  std::call_once(init_threading_internal_once_flag, InitThreadingInternal);</a>
+<a name="ln572">}</a>
+<a name="ln573"> </a>
+<a name="ln574">__thread Thread* Thread::tls_ = nullptr;</a>
+<a name="ln575"> </a>
+<a name="ln576">Status StartThreadInstrumentation(const scoped_refptr&lt;MetricEntity&gt;&amp; server_metrics,</a>
+<a name="ln577">                                  WebCallbackRegistry* web) {</a>
+<a name="ln578">  InitThreading();</a>
+<a name="ln579">  return thread_manager-&gt;StartInstrumentation(server_metrics, web);</a>
+<a name="ln580">}</a>
+<a name="ln581"> </a>
+<a name="ln582">ThreadJoiner::ThreadJoiner(Thread* thr)</a>
+<a name="ln583">  : thread_(CHECK_NOTNULL(thr)) {</a>
+<a name="ln584">}</a>
+<a name="ln585"> </a>
+<a name="ln586">ThreadJoiner&amp; ThreadJoiner::warn_after(MonoDelta duration) {</a>
+<a name="ln587">  warn_after_ = duration;</a>
+<a name="ln588">  return *this;</a>
+<a name="ln589">}</a>
+<a name="ln590"> </a>
+<a name="ln591">ThreadJoiner&amp; ThreadJoiner::warn_every(MonoDelta duration) {</a>
+<a name="ln592">  warn_every_ = duration;</a>
+<a name="ln593">  return *this;</a>
+<a name="ln594">}</a>
+<a name="ln595"> </a>
+<a name="ln596">ThreadJoiner&amp; ThreadJoiner::give_up_after(MonoDelta duration) {</a>
+<a name="ln597">  give_up_after_ = duration;</a>
+<a name="ln598">  return *this;</a>
+<a name="ln599">}</a>
+<a name="ln600"> </a>
+<a name="ln601">Status ThreadJoiner::Join() {</a>
+<a name="ln602">  if (Thread::current_thread() &amp;&amp;</a>
+<a name="ln603">      Thread::current_thread()-&gt;tid() == thread_-&gt;tid()) {</a>
+<a name="ln604">    return STATUS(InvalidArgument, &quot;Can't join on own thread&quot;, thread_-&gt;name_);</a>
+<a name="ln605">  }</a>
+<a name="ln606"> </a>
+<a name="ln607">  // Early exit: double join is a no-op.</a>
+<a name="ln608">  if (!thread_-&gt;joinable_) {</a>
+<a name="ln609">    return Status::OK();</a>
+<a name="ln610">  }</a>
+<a name="ln611"> </a>
+<a name="ln612">  MonoDelta waited = MonoDelta::kZero;</a>
+<a name="ln613">  bool keep_trying = true;</a>
+<a name="ln614">  while (keep_trying) {</a>
+<a name="ln615">    if (waited &gt;= warn_after_) {</a>
+<a name="ln616">      LOG(WARNING) &lt;&lt; Format(&quot;Waited for $0 trying to join with $1 (tid $2)&quot;,</a>
+<a name="ln617">                             waited, thread_-&gt;name_, thread_-&gt;tid_);</a>
+<a name="ln618">    }</a>
+<a name="ln619"> </a>
+<a name="ln620">    auto remaining_before_giveup = give_up_after_;</a>
+<a name="ln621">    if (remaining_before_giveup != MonoDelta::kMax) {</a>
+<a name="ln622">      remaining_before_giveup -= waited;</a>
+<a name="ln623">    }</a>
+<a name="ln624"> </a>
+<a name="ln625">    auto remaining_before_next_warn = warn_every_;</a>
+<a name="ln626">    if (waited &lt; warn_after_) {</a>
+<a name="ln627">      remaining_before_next_warn = warn_after_ - waited;</a>
+<a name="ln628">    }</a>
+<a name="ln629"> </a>
+<a name="ln630">    if (remaining_before_giveup &lt; remaining_before_next_warn) {</a>
+<a name="ln631">      keep_trying = false;</a>
+<a name="ln632">    }</a>
+<a name="ln633"> </a>
+<a name="ln634">    auto wait_for = std::min(remaining_before_giveup, remaining_before_next_warn);</a>
+<a name="ln635"> </a>
+<a name="ln636">    if (thread_-&gt;done_.WaitFor(wait_for)) {</a>
+<a name="ln637">      // Unconditionally join before returning, to guarantee that any TLS</a>
+<a name="ln638">      // has been destroyed (pthread_key_create() destructors only run</a>
+<a name="ln639">      // after a pthread's user method has returned).</a>
+<a name="ln640">      int ret = pthread_join(thread_-&gt;thread_, NULL);</a>
+<a name="ln641">      CHECK_EQ(ret, 0);</a>
+<a name="ln642">      thread_-&gt;joinable_ = false;</a>
+<a name="ln643">      return Status::OK();</a>
+<a name="ln644">    }</a>
+<a name="ln645">    waited += wait_for;</a>
+<a name="ln646">  }</a>
+<a name="ln647"> </a>
+<a name="ln648">#ifndef NDEBUG</a>
+<a name="ln649">  LOG(WARNING) &lt;&lt; &quot;Failed to join:\n&quot; &lt;&lt; DumpThreadStack(thread_-&gt;tid_for_stack());</a>
+<a name="ln650">#endif</a>
+<a name="ln651"> </a>
+<a name="ln652">  return STATUS_FORMAT(Aborted, &quot;Timed out after $0 joining on $1&quot;, waited, thread_-&gt;name_);</a>
+<a name="ln653">}</a>
+<a name="ln654"> </a>
+<a name="ln655">Thread::~Thread() {</a>
+<a name="ln656">  if (joinable_) {</a>
+<a name="ln657">    int ret = pthread_detach(thread_);</a>
+<a name="ln658">    CHECK_EQ(ret, 0);</a>
+<a name="ln659">  }</a>
+<a name="ln660">}</a>
+<a name="ln661"> </a>
+<a name="ln662">void Thread::CallAtExit(const Closure&amp; cb) {</a>
+<a name="ln663">  CHECK_EQ(Thread::current_thread(), this);</a>
+<a name="ln664">  exit_callbacks_.push_back(cb);</a>
+<a name="ln665">}</a>
+<a name="ln666"> </a>
+<a name="ln667">std::string Thread::ToString() const {</a>
+<a name="ln668">  return Substitute(&quot;Thread $0 (name: \&quot;$1\&quot;, category: \&quot;$2\&quot;)&quot;, tid_, name_, category_);</a>
+<a name="ln669">}</a>
+<a name="ln670"> </a>
+<a name="ln671">Status Thread::StartThread(const std::string&amp; category, const std::string&amp; name,</a>
+<a name="ln672">                           ThreadFunctor functor, scoped_refptr&lt;Thread&gt; *holder) {</a>
+<a name="ln673">  InitThreading();</a>
+<a name="ln674">  const string log_prefix = Substitute(&quot;$0 ($1) &quot;, name, category);</a>
+<a name="ln675">  SCOPED_LOG_SLOW_EXECUTION_PREFIX(WARNING, 500 /* ms */, log_prefix, &quot;starting thread&quot;);</a>
+<a name="ln676"> </a>
+<a name="ln677">  // Temporary reference for the duration of this function.</a>
+<a name="ln678">  scoped_refptr&lt;Thread&gt; t(new Thread(category, name, std::move(functor)));</a>
+<a name="ln679"> </a>
+<a name="ln680">  {</a>
+<a name="ln681">    SCOPED_LOG_SLOW_EXECUTION_PREFIX(WARNING, 500 /* ms */, log_prefix, &quot;creating pthread&quot;);</a>
+<a name="ln682">    int ret = pthread_create(&amp;t-&gt;thread_, NULL, &amp;Thread::SuperviseThread, t.get());</a>
+<a name="ln683">    if (ret) {</a>
+<a name="ln684">      return STATUS(RuntimeError, &quot;Could not create thread&quot;, Errno(ret));</a>
+<a name="ln685">    }</a>
+<a name="ln686">  }</a>
+<a name="ln687"> </a>
+<a name="ln688">  // The thread has been created and is now joinable.</a>
+<a name="ln689">  //</a>
+<a name="ln690">  // Why set this in the parent and not the child? Because only the parent</a>
+<a name="ln691">  // (or someone communicating with the parent) can join, so joinable must</a>
+<a name="ln692">  // be set before the parent returns.</a>
+<a name="ln693">  t-&gt;joinable_ = true;</a>
+<a name="ln694"> </a>
+<a name="ln695">  // Optional, and only set if the thread was successfully created.</a>
+<a name="ln696">  if (holder) {</a>
+<a name="ln697">    *holder = t;</a>
+<a name="ln698">  }</a>
+<a name="ln699"> </a>
+<a name="ln700">  // The tid_ member goes through the following states:</a>
+<a name="ln701">  // 1  CHILD_WAITING_TID: the child has just been spawned and is waiting</a>
+<a name="ln702">  //    for the parent to finish writing to caller state (i.e. 'holder').</a>
+<a name="ln703">  // 2. PARENT_WAITING_TID: the parent has updated caller state and is now</a>
+<a name="ln704">  //    waiting for the child to write the tid.</a>
+<a name="ln705">  // 3. &lt;value&gt;: both the parent and the child are free to continue. If the</a>
+<a name="ln706">  //    value is INVALID_TID, the child could not discover its tid.</a>
+<a name="ln707">  Release_Store(&amp;t-&gt;tid_, PARENT_WAITING_TID);</a>
+<a name="ln708">  {</a>
+<a name="ln709">    SCOPED_LOG_SLOW_EXECUTION_PREFIX(WARNING, 500 /* ms */, log_prefix,</a>
+<a name="ln710">                                     &quot;waiting for new thread to publish its TID&quot;);</a>
+<a name="ln711">    int loop_count = 0;</a>
+<a name="ln712">    while (Acquire_Load(&amp;t-&gt;tid_) == PARENT_WAITING_TID) {</a>
+<a name="ln713">      boost::detail::yield(loop_count++);</a>
+<a name="ln714">    }</a>
+<a name="ln715">  }</a>
+<a name="ln716"> </a>
+<a name="ln717">  VLOG(2) &lt;&lt; &quot;Started thread &quot; &lt;&lt; t-&gt;tid()&lt;&lt; &quot; - &quot; &lt;&lt; category &lt;&lt; &quot;:&quot; &lt;&lt; name;</a>
+<a name="ln718">  return Status::OK();</a>
+<a name="ln719">}</a>
+<a name="ln720"> </a>
+<a name="ln721">void* Thread::SuperviseThread(void* arg) {</a>
+<a name="ln722">  Thread* t = static_cast&lt;Thread*&gt;(arg);</a>
+<a name="ln723">  int64_t system_tid = Thread::CurrentThreadId();</a>
+<a name="ln724">  if (system_tid == -1) {</a>
+<a name="ln725">    string error_msg = ErrnoToString(errno);</a>
+<a name="ln726">    YB_LOG_EVERY_N(INFO, 100) &lt;&lt; &quot;Could not determine thread ID: &quot; &lt;&lt; error_msg;</a>
+<a name="ln727">  }</a>
+<a name="ln728">  string name = strings::Substitute(&quot;$0-$1&quot;, t-&gt;name(), system_tid);</a>
+<a name="ln729"> </a>
+<a name="ln730">  // Take an additional reference to the thread manager, which we'll need below.</a>
+<a name="ln731">  ANNOTATE_IGNORE_SYNC_BEGIN();</a>
+<a name="ln732">  shared_ptr&lt;ThreadMgr&gt; thread_mgr_ref = thread_manager;</a>
+<a name="ln733">  ANNOTATE_IGNORE_SYNC_END();</a>
+<a name="ln734"> </a>
+<a name="ln735">  // Set up the TLS.</a>
+<a name="ln736">  //</a>
+<a name="ln737">  // We could store a scoped_refptr in the TLS itself, but as its</a>
+<a name="ln738">  // lifecycle is poorly defined, we'll use a bare pointer and take an</a>
+<a name="ln739">  // additional reference on t out of band, in thread_ref.</a>
+<a name="ln740">  scoped_refptr&lt;Thread&gt; thread_ref = t;</a>
+<a name="ln741">  t-&gt;tls_ = t;</a>
+<a name="ln742"> </a>
+<a name="ln743">  // Wait until the parent has updated all caller-visible state, then write</a>
+<a name="ln744">  // the TID to 'tid_', thus completing the parent&lt;--&gt;child handshake.</a>
+<a name="ln745">  int loop_count = 0;</a>
+<a name="ln746">  while (Acquire_Load(&amp;t-&gt;tid_) == CHILD_WAITING_TID) {</a>
+<a name="ln747">    boost::detail::yield(loop_count++);</a>
+<a name="ln748">  }</a>
+<a name="ln749">  Release_Store(&amp;t-&gt;tid_, system_tid);</a>
+<a name="ln750"> </a>
+<a name="ln751">  thread_manager-&gt;SetThreadName(name, t-&gt;tid());</a>
+<a name="ln752">  thread_manager-&gt;AddThread(pthread_self(), name, t-&gt;category(), t-&gt;tid());</a>
+<a name="ln753"> </a>
+<a name="ln754">  cds::threading::Manager::attachThread();</a>
+<a name="ln755"> </a>
+<a name="ln756">  // FinishThread() is guaranteed to run (even if functor_ throws an</a>
+<a name="ln757">  // exception) because pthread_cleanup_push() creates a scoped object</a>
+<a name="ln758">  // whose destructor invokes the provided callback.</a>
+<a name="ln759">  pthread_cleanup_push(&amp;Thread::FinishThread, t);</a>
+<a name="ln760">  t-&gt;functor_();</a>
+<a name="ln761">  pthread_cleanup_pop(true);</a>
+<a name="ln762"> </a>
+<a name="ln763">  return NULL;</a>
+<a name="ln764">}</a>
+<a name="ln765"> </a>
+<a name="ln766">void Thread::FinishThread(void* arg) {</a>
+<a name="ln767">  cds::threading::Manager::detachThread();</a>
+<a name="ln768"> </a>
+<a name="ln769">  Thread* t = static_cast&lt;Thread*&gt;(arg);</a>
+<a name="ln770"> </a>
+<a name="ln771">  for (Closure&amp; c : t-&gt;exit_callbacks_) {</a>
+<a name="ln772">    c.Run();</a>
+<a name="ln773">  }</a>
+<a name="ln774"> </a>
+<a name="ln775">  // We're here either because of the explicit pthread_cleanup_pop() in</a>
+<a name="ln776">  // SuperviseThread() or through pthread_exit(). In either case,</a>
+<a name="ln777">  // thread_manager is guaranteed to be live because thread_mgr_ref in</a>
+<a name="ln778">  // SuperviseThread() is still live.</a>
+<a name="ln779">  thread_manager-&gt;RemoveThread(pthread_self(), t-&gt;category());</a>
+<a name="ln780"> </a>
+<a name="ln781">  // Signal any Joiner that we're done.</a>
+<a name="ln782">  t-&gt;done_.CountDown();</a>
+<a name="ln783"> </a>
+<a name="ln784">  VLOG(2) &lt;&lt; &quot;Ended thread &quot; &lt;&lt; t-&gt;tid() &lt;&lt; &quot; - &quot;</a>
+<a name="ln785">          &lt;&lt; t-&gt;category() &lt;&lt; &quot;:&quot; &lt;&lt; t-&gt;name();</a>
+<a name="ln786">}</a>
+<a name="ln787"> </a>
+<a name="ln788">CDSAttacher::CDSAttacher() {</a>
+<a name="ln789">  cds::threading::Manager::attachThread();</a>
+<a name="ln790">}</a>
+<a name="ln791"> </a>
+<a name="ln792">CDSAttacher::~CDSAttacher() {</a>
+<a name="ln793">  cds::threading::Manager::detachThread();</a>
+<a name="ln794">}</a>
+<a name="ln795"> </a>
+<a name="ln796">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="119"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="125"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="131"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="137"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="197"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v779/" target="_blank">V779</a> Unreachable code detected. It is possible that an error is present.</p></div>
+<div class="balloon" rel="365"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="432"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="717"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="784"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="220"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: thread_id_.</p></div>
+<div class="balloon" rel="391"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the compiler generated constructor. Consider inspecting: tid, tid_for_stack, name.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

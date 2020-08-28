@@ -1,0 +1,1384 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>redis_commands.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/yql/redis/redisserver/redis_commands.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;boost/algorithm/string.hpp&gt;</a>
+<a name="ln17">#include &lt;boost/preprocessor/seq/for_each.hpp&gt;</a>
+<a name="ln18">#include &lt;boost/preprocessor/stringize.hpp&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln23">#include &quot;yb/client/session.h&quot;</a>
+<a name="ln24">#include &quot;yb/client/table.h&quot;</a>
+<a name="ln25">#include &quot;yb/client/table_creator.h&quot;</a>
+<a name="ln26">#include &quot;yb/client/yb_op.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/master/master.pb.h&quot;</a>
+<a name="ln29">#include &quot;yb/master/master_util.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &quot;yb/rpc/connection.h&quot;</a>
+<a name="ln32">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln33">#include &quot;yb/rpc/scheduler.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &quot;yb/util/crypt.h&quot;</a>
+<a name="ln36">#include &quot;yb/util/metrics.h&quot;</a>
+<a name="ln37">#include &quot;yb/util/redis_util.h&quot;</a>
+<a name="ln38">#include &quot;yb/util/stol_utils.h&quot;</a>
+<a name="ln39">#include &quot;yb/util/string_util.h&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41">#include &quot;yb/yql/redis/redisserver/redis_constants.h&quot;</a>
+<a name="ln42">#include &quot;yb/yql/redis/redisserver/redis_encoding.h&quot;</a>
+<a name="ln43">#include &quot;yb/yql/redis/redisserver/redis_rpc.h&quot;</a>
+<a name="ln44"> </a>
+<a name="ln45">using namespace std::literals;</a>
+<a name="ln46">using namespace std::placeholders;</a>
+<a name="ln47">using yb::client::YBTableName;</a>
+<a name="ln48"> </a>
+<a name="ln49">namespace {</a>
+<a name="ln50">static bool ValidateRedisPasswordSeparator(const char* flagname, const string&amp; value) {</a>
+<a name="ln51">  if (value.size() != 1) {</a>
+<a name="ln52">    LOG(INFO) &lt;&lt; &quot;Expect &quot; &lt;&lt; flagname &lt;&lt; &quot; to be 1 character long&quot;;</a>
+<a name="ln53">    return false;</a>
+<a name="ln54">  }</a>
+<a name="ln55">  return true;</a>
+<a name="ln56">}</a>
+<a name="ln57">}</a>
+<a name="ln58"> </a>
+<a name="ln59">DEFINE_bool(yedis_enable_flush, true, &quot;Enables FLUSHDB and FLUSHALL commands in yedis.&quot;);</a>
+<a name="ln60">DEFINE_bool(use_hashed_redis_password, true, &quot;Store the hash of the redis passwords instead.&quot;);</a>
+<a name="ln61">DEFINE_string(redis_passwords_separator, &quot;,&quot;, &quot;The character used to separate multiple passwords.&quot;);</a>
+<a name="ln62"> </a>
+<a name="ln63">DEFINE_int32(redis_keys_threshold, 10000,</a>
+<a name="ln64">             &quot;Maximum number of keys allowed to be in the db before the KEYS operation errors out&quot;);</a>
+<a name="ln65"> </a>
+<a name="ln66">__attribute__((unused))</a>
+<a name="ln67">DEFINE_validator(redis_passwords_separator, &amp;ValidateRedisPasswordSeparator);</a>
+<a name="ln68"> </a>
+<a name="ln69">namespace yb {</a>
+<a name="ln70">namespace redisserver {</a>
+<a name="ln71"> </a>
+<a name="ln72">#define REDIS_COMMANDS \</a>
+<a name="ln73">    ((get, Get, 2, READ)) \</a>
+<a name="ln74">    ((mget, MGet, -2, READ)) \</a>
+<a name="ln75">    ((hget, HGet, 3, READ)) \</a>
+<a name="ln76">    ((tsget, TsGet, 3, READ)) \</a>
+<a name="ln77">    ((hmget, HMGet, -3, READ)) \</a>
+<a name="ln78">    ((hgetall, HGetAll, 2, READ)) \</a>
+<a name="ln79">    ((hkeys, HKeys, 2, READ)) \</a>
+<a name="ln80">    ((hvals, HVals, 2, READ)) \</a>
+<a name="ln81">    ((hlen, HLen, 2, READ)) \</a>
+<a name="ln82">    ((hexists, HExists, 3, READ)) \</a>
+<a name="ln83">    ((hstrlen, HStrLen, 3, READ)) \</a>
+<a name="ln84">    ((smembers, SMembers, 2, READ)) \</a>
+<a name="ln85">    ((sismember, SIsMember, 3, READ)) \</a>
+<a name="ln86">    ((scard, SCard, 2, READ)) \</a>
+<a name="ln87">    ((strlen, StrLen, 2, READ)) \</a>
+<a name="ln88">    ((exists, Exists, 2, READ)) \</a>
+<a name="ln89">    ((getrange, GetRange, 4, READ)) \</a>
+<a name="ln90">    ((zcard, ZCard, 2, READ)) \</a>
+<a name="ln91">    ((rename, Rename, 3, LOCAL)) \</a>
+<a name="ln92">    ((set, Set, -3, WRITE)) \</a>
+<a name="ln93">    ((mset, MSet, -3, WRITE)) \</a>
+<a name="ln94">    ((hset, HSet, 4, WRITE)) \</a>
+<a name="ln95">    ((hmset, HMSet, -4, WRITE)) \</a>
+<a name="ln96">    ((hincrby, HIncrBy, 4, WRITE)) \</a>
+<a name="ln97">    ((hdel, HDel, -3, WRITE)) \</a>
+<a name="ln98">    ((sadd, SAdd, -3, WRITE)) \</a>
+<a name="ln99">    ((srem, SRem, -3, WRITE)) \</a>
+<a name="ln100">    ((tsadd, TsAdd, -4, WRITE)) \</a>
+<a name="ln101">    ((tsrangebytime, TsRangeByTime, 4, READ)) \</a>
+<a name="ln102">    ((tsrevrangebytime, TsRevRangeByTime, -4, READ)) \</a>
+<a name="ln103">    ((tslastn, TsLastN, 3, READ)) \</a>
+<a name="ln104">    ((tscard, TsCard, 2, READ)) \</a>
+<a name="ln105">    ((zrangebyscore, ZRangeByScore, -4, READ)) \</a>
+<a name="ln106">    ((zrevrange, ZRevRange, -4, READ)) \</a>
+<a name="ln107">    ((zrange, ZRange, -4, READ)) \</a>
+<a name="ln108">    ((zscore, ZScore, 3, READ)) \</a>
+<a name="ln109">    ((tsrem, TsRem, -3, WRITE)) \</a>
+<a name="ln110">    ((zrem, ZRem, -3, WRITE)) \</a>
+<a name="ln111">    ((zadd, ZAdd, -4, WRITE)) \</a>
+<a name="ln112">    ((getset, GetSet, 3, WRITE)) \</a>
+<a name="ln113">    ((append, Append, 3, WRITE)) \</a>
+<a name="ln114">    ((del, Del, 2, WRITE)) \</a>
+<a name="ln115">    ((setrange, SetRange, 4, WRITE)) \</a>
+<a name="ln116">    ((incr, Incr, 2, WRITE)) \</a>
+<a name="ln117">    ((incrby, IncrBy, 3, WRITE)) \</a>
+<a name="ln118">    ((echo, Echo, 2, LOCAL)) \</a>
+<a name="ln119">    ((auth, Auth, 2, LOCAL)) \</a>
+<a name="ln120">    ((config, Config, -1, LOCAL)) \</a>
+<a name="ln121">    ((info, Info, -1, LOCAL)) \</a>
+<a name="ln122">    ((role, Role, 1, LOCAL)) \</a>
+<a name="ln123">    ((select, Select, 2, LOCAL)) \</a>
+<a name="ln124">    ((createdb, CreateDB, 2, LOCAL)) \</a>
+<a name="ln125">    ((listdb, ListDB, 1, LOCAL)) \</a>
+<a name="ln126">    ((deletedb, DeleteDB, 2, LOCAL)) \</a>
+<a name="ln127">    ((ping, Ping, -1, LOCAL)) \</a>
+<a name="ln128">    ((command, Command, -1, LOCAL)) \</a>
+<a name="ln129">    ((monitor, Monitor, 1, LOCAL)) \</a>
+<a name="ln130">    ((pubsub, PubSub, -2, LOCAL)) \</a>
+<a name="ln131">    ((publish, Publish, 3, LOCAL)) \</a>
+<a name="ln132">    ((subscribe, Subscribe, -2, LOCAL)) \</a>
+<a name="ln133">    ((unsubscribe, Unsubscribe, -1, LOCAL)) \</a>
+<a name="ln134">    ((psubscribe, PSubscribe, -2, LOCAL)) \</a>
+<a name="ln135">    ((punsubscribe, PUnsubscribe, -1, LOCAL)) \</a>
+<a name="ln136">    ((quit, Quit, 1, LOCAL)) \</a>
+<a name="ln137">    ((flushdb, FlushDB, 1, LOCAL)) \</a>
+<a name="ln138">    ((flushall, FlushAll, 1, LOCAL)) \</a>
+<a name="ln139">    ((debugsleep, DebugSleep, 2, LOCAL)) \</a>
+<a name="ln140">    ((keys, Keys, 2, LOCAL)) \</a>
+<a name="ln141">    ((cluster, Cluster, -2, CLUSTER)) \</a>
+<a name="ln142">    ((persist, Persist, 2, WRITE)) \</a>
+<a name="ln143">    ((expire, Expire, 3, WRITE)) \</a>
+<a name="ln144">    ((pexpire, PExpire, 3, WRITE)) \</a>
+<a name="ln145">    ((expireat, ExpireAt, 3, WRITE))   \</a>
+<a name="ln146">    ((pexpireat, PExpireAt, 3, WRITE)) \</a>
+<a name="ln147">    ((ttl, Ttl, 2, READ)) \</a>
+<a name="ln148">    ((pttl, PTtl, 2, READ)) \</a>
+<a name="ln149">    ((setex, SetEx, 4, WRITE)) \</a>
+<a name="ln150">    ((psetex, PSetEx, 4, WRITE)) \</a>
+<a name="ln151">    ((lpop, LPop, 2, WRITE)) \</a>
+<a name="ln152">    ((lpush, LPush, -3, WRITE)) \</a>
+<a name="ln153">    ((rpop, RPop, 2, WRITE)) \</a>
+<a name="ln154">    ((rpush, RPush, -3, WRITE)) \</a>
+<a name="ln155">    ((llen, LLen, 2, READ)) \</a>
+<a name="ln156">    ((setnx, SetNX, 3, WRITE)) \</a>
+<a name="ln157">    /**/</a>
+<a name="ln158"> </a>
+<a name="ln159">#define DO_DEFINE_HISTOGRAM(name, cname, arity, type) \</a>
+<a name="ln160">  DEFINE_REDIS_histogram(name, BOOST_PP_STRINGIZE(cname));</a>
+<a name="ln161">#define DEFINE_HISTOGRAM(r, data, elem) DO_DEFINE_HISTOGRAM elem</a>
+<a name="ln162"> </a>
+<a name="ln163">BOOST_PP_SEQ_FOR_EACH(DEFINE_HISTOGRAM, ~, REDIS_COMMANDS)</a>
+<a name="ln164"> </a>
+<a name="ln165">#define READ_OP yb::client::YBRedisReadOp</a>
+<a name="ln166">#define WRITE_OP yb::client::YBRedisWriteOp</a>
+<a name="ln167">#define LOCAL_OP RedisResponsePB</a>
+<a name="ln168">#define CLUSTER_OP RedisResponsePB</a>
+<a name="ln169"> </a>
+<a name="ln170">#define DO_PARSER_FORWARD(name, cname, arity, type) \</a>
+<a name="ln171">    CHECKED_STATUS BOOST_PP_CAT(Parse, cname)( \</a>
+<a name="ln172">        BOOST_PP_CAT(type, _OP) *op, \</a>
+<a name="ln173">        const RedisClientCommand&amp; args);</a>
+<a name="ln174">#define PARSER_FORWARD(r, data, elem) DO_PARSER_FORWARD elem</a>
+<a name="ln175"> </a>
+<a name="ln176">BOOST_PP_SEQ_FOR_EACH(PARSER_FORWARD, ~, REDIS_COMMANDS)</a>
+<a name="ln177"> </a>
+<a name="ln178">YBTableName RedisServiceData::GetYBTableNameForRedisDatabase(const string&amp; db_name) {</a>
+<a name="ln179">  return YBTableName(YQL_DATABASE_REDIS,</a>
+<a name="ln180">                     common::kRedisKeyspaceName,</a>
+<a name="ln181">                     db_name == &quot;0&quot; ? string(common::kRedisTableName)</a>
+<a name="ln182">                                    : StrCat(common::kRedisTableName, &quot;_&quot;, db_name));</a>
+<a name="ln183">}</a>
+<a name="ln184"> </a>
+<a name="ln185">namespace {</a>
+<a name="ln186"> </a>
+<a name="ln187">template&lt;class Op&gt;</a>
+<a name="ln188">using Parser = Status(*)(Op*, const RedisClientCommand&amp;);</a>
+<a name="ln189"> </a>
+<a name="ln190">template&lt;class Op&gt;</a>
+<a name="ln191">void Command(</a>
+<a name="ln192">    const RedisCommandInfo&amp; info,</a>
+<a name="ln193">    size_t idx,</a>
+<a name="ln194">    Parser&lt;Op&gt; parser,</a>
+<a name="ln195">    BatchContext* context) {</a>
+<a name="ln196">  VLOG(1) &lt;&lt; &quot;Processing &quot; &lt;&lt; info.name &lt;&lt; &quot;.&quot;;</a>
+<a name="ln197"> </a>
+<a name="ln198">  auto table = context-&gt;table();</a>
+<a name="ln199">  if (!table) {</a>
+<a name="ln200">    RespondWithFailure(context-&gt;call(), idx, &quot;Could not open YBTable&quot;);</a>
+<a name="ln201">    return;</a>
+<a name="ln202">  }</a>
+<a name="ln203"> </a>
+<a name="ln204">  auto op = std::make_shared&lt;Op&gt;(table);</a>
+<a name="ln205">  const auto&amp; command = context-&gt;command(idx);</a>
+<a name="ln206">  Status s = parser(op.get(), command);</a>
+<a name="ln207">  if (!s.ok()) {</a>
+<a name="ln208">    RespondWithFailure(context-&gt;call(), idx, s.message().ToBuffer());</a>
+<a name="ln209">    return;</a>
+<a name="ln210">  }</a>
+<a name="ln211">  context-&gt;Apply(idx, std::move(op), info.metrics);</a>
+<a name="ln212">}</a>
+<a name="ln213"> </a>
+<a name="ln214">#define READ_COMMAND(cname) \</a>
+<a name="ln215">    Command&lt;yb::client::YBRedisReadOp&gt;(info, idx, &amp;BOOST_PP_CAT(Parse, cname), context)</a>
+<a name="ln216">#define WRITE_COMMAND(cname) \</a>
+<a name="ln217">    Command&lt;yb::client::YBRedisWriteOp&gt;(info, idx, &amp;BOOST_PP_CAT(Parse, cname), context)</a>
+<a name="ln218">#define LOCAL_COMMAND(cname) \</a>
+<a name="ln219">    BOOST_PP_CAT(Handle, cname)({info, idx, context});</a>
+<a name="ln220">#define CLUSTER_COMMAND(cname) ClusterCommand(info, idx, context)</a>
+<a name="ln221"> </a>
+<a name="ln222">#define DO_POPULATE_HANDLER(name, cname, arity, type) \</a>
+<a name="ln223">  { \</a>
+<a name="ln224">    auto functor = [](const RedisCommandInfo&amp; info, \</a>
+<a name="ln225">                      size_t idx, \</a>
+<a name="ln226">                      BatchContext* context) { \</a>
+<a name="ln227">      BOOST_PP_CAT(type, _COMMAND)(cname); \</a>
+<a name="ln228">    }; \</a>
+<a name="ln229">    yb::rpc::RpcMethodMetrics metrics(YB_REDIS_METRIC(name).Instantiate(metric_entity)); \</a>
+<a name="ln230">    setup_method({BOOST_PP_STRINGIZE(name), functor, arity, std::move(metrics)}); \</a>
+<a name="ln231">  } \</a>
+<a name="ln232">  /**/</a>
+<a name="ln233"> </a>
+<a name="ln234">#define POPULATE_HANDLER(z, data, elem) DO_POPULATE_HANDLER elem</a>
+<a name="ln235"> </a>
+<a name="ln236">class LocalCommandData {</a>
+<a name="ln237"> public:</a>
+<a name="ln238">  LocalCommandData(const RedisCommandInfo&amp; info,</a>
+<a name="ln239">                   size_t idx,</a>
+<a name="ln240">                   BatchContext* context)</a>
+<a name="ln241">      : info_(info), idx_(idx), context_(context) {}</a>
+<a name="ln242"> </a>
+<a name="ln243">  const RedisClientCommand&amp; command() const {</a>
+<a name="ln244">    return context_-&gt;command(idx_);</a>
+<a name="ln245">  }</a>
+<a name="ln246"> </a>
+<a name="ln247">  Slice arg(size_t i) const {</a>
+<a name="ln248">    return command()[i];</a>
+<a name="ln249">  }</a>
+<a name="ln250"> </a>
+<a name="ln251">  size_t arg_size() const {</a>
+<a name="ln252">    return command().size();</a>
+<a name="ln253">  }</a>
+<a name="ln254"> </a>
+<a name="ln255">  const std::shared_ptr&lt;RedisInboundCall&gt;&amp; call() const {</a>
+<a name="ln256">    return context_-&gt;call();</a>
+<a name="ln257">  }</a>
+<a name="ln258"> </a>
+<a name="ln259">  client::YBClient* client() const {</a>
+<a name="ln260">    return context_-&gt;client();</a>
+<a name="ln261">  }</a>
+<a name="ln262"> </a>
+<a name="ln263">  const RedisServer* server() {</a>
+<a name="ln264">    return context_-&gt;server();</a>
+<a name="ln265">  }</a>
+<a name="ln266"> </a>
+<a name="ln267">  client::YBTable* table() const {</a>
+<a name="ln268">    return context_-&gt;table().get();</a>
+<a name="ln269">  }</a>
+<a name="ln270"> </a>
+<a name="ln271">  const BatchContextPtr&amp; context() const {</a>
+<a name="ln272">    return context_;</a>
+<a name="ln273">  }</a>
+<a name="ln274"> </a>
+<a name="ln275">  template&lt;class Functor&gt;</a>
+<a name="ln276">  void Apply(const Functor&amp; functor, const std::string&amp; partition_key,</a>
+<a name="ln277">             ManualResponse manual_response) {</a>
+<a name="ln278">    context_-&gt;Apply(idx_, functor, partition_key, info_.metrics, manual_response);</a>
+<a name="ln279">  }</a>
+<a name="ln280"> </a>
+<a name="ln281">  const rpc::RpcMethodMetrics&amp; metrics() const {</a>
+<a name="ln282">    return info_.metrics;</a>
+<a name="ln283">  }</a>
+<a name="ln284"> </a>
+<a name="ln285">  void Respond(const Status&amp; status, RedisResponsePB* response) const {</a>
+<a name="ln286">    if (!status.ok()) {</a>
+<a name="ln287">      call()-&gt;RespondFailure(idx_, status);</a>
+<a name="ln288">      return;</a>
+<a name="ln289">    }</a>
+<a name="ln290"> </a>
+<a name="ln291">    Respond(response);</a>
+<a name="ln292">  }</a>
+<a name="ln293"> </a>
+<a name="ln294">  void Respond(RedisResponsePB* response = nullptr) const {</a>
+<a name="ln295">    if (response == nullptr) {</a>
+<a name="ln296">      RedisResponsePB temp;</a>
+<a name="ln297">      Respond(&amp;temp);</a>
+<a name="ln298">      return;</a>
+<a name="ln299">    }</a>
+<a name="ln300">    const auto&amp; cmd = command();</a>
+<a name="ln301">    VLOG_IF(4, response-&gt;has_string_response()) &lt;&lt; &quot;Responding to &quot; &lt;&lt; cmd[0].ToBuffer()</a>
+<a name="ln302">                                                &lt;&lt; &quot; with &quot; &lt;&lt; response-&gt;string_response();</a>
+<a name="ln303">    context_-&gt;call()-&gt;RespondSuccess(idx_, info_.metrics, response);</a>
+<a name="ln304">    VLOG(4) &lt;&lt; &quot;Done responding to &quot; &lt;&lt; cmd[0].ToBuffer();</a>
+<a name="ln305">  }</a>
+<a name="ln306"> </a>
+<a name="ln307"> private:</a>
+<a name="ln308">  const RedisCommandInfo&amp; info_;</a>
+<a name="ln309">  size_t idx_;</a>
+<a name="ln310">  BatchContextPtr context_;</a>
+<a name="ln311">};</a>
+<a name="ln312"> </a>
+<a name="ln313">void GetTabletLocations(LocalCommandData data, RedisArrayPB* array_response) {</a>
+<a name="ln314">  vector&lt;string&gt; tablets, partitions;</a>
+<a name="ln315">  vector&lt;master::TabletLocationsPB&gt; locations;</a>
+<a name="ln316">  const auto table_name = RedisServiceData::GetYBTableNameForRedisDatabase(</a>
+<a name="ln317">      data.call()-&gt;connection_context().redis_db_to_use());</a>
+<a name="ln318">  auto s = data.client()-&gt;GetTabletsAndUpdateCache(</a>
+<a name="ln319">      table_name, 0, &amp;tablets, &amp;partitions, &amp;locations);</a>
+<a name="ln320">  if (!s.ok()) {</a>
+<a name="ln321">    LOG(ERROR) &lt;&lt; &quot;Error getting tablets: &quot; &lt;&lt; s.message();</a>
+<a name="ln322">    return;</a>
+<a name="ln323">  }</a>
+<a name="ln324">  vector&lt;string&gt; response, ts_info;</a>
+<a name="ln325">  response.reserve(3);</a>
+<a name="ln326">  ts_info.reserve(2);</a>
+<a name="ln327">  for (master::TabletLocationsPB &amp;location : locations) {</a>
+<a name="ln328">    response.clear();</a>
+<a name="ln329">    ts_info.clear();</a>
+<a name="ln330"> </a>
+<a name="ln331">    uint16_t start_key = 0;</a>
+<a name="ln332">    uint16_t end_key_exclusive = kRedisClusterSlots;</a>
+<a name="ln333">    if (location.partition().has_partition_key_start()) {</a>
+<a name="ln334">      if (location.partition().partition_key_start().size() == PartitionSchema::kPartitionKeySize) {</a>
+<a name="ln335">        start_key = PartitionSchema::DecodeMultiColumnHashValue(</a>
+<a name="ln336">            location.partition().partition_key_start());</a>
+<a name="ln337">      }</a>
+<a name="ln338">    }</a>
+<a name="ln339">    if (location.partition().has_partition_key_end()) {</a>
+<a name="ln340">      if (location.partition().partition_key_end().size() == PartitionSchema::kPartitionKeySize) {</a>
+<a name="ln341">        end_key_exclusive = PartitionSchema::DecodeMultiColumnHashValue(</a>
+<a name="ln342">            location.partition().partition_key_end());</a>
+<a name="ln343">      }</a>
+<a name="ln344">    }</a>
+<a name="ln345">    response.push_back(redisserver::EncodeAsInteger(start_key).ToBuffer());</a>
+<a name="ln346">    response.push_back(redisserver::EncodeAsInteger(end_key_exclusive - 1).ToBuffer());</a>
+<a name="ln347"> </a>
+<a name="ln348">    for (const auto &amp;replica : location.replicas()) {</a>
+<a name="ln349">      if (replica.role() == consensus::RaftPeerPB::LEADER) {</a>
+<a name="ln350">        auto host = DesiredHostPort(replica.ts_info(), CloudInfoPB()).host();</a>
+<a name="ln351">        ts_info.push_back(redisserver::EncodeAsBulkString(host).ToBuffer());</a>
+<a name="ln352"> </a>
+<a name="ln353">        const auto redis_port = data.server()-&gt;opts().rpc_opts.default_port;</a>
+<a name="ln354"> </a>
+<a name="ln355">        VLOG(1) &lt;&lt; &quot;Start key: &quot; &lt;&lt; start_key</a>
+<a name="ln356">                &lt;&lt; &quot;, end key: &quot; &lt;&lt; end_key_exclusive - 1</a>
+<a name="ln357">                &lt;&lt; &quot;, node &quot; &lt;&lt; host</a>
+<a name="ln358">                &lt;&lt; &quot;, port &quot; &lt;&lt; redis_port;</a>
+<a name="ln359"> </a>
+<a name="ln360">        ts_info.push_back(redisserver::EncodeAsInteger(redis_port).ToBuffer());</a>
+<a name="ln361">        ts_info.push_back(</a>
+<a name="ln362">            redisserver::EncodeAsBulkString(replica.ts_info().permanent_uuid()).ToBuffer());</a>
+<a name="ln363">        // TODO (hector): add all the replicas to the list of redis servers in charge of this</a>
+<a name="ln364">        // partition range.</a>
+<a name="ln365">        break;</a>
+<a name="ln366">      }</a>
+<a name="ln367">    }</a>
+<a name="ln368">    response.push_back(redisserver::EncodeAsArrayOfEncodedElements(ts_info));</a>
+<a name="ln369">    array_response-&gt;add_elements(redisserver::EncodeAsArrayOfEncodedElements(response));</a>
+<a name="ln370">  }</a>
+<a name="ln371">  array_response-&gt;set_encoded(true);</a>
+<a name="ln372">}</a>
+<a name="ln373"> </a>
+<a name="ln374">void ClusterCommand(</a>
+<a name="ln375">    const RedisCommandInfo&amp; info,</a>
+<a name="ln376">    size_t idx,</a>
+<a name="ln377">    BatchContext* context) {</a>
+<a name="ln378">  RedisResponsePB cluster_response;</a>
+<a name="ln379">  auto array_response = cluster_response.mutable_array_response();</a>
+<a name="ln380">  LocalCommandData data(info, idx, context);</a>
+<a name="ln381">  GetTabletLocations(data, array_response);</a>
+<a name="ln382">  context-&gt;call()-&gt;RespondSuccess(idx, info.metrics, &amp;cluster_response);</a>
+<a name="ln383">  VLOG(1) &lt;&lt; &quot;Done responding to CLUSTER.&quot;;</a>
+<a name="ln384">}</a>
+<a name="ln385"> </a>
+<a name="ln386">void AddElements(const RefCntBuffer&amp; buffer, RedisArrayPB* array) {</a>
+<a name="ln387">  array-&gt;add_elements(buffer.data(), buffer.size());</a>
+<a name="ln388">}</a>
+<a name="ln389"> </a>
+<a name="ln390">void HandleEcho(LocalCommandData data) {</a>
+<a name="ln391">  RedisResponsePB response;</a>
+<a name="ln392">  response.set_code(RedisResponsePB::OK);</a>
+<a name="ln393">  response.set_string_response(data.arg(1).ToBuffer());</a>
+<a name="ln394">  data.Respond(&amp;response);</a>
+<a name="ln395">}</a>
+<a name="ln396"> </a>
+<a name="ln397">void HandleMonitor(LocalCommandData data) {</a>
+<a name="ln398">  data.Respond();</a>
+<a name="ln399"> </a>
+<a name="ln400">  // Add to the appenders after the call has been handled (i.e. reponded with &quot;OK&quot;).</a>
+<a name="ln401">  auto conn = data.call()-&gt;connection().get();</a>
+<a name="ln402">  data.context()-&gt;service_data()-&gt;AppendToMonitors(conn);</a>
+<a name="ln403">}</a>
+<a name="ln404"> </a>
+<a name="ln405">void HandlePubSub(LocalCommandData data) {</a>
+<a name="ln406">  RedisResponsePB response;</a>
+<a name="ln407">  if (boost::iequals(data.arg(1).ToBuffer(), &quot;CHANNELS&quot;) &amp;&amp; data.arg_size() &lt;= 3) {</a>
+<a name="ln408">    auto all = data.context()-&gt;service_data()-&gt;GetAllSubscriptions(AsPattern::kFalse);</a>
+<a name="ln409">    unordered_set&lt;string&gt; matched;</a>
+<a name="ln410">    if (data.arg_size() &gt; 2) {</a>
+<a name="ln411">      const string&amp; pattern = data.arg(2).ToBuffer();</a>
+<a name="ln412">      for (auto&amp; channel : all) {</a>
+<a name="ln413">        if (RedisUtil::RedisPatternMatch(pattern, channel, /* ignore case */ false)) {</a>
+<a name="ln414">          matched.insert(channel);</a>
+<a name="ln415">        }</a>
+<a name="ln416">      }</a>
+<a name="ln417">    } else {</a>
+<a name="ln418">      matched = std::move(all);</a>
+<a name="ln419">    }</a>
+<a name="ln420"> </a>
+<a name="ln421">    // Build and send out an array response of all the matching channels.</a>
+<a name="ln422">    auto array_response = response.mutable_array_response();</a>
+<a name="ln423">    for (auto&amp; channel : matched) {</a>
+<a name="ln424">      AddElements(redisserver::EncodeAsBulkString(channel), array_response);</a>
+<a name="ln425">    }</a>
+<a name="ln426">    array_response-&gt;set_encoded(true);</a>
+<a name="ln427">  } else if (boost::iequals(data.arg(1).ToBuffer(), &quot;NUMPAT&quot;) &amp;&amp; data.arg_size() == 2) {</a>
+<a name="ln428">    auto names = data.context()-&gt;service_data()-&gt;GetAllSubscriptions(AsPattern::kTrue);</a>
+<a name="ln429">    response.set_code(RedisResponsePB::OK);</a>
+<a name="ln430">    response.set_int_response(names.size());</a>
+<a name="ln431">  } else if (boost::iequals(data.arg(1).ToBuffer(), &quot;NUMSUB&quot;)) {</a>
+<a name="ln432">    auto array_response = response.mutable_array_response();</a>
+<a name="ln433">    for (int idx = 2; idx &lt; data.arg_size(); idx++) {</a>
+<a name="ln434">      const string&amp; channel = data.arg(idx).ToBuffer();</a>
+<a name="ln435">      int subs = data.context()-&gt;service_data()-&gt;NumSubscribers(AsPattern::kFalse, channel);</a>
+<a name="ln436">      AddElements(redisserver::EncodeAsBulkString(channel), array_response);</a>
+<a name="ln437">      AddElements(redisserver::EncodeAsInteger(subs), array_response);</a>
+<a name="ln438">    }</a>
+<a name="ln439">    array_response-&gt;set_encoded(true);</a>
+<a name="ln440">  } else {</a>
+<a name="ln441">    response.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln442">    response.set_error_message(&quot;ERR: Wrong number of arguments.&quot;);</a>
+<a name="ln443">  }</a>
+<a name="ln444">  data.Respond(&amp;response);</a>
+<a name="ln445">}</a>
+<a name="ln446"> </a>
+<a name="ln447">void HandlePublish(LocalCommandData data) {</a>
+<a name="ln448">  const string&amp; channel = data.arg(1).ToBuffer();</a>
+<a name="ln449">  const string&amp; published_message = data.arg(2).ToBuffer();</a>
+<a name="ln450"> </a>
+<a name="ln451">  data.context()-&gt;service_data()-&gt;ForwardToInterestedProxies(</a>
+<a name="ln452">      channel, published_message, [data = std::move(data)](int val) {</a>
+<a name="ln453">        RedisResponsePB response;</a>
+<a name="ln454">        response.set_code(RedisResponsePB::OK);</a>
+<a name="ln455">        response.set_int_response(val);</a>
+<a name="ln456">        data.Respond(&amp;response);</a>
+<a name="ln457">      });</a>
+<a name="ln458">}</a>
+<a name="ln459"> </a>
+<a name="ln460">void HandleSubscribeLikeCommand(LocalCommandData data, AsPattern as_pattern) {</a>
+<a name="ln461">  RedisResponsePB response;</a>
+<a name="ln462">  response.set_code(RedisResponsePB::OK);</a>
+<a name="ln463"> </a>
+<a name="ln464">  // Add to the appenders after the call has been handled (i.e. reponded with &quot;OK&quot;).</a>
+<a name="ln465">  vector&lt;string&gt; channels;</a>
+<a name="ln466">  vector&lt;int&gt; subs;</a>
+<a name="ln467">  for (int idx = 1; idx &lt; data.arg_size(); idx++) {</a>
+<a name="ln468">    channels.emplace_back(data.arg(idx).ToBuffer());</a>
+<a name="ln469">  }</a>
+<a name="ln470">  auto conn = data.call()-&gt;connection().get();</a>
+<a name="ln471">  data.context()-&gt;service_data()-&gt;AppendToSubscribers(as_pattern, channels, conn, &amp;subs);</a>
+<a name="ln472">  string encoded_response;</a>
+<a name="ln473">  for (int idx = 0; idx &lt; channels.size(); idx++) {</a>
+<a name="ln474">    encoded_response += redisserver::EncodeAsArrayOfEncodedElements(vector&lt;string&gt;{</a>
+<a name="ln475">        redisserver::EncodeAsBulkString(as_pattern ? &quot;psubscribe&quot; : &quot;subscribe&quot;).ToBuffer(),</a>
+<a name="ln476">        redisserver::EncodeAsBulkString(channels[idx]).ToBuffer(),</a>
+<a name="ln477">        redisserver::EncodeAsInteger(subs[idx]).ToBuffer()});</a>
+<a name="ln478">  }</a>
+<a name="ln479"> </a>
+<a name="ln480">  VLOG(3) &lt;&lt; &quot;In response to [p]Subscribe queueing &quot; &lt;&lt; data.arg_size() - 1</a>
+<a name="ln481">          &lt;&lt; &quot; messages : &quot; &lt;&lt; encoded_response;</a>
+<a name="ln482">  response.set_encoded_response(encoded_response);</a>
+<a name="ln483">  data.Respond(&amp;response);</a>
+<a name="ln484">}</a>
+<a name="ln485"> </a>
+<a name="ln486">void HandleSubscribe(LocalCommandData data) {</a>
+<a name="ln487">  HandleSubscribeLikeCommand(data, AsPattern::kFalse);</a>
+<a name="ln488">}</a>
+<a name="ln489"> </a>
+<a name="ln490">void HandlePSubscribe(LocalCommandData data) {</a>
+<a name="ln491">  HandleSubscribeLikeCommand(data, AsPattern::kTrue);</a>
+<a name="ln492">}</a>
+<a name="ln493"> </a>
+<a name="ln494">void HandleUnsubscribeLikeCommand(LocalCommandData data, AsPattern as_pattern) {</a>
+<a name="ln495">  RedisResponsePB response;</a>
+<a name="ln496">  response.set_code(RedisResponsePB::OK);</a>
+<a name="ln497"> </a>
+<a name="ln498">  // Add to the appenders after the call has been handled (i.e. reponded with &quot;OK&quot;).</a>
+<a name="ln499">  auto conn = data.call()-&gt;connection().get();</a>
+<a name="ln500">  vector&lt;string&gt; channels;</a>
+<a name="ln501">  if (data.arg_size() &gt; 1) {</a>
+<a name="ln502">    for (int idx = 1; idx &lt; data.arg_size(); idx++) {</a>
+<a name="ln503">      channels.push_back(data.arg(idx).ToBuffer());</a>
+<a name="ln504">    }</a>
+<a name="ln505">  } else {</a>
+<a name="ln506">    for (auto name : data.context()-&gt;service_data()-&gt;GetSubscriptions(as_pattern, conn)) {</a>
+<a name="ln507">      channels.push_back(name);</a>
+<a name="ln508">    }</a>
+<a name="ln509">  }</a>
+<a name="ln510"> </a>
+<a name="ln511">  vector&lt;int&gt; subs;</a>
+<a name="ln512">  data.context()-&gt;service_data()-&gt;RemoveFromSubscribers(as_pattern, channels, conn, &amp;subs);</a>
+<a name="ln513">  string encoded_response;</a>
+<a name="ln514">  for (int idx = 0; idx &lt; channels.size(); idx++) {</a>
+<a name="ln515">    encoded_response += redisserver::EncodeAsArrayOfEncodedElements(vector&lt;string&gt;{</a>
+<a name="ln516">        redisserver::EncodeAsBulkString(as_pattern ? &quot;punsubscribe&quot; : &quot;unsubscribe&quot;).ToBuffer(),</a>
+<a name="ln517">        redisserver::EncodeAsBulkString(channels[idx]).ToBuffer(),</a>
+<a name="ln518">        redisserver::EncodeAsInteger(subs[idx]).ToBuffer()});</a>
+<a name="ln519">  }</a>
+<a name="ln520"> </a>
+<a name="ln521">  VLOG(3) &lt;&lt; &quot;In response to [p]Unsubscribe queueing &quot; &lt;&lt; channels.size()</a>
+<a name="ln522">          &lt;&lt; &quot; messages : &quot; &lt;&lt; encoded_response;</a>
+<a name="ln523">  response.set_encoded_response(encoded_response);</a>
+<a name="ln524">  data.Respond(&amp;response);</a>
+<a name="ln525">}</a>
+<a name="ln526"> </a>
+<a name="ln527">void HandleUnsubscribe(LocalCommandData data) {</a>
+<a name="ln528">  HandleUnsubscribeLikeCommand(data, AsPattern::kFalse);</a>
+<a name="ln529">}</a>
+<a name="ln530"> </a>
+<a name="ln531">void HandlePUnsubscribe(LocalCommandData data) {</a>
+<a name="ln532">  HandleUnsubscribeLikeCommand(data, AsPattern::kTrue);</a>
+<a name="ln533">}</a>
+<a name="ln534"> </a>
+<a name="ln535">void HandleRole(LocalCommandData data) {</a>
+<a name="ln536">  RedisResponsePB response;</a>
+<a name="ln537">  response.set_code(RedisResponsePB::OK);</a>
+<a name="ln538">  auto array_response = response.mutable_array_response();</a>
+<a name="ln539">  AddElements(redisserver::EncodeAsBulkString(&quot;master&quot;), array_response);</a>
+<a name="ln540">  AddElements(redisserver::EncodeAsInteger(0), array_response);</a>
+<a name="ln541">  array_response-&gt;add_elements(</a>
+<a name="ln542">      redisserver::EncodeAsArrayOfEncodedElements(std::initializer_list&lt;std::string&gt;()));</a>
+<a name="ln543">  array_response-&gt;set_encoded(true);</a>
+<a name="ln544">  data.Respond(&amp;response);</a>
+<a name="ln545">}</a>
+<a name="ln546"> </a>
+<a name="ln547">void HandleInfo(LocalCommandData data) {</a>
+<a name="ln548">  RedisResponsePB response;</a>
+<a name="ln549">  response.set_code(RedisResponsePB::OK);</a>
+<a name="ln550">  response.set_string_response(kInfoResponse);</a>
+<a name="ln551">  data.Respond(&amp;response);</a>
+<a name="ln552">}</a>
+<a name="ln553"> </a>
+<a name="ln554">void HandlePing(LocalCommandData data) {</a>
+<a name="ln555">  RedisResponsePB response;</a>
+<a name="ln556">  response.set_code(RedisResponsePB::OK);</a>
+<a name="ln557">  if (data.call()-&gt;connection_context().ClientMode() == RedisClientMode::kSubscribed) {</a>
+<a name="ln558">    const auto&amp; second = (data.arg_size() &gt; 1 ? data.arg(1).ToBuffer() : &quot;&quot;);</a>
+<a name="ln559">    response.set_encoded_response(redisserver::EncodeAsArrayOfEncodedElements(</a>
+<a name="ln560">        vector&lt;string&gt;{redisserver::EncodeAsBulkString(&quot;pong&quot;).ToBuffer(),</a>
+<a name="ln561">                       redisserver::EncodeAsBulkString(second).ToBuffer()}));</a>
+<a name="ln562">  } else {</a>
+<a name="ln563">    if (data.arg_size() &gt; 1) {</a>
+<a name="ln564">      response.set_string_response(data.arg(1).cdata(), data.arg(1).size());</a>
+<a name="ln565">    } else {</a>
+<a name="ln566">      response.set_status_response(&quot;PONG&quot;);</a>
+<a name="ln567">    }</a>
+<a name="ln568">  }</a>
+<a name="ln569">  data.Respond(&amp;response);</a>
+<a name="ln570">}</a>
+<a name="ln571"> </a>
+<a name="ln572">class RenameData : public std::enable_shared_from_this&lt;RenameData&gt; {</a>
+<a name="ln573"> public:</a>
+<a name="ln574">  explicit RenameData(LocalCommandData&amp;&amp; data) : data_(data) {</a>
+<a name="ln575">    auto table = data_.context()-&gt;table();</a>
+<a name="ln576">    const auto&amp; source = data_.arg(1);</a>
+<a name="ln577">    const auto&amp; dest = data_.arg(2);</a>
+<a name="ln578"> </a>
+<a name="ln579">    read_src_op_ = std::make_shared&lt;client::YBRedisReadOp&gt;(table);</a>
+<a name="ln580">    read_src_op_-&gt;mutable_request()-&gt;mutable_get_for_rename_request();</a>
+<a name="ln581">    read_src_op_-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(source.cdata(), source.size());</a>
+<a name="ln582"> </a>
+<a name="ln583">    read_ttl_op_ = std::make_shared&lt;client::YBRedisReadOp&gt;(table);</a>
+<a name="ln584">    read_ttl_op_-&gt;mutable_request()-&gt;mutable_get_ttl_request();</a>
+<a name="ln585">    read_ttl_op_-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(source.cdata(), source.size());</a>
+<a name="ln586"> </a>
+<a name="ln587">    delete_dest_op_ = std::make_shared&lt;client::YBRedisWriteOp&gt;(table);</a>
+<a name="ln588">    delete_dest_op_-&gt;mutable_request()-&gt;mutable_del_request();</a>
+<a name="ln589">    delete_dest_op_-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(dest.cdata(), dest.size());</a>
+<a name="ln590">    delete_dest_op_-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(REDIS_TYPE_NONE);</a>
+<a name="ln591"> </a>
+<a name="ln592">    write_dest_op_ = std::make_shared&lt;client::YBRedisWriteOp&gt;(table);</a>
+<a name="ln593">    write_dest_op_-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(dest.cdata(), dest.size());</a>
+<a name="ln594"> </a>
+<a name="ln595">    // write_dest_ttl_op_ will be set if needed. i.e. src has as ttl set on it.</a>
+<a name="ln596">    delete_src_op_ = std::make_shared&lt;client::YBRedisWriteOp&gt;(table);</a>
+<a name="ln597">    delete_src_op_-&gt;mutable_request()-&gt;mutable_del_request();</a>
+<a name="ln598">    delete_src_op_-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(source.cdata(), source.size());</a>
+<a name="ln599">    delete_src_op_-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(REDIS_TYPE_NONE);</a>
+<a name="ln600">  }</a>
+<a name="ln601"> </a>
+<a name="ln602">  void Execute() {</a>
+<a name="ln603">    // Rename is performed in 4 steps:</a>
+<a name="ln604">    // 1) Read from the source</a>
+<a name="ln605">    // 2) delete the destination, and overwrite the destination with contents read from the source.</a>
+<a name="ln606">    // 3) update the TTL on the destination.</a>
+<a name="ln607">    // 4) delete the source.</a>
+<a name="ln608"> </a>
+<a name="ln609">    std::string src_partition_key;</a>
+<a name="ln610">    auto status = read_src_op_-&gt;GetPartitionKey(&amp;src_partition_key);</a>
+<a name="ln611">    if (!status.ok()) {</a>
+<a name="ln612">      RedisResponsePB response;</a>
+<a name="ln613">      response.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln614">      response.set_error_message(status.message().ToBuffer());</a>
+<a name="ln615">      Respond(&amp;response);</a>
+<a name="ln616">      return;</a>
+<a name="ln617">    }</a>
+<a name="ln618">    data_.Apply(</a>
+<a name="ln619">        std::bind(&amp;RenameData::SaveSrcCB, shared_from_this(), _1, _2), src_partition_key,</a>
+<a name="ln620">        ManualResponse::kTrue);</a>
+<a name="ln621"> </a>
+<a name="ln622">    std::string dest_partition_key;</a>
+<a name="ln623">    status = write_dest_op_-&gt;GetPartitionKey(&amp;dest_partition_key);</a>
+<a name="ln624">    if (!status.ok()) {</a>
+<a name="ln625">      RedisResponsePB response;</a>
+<a name="ln626">      response.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln627">      response.set_error_message(status.message().ToBuffer());</a>
+<a name="ln628">      Respond(&amp;response);</a>
+<a name="ln629">      return;</a>
+<a name="ln630">    }</a>
+<a name="ln631"> </a>
+<a name="ln632">    auto table = data_.context()-&gt;table();</a>
+<a name="ln633">    const std::string src_partition_start = table-&gt;FindPartitionStart(src_partition_key);</a>
+<a name="ln634">    const std::string dest_partition_start = table-&gt;FindPartitionStart(dest_partition_key);</a>
+<a name="ln635">    if (src_partition_start == dest_partition_start) {</a>
+<a name="ln636">      num_tablets_.store(1, std::memory_order_release);</a>
+<a name="ln637">    } else {</a>
+<a name="ln638">      data_.Apply(</a>
+<a name="ln639">          std::bind(&amp;RenameData::SaveDestCB, shared_from_this(), _1, _2), dest_partition_key,</a>
+<a name="ln640">          ManualResponse::kTrue);</a>
+<a name="ln641">      num_tablets_.store(2, std::memory_order_release);</a>
+<a name="ln642">    }</a>
+<a name="ln643">    VLOG(1) &lt;&lt; &quot;num_tablets_ set to &quot; &lt;&lt; num_tablets_.load(std::memory_order_acquire);</a>
+<a name="ln644">  }</a>
+<a name="ln645"> </a>
+<a name="ln646"> private:</a>
+<a name="ln647">  LocalCommandData data_;</a>
+<a name="ln648">  std::shared_ptr&lt;client::YBRedisReadOp&gt; read_src_op_;</a>
+<a name="ln649">  std::shared_ptr&lt;client::YBRedisReadOp&gt; read_ttl_op_;</a>
+<a name="ln650">  std::shared_ptr&lt;client::YBRedisWriteOp&gt; delete_dest_op_;</a>
+<a name="ln651">  std::shared_ptr&lt;client::YBRedisWriteOp&gt; write_dest_op_;</a>
+<a name="ln652">  std::shared_ptr&lt;client::YBRedisWriteOp&gt; write_dest_ttl_op_;</a>
+<a name="ln653">  std::shared_ptr&lt;client::YBRedisWriteOp&gt; delete_src_op_;</a>
+<a name="ln654">  std::atomic_int num_tablets_{0};</a>
+<a name="ln655"> </a>
+<a name="ln656">  client::YBSession* session_;</a>
+<a name="ln657">  StatusFunctor src_functor_, dest_functor_;</a>
+<a name="ln658">  std::atomic&lt;size_t&gt; stored_{0};</a>
+<a name="ln659"> </a>
+<a name="ln660">  bool SaveSrcCB(client::YBSession* sess, const StatusFunctor&amp; functor) {</a>
+<a name="ln661">    VLOG(1) &lt;&lt; &quot;a. SaveSrcCB&quot;;</a>
+<a name="ln662">    session_ = sess;</a>
+<a name="ln663">    src_functor_ = functor;</a>
+<a name="ln664">    if (stored_.fetch_add(1, std::memory_order_acq_rel) + 1 ==</a>
+<a name="ln665">        num_tablets_.load(std::memory_order_acquire)) {</a>
+<a name="ln666">      BeginReadSrc();</a>
+<a name="ln667">    }</a>
+<a name="ln668">    return true;</a>
+<a name="ln669">  }</a>
+<a name="ln670"> </a>
+<a name="ln671">  bool SaveDestCB(client::YBSession* session, const StatusFunctor&amp; functor) {</a>
+<a name="ln672">    VLOG(1) &lt;&lt; &quot;b. SaveDestCB&quot;;</a>
+<a name="ln673">    dest_functor_ = functor;</a>
+<a name="ln674">    if (stored_.fetch_add(1, std::memory_order_acq_rel) + 1 ==</a>
+<a name="ln675">        num_tablets_.load(std::memory_order_acquire)) {</a>
+<a name="ln676">      BeginReadSrc();</a>
+<a name="ln677">    }</a>
+<a name="ln678">    return true;</a>
+<a name="ln679">  }</a>
+<a name="ln680"> </a>
+<a name="ln681">  void RespondWithError(const string&amp; msg) {</a>
+<a name="ln682">    RedisResponsePB response;</a>
+<a name="ln683">    response.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln684">    response.set_error_message(msg);</a>
+<a name="ln685">    Respond(&amp;response);</a>
+<a name="ln686">  }</a>
+<a name="ln687"> </a>
+<a name="ln688">  void Respond(RedisResponsePB* response) {</a>
+<a name="ln689">    data_.Respond(response);</a>
+<a name="ln690">    if (src_functor_) {</a>
+<a name="ln691">      src_functor_(Status::OK());</a>
+<a name="ln692">    }</a>
+<a name="ln693">    if (dest_functor_) {</a>
+<a name="ln694">      dest_functor_(Status::OK());</a>
+<a name="ln695">    }</a>
+<a name="ln696">  }</a>
+<a name="ln697"> </a>
+<a name="ln698">  void BeginReadSrc() {</a>
+<a name="ln699">    VLOG(1) &lt;&lt; &quot;1. BeginReadSrc&quot;;</a>
+<a name="ln700">    auto table = data_.context()-&gt;table();</a>
+<a name="ln701">    if (!table) {</a>
+<a name="ln702">      RespondWithError(&quot;Table is not open&quot;);</a>
+<a name="ln703">      return;</a>
+<a name="ln704">    }</a>
+<a name="ln705"> </a>
+<a name="ln706">    auto status1 = session_-&gt;Apply(read_src_op_);</a>
+<a name="ln707">    auto status2 = session_-&gt;Apply(read_ttl_op_);</a>
+<a name="ln708">    if (!status1.ok() || !status2.ok()) {</a>
+<a name="ln709">      RespondWithError(&quot;Could not apply read_src_op_.&quot;);</a>
+<a name="ln710">      return;</a>
+<a name="ln711">    }</a>
+<a name="ln712">    session_-&gt;FlushAsync([retained_self = shared_from_this()](const Status&amp; s) {</a>
+<a name="ln713">      if (!s.ok()) {</a>
+<a name="ln714">        LOG(ERROR) &lt;&lt; &quot;Reading from src during a Rename failed. &quot; &lt;&lt; s;</a>
+<a name="ln715">        retained_self-&gt;RespondWithError(s.message().ToBuffer());</a>
+<a name="ln716">      } else {</a>
+<a name="ln717">        retained_self-&gt;BeginWriteDest();</a>
+<a name="ln718">      }</a>
+<a name="ln719">    });</a>
+<a name="ln720">    VLOG(2) &lt;&lt; &quot;Launched read ops&quot;;</a>
+<a name="ln721">  }</a>
+<a name="ln722"> </a>
+<a name="ln723">  void BeginWriteDest() {</a>
+<a name="ln724">    VLOG(1) &lt;&lt; &quot;2. BeginWriteDest&quot;;</a>
+<a name="ln725">    RedisResponsePB readResponse = read_src_op_-&gt;response();</a>
+<a name="ln726">    if (readResponse.code() == RedisResponsePB_RedisStatusCode_NOT_FOUND) {</a>
+<a name="ln727">      // Nothing to write. The source is empty.</a>
+<a name="ln728">      RespondWithError(&quot;No such key.&quot;);</a>
+<a name="ln729">      return;</a>
+<a name="ln730">    }</a>
+<a name="ln731"> </a>
+<a name="ln732">    auto type = readResponse.type();</a>
+<a name="ln733">    write_dest_op_-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_type(type);</a>
+<a name="ln734">    switch (type) {</a>
+<a name="ln735">      case RedisDataType::REDIS_TYPE_STRING: {</a>
+<a name="ln736">        write_dest_op_-&gt;mutable_request()-&gt;mutable_set_request();</a>
+<a name="ln737">        write_dest_op_-&gt;mutable_request()-&gt;mutable_key_value()-&gt;add_value(</a>
+<a name="ln738">            readResponse.string_response());</a>
+<a name="ln739">        break;</a>
+<a name="ln740">      }</a>
+<a name="ln741">      case RedisDataType::REDIS_TYPE_HASH:</a>
+<a name="ln742">      case RedisDataType::REDIS_TYPE_SORTEDSET:</a>
+<a name="ln743">      case RedisDataType::REDIS_TYPE_TIMESERIES: {</a>
+<a name="ln744">        write_dest_op_-&gt;mutable_request()-&gt;mutable_set_request();</a>
+<a name="ln745">        size_t count = readResponse.array_response().elements_size();</a>
+<a name="ln746">        auto** elements = readResponse.mutable_array_response()-&gt;mutable_elements()-&gt;mutable_data();</a>
+<a name="ln747">        for (size_t i = 0; i &lt; count; i += 2) {</a>
+<a name="ln748">          const string&amp; first = *elements[i];</a>
+<a name="ln749">          const string&amp; second = *elements[i + 1];</a>
+<a name="ln750">          auto req_kv = write_dest_op_-&gt;mutable_request()-&gt;mutable_key_value();</a>
+<a name="ln751">          if (type == REDIS_TYPE_SORTEDSET) {</a>
+<a name="ln752">            auto score = CheckedStold(second);</a>
+<a name="ln753">            if (!score.ok()) {</a>
+<a name="ln754">              LOG(DFATAL) &lt;&lt; &quot;Could not parse sorted set score &quot; &lt;&lt; second;</a>
+<a name="ln755">              RespondWithError(&quot;Could not parse sorted set score&quot;);</a>
+<a name="ln756">              return;</a>
+<a name="ln757">            }</a>
+<a name="ln758">            req_kv-&gt;add_subkey()-&gt;set_double_subkey(*score);</a>
+<a name="ln759">            req_kv-&gt;add_value(first);</a>
+<a name="ln760">          } else if (type == REDIS_TYPE_TIMESERIES) {</a>
+<a name="ln761">            auto ts = CheckedStoll(first);</a>
+<a name="ln762">            if (!ts.ok()) {</a>
+<a name="ln763">              LOG(DFATAL) &lt;&lt; &quot;Could not parse sorted set ts &quot; &lt;&lt; first;</a>
+<a name="ln764">              RespondWithError(&quot;Could not parse timeseries ts&quot;);</a>
+<a name="ln765">              return;</a>
+<a name="ln766">            }</a>
+<a name="ln767">            req_kv-&gt;add_subkey()-&gt;set_timestamp_subkey(*ts);</a>
+<a name="ln768">            req_kv-&gt;add_value(second);</a>
+<a name="ln769">          } else {</a>
+<a name="ln770">            req_kv-&gt;add_subkey()-&gt;set_string_subkey(first);</a>
+<a name="ln771">            req_kv-&gt;add_value(second);</a>
+<a name="ln772">          }</a>
+<a name="ln773">        }</a>
+<a name="ln774">        break;</a>
+<a name="ln775">      }</a>
+<a name="ln776">      case RedisDataType::REDIS_TYPE_SET: {</a>
+<a name="ln777">        write_dest_op_-&gt;mutable_request()-&gt;mutable_add_request();</a>
+<a name="ln778">        size_t count = readResponse.array_response().elements_size();</a>
+<a name="ln779">        auto** elements = readResponse.mutable_array_response()-&gt;mutable_elements()-&gt;mutable_data();</a>
+<a name="ln780">        for (size_t i = 0; i &lt; count;) {</a>
+<a name="ln781">          const string&amp; subkey = *elements[i++];</a>
+<a name="ln782">          write_dest_op_-&gt;mutable_request()-&gt;mutable_key_value()-&gt;add_subkey()-&gt;set_string_subkey(</a>
+<a name="ln783">              subkey);</a>
+<a name="ln784">        }</a>
+<a name="ln785">        break;</a>
+<a name="ln786">      }</a>
+<a name="ln787">      case RedisDataType::REDIS_TYPE_LIST:</a>
+<a name="ln788">      default: {</a>
+<a name="ln789">        LOG(DFATAL) &lt;&lt; &quot;Unsupported rename for type &quot; &lt;&lt; type;</a>
+<a name="ln790">        RespondWithError(&quot;Unsupported rename for source type&quot;);</a>
+<a name="ln791">        return;</a>
+<a name="ln792">      }</a>
+<a name="ln793">    }</a>
+<a name="ln794"> </a>
+<a name="ln795">    const auto&amp; source = data_.arg(1);</a>
+<a name="ln796">    const auto&amp; dest = data_.arg(2);</a>
+<a name="ln797">    if (source == dest) {</a>
+<a name="ln798">      // Check after ensuring that source does exist.</a>
+<a name="ln799">      // Short circuit the operation. Return success.</a>
+<a name="ln800">      RedisResponsePB response;</a>
+<a name="ln801">      Respond(&amp;response);</a>
+<a name="ln802">      return;</a>
+<a name="ln803">    }</a>
+<a name="ln804"> </a>
+<a name="ln805">    RedisResponsePB ttlResponse = read_ttl_op_-&gt;response();</a>
+<a name="ln806">    int ttl_ms = ttlResponse.int_response();</a>
+<a name="ln807">    if (ttl_ms &gt; 0) {</a>
+<a name="ln808">      auto table = data_.context()-&gt;table();</a>
+<a name="ln809">      write_dest_ttl_op_ = std::make_shared&lt;client::YBRedisWriteOp&gt;(table);</a>
+<a name="ln810">      write_dest_ttl_op_-&gt;mutable_request()-&gt;mutable_set_ttl_request();</a>
+<a name="ln811">      write_dest_ttl_op_-&gt;mutable_request()-&gt;mutable_key_value()-&gt;set_key(</a>
+<a name="ln812">          dest.cdata(), dest.size());</a>
+<a name="ln813">      write_dest_ttl_op_-&gt;mutable_request()-&gt;mutable_set_ttl_request()-&gt;set_ttl(ttl_ms);</a>
+<a name="ln814">    }</a>
+<a name="ln815"> </a>
+<a name="ln816">    auto status1 = session_-&gt;Apply(delete_dest_op_);</a>
+<a name="ln817">    auto status2 = session_-&gt;Apply(write_dest_op_);</a>
+<a name="ln818">    if (!status1.ok() || !status2.ok()) {</a>
+<a name="ln819">      RespondWithError(&quot;Could not apply deleteOps/write_dest_op_.&quot;);</a>
+<a name="ln820">      return;</a>
+<a name="ln821">    }</a>
+<a name="ln822">    session_-&gt;FlushAsync([retained_self = shared_from_this()](const Status&amp; s) {</a>
+<a name="ln823">      if (!s.ok()) {</a>
+<a name="ln824">        LOG(ERROR) &lt;&lt; &quot;Writing to dest during a Rename failed. &quot; &lt;&lt; s;</a>
+<a name="ln825">        retained_self-&gt;RespondWithError(s.message().ToBuffer());</a>
+<a name="ln826">        return;</a>
+<a name="ln827">      }</a>
+<a name="ln828">      retained_self-&gt;BeginUpdateTTL();</a>
+<a name="ln829">    });</a>
+<a name="ln830">  }</a>
+<a name="ln831"> </a>
+<a name="ln832">  void BeginUpdateTTL() {</a>
+<a name="ln833">    VLOG(1) &lt;&lt; &quot;3. BeginUpdateTTL&quot;;</a>
+<a name="ln834">    if (!write_dest_ttl_op_) {</a>
+<a name="ln835">      BeginDeleteSrc();</a>
+<a name="ln836">      return;</a>
+<a name="ln837">    }</a>
+<a name="ln838"> </a>
+<a name="ln839">    auto status = session_-&gt;Apply(write_dest_ttl_op_);</a>
+<a name="ln840">    if (!status.ok()) {</a>
+<a name="ln841">      RespondWithError(&quot;Could not apply write_dest_ttl_op_.&quot;);</a>
+<a name="ln842">      return;</a>
+<a name="ln843">    }</a>
+<a name="ln844"> </a>
+<a name="ln845">    session_-&gt;FlushAsync([retained_self = shared_from_this()](const Status&amp; s) {</a>
+<a name="ln846">      if (!s.ok()) {</a>
+<a name="ln847">        LOG(ERROR) &lt;&lt; &quot;Updating ttl for dest during a Rename failed. &quot; &lt;&lt; s;</a>
+<a name="ln848">        retained_self-&gt;RespondWithError(s.message().ToBuffer());</a>
+<a name="ln849">        return;</a>
+<a name="ln850">      }</a>
+<a name="ln851">      retained_self-&gt;BeginDeleteSrc();</a>
+<a name="ln852">    });</a>
+<a name="ln853">  }</a>
+<a name="ln854"> </a>
+<a name="ln855">  void BeginDeleteSrc() {</a>
+<a name="ln856">    VLOG(1) &lt;&lt; &quot;4. BeginDeleteSrc&quot;;</a>
+<a name="ln857">    auto status = session_-&gt;Apply(delete_src_op_);</a>
+<a name="ln858">    if (!status.ok()) {</a>
+<a name="ln859">      RespondWithError(&quot;Could not apply delete_src_op_.&quot;);</a>
+<a name="ln860">      return;</a>
+<a name="ln861">    }</a>
+<a name="ln862">    session_-&gt;FlushAsync([retained_self = shared_from_this()](const Status&amp; s) {</a>
+<a name="ln863">      if (!s.ok()) {</a>
+<a name="ln864">        LOG(ERROR) &lt;&lt; &quot;Deleting src during a Rename failed. &quot; &lt;&lt; s;</a>
+<a name="ln865">        retained_self-&gt;RespondWithError(s.message().ToBuffer());</a>
+<a name="ln866">        return;</a>
+<a name="ln867">      }</a>
+<a name="ln868">      RedisResponsePB response;</a>
+<a name="ln869">      retained_self-&gt;Respond(&amp;response);</a>
+<a name="ln870">    });</a>
+<a name="ln871">  }</a>
+<a name="ln872">};</a>
+<a name="ln873"> </a>
+<a name="ln874">void HandleRename(LocalCommandData data) {</a>
+<a name="ln875">  VLOG(1) &lt;&lt; &quot;0. HandleRename&quot;;</a>
+<a name="ln876">  std::shared_ptr&lt;RenameData&gt; rename_data = std::make_shared&lt;RenameData&gt;(std::move(data));</a>
+<a name="ln877">  rename_data-&gt;Execute();</a>
+<a name="ln878">}</a>
+<a name="ln879"> </a>
+<a name="ln880">class KeysProcessor : public std::enable_shared_from_this&lt;KeysProcessor&gt; {</a>
+<a name="ln881"> public:</a>
+<a name="ln882">  explicit KeysProcessor(const LocalCommandData&amp; data)</a>
+<a name="ln883">      : data_(data),</a>
+<a name="ln884">        partitions_(data.table()-&gt;GetPartitions()), sessions_(partitions_.size()),</a>
+<a name="ln885">        callbacks_(partitions_.size()) {</a>
+<a name="ln886">    resp_.set_code(RedisResponsePB::OK);</a>
+<a name="ln887">  }</a>
+<a name="ln888"> </a>
+<a name="ln889">  bool Store(size_t idx, client::YBSession* session, const StatusFunctor&amp; callback) {</a>
+<a name="ln890">    sessions_[idx] = session;</a>
+<a name="ln891">    callbacks_[idx] = callback;</a>
+<a name="ln892">    if (stored_.fetch_add(1, std::memory_order_acq_rel) + 1 == callbacks_.size()) {</a>
+<a name="ln893">      Execute(0);</a>
+<a name="ln894">    }</a>
+<a name="ln895">    return true;</a>
+<a name="ln896">  }</a>
+<a name="ln897"> </a>
+<a name="ln898">  const std::vector&lt;std::string&gt;&amp; partitions() const {</a>
+<a name="ln899">    return partitions_;</a>
+<a name="ln900">  }</a>
+<a name="ln901"> </a>
+<a name="ln902"> private:</a>
+<a name="ln903">  void Execute(size_t idx) {</a>
+<a name="ln904">    if (idx == partitions_.size()) {</a>
+<a name="ln905">      ProcessedAll(Status::OK());</a>
+<a name="ln906">      return;</a>
+<a name="ln907">    }</a>
+<a name="ln908"> </a>
+<a name="ln909">    const auto&amp; partition_key = partitions_[idx];</a>
+<a name="ln910">    auto operation = std::make_shared&lt;client::YBRedisReadOp&gt;(data_.table()-&gt;shared_from_this());</a>
+<a name="ln911">    auto request = operation-&gt;mutable_request();</a>
+<a name="ln912">    uint16_t hash_code = partition_key.size() == 0 ?</a>
+<a name="ln913">        0 : PartitionSchema::DecodeMultiColumnHashValue(partition_key);</a>
+<a name="ln914">    request-&gt;mutable_key_value()-&gt;set_hash_code(hash_code);</a>
+<a name="ln915">    request-&gt;mutable_keys_request()-&gt;set_pattern(data_.arg(1).ToBuffer());</a>
+<a name="ln916">    request-&gt;mutable_keys_request()-&gt;set_threshold(keys_threshold_);</a>
+<a name="ln917">    sessions_[idx]-&gt;set_allow_local_calls_in_curr_thread(false);</a>
+<a name="ln918">    auto status = sessions_[idx]-&gt;Apply(operation);</a>
+<a name="ln919">    if (!status.ok()) {</a>
+<a name="ln920">      ProcessedAll(status);</a>
+<a name="ln921">      return;</a>
+<a name="ln922">    }</a>
+<a name="ln923">    sessions_[idx]-&gt;FlushAsync(std::bind(</a>
+<a name="ln924">        &amp;KeysProcessor::ProcessedOne, shared_from_this(), idx, operation, _1));</a>
+<a name="ln925">  }</a>
+<a name="ln926"> </a>
+<a name="ln927">  void ProcessedOne(</a>
+<a name="ln928">      size_t idx, const std::shared_ptr&lt;client::YBRedisReadOp&gt;&amp; operation, const Status&amp; status) {</a>
+<a name="ln929">    if (!status.ok()) {</a>
+<a name="ln930">      ProcessedAll(status);</a>
+<a name="ln931">      return;</a>
+<a name="ln932">    }</a>
+<a name="ln933"> </a>
+<a name="ln934">    auto&amp; response = *operation-&gt;mutable_response();</a>
+<a name="ln935">    if (response.code() == RedisResponsePB::SERVER_ERROR) {</a>
+<a name="ln936">      // We received too many keys or timed out, forwarding the error message.</a>
+<a name="ln937">      resp_ = response;</a>
+<a name="ln938">      ProcessedAll(Status::OK());</a>
+<a name="ln939">      return;</a>
+<a name="ln940">    }</a>
+<a name="ln941"> </a>
+<a name="ln942">    size_t count = response.array_response().elements_size();</a>
+<a name="ln943">    auto** elements = response.mutable_array_response()-&gt;mutable_elements()-&gt;mutable_data();</a>
+<a name="ln944">    keys_threshold_ -= count;</a>
+<a name="ln945"> </a>
+<a name="ln946">    auto&amp; array_response = *resp_.mutable_array_response();</a>
+<a name="ln947">    for (size_t i = 0; i != count; ++i) {</a>
+<a name="ln948">      array_response.mutable_elements()-&gt;AddAllocated(elements[i]);</a>
+<a name="ln949">    }</a>
+<a name="ln950"> </a>
+<a name="ln951">    response.mutable_array_response()-&gt;mutable_elements()-&gt;ExtractSubrange(0, count, nullptr);</a>
+<a name="ln952"> </a>
+<a name="ln953">    if (keys_threshold_ == 0) {</a>
+<a name="ln954">      ProcessedAll(Status::OK());</a>
+<a name="ln955">      return;</a>
+<a name="ln956">    }</a>
+<a name="ln957"> </a>
+<a name="ln958">    Execute(idx + 1);</a>
+<a name="ln959">  }</a>
+<a name="ln960"> </a>
+<a name="ln961">  void ProcessedAll(const Status&amp; status) {</a>
+<a name="ln962">    data_.Respond(status, &amp;resp_);</a>
+<a name="ln963"> </a>
+<a name="ln964">    for (const auto&amp; callback : callbacks_) {</a>
+<a name="ln965">      callback(status);</a>
+<a name="ln966">    }</a>
+<a name="ln967">  }</a>
+<a name="ln968"> </a>
+<a name="ln969">  LocalCommandData data_;</a>
+<a name="ln970"> </a>
+<a name="ln971">  std::vector&lt;std::string&gt; partitions_;</a>
+<a name="ln972">  std::vector&lt;client::YBSession*&gt; sessions_;</a>
+<a name="ln973">  std::vector&lt;StatusFunctor&gt; callbacks_;</a>
+<a name="ln974">  std::atomic&lt;size_t&gt; stored_{0};</a>
+<a name="ln975">  RedisResponsePB resp_;</a>
+<a name="ln976">  size_t keys_threshold_ = FLAGS_redis_keys_threshold;</a>
+<a name="ln977">};</a>
+<a name="ln978"> </a>
+<a name="ln979">void HandleKeys(LocalCommandData data) {</a>
+<a name="ln980">  auto processor = std::make_shared&lt;KeysProcessor&gt;(data);</a>
+<a name="ln981">  size_t idx = 0;</a>
+<a name="ln982">  for (const std::string&amp; partition_key : processor-&gt;partitions()) {</a>
+<a name="ln983">    data.Apply(std::bind(</a>
+<a name="ln984">        &amp;KeysProcessor::Store, processor, idx, _1, _2), partition_key, ManualResponse::kTrue);</a>
+<a name="ln985">    ++idx;</a>
+<a name="ln986">  }</a>
+<a name="ln987">}</a>
+<a name="ln988"> </a>
+<a name="ln989">void HandleCommand(LocalCommandData data) {</a>
+<a name="ln990">  data.Respond();</a>
+<a name="ln991">}</a>
+<a name="ln992"> </a>
+<a name="ln993">void HandleQuit(LocalCommandData data) {</a>
+<a name="ln994">  data.call()-&gt;MarkForClose();</a>
+<a name="ln995">  data.Respond();</a>
+<a name="ln996">}</a>
+<a name="ln997"> </a>
+<a name="ln998">bool AcceptPassword(const vector&lt;string&gt;&amp; allowed, const string&amp; candidate) {</a>
+<a name="ln999">  for (auto&amp; stored_hash_or_pwd : allowed) {</a>
+<a name="ln1000">    if (FLAGS_use_hashed_redis_password</a>
+<a name="ln1001">            ? (0 == yb::util::bcrypt_checkpw(candidate.c_str(), stored_hash_or_pwd.c_str()))</a>
+<a name="ln1002">            : (stored_hash_or_pwd == candidate)) {</a>
+<a name="ln1003">      return true;</a>
+<a name="ln1004">    }</a>
+<a name="ln1005">  }</a>
+<a name="ln1006">  return false;</a>
+<a name="ln1007">}</a>
+<a name="ln1008"> </a>
+<a name="ln1009">void HandleConfig(LocalCommandData data) {</a>
+<a name="ln1010">  RedisResponsePB resp;</a>
+<a name="ln1011">  // We only handle config requests of the type:</a>
+<a name="ln1012">  // CONFIG SET REQUIREPASS &lt;password&gt;</a>
+<a name="ln1013">  // everything else is handled as a no-op.</a>
+<a name="ln1014">  if (data.arg_size() != 4 ||</a>
+<a name="ln1015">      !(boost::iequals(data.arg(1).ToBuffer(), &quot;SET&quot;) &amp;&amp;</a>
+<a name="ln1016">        boost::iequals(data.arg(2).ToBuffer(), &quot;REQUIREPASS&quot;))) {</a>
+<a name="ln1017">    if (data.arg_size() &gt;= 2 &amp;&amp; boost::iequals(data.arg(1).ToBuffer(), &quot;GET&quot;)) {</a>
+<a name="ln1018">      // CONFIG GET will be responded to with an empty array.</a>
+<a name="ln1019">      resp.mutable_array_response()-&gt;set_encoded(false);</a>
+<a name="ln1020">    }</a>
+<a name="ln1021">    data.Respond(&amp;resp);</a>
+<a name="ln1022">    return;</a>
+<a name="ln1023">  }</a>
+<a name="ln1024"> </a>
+<a name="ln1025">  // Handle Config Set Requirepass &lt;passwords&gt;</a>
+<a name="ln1026">  DCHECK_EQ(FLAGS_redis_passwords_separator.size(), 1);</a>
+<a name="ln1027">  vector&lt;string&gt; passwords =</a>
+<a name="ln1028">      yb::StringSplit(data.arg(3).ToBuffer(), FLAGS_redis_passwords_separator[0]);</a>
+<a name="ln1029">  Status status;</a>
+<a name="ln1030">  if (passwords.size() &gt; 2) {</a>
+<a name="ln1031">    status = STATUS(InvalidArgument, &quot;Only maximum of 2 passwords are supported&quot;);</a>
+<a name="ln1032">  } else if (FLAGS_use_hashed_redis_password) {</a>
+<a name="ln1033">    std::vector&lt;string&gt; hashes;</a>
+<a name="ln1034">    for (const auto&amp; pwd : passwords) {</a>
+<a name="ln1035">      char hash[yb::util::kBcryptHashSize];</a>
+<a name="ln1036">      if (yb::util::bcrypt_hashpw(pwd.c_str(), hash) != 0) {</a>
+<a name="ln1037">        resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln1038">        resp.set_error_message(&quot;ERR: Error while hashing the password.&quot;);</a>
+<a name="ln1039">        data.Respond(&amp;resp);</a>
+<a name="ln1040">        return;</a>
+<a name="ln1041">      }</a>
+<a name="ln1042">      hashes.emplace_back(hash, yb::util::kBcryptHashSize);</a>
+<a name="ln1043">    }</a>
+<a name="ln1044">    status = data.client()-&gt;SetRedisPasswords(hashes);</a>
+<a name="ln1045">  } else {</a>
+<a name="ln1046">    status = data.client()-&gt;SetRedisPasswords(passwords);</a>
+<a name="ln1047">  }</a>
+<a name="ln1048"> </a>
+<a name="ln1049">  if (!status.ok()) {</a>
+<a name="ln1050">    resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln1051">    resp.set_error_message(StrCat(&quot;ERR: &quot;, status.ToString()));</a>
+<a name="ln1052">  } else {</a>
+<a name="ln1053">    resp.set_code(RedisResponsePB::OK);</a>
+<a name="ln1054">  }</a>
+<a name="ln1055">  data.Respond(&amp;resp);</a>
+<a name="ln1056">}</a>
+<a name="ln1057"> </a>
+<a name="ln1058">void HandleAuth(LocalCommandData data) {</a>
+<a name="ln1059">  vector&lt;string&gt; passwords;</a>
+<a name="ln1060">  auto status = data.context()-&gt;service_data()-&gt;GetRedisPasswords(&amp;passwords);</a>
+<a name="ln1061">  RedisResponsePB resp;</a>
+<a name="ln1062">  if (!status.ok() || !AcceptPassword(passwords, data.arg(1).ToBuffer())) {</a>
+<a name="ln1063">    resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln1064">    auto error_message =</a>
+<a name="ln1065">        (status.ok() ? &quot;ERR: Bad Password.&quot;</a>
+<a name="ln1066">                     : strings::Substitute(&quot;ERR: Bad Password. $0&quot;, status.ToString()));</a>
+<a name="ln1067">    resp.set_error_message(error_message);</a>
+<a name="ln1068">  } else {</a>
+<a name="ln1069">    RedisConnectionContext&amp; context = data.call()-&gt;connection_context();</a>
+<a name="ln1070">    context.set_authenticated(true);</a>
+<a name="ln1071">    resp.set_code(RedisResponsePB::OK);</a>
+<a name="ln1072">  }</a>
+<a name="ln1073">  data.Respond(&amp;resp);</a>
+<a name="ln1074">}</a>
+<a name="ln1075"> </a>
+<a name="ln1076">void FlushDBs(LocalCommandData data, const vector&lt;string&gt; ids) {</a>
+<a name="ln1077">  RedisResponsePB resp;</a>
+<a name="ln1078"> </a>
+<a name="ln1079">  const Status s = FLAGS_yedis_enable_flush</a>
+<a name="ln1080">                       ? data.client()-&gt;TruncateTables(ids)</a>
+<a name="ln1081">                       : STATUS(InvalidArgument, &quot;FLUSHDB and FLUSHALL are not enabled.&quot;);</a>
+<a name="ln1082"> </a>
+<a name="ln1083">  if (s.ok()) {</a>
+<a name="ln1084">    resp.set_code(RedisResponsePB_RedisStatusCode_OK);</a>
+<a name="ln1085">  } else {</a>
+<a name="ln1086">    const Slice message = s.message();</a>
+<a name="ln1087">    resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln1088">    resp.set_error_message(message.data(), message.size());</a>
+<a name="ln1089">  }</a>
+<a name="ln1090">  data.Respond(&amp;resp);</a>
+<a name="ln1091">}</a>
+<a name="ln1092"> </a>
+<a name="ln1093">void HandleFlushDB(LocalCommandData data) {</a>
+<a name="ln1094">  FlushDBs(data, {data.table()-&gt;id()});</a>
+<a name="ln1095">}</a>
+<a name="ln1096"> </a>
+<a name="ln1097">void HandleFlushAll(LocalCommandData data) {</a>
+<a name="ln1098">  const string prefix = common::kRedisTableName;</a>
+<a name="ln1099">  auto result = data.client()-&gt;ListTables(prefix);</a>
+<a name="ln1100">  if (!result.ok()) {</a>
+<a name="ln1101">    RedisResponsePB resp;</a>
+<a name="ln1102">    const Slice message = result.status().message();</a>
+<a name="ln1103">    resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln1104">    resp.set_error_message(message.data(), message.size());</a>
+<a name="ln1105">    data.Respond(&amp;resp);</a>
+<a name="ln1106">    return;</a>
+<a name="ln1107">  }</a>
+<a name="ln1108">  const auto&amp; table_names = *result;</a>
+<a name="ln1109">  // Gather table ids.</a>
+<a name="ln1110">  vector&lt;string&gt; table_ids;</a>
+<a name="ln1111">  for (const auto&amp; name : table_names) {</a>
+<a name="ln1112">    std::shared_ptr&lt;client::YBTable&gt; table;</a>
+<a name="ln1113">    const auto s = data.client()-&gt;OpenTable(name, &amp;table);</a>
+<a name="ln1114">    if (!s.ok()) {</a>
+<a name="ln1115">      RedisResponsePB resp;</a>
+<a name="ln1116">      const Slice message = s.message();</a>
+<a name="ln1117">      resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln1118">      resp.set_error_message(message.data(), message.size());</a>
+<a name="ln1119">      data.Respond(&amp;resp);</a>
+<a name="ln1120">      return;</a>
+<a name="ln1121">    }</a>
+<a name="ln1122">    table_ids.push_back(table-&gt;id());</a>
+<a name="ln1123">  }</a>
+<a name="ln1124">  FlushDBs(data, table_ids);</a>
+<a name="ln1125">}</a>
+<a name="ln1126"> </a>
+<a name="ln1127">void HandleCreateDB(LocalCommandData data) {</a>
+<a name="ln1128">  RedisResponsePB resp;</a>
+<a name="ln1129">  // Ensure that the rediskeyspace exists. If not create it.</a>
+<a name="ln1130">  Status s = data.client()-&gt;CreateNamespaceIfNotExists(common::kRedisKeyspaceName,</a>
+<a name="ln1131">                                                       YQLDatabase::YQL_DATABASE_REDIS);</a>
+<a name="ln1132">  if (!s.ok()) {</a>
+<a name="ln1133">    VLOG(1) &lt;&lt; &quot;Namespace '&quot; &lt;&lt; common::kRedisKeyspaceName &lt;&lt; &quot;' could not be created.&quot;;</a>
+<a name="ln1134">    const Slice message = s.message();</a>
+<a name="ln1135">    resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln1136">    resp.set_error_message(message.data(), message.size());</a>
+<a name="ln1137">    data.Respond(&amp;resp);</a>
+<a name="ln1138">    return;</a>
+<a name="ln1139">  }</a>
+<a name="ln1140"> </a>
+<a name="ln1141">  // Figure out the redis table name that we should be using.</a>
+<a name="ln1142">  const string db_name = data.arg(1).ToBuffer();</a>
+<a name="ln1143">  const auto table_name = RedisServiceData::GetYBTableNameForRedisDatabase(db_name);</a>
+<a name="ln1144">  std::unique_ptr&lt;yb::client::YBTableCreator&gt; table_creator(data.client()-&gt;NewTableCreator());</a>
+<a name="ln1145">  s = table_creator-&gt;table_name(table_name)</a>
+<a name="ln1146">          .table_type(yb::client::YBTableType::REDIS_TABLE_TYPE)</a>
+<a name="ln1147">          .Create();</a>
+<a name="ln1148">  if (s.ok()) {</a>
+<a name="ln1149">    resp.set_code(RedisResponsePB_RedisStatusCode_OK);</a>
+<a name="ln1150">  } else if (s.IsAlreadyPresent()) {</a>
+<a name="ln1151">    VLOG(1) &lt;&lt; &quot;Table '&quot; &lt;&lt; table_name.ToString() &lt;&lt; &quot;' already exists&quot;;</a>
+<a name="ln1152">    resp.set_code(RedisResponsePB_RedisStatusCode_OK);</a>
+<a name="ln1153">  } else {</a>
+<a name="ln1154">    const Slice message = s.message();</a>
+<a name="ln1155">    resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln1156">    resp.set_error_message(message.data(), message.size());</a>
+<a name="ln1157">  }</a>
+<a name="ln1158">  data.Respond(&amp;resp);</a>
+<a name="ln1159">}</a>
+<a name="ln1160"> </a>
+<a name="ln1161">void HandleListDB(LocalCommandData data) {</a>
+<a name="ln1162">  RedisResponsePB resp;</a>
+<a name="ln1163">  // Figure out the redis table name that we should be using.</a>
+<a name="ln1164">  const string prefix = common::kRedisTableName;</a>
+<a name="ln1165">  const size_t prefix_len = strlen(common::kRedisTableName);</a>
+<a name="ln1166">  const auto result = data.client()-&gt;ListTables(prefix);</a>
+<a name="ln1167">  if (!result.ok()) {</a>
+<a name="ln1168">    const Slice message = result.status().message();</a>
+<a name="ln1169">    resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln1170">    resp.set_error_message(message.data(), message.size());</a>
+<a name="ln1171">    data.Respond(&amp;resp);</a>
+<a name="ln1172">    return;</a>
+<a name="ln1173">  }</a>
+<a name="ln1174">  const auto&amp; table_names = *result;</a>
+<a name="ln1175">  auto array_response = resp.mutable_array_response();</a>
+<a name="ln1176">  vector&lt;string&gt; dbs;</a>
+<a name="ln1177">  for (const auto&amp; ybname : table_names) {</a>
+<a name="ln1178">    if (!ybname.is_redis_table()) continue;</a>
+<a name="ln1179">    const auto&amp; tablename = ybname.table_name();</a>
+<a name="ln1180">    if (tablename == common::kRedisTableName) {</a>
+<a name="ln1181">      dbs.push_back(&quot;0&quot;);</a>
+<a name="ln1182">    } else {</a>
+<a name="ln1183">      // Of the form &lt;prefix&gt;_&lt;DB&gt;.</a>
+<a name="ln1184">      dbs.push_back(tablename.substr(prefix_len + 1));</a>
+<a name="ln1185">    }</a>
+<a name="ln1186">  }</a>
+<a name="ln1187">  std::sort(dbs.begin(), dbs.end());</a>
+<a name="ln1188">  for (const string&amp; db : dbs) {</a>
+<a name="ln1189">    AddElements(redisserver::EncodeAsBulkString(db), array_response);</a>
+<a name="ln1190">  }</a>
+<a name="ln1191">  array_response-&gt;set_encoded(true);</a>
+<a name="ln1192">  resp.set_code(RedisResponsePB::OK);</a>
+<a name="ln1193">  data.Respond(&amp;resp);</a>
+<a name="ln1194">}</a>
+<a name="ln1195"> </a>
+<a name="ln1196">void HandleDeleteDB(LocalCommandData data) {</a>
+<a name="ln1197">  RedisResponsePB resp;</a>
+<a name="ln1198">  // Figure out the redis table name that we should be using.</a>
+<a name="ln1199">  const string db_name = data.arg(1).ToBuffer();</a>
+<a name="ln1200">  const auto table_name = RedisServiceData::GetYBTableNameForRedisDatabase(db_name);</a>
+<a name="ln1201"> </a>
+<a name="ln1202">  Status s = data.client()-&gt;DeleteTable(table_name, /* wait */ true);</a>
+<a name="ln1203">  if (s.ok()) {</a>
+<a name="ln1204">    resp.set_code(RedisResponsePB_RedisStatusCode_OK);</a>
+<a name="ln1205">  } else if (s.IsNotFound()) {</a>
+<a name="ln1206">    VLOG(1) &lt;&lt; &quot;Table '&quot; &lt;&lt; table_name.ToString() &lt;&lt; &quot;' does not exist.&quot;;</a>
+<a name="ln1207">    resp.set_code(RedisResponsePB_RedisStatusCode_OK);</a>
+<a name="ln1208">  } else {</a>
+<a name="ln1209">    const Slice message = s.message();</a>
+<a name="ln1210">    resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln1211">    resp.set_error_message(message.data(), message.size());</a>
+<a name="ln1212">  }</a>
+<a name="ln1213">  data.Respond(&amp;resp);</a>
+<a name="ln1214">}</a>
+<a name="ln1215"> </a>
+<a name="ln1216">void HandleSelect(LocalCommandData data) {</a>
+<a name="ln1217">  RedisResponsePB resp;</a>
+<a name="ln1218">  const string db_name = data.arg(1).ToBuffer();</a>
+<a name="ln1219">  RedisServiceData* sd = data.context()-&gt;service_data();</a>
+<a name="ln1220">  auto s = sd-&gt;GetYBTableForDB(db_name);</a>
+<a name="ln1221">  if (s.ok()) {</a>
+<a name="ln1222">    // Update RedisConnectionContext to use the specified table.</a>
+<a name="ln1223">    RedisConnectionContext&amp; context = data.call()-&gt;connection_context();</a>
+<a name="ln1224">    context.use_redis_db(db_name);</a>
+<a name="ln1225">    resp.set_code(RedisResponsePB_RedisStatusCode_OK);</a>
+<a name="ln1226">  } else {</a>
+<a name="ln1227">    const Slice message = s.status().message();</a>
+<a name="ln1228">    VLOG(1) &lt;&lt; &quot; Could not open Redis Table for db &quot; &lt;&lt; db_name &lt;&lt; &quot; : &quot; &lt;&lt; message.ToString();</a>
+<a name="ln1229">    resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);</a>
+<a name="ln1230">    resp.set_error_message(message.data(), message.size());</a>
+<a name="ln1231">    data.call()-&gt;MarkForClose();</a>
+<a name="ln1232">  }</a>
+<a name="ln1233">  data.Respond(&amp;resp);</a>
+<a name="ln1234">}</a>
+<a name="ln1235"> </a>
+<a name="ln1236">void HandleDebugSleep(LocalCommandData data) {</a>
+<a name="ln1237">  struct SleepWaiter {</a>
+<a name="ln1238">    std::chrono::steady_clock::time_point end;</a>
+<a name="ln1239">    StatusFunctor callback;</a>
+<a name="ln1240">    LocalCommandData data;</a>
+<a name="ln1241"> </a>
+<a name="ln1242">    void operator()(const Status&amp; status) const {</a>
+<a name="ln1243">      if (!status.ok()) {</a>
+<a name="ln1244">        callback(status);</a>
+<a name="ln1245">        return;</a>
+<a name="ln1246">      }</a>
+<a name="ln1247">      if (data.call()-&gt;aborted()) {</a>
+<a name="ln1248">        callback(STATUS(Aborted, &quot;&quot;));</a>
+<a name="ln1249">        return;</a>
+<a name="ln1250">      }</a>
+<a name="ln1251">      auto now = std::chrono::steady_clock::now();</a>
+<a name="ln1252">      if (now &gt;= end) {</a>
+<a name="ln1253">        callback(Status::OK());</a>
+<a name="ln1254">        return;</a>
+<a name="ln1255">      }</a>
+<a name="ln1256">      data.context()-&gt;client()-&gt;messenger()-&gt;scheduler().Schedule(</a>
+<a name="ln1257">          *this, std::min(end, now + 100ms));</a>
+<a name="ln1258">    }</a>
+<a name="ln1259">  };</a>
+<a name="ln1260"> </a>
+<a name="ln1261">  auto time_ms = CheckedStoll(data.arg(1));</a>
+<a name="ln1262">  if (!time_ms.ok()) {</a>
+<a name="ln1263">    RedisResponsePB resp;</a>
+<a name="ln1264">    resp.set_code(RedisResponsePB::PARSING_ERROR);</a>
+<a name="ln1265">    const Slice message = time_ms.status().message();</a>
+<a name="ln1266">    resp.set_error_message(message.data(), message.size());</a>
+<a name="ln1267">    data.Respond(&amp;resp);</a>
+<a name="ln1268">  }</a>
+<a name="ln1269"> </a>
+<a name="ln1270">  auto now = std::chrono::steady_clock::now();</a>
+<a name="ln1271">  auto functor = [end = now + std::chrono::milliseconds(*time_ms),</a>
+<a name="ln1272">                  data](client::YBSession*, const StatusFunctor&amp; callback) {</a>
+<a name="ln1273">    SleepWaiter waiter{ end, callback, data };</a>
+<a name="ln1274">    waiter(Status::OK());</a>
+<a name="ln1275">    return true;</a>
+<a name="ln1276">  };</a>
+<a name="ln1277"> </a>
+<a name="ln1278">  data.Apply(functor, std::string(), ManualResponse::kFalse);</a>
+<a name="ln1279">}</a>
+<a name="ln1280"> </a>
+<a name="ln1281">} // namespace</a>
+<a name="ln1282"> </a>
+<a name="ln1283">void RespondWithFailure(</a>
+<a name="ln1284">    std::shared_ptr&lt;RedisInboundCall&gt; call,</a>
+<a name="ln1285">    size_t idx,</a>
+<a name="ln1286">    const std::string&amp; error,</a>
+<a name="ln1287">    const char* redis_code) {</a>
+<a name="ln1288">  // process the request</a>
+<a name="ln1289">  DVLOG(4) &lt;&lt; &quot; Processing request from client &quot;;</a>
+<a name="ln1290">  const auto&amp; command = call-&gt;client_batch()[idx];</a>
+<a name="ln1291">  size_t size = command.size();</a>
+<a name="ln1292">  for (size_t i = 0; i &lt; size; i++) {</a>
+<a name="ln1293">    DVLOG(4) &lt;&lt; i + 1 &lt;&lt; &quot; / &quot; &lt;&lt; size &lt;&lt; &quot; : &quot; &lt;&lt; command[i].ToDebugString(8);</a>
+<a name="ln1294">  }</a>
+<a name="ln1295"> </a>
+<a name="ln1296">  // Send the result.</a>
+<a name="ln1297">  DVLOG(4) &lt;&lt; &quot;Responding to call &quot; &lt;&lt; call-&gt;ToString() &lt;&lt; &quot; with failure &quot; &lt;&lt; error;</a>
+<a name="ln1298">  std::string cmd = command[0].ToBuffer();</a>
+<a name="ln1299">  call-&gt;RespondFailure(idx, STATUS_FORMAT(InvalidCommand, &quot;$0 $1: $2&quot;, redis_code, cmd, error));</a>
+<a name="ln1300">}</a>
+<a name="ln1301"> </a>
+<a name="ln1302">void FillRedisCommands(const scoped_refptr&lt;MetricEntity&gt;&amp; metric_entity,</a>
+<a name="ln1303">                       const std::function&lt;void(const RedisCommandInfo&amp; info)&gt;&amp; setup_method) {</a>
+<a name="ln1304">  BOOST_PP_SEQ_FOR_EACH(POPULATE_HANDLER, ~, REDIS_COMMANDS);</a>
+<a name="ln1305">}</a>
+<a name="ln1306"> </a>
+<a name="ln1307">} // namespace redisserver</a>
+<a name="ln1308">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="196"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="301"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="304"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="355"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="383"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="480"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="521"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="580"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_get_for_rename_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="584"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_get_ttl_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="588"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_del_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="597"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_del_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="643"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="661"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="672"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="699"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="720"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="724"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="736"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_set_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="744"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_set_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="777"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_add_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="810"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_set_ttl_request' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="833"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="856"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="875"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1133"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1151"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1206"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1228"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1289"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1293"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1297"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

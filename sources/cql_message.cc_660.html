@@ -1,0 +1,1871 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>cql_message.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;lz4.h&gt;</a>
+<a name="ln15">#include &lt;snappy.h&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;regex&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/common/ql_protocol.pb.h&quot;</a>
+<a name="ln22">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;yb/yql/cql/cqlserver/cql_message.h&quot;</a>
+<a name="ln25">#include &quot;yb/yql/cql/cqlserver/cql_processor.h&quot;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;yb/gutil/endian.h&quot;</a>
+<a name="ln28">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;yb/util/random_util.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32">namespace yb {</a>
+<a name="ln33">namespace cqlserver {</a>
+<a name="ln34"> </a>
+<a name="ln35">using std::shared_ptr;</a>
+<a name="ln36">using std::unique_ptr;</a>
+<a name="ln37">using std::string;</a>
+<a name="ln38">using std::set;</a>
+<a name="ln39">using std::vector;</a>
+<a name="ln40">using std::unordered_map;</a>
+<a name="ln41">using strings::Substitute;</a>
+<a name="ln42">using util::to_char_ptr;</a>
+<a name="ln43">using util::to_uchar_ptr;</a>
+<a name="ln44">using snappy::GetUncompressedLength;</a>
+<a name="ln45">using snappy::MaxCompressedLength;</a>
+<a name="ln46">using snappy::RawUncompress;</a>
+<a name="ln47">using snappy::RawCompress;</a>
+<a name="ln48"> </a>
+<a name="ln49">#define RETURN_NOT_ENOUGH(sz)                               \</a>
+<a name="ln50">  do {                                                      \</a>
+<a name="ln51">    if (body_.size() &lt; (sz)) {                              \</a>
+<a name="ln52">      return STATUS(NetworkError, &quot;Truncated CQL message&quot;); \</a>
+<a name="ln53">    }                                                       \</a>
+<a name="ln54">  } while (0)</a>
+<a name="ln55"> </a>
+<a name="ln56">constexpr char CQLMessage::kCQLVersionOption[];</a>
+<a name="ln57">constexpr char CQLMessage::kCompressionOption[];</a>
+<a name="ln58">constexpr char CQLMessage::kNoCompactOption[];</a>
+<a name="ln59"> </a>
+<a name="ln60">constexpr char CQLMessage::kLZ4Compression[];</a>
+<a name="ln61">constexpr char CQLMessage::kSnappyCompression[];</a>
+<a name="ln62"> </a>
+<a name="ln63">constexpr char CQLMessage::kTopologyChangeEvent[];</a>
+<a name="ln64">constexpr char CQLMessage::kStatusChangeEvent[];</a>
+<a name="ln65">constexpr char CQLMessage::kSchemaChangeEvent[];</a>
+<a name="ln66"> </a>
+<a name="ln67">Status CQLMessage::QueryParameters::GetBindVariable(const std::string&amp; name,</a>
+<a name="ln68">                                                    const int64_t pos,</a>
+<a name="ln69">                                                    const shared_ptr&lt;QLType&gt;&amp; type,</a>
+<a name="ln70">                                                    QLValue* value) const {</a>
+<a name="ln71">  const Value* v = nullptr;</a>
+<a name="ln72">  if (!value_map.empty()) {</a>
+<a name="ln73">    const auto itr = value_map.find(name);</a>
+<a name="ln74">    if (itr == value_map.end()) {</a>
+<a name="ln75">      return STATUS_SUBSTITUTE(RuntimeError, &quot;Bind variable \&quot;$0\&quot; not found&quot;, name);</a>
+<a name="ln76">    }</a>
+<a name="ln77">    v = &amp;values.at(itr-&gt;second);</a>
+<a name="ln78">  } else {</a>
+<a name="ln79">    if (pos &lt; 0 || pos &gt;= values.size()) {</a>
+<a name="ln80">      // Return error with 1-based position.</a>
+<a name="ln81">      return STATUS_SUBSTITUTE(RuntimeError, &quot;Bind variable at position $0 not found&quot;, pos + 1);</a>
+<a name="ln82">    }</a>
+<a name="ln83">    v = &amp;values.at(pos);</a>
+<a name="ln84">  }</a>
+<a name="ln85">  switch (v-&gt;kind) {</a>
+<a name="ln86">    case Value::Kind::NOT_NULL: {</a>
+<a name="ln87">      if (v-&gt;value.empty()) {</a>
+<a name="ln88">        switch (type-&gt;main()) {</a>
+<a name="ln89">          case DataType::STRING:</a>
+<a name="ln90">            value-&gt;set_string_value(&quot;&quot;);</a>
+<a name="ln91">            return Status::OK();</a>
+<a name="ln92">          case DataType::BINARY:</a>
+<a name="ln93">            value-&gt;set_binary_value(&quot;&quot;);</a>
+<a name="ln94">            return Status::OK();</a>
+<a name="ln95">          case DataType::NULL_VALUE_TYPE: FALLTHROUGH_INTENDED;</a>
+<a name="ln96">          case DataType::INT8: FALLTHROUGH_INTENDED;</a>
+<a name="ln97">          case DataType::INT16: FALLTHROUGH_INTENDED;</a>
+<a name="ln98">          case DataType::INT32: FALLTHROUGH_INTENDED;</a>
+<a name="ln99">          case DataType::INT64: FALLTHROUGH_INTENDED;</a>
+<a name="ln100">          case DataType::BOOL: FALLTHROUGH_INTENDED;</a>
+<a name="ln101">          case DataType::FLOAT: FALLTHROUGH_INTENDED;</a>
+<a name="ln102">          case DataType::DOUBLE: FALLTHROUGH_INTENDED;</a>
+<a name="ln103">          case DataType::TIMESTAMP: FALLTHROUGH_INTENDED;</a>
+<a name="ln104">          case DataType::DECIMAL: FALLTHROUGH_INTENDED;</a>
+<a name="ln105">          case DataType::VARINT: FALLTHROUGH_INTENDED;</a>
+<a name="ln106">          case DataType::INET: FALLTHROUGH_INTENDED;</a>
+<a name="ln107">          case DataType::JSONB: FALLTHROUGH_INTENDED;</a>
+<a name="ln108">          case DataType::LIST: FALLTHROUGH_INTENDED;</a>
+<a name="ln109">          case DataType::MAP: FALLTHROUGH_INTENDED;</a>
+<a name="ln110">          case DataType::SET: FALLTHROUGH_INTENDED;</a>
+<a name="ln111">          case DataType::UUID: FALLTHROUGH_INTENDED;</a>
+<a name="ln112">          case DataType::TIMEUUID:</a>
+<a name="ln113">            value-&gt;SetNull();</a>
+<a name="ln114">            return Status::OK();</a>
+<a name="ln115">          case DataType::UNKNOWN_DATA: FALLTHROUGH_INTENDED;</a>
+<a name="ln116">          case DataType::TUPLE: FALLTHROUGH_INTENDED;</a>
+<a name="ln117">          case DataType::TYPEARGS: FALLTHROUGH_INTENDED;</a>
+<a name="ln118">          case DataType::USER_DEFINED_TYPE: FALLTHROUGH_INTENDED;</a>
+<a name="ln119">          case DataType::FROZEN: FALLTHROUGH_INTENDED;</a>
+<a name="ln120">          case DataType::DATE: FALLTHROUGH_INTENDED;</a>
+<a name="ln121">          case DataType::TIME: FALLTHROUGH_INTENDED;</a>
+<a name="ln122">          case DataType::UINT8: FALLTHROUGH_INTENDED;</a>
+<a name="ln123">          case DataType::UINT16: FALLTHROUGH_INTENDED;</a>
+<a name="ln124">          case DataType::UINT32: FALLTHROUGH_INTENDED;</a>
+<a name="ln125">          case DataType::UINT64:</a>
+<a name="ln126">            break;</a>
+<a name="ln127">        }</a>
+<a name="ln128">        return STATUS_SUBSTITUTE(</a>
+<a name="ln129">            NotSupported, &quot;Unsupported datatype $0&quot;, static_cast&lt;int&gt;(type-&gt;main()));</a>
+<a name="ln130">      }</a>
+<a name="ln131">      Slice data(v-&gt;value);</a>
+<a name="ln132">      return value-&gt;Deserialize(type, YQL_CLIENT_CQL, &amp;data);</a>
+<a name="ln133">    }</a>
+<a name="ln134">    case Value::Kind::IS_NULL:</a>
+<a name="ln135">      value-&gt;SetNull();</a>
+<a name="ln136">      return Status::OK();</a>
+<a name="ln137">    case Value::Kind::NOT_SET:</a>
+<a name="ln138">      // The RuntimeError status code will be mapped later into the non-retryable INVALID_REQUEST</a>
+<a name="ln139">      // error code (non-retryable due to not mapping into STALE_METADATA code later).</a>
+<a name="ln140">      return STATUS(RuntimeError, &quot;Bind variable was not set&quot;);</a>
+<a name="ln141">  }</a>
+<a name="ln142">  return STATUS_SUBSTITUTE(</a>
+<a name="ln143">      RuntimeError, &quot;Invalid bind variable kind $0&quot;, static_cast&lt;int&gt;(v-&gt;kind));</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146">Status CQLMessage::QueryParameters::ValidateConsistency() {</a>
+<a name="ln147">  switch(consistency) {</a>
+<a name="ln148">    case Consistency::LOCAL_ONE: FALLTHROUGH_INTENDED;</a>
+<a name="ln149">    case Consistency::QUORUM: {</a>
+<a name="ln150">      // We are repurposing cassandra's &quot;QUORUM&quot; consistency level to indicate &quot;STRONG&quot;</a>
+<a name="ln151">      // consistency for YB. Although, by default the datastax client uses &quot;LOCAL_ONE&quot; as its</a>
+<a name="ln152">      // consistency level and since by default we want to support STRONG consistency, we use</a>
+<a name="ln153">      // STRONG consistency even for LOCAL_ONE. This way existing cassandra clients don't need</a>
+<a name="ln154">      // any changes.</a>
+<a name="ln155">      set_yb_consistency_level(YBConsistencyLevel::STRONG);</a>
+<a name="ln156">      break;</a>
+<a name="ln157">    }</a>
+<a name="ln158">    case Consistency::ONE: {</a>
+<a name="ln159">      // Here we repurpose cassandra's ONE consistency level to be CONSISTENT_PREFIX for us since</a>
+<a name="ln160">      // that seems to be the most appropriate.</a>
+<a name="ln161">      set_yb_consistency_level(YBConsistencyLevel::CONSISTENT_PREFIX);</a>
+<a name="ln162">      break;</a>
+<a name="ln163">    }</a>
+<a name="ln164">    default:</a>
+<a name="ln165">      YB_LOG_EVERY_N_SECS(WARNING, 10) &lt;&lt; &quot;Consistency level &quot; &lt;&lt; static_cast&lt;uint16_t&gt;(consistency)</a>
+<a name="ln166">                                       &lt;&lt; &quot; is not supported, defaulting to strong consistency&quot;;</a>
+<a name="ln167">      set_yb_consistency_level(YBConsistencyLevel::STRONG);</a>
+<a name="ln168">  }</a>
+<a name="ln169">  return Status::OK();</a>
+<a name="ln170">}</a>
+<a name="ln171"> </a>
+<a name="ln172">namespace {</a>
+<a name="ln173"> </a>
+<a name="ln174">template&lt;class Type&gt;</a>
+<a name="ln175">Type LoadByte(const Slice&amp; slice, size_t offset) {</a>
+<a name="ln176">  return static_cast&lt;Type&gt;(Load8(slice.data() + offset));</a>
+<a name="ln177">}</a>
+<a name="ln178"> </a>
+<a name="ln179">template&lt;class Type&gt;</a>
+<a name="ln180">Type LoadShort(const Slice&amp; slice, size_t offset) {</a>
+<a name="ln181">  return static_cast&lt;Type&gt;(NetworkByteOrder::Load16(slice.data() + offset));</a>
+<a name="ln182">}</a>
+<a name="ln183"> </a>
+<a name="ln184">template&lt;class Type&gt;</a>
+<a name="ln185">Type LoadInt(const Slice&amp; slice, size_t offset) {</a>
+<a name="ln186">  return static_cast&lt;Type&gt;(NetworkByteOrder::Load32(slice.data() + offset));</a>
+<a name="ln187">}</a>
+<a name="ln188"> </a>
+<a name="ln189">} // namespace</a>
+<a name="ln190"> </a>
+<a name="ln191">// ------------------------------------ CQL request -----------------------------------</a>
+<a name="ln192">bool CQLRequest::ParseRequest(</a>
+<a name="ln193">  const Slice&amp; mesg, const CompressionScheme compression_scheme,</a>
+<a name="ln194">  unique_ptr&lt;CQLRequest&gt;* request, unique_ptr&lt;CQLResponse&gt;* error_response) {</a>
+<a name="ln195"> </a>
+<a name="ln196">  *request = nullptr;</a>
+<a name="ln197">  *error_response = nullptr;</a>
+<a name="ln198"> </a>
+<a name="ln199">  if (mesg.size() &lt; kMessageHeaderLength) {</a>
+<a name="ln200">    error_response-&gt;reset(</a>
+<a name="ln201">        new ErrorResponse(</a>
+<a name="ln202">            static_cast&lt;StreamId&gt;(0), ErrorResponse::Code::PROTOCOL_ERROR, &quot;Incomplete header&quot;));</a>
+<a name="ln203">    return false;</a>
+<a name="ln204">  }</a>
+<a name="ln205"> </a>
+<a name="ln206">  Header header(</a>
+<a name="ln207">      LoadByte&lt;Version&gt;(mesg, kHeaderPosVersion),</a>
+<a name="ln208">      LoadByte&lt;Flags&gt;(mesg, kHeaderPosFlags),</a>
+<a name="ln209">      ParseStreamId(mesg),</a>
+<a name="ln210">      LoadByte&lt;Opcode&gt;(mesg, kHeaderPosOpcode));</a>
+<a name="ln211"> </a>
+<a name="ln212">  uint32_t length = LoadInt&lt;uint32_t&gt;(mesg, kHeaderPosLength);</a>
+<a name="ln213">  DVLOG(4) &lt;&lt; &quot;CQL message &quot;</a>
+<a name="ln214">           &lt;&lt; &quot;version 0x&quot; &lt;&lt; std::hex &lt;&lt; static_cast&lt;uint32_t&gt;(header.version)   &lt;&lt; &quot; &quot;</a>
+<a name="ln215">           &lt;&lt; &quot;flags 0x&quot;   &lt;&lt; std::hex &lt;&lt; static_cast&lt;uint32_t&gt;(header.flags)     &lt;&lt; &quot; &quot;</a>
+<a name="ln216">           &lt;&lt; &quot;stream id &quot; &lt;&lt; std::dec &lt;&lt; static_cast&lt;uint32_t&gt;(header.stream_id) &lt;&lt; &quot; &quot;</a>
+<a name="ln217">           &lt;&lt; &quot;opcode 0x&quot;  &lt;&lt; std::hex &lt;&lt; static_cast&lt;uint32_t&gt;(header.opcode)    &lt;&lt; &quot; &quot;</a>
+<a name="ln218">           &lt;&lt; &quot;length &quot;    &lt;&lt; std::dec &lt;&lt; static_cast&lt;uint32_t&gt;(length);</a>
+<a name="ln219"> </a>
+<a name="ln220">  // Verify proper version that the response bit is not set in the request protocol version and</a>
+<a name="ln221">  // the protocol version is one we support.</a>
+<a name="ln222">  if (header.version &amp; kResponseVersion) {</a>
+<a name="ln223">    error_response-&gt;reset(</a>
+<a name="ln224">        new ErrorResponse(</a>
+<a name="ln225">            header.stream_id, ErrorResponse::Code::PROTOCOL_ERROR, &quot;Not a request&quot;));</a>
+<a name="ln226">    return false;</a>
+<a name="ln227">  }</a>
+<a name="ln228">  if (header.version &lt; kMinimumVersion || header.version &gt; kCurrentVersion) {</a>
+<a name="ln229">    error_response-&gt;reset(</a>
+<a name="ln230">        new ErrorResponse(</a>
+<a name="ln231">            header.stream_id, ErrorResponse::Code::PROTOCOL_ERROR,</a>
+<a name="ln232">            Substitute(&quot;Invalid or unsupported protocol version $0. Supported versions are between &quot;</a>
+<a name="ln233">                       &quot;$1 and $2.&quot;, header.version, kMinimumVersion, kCurrentVersion)));</a>
+<a name="ln234">    return false;</a>
+<a name="ln235">  }</a>
+<a name="ln236"> </a>
+<a name="ln237">  size_t body_size = mesg.size() - kMessageHeaderLength;</a>
+<a name="ln238">  const uint8_t* body_data = body_size &gt; 0 ? mesg.data() + kMessageHeaderLength : to_uchar_ptr(&quot;&quot;);</a>
+<a name="ln239">  unique_ptr&lt;uint8_t[]&gt; buffer;</a>
+<a name="ln240"> </a>
+<a name="ln241">  // If the message body is compressed, uncompress it.</a>
+<a name="ln242">  if (body_size &gt; 0 &amp;&amp; (header.flags &amp; kCompressionFlag)) {</a>
+<a name="ln243">    if (header.opcode == Opcode::STARTUP) {</a>
+<a name="ln244">      error_response-&gt;reset(</a>
+<a name="ln245">          new ErrorResponse(</a>
+<a name="ln246">              header.stream_id, ErrorResponse::Code::PROTOCOL_ERROR,</a>
+<a name="ln247">              &quot;STARTUP request should not be compressed&quot;));</a>
+<a name="ln248">      return false;</a>
+<a name="ln249">    }</a>
+<a name="ln250">    switch (compression_scheme) {</a>
+<a name="ln251">      case CompressionScheme::kLz4: {</a>
+<a name="ln252">        if (body_size &lt; sizeof(uint32_t)) {</a>
+<a name="ln253">          error_response-&gt;reset(</a>
+<a name="ln254">              new ErrorResponse(</a>
+<a name="ln255">                  header.stream_id, ErrorResponse::Code::PROTOCOL_ERROR,</a>
+<a name="ln256">                  &quot;Insufficient compressed data&quot;));</a>
+<a name="ln257">          return false;</a>
+<a name="ln258">        }</a>
+<a name="ln259"> </a>
+<a name="ln260">        const uint32_t uncomp_size = static_cast&lt;uint32_t&gt;(NetworkByteOrder::Load32(body_data));</a>
+<a name="ln261">        buffer = std::make_unique&lt;uint8_t[]&gt;(uncomp_size);</a>
+<a name="ln262">        body_data += sizeof(uncomp_size);</a>
+<a name="ln263">        body_size -= sizeof(uncomp_size);</a>
+<a name="ln264">        const int size = LZ4_decompress_safe(to_char_ptr(body_data), to_char_ptr(buffer.get()),</a>
+<a name="ln265">                                             body_size, uncomp_size);</a>
+<a name="ln266">        if (size &lt; 0 || size != uncomp_size) {</a>
+<a name="ln267">          error_response-&gt;reset(</a>
+<a name="ln268">              new ErrorResponse(</a>
+<a name="ln269">                  header.stream_id, ErrorResponse::Code::PROTOCOL_ERROR,</a>
+<a name="ln270">                  &quot;Error occurred when uncompressing CQL message&quot;));</a>
+<a name="ln271">          return false;</a>
+<a name="ln272">        }</a>
+<a name="ln273">        body_data = buffer.get();</a>
+<a name="ln274">        body_size = uncomp_size;</a>
+<a name="ln275">        break;</a>
+<a name="ln276">      }</a>
+<a name="ln277">      case CompressionScheme::kSnappy: {</a>
+<a name="ln278">        size_t uncomp_size = 0;</a>
+<a name="ln279">        if (GetUncompressedLength(to_char_ptr(body_data), body_size, &amp;uncomp_size)) {</a>
+<a name="ln280">          buffer = std::make_unique&lt;uint8_t[]&gt;(uncomp_size);</a>
+<a name="ln281">          if (RawUncompress(to_char_ptr(body_data), body_size, to_char_ptr(buffer.get()))) {</a>
+<a name="ln282">            body_data = buffer.get();</a>
+<a name="ln283">            body_size = uncomp_size;</a>
+<a name="ln284">            break;</a>
+<a name="ln285">          }</a>
+<a name="ln286">        }</a>
+<a name="ln287">        error_response-&gt;reset(</a>
+<a name="ln288">            new ErrorResponse(</a>
+<a name="ln289">                header.stream_id, ErrorResponse::Code::PROTOCOL_ERROR,</a>
+<a name="ln290">                &quot;Error occurred when uncompressing CQL message&quot;));</a>
+<a name="ln291">        break;</a>
+<a name="ln292">      }</a>
+<a name="ln293">      case CompressionScheme::kNone:</a>
+<a name="ln294">        error_response-&gt;reset(</a>
+<a name="ln295">            new ErrorResponse(</a>
+<a name="ln296">                header.stream_id, ErrorResponse::Code::PROTOCOL_ERROR,</a>
+<a name="ln297">                &quot;No compression scheme specified&quot;));</a>
+<a name="ln298">        return false;</a>
+<a name="ln299">    }</a>
+<a name="ln300">  }</a>
+<a name="ln301"> </a>
+<a name="ln302">  const Slice body = (body_size == 0) ? Slice() : Slice(body_data, body_size);</a>
+<a name="ln303"> </a>
+<a name="ln304">  // Construct the skeleton request by the opcode</a>
+<a name="ln305">  switch (header.opcode) {</a>
+<a name="ln306">    case Opcode::STARTUP:</a>
+<a name="ln307">      request-&gt;reset(new StartupRequest(header, body));</a>
+<a name="ln308">      break;</a>
+<a name="ln309">    case Opcode::AUTH_RESPONSE:</a>
+<a name="ln310">      request-&gt;reset(new AuthResponseRequest(header, body));</a>
+<a name="ln311">      break;</a>
+<a name="ln312">    case Opcode::OPTIONS:</a>
+<a name="ln313">      request-&gt;reset(new OptionsRequest(header, body));</a>
+<a name="ln314">      break;</a>
+<a name="ln315">    case Opcode::QUERY:</a>
+<a name="ln316">      request-&gt;reset(new QueryRequest(header, body));</a>
+<a name="ln317">      break;</a>
+<a name="ln318">    case Opcode::PREPARE:</a>
+<a name="ln319">      request-&gt;reset(new PrepareRequest(header, body));</a>
+<a name="ln320">      break;</a>
+<a name="ln321">    case Opcode::EXECUTE:</a>
+<a name="ln322">      request-&gt;reset(new ExecuteRequest(header, body));</a>
+<a name="ln323">      break;</a>
+<a name="ln324">    case Opcode::BATCH:</a>
+<a name="ln325">      request-&gt;reset(new BatchRequest(header, body));</a>
+<a name="ln326">      break;</a>
+<a name="ln327">    case Opcode::REGISTER:</a>
+<a name="ln328">      request-&gt;reset(new RegisterRequest(header, body));</a>
+<a name="ln329">      break;</a>
+<a name="ln330"> </a>
+<a name="ln331">    // These are not request but response opcodes</a>
+<a name="ln332">    case Opcode::ERROR:</a>
+<a name="ln333">    case Opcode::READY:</a>
+<a name="ln334">    case Opcode::AUTHENTICATE:</a>
+<a name="ln335">    case Opcode::SUPPORTED:</a>
+<a name="ln336">    case Opcode::RESULT:</a>
+<a name="ln337">    case Opcode::EVENT:</a>
+<a name="ln338">    case Opcode::AUTH_CHALLENGE:</a>
+<a name="ln339">    case Opcode::AUTH_SUCCESS:</a>
+<a name="ln340">      error_response-&gt;reset(</a>
+<a name="ln341">          new ErrorResponse(</a>
+<a name="ln342">              header.stream_id, ErrorResponse::Code::PROTOCOL_ERROR, &quot;Not a request opcode&quot;));</a>
+<a name="ln343">      return false;</a>
+<a name="ln344"> </a>
+<a name="ln345">    // default: -&gt; fall through</a>
+<a name="ln346">  }</a>
+<a name="ln347"> </a>
+<a name="ln348">  if (*request == nullptr) {</a>
+<a name="ln349">    error_response-&gt;reset(</a>
+<a name="ln350">        new ErrorResponse(</a>
+<a name="ln351">            header.stream_id, ErrorResponse::Code::PROTOCOL_ERROR, &quot;Unknown opcode&quot;));</a>
+<a name="ln352">    return false;</a>
+<a name="ln353">  }</a>
+<a name="ln354"> </a>
+<a name="ln355">  // Parse the request body</a>
+<a name="ln356">  const Status status = (*request)-&gt;ParseBody();</a>
+<a name="ln357">  if (!status.ok()) {</a>
+<a name="ln358">    error_response-&gt;reset(</a>
+<a name="ln359">        new ErrorResponse(</a>
+<a name="ln360">            *(*request), ErrorResponse::Code::PROTOCOL_ERROR, status.message().ToString()));</a>
+<a name="ln361">  } else if (!(*request)-&gt;body_.empty()) {</a>
+<a name="ln362">    // Flag error when there are bytes remaining after we have parsed the whole request body</a>
+<a name="ln363">    // according to the protocol. Either the request's length field from the client is</a>
+<a name="ln364">    // wrong. Or we could have a bug in our parser.</a>
+<a name="ln365">    error_response-&gt;reset(</a>
+<a name="ln366">        new ErrorResponse(</a>
+<a name="ln367">            *(*request), ErrorResponse::Code::PROTOCOL_ERROR, &quot;Request length too long&quot;));</a>
+<a name="ln368">  }</a>
+<a name="ln369"> </a>
+<a name="ln370">  // If there is any error, free the partially parsed request and return.</a>
+<a name="ln371">  if (*error_response != nullptr) {</a>
+<a name="ln372">    *request = nullptr;</a>
+<a name="ln373">    return false;</a>
+<a name="ln374">  }</a>
+<a name="ln375"> </a>
+<a name="ln376">  // Clear and release the body after parsing.</a>
+<a name="ln377">  (*request)-&gt;body_.clear();</a>
+<a name="ln378"> </a>
+<a name="ln379">  return true;</a>
+<a name="ln380">}</a>
+<a name="ln381"> </a>
+<a name="ln382">CQLRequest::CQLRequest(const Header&amp; header, const Slice&amp; body) : CQLMessage(header), body_(body) {</a>
+<a name="ln383">}</a>
+<a name="ln384"> </a>
+<a name="ln385">CQLRequest::~CQLRequest() {</a>
+<a name="ln386">}</a>
+<a name="ln387"> </a>
+<a name="ln388">//----------------------------------------------------------------------------------------</a>
+<a name="ln389"> </a>
+<a name="ln390">Status CQLRequest::ParseUUID(string* value) {</a>
+<a name="ln391">  RETURN_NOT_ENOUGH(kUUIDSize);</a>
+<a name="ln392">  *value = string(to_char_ptr(body_.data()), kUUIDSize);</a>
+<a name="ln393">  body_.remove_prefix(kUUIDSize);</a>
+<a name="ln394">  DVLOG(4) &lt;&lt; &quot;CQL uuid &quot; &lt;&lt; *value;</a>
+<a name="ln395">  return Status::OK();</a>
+<a name="ln396">}</a>
+<a name="ln397"> </a>
+<a name="ln398">Status CQLRequest::ParseTimeUUID(string* value) {</a>
+<a name="ln399">  RETURN_NOT_ENOUGH(kUUIDSize);</a>
+<a name="ln400">  *value = string(to_char_ptr(body_.data()), kUUIDSize);</a>
+<a name="ln401">  body_.remove_prefix(kUUIDSize);</a>
+<a name="ln402">  DVLOG(4) &lt;&lt; &quot;CQL timeuuid &quot; &lt;&lt; *value;</a>
+<a name="ln403">  return Status::OK();</a>
+<a name="ln404">}</a>
+<a name="ln405"> </a>
+<a name="ln406">Status CQLRequest::ParseStringList(vector&lt;string&gt;* list) {</a>
+<a name="ln407">  DVLOG(4) &lt;&lt; &quot;CQL string list ...&quot;;</a>
+<a name="ln408">  uint16_t count = 0;</a>
+<a name="ln409">  RETURN_NOT_OK(ParseShort(&amp;count));</a>
+<a name="ln410">  list-&gt;resize(count);</a>
+<a name="ln411">  for (uint16_t i = 0; i &lt; count; ++i) {</a>
+<a name="ln412">    RETURN_NOT_OK(ParseString(&amp;list-&gt;at(i)));</a>
+<a name="ln413">  }</a>
+<a name="ln414">  return Status::OK();</a>
+<a name="ln415">}</a>
+<a name="ln416"> </a>
+<a name="ln417">Status CQLRequest::ParseInet(Endpoint* value) {</a>
+<a name="ln418">  std::string ipaddr;</a>
+<a name="ln419">  int32_t port = 0;</a>
+<a name="ln420">  RETURN_NOT_OK(ParseBytes(&quot;CQL ipaddr&quot;, &amp;CQLRequest::ParseByte, &amp;ipaddr));</a>
+<a name="ln421">  RETURN_NOT_OK(ParseInt(&amp;port));</a>
+<a name="ln422">  if (port &lt; 0 || port &gt; 65535) {</a>
+<a name="ln423">    return STATUS(NetworkError, &quot;Invalid inet port&quot;);</a>
+<a name="ln424">  }</a>
+<a name="ln425">  IpAddress address;</a>
+<a name="ln426">  if (ipaddr.size() == boost::asio::ip::address_v4::bytes_type().size()) {</a>
+<a name="ln427">    boost::asio::ip::address_v4::bytes_type bytes;</a>
+<a name="ln428">    memcpy(bytes.data(), ipaddr.data(), ipaddr.size());</a>
+<a name="ln429">    address = boost::asio::ip::address_v4(bytes);</a>
+<a name="ln430">  } else if (ipaddr.size() == boost::asio::ip::address_v6::bytes_type().size()) {</a>
+<a name="ln431">    boost::asio::ip::address_v6::bytes_type bytes;</a>
+<a name="ln432">    memcpy(bytes.data(), ipaddr.data(), ipaddr.size());</a>
+<a name="ln433">    address = boost::asio::ip::address_v6(bytes);</a>
+<a name="ln434">  } else {</a>
+<a name="ln435">    return STATUS_SUBSTITUTE(NetworkError, &quot;Invalid size of ipaddr: $0&quot;, ipaddr.size());</a>
+<a name="ln436">  }</a>
+<a name="ln437">  *value = Endpoint(address, port);</a>
+<a name="ln438">  DVLOG(4) &lt;&lt; &quot;CQL inet &quot; &lt;&lt; *value;</a>
+<a name="ln439">  return Status::OK();</a>
+<a name="ln440">}</a>
+<a name="ln441"> </a>
+<a name="ln442">Status CQLRequest::ParseStringMap(unordered_map&lt;string, string&gt;* map) {</a>
+<a name="ln443">  DVLOG(4) &lt;&lt; &quot;CQL string map ...&quot;;</a>
+<a name="ln444">  uint16_t count = 0;</a>
+<a name="ln445">  RETURN_NOT_OK(ParseShort(&amp;count));</a>
+<a name="ln446">  for (uint16_t i = 0; i &lt; count; ++i) {</a>
+<a name="ln447">    string name, value;</a>
+<a name="ln448">    RETURN_NOT_OK(ParseString(&amp;name));</a>
+<a name="ln449">    RETURN_NOT_OK(ParseString(&amp;value));</a>
+<a name="ln450">    (*map)[name] = value;</a>
+<a name="ln451">  }</a>
+<a name="ln452">  return Status::OK();</a>
+<a name="ln453">}</a>
+<a name="ln454"> </a>
+<a name="ln455">Status CQLRequest::ParseStringMultiMap(unordered_map&lt;string, vector&lt;string&gt;&gt;* map) {</a>
+<a name="ln456">  DVLOG(4) &lt;&lt; &quot;CQL string multimap ...&quot;;</a>
+<a name="ln457">  uint16_t count = 0;</a>
+<a name="ln458">  RETURN_NOT_OK(ParseShort(&amp;count));</a>
+<a name="ln459">  for (uint16_t i = 0; i &lt; count; ++i) {</a>
+<a name="ln460">    string name;</a>
+<a name="ln461">    vector&lt;string&gt; value;</a>
+<a name="ln462">    RETURN_NOT_OK(ParseString(&amp;name));</a>
+<a name="ln463">    RETURN_NOT_OK(ParseStringList(&amp;value));</a>
+<a name="ln464">    (*map)[name] = value;</a>
+<a name="ln465">  }</a>
+<a name="ln466">  return Status::OK();</a>
+<a name="ln467">}</a>
+<a name="ln468"> </a>
+<a name="ln469">Status CQLRequest::ParseBytesMap(unordered_map&lt;string, string&gt;* map) {</a>
+<a name="ln470">  DVLOG(4) &lt;&lt; &quot;CQL bytes map ...&quot;;</a>
+<a name="ln471">  uint16_t count = 0;</a>
+<a name="ln472">  RETURN_NOT_OK(ParseShort(&amp;count));</a>
+<a name="ln473">  for (uint16_t i = 0; i &lt; count; ++i) {</a>
+<a name="ln474">    string name, value;</a>
+<a name="ln475">    RETURN_NOT_OK(ParseString(&amp;name));</a>
+<a name="ln476">    RETURN_NOT_OK(ParseBytes(&amp;value));</a>
+<a name="ln477">    (*map)[name] = value;</a>
+<a name="ln478">  }</a>
+<a name="ln479">  return Status::OK();</a>
+<a name="ln480">}</a>
+<a name="ln481"> </a>
+<a name="ln482">Status CQLRequest::ParseValue(const bool with_name, Value* value) {</a>
+<a name="ln483">  DVLOG(4) &lt;&lt; &quot;CQL value ...&quot;;</a>
+<a name="ln484">  if (with_name) {</a>
+<a name="ln485">    RETURN_NOT_OK(ParseString(&amp;value-&gt;name));</a>
+<a name="ln486">  }</a>
+<a name="ln487">  // Save data pointer to assign the value with length bytes below.</a>
+<a name="ln488">  const uint8_t* data = body_.data();</a>
+<a name="ln489">  int32_t length = 0;</a>
+<a name="ln490">  RETURN_NOT_OK(ParseInt(&amp;length));</a>
+<a name="ln491">  if (length &gt;= 0) {</a>
+<a name="ln492">    value-&gt;kind = Value::Kind::NOT_NULL;</a>
+<a name="ln493">    if (length &gt; 0) {</a>
+<a name="ln494">      RETURN_NOT_ENOUGH(length);</a>
+<a name="ln495">      value-&gt;value.assign(to_char_ptr(data), kIntSize + length);</a>
+<a name="ln496">      body_.remove_prefix(length);</a>
+<a name="ln497">      DVLOG(4) &lt;&lt; &quot;CQL value bytes &quot; &lt;&lt; value-&gt;value;</a>
+<a name="ln498">    }</a>
+<a name="ln499">  } else if (VersionIsCompatible(kV4Version)) {</a>
+<a name="ln500">    switch (length) {</a>
+<a name="ln501">      case -1:</a>
+<a name="ln502">        value-&gt;kind = Value::Kind::IS_NULL;</a>
+<a name="ln503">        break;</a>
+<a name="ln504">      case -2:</a>
+<a name="ln505">        value-&gt;kind = Value::Kind::NOT_SET;</a>
+<a name="ln506">        break;</a>
+<a name="ln507">      default:</a>
+<a name="ln508">        return STATUS(NetworkError, &quot;Invalid length in value&quot;);</a>
+<a name="ln509">        break;</a>
+<a name="ln510">    }</a>
+<a name="ln511">  } else {</a>
+<a name="ln512">    value-&gt;kind = Value::Kind::IS_NULL;</a>
+<a name="ln513">  }</a>
+<a name="ln514">  return Status::OK();</a>
+<a name="ln515">}</a>
+<a name="ln516"> </a>
+<a name="ln517">Status CQLRequest::ParseQueryParameters(QueryParameters* params) {</a>
+<a name="ln518">  DVLOG(4) &lt;&lt; &quot;CQL query parameters ...&quot;;</a>
+<a name="ln519">  RETURN_NOT_OK(ParseConsistency(&amp;params-&gt;consistency));</a>
+<a name="ln520">  RETURN_NOT_OK(params-&gt;ValidateConsistency());</a>
+<a name="ln521">  RETURN_NOT_OK(ParseByte(&amp;params-&gt;flags));</a>
+<a name="ln522">  params-&gt;set_request_id(RandomUniformInt&lt;uint64_t&gt;());</a>
+<a name="ln523">  if (params-&gt;flags &amp; CQLMessage::QueryParameters::kWithValuesFlag) {</a>
+<a name="ln524">    const bool with_name = (params-&gt;flags &amp; CQLMessage::QueryParameters::kWithNamesForValuesFlag);</a>
+<a name="ln525">    uint16_t count = 0;</a>
+<a name="ln526">    RETURN_NOT_OK(ParseShort(&amp;count));</a>
+<a name="ln527">    params-&gt;values.resize(count);</a>
+<a name="ln528">    for (uint16_t i = 0; i &lt; count; ++i) {</a>
+<a name="ln529">      Value&amp; value = params-&gt;values[i];</a>
+<a name="ln530">      RETURN_NOT_OK(ParseValue(with_name, &amp;value));</a>
+<a name="ln531">      if (with_name) {</a>
+<a name="ln532">        params-&gt;value_map[value.name] = i;</a>
+<a name="ln533">      }</a>
+<a name="ln534">    }</a>
+<a name="ln535">  }</a>
+<a name="ln536">  if (params-&gt;flags &amp; CQLMessage::QueryParameters::kWithPageSizeFlag) {</a>
+<a name="ln537">    int32_t page_size = 0;</a>
+<a name="ln538">    RETURN_NOT_OK(ParseInt(&amp;page_size));</a>
+<a name="ln539">    params-&gt;set_page_size(page_size);</a>
+<a name="ln540">  }</a>
+<a name="ln541">  if (params-&gt;flags &amp; CQLMessage::QueryParameters::kWithPagingStateFlag) {</a>
+<a name="ln542">    string paging_state;</a>
+<a name="ln543">    RETURN_NOT_OK(ParseBytes(&amp;paging_state));</a>
+<a name="ln544">    RETURN_NOT_OK(params-&gt;SetPagingState(paging_state));</a>
+<a name="ln545">  }</a>
+<a name="ln546">  if (params-&gt;flags &amp; CQLMessage::QueryParameters::kWithSerialConsistencyFlag) {</a>
+<a name="ln547">    RETURN_NOT_OK(ParseConsistency(&amp;params-&gt;serial_consistency));</a>
+<a name="ln548">  }</a>
+<a name="ln549">  if (params-&gt;flags &amp; CQLMessage::QueryParameters::kWithDefaultTimestampFlag) {</a>
+<a name="ln550">    RETURN_NOT_OK(ParseLong(&amp;params-&gt;default_timestamp));</a>
+<a name="ln551">  }</a>
+<a name="ln552">  return Status::OK();</a>
+<a name="ln553">}</a>
+<a name="ln554"> </a>
+<a name="ln555">// ------------------------------ Individual CQL requests -----------------------------------</a>
+<a name="ln556">StartupRequest::StartupRequest(const Header&amp; header, const Slice&amp; body)</a>
+<a name="ln557">    : CQLRequest(header, body) {</a>
+<a name="ln558">}</a>
+<a name="ln559"> </a>
+<a name="ln560">StartupRequest::~StartupRequest() {</a>
+<a name="ln561">}</a>
+<a name="ln562"> </a>
+<a name="ln563">Status StartupRequest::ParseBody() {</a>
+<a name="ln564">  return ParseStringMap(&amp;options_);</a>
+<a name="ln565">}</a>
+<a name="ln566"> </a>
+<a name="ln567">//----------------------------------------------------------------------------------------</a>
+<a name="ln568">AuthResponseRequest::AuthResponseRequest(const Header&amp; header, const Slice&amp; body)</a>
+<a name="ln569">    : CQLRequest(header, body) {</a>
+<a name="ln570">}</a>
+<a name="ln571"> </a>
+<a name="ln572">AuthResponseRequest::~AuthResponseRequest() {</a>
+<a name="ln573">}</a>
+<a name="ln574"> </a>
+<a name="ln575">Status AuthResponseRequest::ParseBody() {</a>
+<a name="ln576">  RETURN_NOT_OK(ParseBytes(&amp;token_));</a>
+<a name="ln577">  string error_msg;</a>
+<a name="ln578">  do {</a>
+<a name="ln579">    if (token_.empty()) {</a>
+<a name="ln580">      error_msg = &quot;Invalid empty token!&quot;;</a>
+<a name="ln581">      break;</a>
+<a name="ln582">    }</a>
+<a name="ln583">    if (token_[0] != '\0') {</a>
+<a name="ln584">      error_msg = &quot;Invalid format. Message must begin with \\0&quot;;</a>
+<a name="ln585">      break;</a>
+<a name="ln586">    }</a>
+<a name="ln587">    size_t next_delim = token_.find_first_of('\0', 1);</a>
+<a name="ln588">    if (next_delim == std::string::npos) {</a>
+<a name="ln589">      error_msg = &quot;Invalid format. Message must contain \\0 after username&quot;;</a>
+<a name="ln590">      break;</a>
+<a name="ln591">    }</a>
+<a name="ln592">    // Start from token_[1], read all the username.</a>
+<a name="ln593">    params_.username = token_.substr(1, next_delim - 1);</a>
+<a name="ln594">    // Start from after the delimiter, go to the end.</a>
+<a name="ln595">    params_.password = token_.substr(next_delim + 1);</a>
+<a name="ln596">    return Status::OK();</a>
+<a name="ln597">  } while (0);</a>
+<a name="ln598">  return STATUS(InvalidArgument, error_msg);</a>
+<a name="ln599">}</a>
+<a name="ln600"> </a>
+<a name="ln601">CHECKED_STATUS AuthResponseRequest::AuthQueryParameters::GetBindVariable(</a>
+<a name="ln602">    const std::string&amp; name,</a>
+<a name="ln603">    int64_t pos,</a>
+<a name="ln604">    const std::shared_ptr&lt;QLType&gt;&amp; type,</a>
+<a name="ln605">    QLValue* value) const {</a>
+<a name="ln606">  if (pos == 0) {</a>
+<a name="ln607">    value-&gt;set_string_value(username);</a>
+<a name="ln608">    return Status::OK();</a>
+<a name="ln609">  } else {</a>
+<a name="ln610">    return STATUS(InvalidArgument, Substitute(&quot;Bind variable position $0 out of range: &quot;, pos));</a>
+<a name="ln611">  }</a>
+<a name="ln612">}</a>
+<a name="ln613"> </a>
+<a name="ln614">//----------------------------------------------------------------------------------------</a>
+<a name="ln615">OptionsRequest::OptionsRequest(const Header&amp; header, const Slice&amp; body) : CQLRequest(header, body) {</a>
+<a name="ln616">}</a>
+<a name="ln617"> </a>
+<a name="ln618">OptionsRequest::~OptionsRequest() {</a>
+<a name="ln619">}</a>
+<a name="ln620"> </a>
+<a name="ln621">Status OptionsRequest::ParseBody() {</a>
+<a name="ln622">  // Options body is empty</a>
+<a name="ln623">  return Status::OK();</a>
+<a name="ln624">}</a>
+<a name="ln625"> </a>
+<a name="ln626">//----------------------------------------------------------------------------------------</a>
+<a name="ln627">QueryRequest::QueryRequest(const Header&amp; header, const Slice&amp; body) : CQLRequest(header, body) {</a>
+<a name="ln628">}</a>
+<a name="ln629"> </a>
+<a name="ln630">QueryRequest::~QueryRequest() {</a>
+<a name="ln631">}</a>
+<a name="ln632"> </a>
+<a name="ln633">Status QueryRequest::ParseBody() {</a>
+<a name="ln634">  RETURN_NOT_OK(ParseLongString(&amp;query_));</a>
+<a name="ln635">  RETURN_NOT_OK(ParseQueryParameters(&amp;params_));</a>
+<a name="ln636">  return Status::OK();</a>
+<a name="ln637">}</a>
+<a name="ln638"> </a>
+<a name="ln639">//----------------------------------------------------------------------------------------</a>
+<a name="ln640">PrepareRequest::PrepareRequest(const Header&amp; header, const Slice&amp; body) : CQLRequest(header, body) {</a>
+<a name="ln641">}</a>
+<a name="ln642"> </a>
+<a name="ln643">PrepareRequest::~PrepareRequest() {</a>
+<a name="ln644">}</a>
+<a name="ln645"> </a>
+<a name="ln646">Status PrepareRequest::ParseBody() {</a>
+<a name="ln647">  RETURN_NOT_OK(ParseLongString(&amp;query_));</a>
+<a name="ln648">  return Status::OK();</a>
+<a name="ln649">}</a>
+<a name="ln650"> </a>
+<a name="ln651">//----------------------------------------------------------------------------------------</a>
+<a name="ln652">ExecuteRequest::ExecuteRequest(const Header&amp; header, const Slice&amp; body) : CQLRequest(header, body) {</a>
+<a name="ln653">}</a>
+<a name="ln654"> </a>
+<a name="ln655">ExecuteRequest::~ExecuteRequest() {</a>
+<a name="ln656">}</a>
+<a name="ln657"> </a>
+<a name="ln658">Status ExecuteRequest::ParseBody() {</a>
+<a name="ln659">  RETURN_NOT_OK(ParseShortBytes(&amp;query_id_));</a>
+<a name="ln660">  RETURN_NOT_OK(ParseQueryParameters(&amp;params_));</a>
+<a name="ln661">  return Status::OK();</a>
+<a name="ln662">}</a>
+<a name="ln663"> </a>
+<a name="ln664">//----------------------------------------------------------------------------------------</a>
+<a name="ln665">BatchRequest::BatchRequest(const Header&amp; header, const Slice&amp; body) : CQLRequest(header, body) {</a>
+<a name="ln666">}</a>
+<a name="ln667"> </a>
+<a name="ln668">BatchRequest::~BatchRequest() {</a>
+<a name="ln669">}</a>
+<a name="ln670"> </a>
+<a name="ln671">Status BatchRequest::ParseBody() {</a>
+<a name="ln672">  uint8_t type = 0;</a>
+<a name="ln673">  RETURN_NOT_OK(ParseByte(&amp;type));</a>
+<a name="ln674">  type_ = static_cast&lt;Type&gt;(type);</a>
+<a name="ln675">  uint16_t query_count = 0;</a>
+<a name="ln676">  RETURN_NOT_OK(ParseShort(&amp;query_count));</a>
+<a name="ln677">  queries_.resize(query_count);</a>
+<a name="ln678">  for (uint16_t i = 0; i &lt; query_count; ++i) {</a>
+<a name="ln679">    Query&amp; query = queries_[i];</a>
+<a name="ln680">    uint8_t is_prepared_query = 0;</a>
+<a name="ln681">    RETURN_NOT_OK(ParseByte(&amp;is_prepared_query));</a>
+<a name="ln682">    switch (is_prepared_query) {</a>
+<a name="ln683">      case 0:</a>
+<a name="ln684">        query.is_prepared = false;</a>
+<a name="ln685">        RETURN_NOT_OK(ParseLongString(&amp;query.query));</a>
+<a name="ln686">        break;</a>
+<a name="ln687">      case 1:</a>
+<a name="ln688">        query.is_prepared = true;</a>
+<a name="ln689">        RETURN_NOT_OK(ParseShortBytes(&amp;query.query_id));</a>
+<a name="ln690">        break;</a>
+<a name="ln691">      default:</a>
+<a name="ln692">        return STATUS(NetworkError, &quot;Invalid is_prepared_query byte in batch request&quot;);</a>
+<a name="ln693">        break;</a>
+<a name="ln694">    }</a>
+<a name="ln695">    uint16_t value_count = 0;</a>
+<a name="ln696">    RETURN_NOT_OK(ParseShort(&amp;value_count));</a>
+<a name="ln697">    query.params.values.resize(value_count);</a>
+<a name="ln698">    for (uint16_t j = 0; j &lt; value_count; ++j) {</a>
+<a name="ln699">      // with_name is not possible in the protocol due to a design flaw. See JIRA CASSANDRA-10246.</a>
+<a name="ln700">      RETURN_NOT_OK(ParseValue(false /* with_name */, &amp;query.params.values[j]));</a>
+<a name="ln701">    }</a>
+<a name="ln702">  }</a>
+<a name="ln703"> </a>
+<a name="ln704">  Consistency consistency = Consistency::ANY;</a>
+<a name="ln705">  QueryParameters::Flags flags = 0;</a>
+<a name="ln706">  Consistency serial_consistency = Consistency::ANY;</a>
+<a name="ln707">  int64_t default_timestamp = 0;</a>
+<a name="ln708">  RETURN_NOT_OK(ParseConsistency(&amp;consistency));</a>
+<a name="ln709">  RETURN_NOT_OK(ParseByte(&amp;flags));</a>
+<a name="ln710">  if (flags &amp; CQLMessage::QueryParameters::kWithSerialConsistencyFlag) {</a>
+<a name="ln711">    RETURN_NOT_OK(ParseConsistency(&amp;serial_consistency));</a>
+<a name="ln712">  }</a>
+<a name="ln713">  if (flags &amp; CQLMessage::QueryParameters::kWithDefaultTimestampFlag) {</a>
+<a name="ln714">    RETURN_NOT_OK(ParseLong(&amp;default_timestamp));</a>
+<a name="ln715">  }</a>
+<a name="ln716"> </a>
+<a name="ln717">  for (Query&amp; query : queries_) {</a>
+<a name="ln718">    QueryParameters&amp; params = query.params;</a>
+<a name="ln719">    params.consistency = consistency;</a>
+<a name="ln720">    params.flags = flags;</a>
+<a name="ln721">    params.serial_consistency = serial_consistency;</a>
+<a name="ln722">    params.default_timestamp = default_timestamp;</a>
+<a name="ln723">  }</a>
+<a name="ln724">  return Status::OK();</a>
+<a name="ln725">}</a>
+<a name="ln726"> </a>
+<a name="ln727">//----------------------------------------------------------------------------------------</a>
+<a name="ln728">RegisterRequest::RegisterRequest(const Header&amp; header, const Slice&amp; body)</a>
+<a name="ln729">    : CQLRequest(header, body) {</a>
+<a name="ln730">}</a>
+<a name="ln731"> </a>
+<a name="ln732">RegisterRequest::~RegisterRequest() {</a>
+<a name="ln733">}</a>
+<a name="ln734"> </a>
+<a name="ln735">Status RegisterRequest::ParseBody() {</a>
+<a name="ln736">  vector&lt;string&gt; event_types;</a>
+<a name="ln737">  RETURN_NOT_OK(ParseStringList(&amp;event_types));</a>
+<a name="ln738">  events_ = kNoEvents;</a>
+<a name="ln739"> </a>
+<a name="ln740">  for (const string&amp; event_type : event_types) {</a>
+<a name="ln741">    if (event_type == kTopologyChangeEvent) {</a>
+<a name="ln742">      events_ |= kTopologyChange;</a>
+<a name="ln743">    } else if (event_type == kStatusChangeEvent) {</a>
+<a name="ln744">      events_ |= kStatusChange;</a>
+<a name="ln745">    } else if (event_type == kSchemaChangeEvent) {</a>
+<a name="ln746">      events_ |= kSchemaChange;</a>
+<a name="ln747">    } else {</a>
+<a name="ln748">      return STATUS(NetworkError, &quot;Invalid event type in register request&quot;);</a>
+<a name="ln749">    }</a>
+<a name="ln750">  }</a>
+<a name="ln751"> </a>
+<a name="ln752">  return Status::OK();</a>
+<a name="ln753">}</a>
+<a name="ln754"> </a>
+<a name="ln755">// --------------------------- Serialization utility functions -------------------------------</a>
+<a name="ln756">namespace {</a>
+<a name="ln757"> </a>
+<a name="ln758">using yb::cqlserver::CQLMessage;</a>
+<a name="ln759"> </a>
+<a name="ln760">// Serialize a CQL number (8, 16, 32 and 64-bit integer). &lt;num_type&gt; is the integer type.</a>
+<a name="ln761">// &lt;converter&gt; converts the number from machine byte-order to network order and &lt;data_type&gt;</a>
+<a name="ln762">// is the coverter's return type. The converter's return type &lt;data_type&gt; is unsigned while</a>
+<a name="ln763">// &lt;num_type&gt; may be signed or unsigned.</a>
+<a name="ln764">template&lt;typename num_type, typename data_type&gt;</a>
+<a name="ln765">void SerializeNum(void (*converter)(void *, data_type), const num_type val, faststring* mesg) {</a>
+<a name="ln766">  data_type byte_value;</a>
+<a name="ln767">  (*converter)(&amp;byte_value, static_cast&lt;data_type&gt;(val));</a>
+<a name="ln768">  mesg-&gt;append(&amp;byte_value, sizeof(byte_value));</a>
+<a name="ln769">}</a>
+<a name="ln770"> </a>
+<a name="ln771">// Serialize a CQL byte stream (string or bytes). &lt;len_type&gt; is the length type.</a>
+<a name="ln772">// &lt;len_serializer&gt; serializes the byte length from machine byte-order to network order.</a>
+<a name="ln773">template&lt;typename len_type&gt;</a>
+<a name="ln774">inline void SerializeBytes(</a>
+<a name="ln775">    void (*len_serializer)(len_type, faststring* mesg), string val,</a>
+<a name="ln776">    faststring* mesg) {</a>
+<a name="ln777">  (*len_serializer)(static_cast&lt;len_type&gt;(val.size()), mesg);</a>
+<a name="ln778">  mesg-&gt;append(val);</a>
+<a name="ln779">}</a>
+<a name="ln780"> </a>
+<a name="ln781">inline void SerializeByte(const uint8_t value, faststring* mesg) {</a>
+<a name="ln782">  static_assert(sizeof(value) == CQLMessage::kByteSize, &quot;inconsistent byte size&quot;);</a>
+<a name="ln783">  SerializeNum(Store8, value, mesg);</a>
+<a name="ln784">}</a>
+<a name="ln785"> </a>
+<a name="ln786">inline void SerializeShort(const uint16_t value, faststring* mesg) {</a>
+<a name="ln787">  static_assert(sizeof(value) == CQLMessage::kShortSize, &quot;inconsistent short size&quot;);</a>
+<a name="ln788">  SerializeNum(NetworkByteOrder::Store16, value, mesg);</a>
+<a name="ln789">}</a>
+<a name="ln790"> </a>
+<a name="ln791">inline void SerializeInt(const int32_t value, faststring* mesg) {</a>
+<a name="ln792">  static_assert(sizeof(value) == CQLMessage::kIntSize, &quot;inconsistent int size&quot;);</a>
+<a name="ln793">  SerializeNum(NetworkByteOrder::Store32, value, mesg);</a>
+<a name="ln794">}</a>
+<a name="ln795"> </a>
+<a name="ln796">#if 0 // Save this function for future use</a>
+<a name="ln797">inline void SerializeLong(const int64_t value, faststring* mesg) {</a>
+<a name="ln798">  static_assert(sizeof(value) == CQLMessage::kLongSize, &quot;inconsistent long size&quot;);</a>
+<a name="ln799">  SerializeNum(NetworkByteOrder::Store64, value, mesg);</a>
+<a name="ln800">}</a>
+<a name="ln801">#endif</a>
+<a name="ln802"> </a>
+<a name="ln803">inline void SerializeString(const string&amp; value, faststring* mesg) {</a>
+<a name="ln804">  SerializeBytes(&amp;SerializeShort, value, mesg);</a>
+<a name="ln805">}</a>
+<a name="ln806"> </a>
+<a name="ln807">#if 0 // Save these functions for future use</a>
+<a name="ln808">inline void SerializeLongString(const string&amp; value, faststring* mesg) {</a>
+<a name="ln809">  SerializeBytes(&amp;SerializeInt, value, mesg);</a>
+<a name="ln810">}</a>
+<a name="ln811">#endif</a>
+<a name="ln812"> </a>
+<a name="ln813">inline void SerializeShortBytes(const string&amp; value, faststring* mesg) {</a>
+<a name="ln814">  SerializeBytes(&amp;SerializeShort, value, mesg);</a>
+<a name="ln815">}</a>
+<a name="ln816"> </a>
+<a name="ln817">inline void SerializeBytes(const string&amp; value, faststring* mesg) {</a>
+<a name="ln818">  SerializeBytes(&amp;SerializeInt, value, mesg);</a>
+<a name="ln819">}</a>
+<a name="ln820"> </a>
+<a name="ln821">#if 0 // Save these functions for future use</a>
+<a name="ln822">inline void SerializeConsistency(const CQLMessage::Consistency consistency, faststring* mesg) {</a>
+<a name="ln823">  static_assert(</a>
+<a name="ln824">      sizeof(consistency) == CQLMessage::kConsistencySize,</a>
+<a name="ln825">      &quot;inconsistent consistency size&quot;);</a>
+<a name="ln826">  SerializeNum(NetworkByteOrder::Store16, consistency, mesg);</a>
+<a name="ln827">}</a>
+<a name="ln828"> </a>
+<a name="ln829">void SerializeUUID(const string&amp; value, faststring* mesg) {</a>
+<a name="ln830">  if (value.size() == CQLMessage::kUUIDSize) {</a>
+<a name="ln831">    mesg-&gt;append(value);</a>
+<a name="ln832">  } else {</a>
+<a name="ln833">    LOG(ERROR) &lt;&lt; &quot;Internal error: inconsistent UUID size: &quot; &lt;&lt; value.size();</a>
+<a name="ln834">    uint8_t empty_uuid[CQLMessage::kUUIDSize] = {0};</a>
+<a name="ln835">    mesg-&gt;append(empty_uuid, sizeof(empty_uuid));</a>
+<a name="ln836">  }</a>
+<a name="ln837">}</a>
+<a name="ln838"> </a>
+<a name="ln839">void SerializeTimeUUID(const string&amp; value, faststring* mesg) {</a>
+<a name="ln840">  if (value.size() == CQLMessage::kUUIDSize) {</a>
+<a name="ln841">    mesg-&gt;append(value);</a>
+<a name="ln842">  } else {</a>
+<a name="ln843">    LOG(ERROR) &lt;&lt; &quot;Internal error: inconsistent TimeUUID size: &quot; &lt;&lt; value.size();</a>
+<a name="ln844">    uint8_t empty_uuid[CQLMessage::kUUIDSize] = {0};</a>
+<a name="ln845">    mesg-&gt;append(empty_uuid, sizeof(empty_uuid));</a>
+<a name="ln846">  }</a>
+<a name="ln847">}</a>
+<a name="ln848">#endif</a>
+<a name="ln849"> </a>
+<a name="ln850">void SerializeStringList(const vector&lt;string&gt;&amp; list, faststring* mesg) {</a>
+<a name="ln851">  SerializeShort(list.size(), mesg);</a>
+<a name="ln852">  for (int i = 0; i &lt; list.size(); ++i) {</a>
+<a name="ln853">    SerializeString(list[i], mesg);</a>
+<a name="ln854">  }</a>
+<a name="ln855">}</a>
+<a name="ln856"> </a>
+<a name="ln857">void SerializeInet(const Endpoint&amp; value, faststring* mesg) {</a>
+<a name="ln858">  auto address = value.address();</a>
+<a name="ln859">  if (address.is_v4()) {</a>
+<a name="ln860">    auto bytes = address.to_v4().to_bytes();</a>
+<a name="ln861">    SerializeByte(bytes.size(), mesg);</a>
+<a name="ln862">    mesg-&gt;append(bytes.data(), bytes.size());</a>
+<a name="ln863">  } else {</a>
+<a name="ln864">    auto bytes = address.to_v6().to_bytes();</a>
+<a name="ln865">    SerializeByte(bytes.size(), mesg);</a>
+<a name="ln866">    mesg-&gt;append(bytes.data(), bytes.size());</a>
+<a name="ln867">  }</a>
+<a name="ln868">  const uint16_t port = value.port();</a>
+<a name="ln869">  SerializeInt(port, mesg);</a>
+<a name="ln870">}</a>
+<a name="ln871"> </a>
+<a name="ln872">#if 0 // Save these functions for future use</a>
+<a name="ln873">void SerializeStringMap(const unordered_map&lt;string, string&gt;&amp; map, faststring* mesg) {</a>
+<a name="ln874">  SerializeShort(map.size(), mesg);</a>
+<a name="ln875">  for (const auto&amp; element : map) {</a>
+<a name="ln876">    SerializeString(element.first, mesg);</a>
+<a name="ln877">    SerializeString(element.second, mesg);</a>
+<a name="ln878">  }</a>
+<a name="ln879">}</a>
+<a name="ln880">#endif</a>
+<a name="ln881"> </a>
+<a name="ln882">void SerializeStringMultiMap(const unordered_map&lt;string, vector&lt;string&gt;&gt;&amp; map, faststring* mesg) {</a>
+<a name="ln883">  SerializeShort(map.size(), mesg);</a>
+<a name="ln884">  for (const auto&amp; element : map) {</a>
+<a name="ln885">    SerializeString(element.first, mesg);</a>
+<a name="ln886">    SerializeStringList(element.second, mesg);</a>
+<a name="ln887">  }</a>
+<a name="ln888">}</a>
+<a name="ln889"> </a>
+<a name="ln890">#if 0 // Save these functions for future use</a>
+<a name="ln891">void SerializeBytesMap(const unordered_map&lt;string, string&gt;&amp; map, faststring* mesg) {</a>
+<a name="ln892">  SerializeShort(map.size(), mesg);</a>
+<a name="ln893">  for (const auto&amp; element : map) {</a>
+<a name="ln894">    SerializeString(element.first, mesg);</a>
+<a name="ln895">    SerializeBytes(element.second, mesg);</a>
+<a name="ln896">  }</a>
+<a name="ln897">}</a>
+<a name="ln898"> </a>
+<a name="ln899">void SerializeValue(const CQLMessage::Value&amp; value, faststring* mesg) {</a>
+<a name="ln900">  switch (value.kind) {</a>
+<a name="ln901">    case CQLMessage::Value::Kind::NOT_NULL:</a>
+<a name="ln902">      SerializeInt(value.value.size(), mesg);</a>
+<a name="ln903">      mesg-&gt;append(value.value);</a>
+<a name="ln904">      return;</a>
+<a name="ln905">    case CQLMessage::Value::Kind::IS_NULL:</a>
+<a name="ln906">      SerializeInt(-1, mesg);</a>
+<a name="ln907">      return;</a>
+<a name="ln908">    case CQLMessage::Value::Kind::NOT_SET: // NOT_SET value kind should appear in request msg only.</a>
+<a name="ln909">      break;</a>
+<a name="ln910">      // default: fall through</a>
+<a name="ln911">  }</a>
+<a name="ln912">  LOG(ERROR) &lt;&lt; &quot;Internal error: invalid/unknown value kind &quot; &lt;&lt; static_cast&lt;uint32_t&gt;(value.kind);</a>
+<a name="ln913">  SerializeInt(-1, mesg);</a>
+<a name="ln914">}</a>
+<a name="ln915">#endif</a>
+<a name="ln916"> </a>
+<a name="ln917">} // namespace</a>
+<a name="ln918"> </a>
+<a name="ln919">// ------------------------------------ CQL response -----------------------------------</a>
+<a name="ln920">CQLResponse::CQLResponse(const CQLRequest&amp; request, const Opcode opcode)</a>
+<a name="ln921">    : CQLMessage(Header(request.version() | kResponseVersion, 0, request.stream_id(), opcode)) {</a>
+<a name="ln922">}</a>
+<a name="ln923"> </a>
+<a name="ln924">CQLResponse::CQLResponse(const StreamId stream_id, const Opcode opcode)</a>
+<a name="ln925">    : CQLMessage(Header(kCurrentVersion | kResponseVersion, 0, stream_id, opcode)) {</a>
+<a name="ln926">}</a>
+<a name="ln927"> </a>
+<a name="ln928">CQLResponse::~CQLResponse() {</a>
+<a name="ln929">}</a>
+<a name="ln930"> </a>
+<a name="ln931">// Short-hand macros for serializing fields from the message header</a>
+<a name="ln932">#define SERIALIZE_BYTE(buf, pos, value) \</a>
+<a name="ln933">  Store8(&amp;(buf)[pos], static_cast&lt;uint8_t&gt;(value))</a>
+<a name="ln934">#define SERIALIZE_SHORT(buf, pos, value) \</a>
+<a name="ln935">  NetworkByteOrder::Store16(&amp;(buf)[pos], static_cast&lt;uint16_t&gt;(value))</a>
+<a name="ln936">#define SERIALIZE_INT(buf, pos, value) \</a>
+<a name="ln937">  NetworkByteOrder::Store32(&amp;(buf)[pos], static_cast&lt;int32_t&gt;(value))</a>
+<a name="ln938">#define SERIALIZE_LONG(buf, pos, value) \</a>
+<a name="ln939">  NetworkByteOrder::Store64(&amp;(buf)[pos], static_cast&lt;int64_t&gt;(value))</a>
+<a name="ln940"> </a>
+<a name="ln941">void CQLResponse::Serialize(const CompressionScheme compression_scheme, faststring* mesg) const {</a>
+<a name="ln942">  const size_t start_pos = mesg-&gt;size(); // save the start position</a>
+<a name="ln943">  const bool compress = (compression_scheme != CQLMessage::CompressionScheme::kNone);</a>
+<a name="ln944">  SerializeHeader(compress, mesg);</a>
+<a name="ln945">  if (compress) {</a>
+<a name="ln946">    faststring body;</a>
+<a name="ln947">    SerializeBody(&amp;body);</a>
+<a name="ln948">    switch (compression_scheme) {</a>
+<a name="ln949">      case CQLMessage::CompressionScheme::kLz4: {</a>
+<a name="ln950">        SerializeInt(static_cast&lt;int32_t&gt;(body.size()), mesg);</a>
+<a name="ln951">        const size_t curr_size = mesg-&gt;size();</a>
+<a name="ln952">        const int max_comp_size = LZ4_compressBound(body.size());</a>
+<a name="ln953">        mesg-&gt;resize(curr_size + max_comp_size);</a>
+<a name="ln954">        const int comp_size = LZ4_compress_default(to_char_ptr(body.data()),</a>
+<a name="ln955">                                                   to_char_ptr(mesg-&gt;data() + curr_size),</a>
+<a name="ln956">                                                   body.size(),</a>
+<a name="ln957">                                                   max_comp_size);</a>
+<a name="ln958">        CHECK_NE(comp_size, 0) &lt;&lt; &quot;LZ4 compression failed&quot;;</a>
+<a name="ln959">        mesg-&gt;resize(curr_size + comp_size);</a>
+<a name="ln960">        break;</a>
+<a name="ln961">      }</a>
+<a name="ln962">      case CQLMessage::CompressionScheme::kSnappy: {</a>
+<a name="ln963">        const size_t curr_size = mesg-&gt;size();</a>
+<a name="ln964">        const size_t max_comp_size = MaxCompressedLength(body.size());</a>
+<a name="ln965">        size_t comp_size = 0;</a>
+<a name="ln966">        mesg-&gt;resize(curr_size + max_comp_size);</a>
+<a name="ln967">        RawCompress(to_char_ptr(body.data()), body.size(),</a>
+<a name="ln968">                    to_char_ptr(mesg-&gt;data() + curr_size), &amp;comp_size);</a>
+<a name="ln969">        mesg-&gt;resize(curr_size + comp_size);</a>
+<a name="ln970">        break;</a>
+<a name="ln971">      }</a>
+<a name="ln972">      case CQLMessage::CompressionScheme::kNone:</a>
+<a name="ln973">        LOG(FATAL) &lt;&lt; &quot;No compression scheme&quot;;</a>
+<a name="ln974">        break;</a>
+<a name="ln975">    }</a>
+<a name="ln976">  } else {</a>
+<a name="ln977">    SerializeBody(mesg);</a>
+<a name="ln978">  }</a>
+<a name="ln979">  SERIALIZE_INT(</a>
+<a name="ln980">      mesg-&gt;data(), start_pos + kHeaderPosLength, mesg-&gt;size() - start_pos - kMessageHeaderLength);</a>
+<a name="ln981">}</a>
+<a name="ln982"> </a>
+<a name="ln983">void CQLResponse::SerializeHeader(const bool compress, faststring* mesg) const {</a>
+<a name="ln984">  uint8_t buffer[kMessageHeaderLength];</a>
+<a name="ln985">  SERIALIZE_BYTE(buffer, kHeaderPosVersion, version());</a>
+<a name="ln986">  SERIALIZE_BYTE(buffer, kHeaderPosFlags, flags() | (compress ? kCompressionFlag : 0));</a>
+<a name="ln987">  SERIALIZE_SHORT(buffer, kHeaderPosStreamId, stream_id());</a>
+<a name="ln988">  SERIALIZE_INT(buffer, kHeaderPosLength, 0);</a>
+<a name="ln989">  SERIALIZE_BYTE(buffer, kHeaderPosOpcode, opcode());</a>
+<a name="ln990">  mesg-&gt;append(buffer, sizeof(buffer));</a>
+<a name="ln991">}</a>
+<a name="ln992"> </a>
+<a name="ln993">#undef SERIALIZE_BYTE</a>
+<a name="ln994">#undef SERIALIZE_SHORT</a>
+<a name="ln995">#undef SERIALIZE_INT</a>
+<a name="ln996">#undef SERIALIZE_LONG</a>
+<a name="ln997"> </a>
+<a name="ln998">// ------------------------------ Individual CQL responses -----------------------------------</a>
+<a name="ln999">ErrorResponse::ErrorResponse(const CQLRequest&amp; request, const Code code, const string&amp; message)</a>
+<a name="ln1000">    : CQLResponse(request, Opcode::ERROR), code_(code), message_(message) {</a>
+<a name="ln1001">}</a>
+<a name="ln1002"> </a>
+<a name="ln1003">ErrorResponse::ErrorResponse(const CQLRequest&amp; request, const Code code, const Status&amp; status)</a>
+<a name="ln1004">    : CQLResponse(request, Opcode::ERROR), code_(code),</a>
+<a name="ln1005">      message_(to_char_ptr(status.message().data())) {</a>
+<a name="ln1006">}</a>
+<a name="ln1007"> </a>
+<a name="ln1008">ErrorResponse::ErrorResponse(const StreamId stream_id, const Code code, const string&amp; message)</a>
+<a name="ln1009">    : CQLResponse(stream_id, Opcode::ERROR), code_(code), message_(message) {</a>
+<a name="ln1010">}</a>
+<a name="ln1011"> </a>
+<a name="ln1012">ErrorResponse::~ErrorResponse() {</a>
+<a name="ln1013">}</a>
+<a name="ln1014"> </a>
+<a name="ln1015">void ErrorResponse::SerializeBody(faststring* mesg) const {</a>
+<a name="ln1016">  SerializeInt(static_cast&lt;int32_t&gt;(code_), mesg);</a>
+<a name="ln1017">  SerializeString(message_, mesg);</a>
+<a name="ln1018">  SerializeErrorBody(mesg);</a>
+<a name="ln1019">}</a>
+<a name="ln1020"> </a>
+<a name="ln1021">void ErrorResponse::SerializeErrorBody(faststring* mesg) const {</a>
+<a name="ln1022">}</a>
+<a name="ln1023"> </a>
+<a name="ln1024">//----------------------------------------------------------------------------------------</a>
+<a name="ln1025">UnpreparedErrorResponse::UnpreparedErrorResponse(const CQLRequest&amp; request, const QueryId&amp; query_id)</a>
+<a name="ln1026">    : ErrorResponse(request, Code::UNPREPARED, &quot;Unprepared query&quot;), query_id_(query_id) {</a>
+<a name="ln1027">}</a>
+<a name="ln1028"> </a>
+<a name="ln1029">UnpreparedErrorResponse::~UnpreparedErrorResponse() {</a>
+<a name="ln1030">}</a>
+<a name="ln1031"> </a>
+<a name="ln1032">void UnpreparedErrorResponse::SerializeErrorBody(faststring* mesg) const {</a>
+<a name="ln1033">  SerializeShortBytes(query_id_, mesg);</a>
+<a name="ln1034">}</a>
+<a name="ln1035"> </a>
+<a name="ln1036">//----------------------------------------------------------------------------------------</a>
+<a name="ln1037">ReadyResponse::ReadyResponse(const CQLRequest&amp; request) : CQLResponse(request, Opcode::READY) {</a>
+<a name="ln1038">}</a>
+<a name="ln1039"> </a>
+<a name="ln1040">ReadyResponse::~ReadyResponse() {</a>
+<a name="ln1041">}</a>
+<a name="ln1042"> </a>
+<a name="ln1043">void ReadyResponse::SerializeBody(faststring* mesg) const {</a>
+<a name="ln1044">  // Ready body is empty</a>
+<a name="ln1045">}</a>
+<a name="ln1046"> </a>
+<a name="ln1047">//----------------------------------------------------------------------------------------</a>
+<a name="ln1048">AuthenticateResponse::AuthenticateResponse(const CQLRequest&amp; request, const string&amp; authenticator)</a>
+<a name="ln1049">    : CQLResponse(request, Opcode::AUTHENTICATE), authenticator_(authenticator) {</a>
+<a name="ln1050">}</a>
+<a name="ln1051"> </a>
+<a name="ln1052">AuthenticateResponse::~AuthenticateResponse() {</a>
+<a name="ln1053">}</a>
+<a name="ln1054"> </a>
+<a name="ln1055">void AuthenticateResponse::SerializeBody(faststring* mesg) const {</a>
+<a name="ln1056">  SerializeString(authenticator_, mesg);</a>
+<a name="ln1057">}</a>
+<a name="ln1058"> </a>
+<a name="ln1059">//----------------------------------------------------------------------------------------</a>
+<a name="ln1060">SupportedResponse::SupportedResponse(const CQLRequest&amp; request,</a>
+<a name="ln1061">                                     const unordered_map&lt;string, vector&lt;string&gt;&gt;* options)</a>
+<a name="ln1062">    : CQLResponse(request, Opcode::SUPPORTED), options_(options) {</a>
+<a name="ln1063">}</a>
+<a name="ln1064"> </a>
+<a name="ln1065">SupportedResponse::~SupportedResponse() {</a>
+<a name="ln1066">}</a>
+<a name="ln1067"> </a>
+<a name="ln1068">void SupportedResponse::SerializeBody(faststring* mesg) const {</a>
+<a name="ln1069">  SerializeStringMultiMap(*options_, mesg);</a>
+<a name="ln1070">}</a>
+<a name="ln1071"> </a>
+<a name="ln1072">//----------------------------------------------------------------------------------------</a>
+<a name="ln1073">ResultResponse::ResultResponse(const CQLRequest&amp; request, const Kind kind)</a>
+<a name="ln1074">  : CQLResponse(request, Opcode::RESULT), kind_(kind) {</a>
+<a name="ln1075">}</a>
+<a name="ln1076"> </a>
+<a name="ln1077">ResultResponse::~ResultResponse() {</a>
+<a name="ln1078">}</a>
+<a name="ln1079"> </a>
+<a name="ln1080">ResultResponse::RowsMetadata::Type::Type(const Id id) : id(id) {</a>
+<a name="ln1081">  switch (id) {</a>
+<a name="ln1082">    // Verify that the type id is a primitive type indeed.</a>
+<a name="ln1083">    case Id::ASCII:</a>
+<a name="ln1084">    case Id::BIGINT:</a>
+<a name="ln1085">    case Id::BLOB:</a>
+<a name="ln1086">    case Id::BOOLEAN:</a>
+<a name="ln1087">    case Id::COUNTER:</a>
+<a name="ln1088">    case Id::DECIMAL:</a>
+<a name="ln1089">    case Id::DOUBLE:</a>
+<a name="ln1090">    case Id::FLOAT:</a>
+<a name="ln1091">    case Id::INT:</a>
+<a name="ln1092">    case Id::TIMESTAMP:</a>
+<a name="ln1093">    case Id::UUID:</a>
+<a name="ln1094">    case Id::VARCHAR:</a>
+<a name="ln1095">    case Id::VARINT:</a>
+<a name="ln1096">    case Id::TIMEUUID:</a>
+<a name="ln1097">    case Id::INET:</a>
+<a name="ln1098">    case Id::JSONB:</a>
+<a name="ln1099">    case Id::DATE:</a>
+<a name="ln1100">    case Id::TIME:</a>
+<a name="ln1101">    case Id::SMALLINT:</a>
+<a name="ln1102">    case Id::TINYINT:</a>
+<a name="ln1103">      return;</a>
+<a name="ln1104"> </a>
+<a name="ln1105">    // Non-primitive types</a>
+<a name="ln1106">    case Id::CUSTOM:</a>
+<a name="ln1107">    case Id::LIST:</a>
+<a name="ln1108">    case Id::MAP:</a>
+<a name="ln1109">    case Id::SET:</a>
+<a name="ln1110">    case Id::UDT:</a>
+<a name="ln1111">    case Id::TUPLE:</a>
+<a name="ln1112">      break;</a>
+<a name="ln1113"> </a>
+<a name="ln1114">    // default: fall through</a>
+<a name="ln1115">  }</a>
+<a name="ln1116"> </a>
+<a name="ln1117">  LOG(ERROR) &lt;&lt; &quot;Internal error: invalid/unknown primitive type id &quot; &lt;&lt; static_cast&lt;uint32_t&gt;(id);</a>
+<a name="ln1118">}</a>
+<a name="ln1119"> </a>
+<a name="ln1120">// These union members in Type below are not initialized by default. They need to be explicitly</a>
+<a name="ln1121">// initialized using the new() operator in the Type constructors.</a>
+<a name="ln1122">ResultResponse::RowsMetadata::Type::Type(const string&amp; custom_class_name) : id(Id::CUSTOM) {</a>
+<a name="ln1123">  new(&amp;this-&gt;custom_class_name) string(custom_class_name);</a>
+<a name="ln1124">}</a>
+<a name="ln1125"> </a>
+<a name="ln1126">ResultResponse::RowsMetadata::Type::Type(const Id id, shared_ptr&lt;const Type&gt; element_type)</a>
+<a name="ln1127">    : id(id) {</a>
+<a name="ln1128">  switch (id) {</a>
+<a name="ln1129">    case Id::LIST:</a>
+<a name="ln1130">    case Id::SET:</a>
+<a name="ln1131">      new(&amp;this-&gt;element_type) shared_ptr&lt;const Type&gt;(element_type);</a>
+<a name="ln1132">      return;</a>
+<a name="ln1133"> </a>
+<a name="ln1134">    // Not list nor map</a>
+<a name="ln1135">    case Id::CUSTOM:</a>
+<a name="ln1136">    case Id::ASCII:</a>
+<a name="ln1137">    case Id::BIGINT:</a>
+<a name="ln1138">    case Id::BLOB:</a>
+<a name="ln1139">    case Id::BOOLEAN:</a>
+<a name="ln1140">    case Id::COUNTER:</a>
+<a name="ln1141">    case Id::DECIMAL:</a>
+<a name="ln1142">    case Id::DOUBLE:</a>
+<a name="ln1143">    case Id::FLOAT:</a>
+<a name="ln1144">    case Id::INT:</a>
+<a name="ln1145">    case Id::TIMESTAMP:</a>
+<a name="ln1146">    case Id::UUID:</a>
+<a name="ln1147">    case Id::VARCHAR:</a>
+<a name="ln1148">    case Id::VARINT:</a>
+<a name="ln1149">    case Id::TIMEUUID:</a>
+<a name="ln1150">    case Id::INET:</a>
+<a name="ln1151">    case Id::JSONB:</a>
+<a name="ln1152">    case Id::DATE:</a>
+<a name="ln1153">    case Id::TIME:</a>
+<a name="ln1154">    case Id::SMALLINT:</a>
+<a name="ln1155">    case Id::TINYINT:</a>
+<a name="ln1156">    case Id::MAP:</a>
+<a name="ln1157">    case Id::UDT:</a>
+<a name="ln1158">    case Id::TUPLE:</a>
+<a name="ln1159">      break;</a>
+<a name="ln1160"> </a>
+<a name="ln1161">    // default: fall through</a>
+<a name="ln1162">  }</a>
+<a name="ln1163"> </a>
+<a name="ln1164">  LOG(ERROR) &lt;&lt; &quot;Internal error: invalid/unknown list/map type id &quot; &lt;&lt; static_cast&lt;uint32_t&gt;(id);</a>
+<a name="ln1165">}</a>
+<a name="ln1166"> </a>
+<a name="ln1167">ResultResponse::RowsMetadata::Type::Type(shared_ptr&lt;const MapType&gt; map_type) : id(Id::MAP) {</a>
+<a name="ln1168">  new(&amp;this-&gt;map_type) shared_ptr&lt;const MapType&gt;(map_type);</a>
+<a name="ln1169">}</a>
+<a name="ln1170"> </a>
+<a name="ln1171">ResultResponse::RowsMetadata::Type::Type(shared_ptr&lt;const UDTType&gt; udt_type) : id(Id::UDT) {</a>
+<a name="ln1172">  new(&amp;this-&gt;udt_type) shared_ptr&lt;const UDTType&gt;(udt_type);</a>
+<a name="ln1173">}</a>
+<a name="ln1174"> </a>
+<a name="ln1175">ResultResponse::RowsMetadata::Type::Type(</a>
+<a name="ln1176">    shared_ptr&lt;const TupleComponentTypes&gt; tuple_component_types) : id(Id::TUPLE) {</a>
+<a name="ln1177">  new(&amp;this-&gt;tuple_component_types) shared_ptr&lt;const TupleComponentTypes&gt;(tuple_component_types);</a>
+<a name="ln1178">}</a>
+<a name="ln1179"> </a>
+<a name="ln1180">ResultResponse::RowsMetadata::Type::Type(const Type&amp; t) : id(t.id) {</a>
+<a name="ln1181">  switch (id) {</a>
+<a name="ln1182">    case Id::CUSTOM:</a>
+<a name="ln1183">      new(&amp;this-&gt;custom_class_name) string(t.custom_class_name);</a>
+<a name="ln1184">      return;</a>
+<a name="ln1185">    case Id::ASCII:</a>
+<a name="ln1186">    case Id::BIGINT:</a>
+<a name="ln1187">    case Id::BLOB:</a>
+<a name="ln1188">    case Id::BOOLEAN:</a>
+<a name="ln1189">    case Id::COUNTER:</a>
+<a name="ln1190">    case Id::DECIMAL:</a>
+<a name="ln1191">    case Id::DOUBLE:</a>
+<a name="ln1192">    case Id::FLOAT:</a>
+<a name="ln1193">    case Id::INT:</a>
+<a name="ln1194">    case Id::TIMESTAMP:</a>
+<a name="ln1195">    case Id::UUID:</a>
+<a name="ln1196">    case Id::VARCHAR:</a>
+<a name="ln1197">    case Id::VARINT:</a>
+<a name="ln1198">    case Id::TIMEUUID:</a>
+<a name="ln1199">    case Id::INET:</a>
+<a name="ln1200">    case Id::JSONB:</a>
+<a name="ln1201">    case Id::DATE:</a>
+<a name="ln1202">    case Id::TIME:</a>
+<a name="ln1203">    case Id::SMALLINT:</a>
+<a name="ln1204">    case Id::TINYINT:</a>
+<a name="ln1205">      return;</a>
+<a name="ln1206">    case Id::LIST:</a>
+<a name="ln1207">    case Id::SET:</a>
+<a name="ln1208">      new(&amp;element_type) shared_ptr&lt;const Type&gt;(t.element_type);</a>
+<a name="ln1209">      return;</a>
+<a name="ln1210">    case Id::MAP:</a>
+<a name="ln1211">      new(&amp;map_type) shared_ptr&lt;const MapType&gt;(t.map_type);</a>
+<a name="ln1212">      return;</a>
+<a name="ln1213">    case Id::UDT:</a>
+<a name="ln1214">      new(&amp;udt_type) shared_ptr&lt;const UDTType&gt;(t.udt_type);</a>
+<a name="ln1215">      return;</a>
+<a name="ln1216">    case Id::TUPLE:</a>
+<a name="ln1217">      new(&amp;tuple_component_types) shared_ptr&lt;const TupleComponentTypes&gt;(t.tuple_component_types);</a>
+<a name="ln1218">      return;</a>
+<a name="ln1219"> </a>
+<a name="ln1220">    // default: fall through</a>
+<a name="ln1221">  }</a>
+<a name="ln1222"> </a>
+<a name="ln1223">  LOG(ERROR) &lt;&lt; &quot;Internal error: unknown type id &quot; &lt;&lt; static_cast&lt;uint32_t&gt;(id);</a>
+<a name="ln1224">}</a>
+<a name="ln1225"> </a>
+<a name="ln1226">ResultResponse::RowsMetadata::Type::Type(const shared_ptr&lt;QLType&gt;&amp; ql_type) {</a>
+<a name="ln1227">  auto type = ql_type;</a>
+<a name="ln1228">  if (type-&gt;IsFrozen()) {</a>
+<a name="ln1229">    type = ql_type-&gt;param_type(0);</a>
+<a name="ln1230">  }</a>
+<a name="ln1231">  switch (type-&gt;main()) {</a>
+<a name="ln1232">    case DataType::INT8:</a>
+<a name="ln1233">      id = Id::TINYINT;</a>
+<a name="ln1234">      return;</a>
+<a name="ln1235">    case DataType::INT16:</a>
+<a name="ln1236">      id = Id::SMALLINT;</a>
+<a name="ln1237">      return;</a>
+<a name="ln1238">    case DataType::INT32:</a>
+<a name="ln1239">      id = Id::INT;</a>
+<a name="ln1240">      return;</a>
+<a name="ln1241">    case DataType::INT64:</a>
+<a name="ln1242">      id = Id::BIGINT;</a>
+<a name="ln1243">      return;</a>
+<a name="ln1244">    case DataType::VARINT:</a>
+<a name="ln1245">      id = Id::VARINT;</a>
+<a name="ln1246">      return;</a>
+<a name="ln1247">    case DataType::FLOAT:</a>
+<a name="ln1248">      id = Id::FLOAT;</a>
+<a name="ln1249">      return;</a>
+<a name="ln1250">    case DataType::DOUBLE:</a>
+<a name="ln1251">      id = Id::DOUBLE;</a>
+<a name="ln1252">      return;</a>
+<a name="ln1253">    case DataType::STRING:</a>
+<a name="ln1254">      id = Id::VARCHAR;</a>
+<a name="ln1255">      return;</a>
+<a name="ln1256">    case DataType::BOOL:</a>
+<a name="ln1257">      id = Id::BOOLEAN;</a>
+<a name="ln1258">      return;</a>
+<a name="ln1259">    case DataType::TIMESTAMP:</a>
+<a name="ln1260">      id = Id::TIMESTAMP;</a>
+<a name="ln1261">      return;</a>
+<a name="ln1262">    case DataType::DATE:</a>
+<a name="ln1263">      id = Id::DATE;</a>
+<a name="ln1264">      return;</a>
+<a name="ln1265">    case DataType::TIME:</a>
+<a name="ln1266">      id = Id::TIME;</a>
+<a name="ln1267">      return;</a>
+<a name="ln1268">    case DataType::INET:</a>
+<a name="ln1269">      id = Id::INET;</a>
+<a name="ln1270">      return;</a>
+<a name="ln1271">    case DataType::JSONB:</a>
+<a name="ln1272">      id = Id::JSONB;</a>
+<a name="ln1273">      return;</a>
+<a name="ln1274">    case DataType::UUID:</a>
+<a name="ln1275">      id = Id::UUID;</a>
+<a name="ln1276">      return;</a>
+<a name="ln1277">    case DataType::TIMEUUID:</a>
+<a name="ln1278">      id = Id::TIMEUUID;</a>
+<a name="ln1279">      return;</a>
+<a name="ln1280">    case DataType::BINARY:</a>
+<a name="ln1281">      id = Id::BLOB;</a>
+<a name="ln1282">      return;</a>
+<a name="ln1283">    case DataType::DECIMAL:</a>
+<a name="ln1284">      id = Id::DECIMAL;</a>
+<a name="ln1285">      return;</a>
+<a name="ln1286">    case DataType::LIST:</a>
+<a name="ln1287">      id = Id::LIST;</a>
+<a name="ln1288">      new (&amp;element_type) shared_ptr&lt;const Type&gt;(</a>
+<a name="ln1289">          std::make_shared&lt;const Type&gt;(Type(type-&gt;param_type(0))));</a>
+<a name="ln1290">      return;</a>
+<a name="ln1291">    case DataType::SET:</a>
+<a name="ln1292">      id = Id::SET;</a>
+<a name="ln1293">      new (&amp;element_type) shared_ptr&lt;const Type&gt;(</a>
+<a name="ln1294">          std::make_shared&lt;const Type&gt;(Type(type-&gt;param_type(0))));</a>
+<a name="ln1295">      return;</a>
+<a name="ln1296">    case DataType::MAP: {</a>
+<a name="ln1297">      id = Id::MAP;</a>
+<a name="ln1298">      auto key = std::make_shared&lt;const Type&gt;(Type(type-&gt;param_type(0)));</a>
+<a name="ln1299">      auto value = std::make_shared&lt;const Type&gt;(Type(type-&gt;param_type(1)));</a>
+<a name="ln1300">      new (&amp;map_type) shared_ptr&lt;const MapType&gt;(std::make_shared&lt;MapType&gt;(MapType{key, value}));</a>
+<a name="ln1301">      return;</a>
+<a name="ln1302">    }</a>
+<a name="ln1303">    case DataType::USER_DEFINED_TYPE: {</a>
+<a name="ln1304">      id = Id::UDT;</a>
+<a name="ln1305">      std::vector&lt;UDTType::Field&gt; fields;</a>
+<a name="ln1306">      for (int i = 0; i &lt; type-&gt;params().size(); i++) {</a>
+<a name="ln1307">        auto field_type = std::make_shared&lt;const Type&gt;(Type(type-&gt;param_type(i)));</a>
+<a name="ln1308">        UDTType::Field field{type-&gt;udtype_field_name(i), field_type};</a>
+<a name="ln1309">        fields.push_back(std::move(field));</a>
+<a name="ln1310">      }</a>
+<a name="ln1311">      new(&amp;udt_type) shared_ptr&lt;const UDTType&gt;(std::make_shared&lt;UDTType&gt;(</a>
+<a name="ln1312">          UDTType{type-&gt;udtype_keyspace_name(), type-&gt;udtype_name(), fields}));</a>
+<a name="ln1313">      return;</a>
+<a name="ln1314">    }</a>
+<a name="ln1315">    case DataType::FROZEN: FALLTHROUGH_INTENDED;</a>
+<a name="ln1316">    case DataType::NULL_VALUE_TYPE: FALLTHROUGH_INTENDED;</a>
+<a name="ln1317">    case DataType::TUPLE: FALLTHROUGH_INTENDED;</a>
+<a name="ln1318">    case DataType::TYPEARGS: FALLTHROUGH_INTENDED;</a>
+<a name="ln1319"> </a>
+<a name="ln1320">    case DataType::UINT8:  FALLTHROUGH_INTENDED;</a>
+<a name="ln1321">    case DataType::UINT16: FALLTHROUGH_INTENDED;</a>
+<a name="ln1322">    case DataType::UINT32: FALLTHROUGH_INTENDED;</a>
+<a name="ln1323">    case DataType::UINT64: FALLTHROUGH_INTENDED;</a>
+<a name="ln1324">    case DataType::UNKNOWN_DATA:</a>
+<a name="ln1325">      break;</a>
+<a name="ln1326"> </a>
+<a name="ln1327">    // default: fall through</a>
+<a name="ln1328">  }</a>
+<a name="ln1329"> </a>
+<a name="ln1330">  LOG(ERROR) &lt;&lt; &quot;Internal error: invalid/unsupported type &quot; &lt;&lt; type-&gt;ToString();</a>
+<a name="ln1331">}</a>
+<a name="ln1332"> </a>
+<a name="ln1333">ResultResponse::RowsMetadata::Type::~Type() {</a>
+<a name="ln1334">  switch (id) {</a>
+<a name="ln1335">    case Id::CUSTOM:</a>
+<a name="ln1336">      custom_class_name.~basic_string();</a>
+<a name="ln1337">      return;</a>
+<a name="ln1338">    case Id::ASCII:</a>
+<a name="ln1339">    case Id::BIGINT:</a>
+<a name="ln1340">    case Id::BLOB:</a>
+<a name="ln1341">    case Id::BOOLEAN:</a>
+<a name="ln1342">    case Id::COUNTER:</a>
+<a name="ln1343">    case Id::DECIMAL:</a>
+<a name="ln1344">    case Id::DOUBLE:</a>
+<a name="ln1345">    case Id::FLOAT:</a>
+<a name="ln1346">    case Id::INT:</a>
+<a name="ln1347">    case Id::TIMESTAMP:</a>
+<a name="ln1348">    case Id::UUID:</a>
+<a name="ln1349">    case Id::VARCHAR:</a>
+<a name="ln1350">    case Id::VARINT:</a>
+<a name="ln1351">    case Id::TIMEUUID:</a>
+<a name="ln1352">    case Id::INET:</a>
+<a name="ln1353">    case Id::JSONB:</a>
+<a name="ln1354">    case Id::DATE:</a>
+<a name="ln1355">    case Id::TIME:</a>
+<a name="ln1356">    case Id::SMALLINT:</a>
+<a name="ln1357">    case Id::TINYINT:</a>
+<a name="ln1358">      return;</a>
+<a name="ln1359">    case Id::LIST:</a>
+<a name="ln1360">    case Id::SET:</a>
+<a name="ln1361">      element_type.reset();</a>
+<a name="ln1362">      return;</a>
+<a name="ln1363">    case Id::MAP:</a>
+<a name="ln1364">      map_type.reset();</a>
+<a name="ln1365">      return;</a>
+<a name="ln1366">    case Id::UDT:</a>
+<a name="ln1367">      udt_type.reset();</a>
+<a name="ln1368">      return;</a>
+<a name="ln1369">    case Id::TUPLE:</a>
+<a name="ln1370">      tuple_component_types.reset();</a>
+<a name="ln1371">      return;</a>
+<a name="ln1372"> </a>
+<a name="ln1373">    // default: fall through</a>
+<a name="ln1374">  }</a>
+<a name="ln1375"> </a>
+<a name="ln1376">  LOG(ERROR) &lt;&lt; &quot;Internal error: unknown type id &quot; &lt;&lt; static_cast&lt;uint32_t&gt;(id);</a>
+<a name="ln1377">}</a>
+<a name="ln1378"> </a>
+<a name="ln1379">ResultResponse::RowsMetadata::RowsMetadata()</a>
+<a name="ln1380">    : flags(kNoMetadata),</a>
+<a name="ln1381">      paging_state(&quot;&quot;),</a>
+<a name="ln1382">      global_table_spec(&quot;&quot; /* keyspace */, &quot;&quot; /* table_name */),</a>
+<a name="ln1383">      col_count(0) {</a>
+<a name="ln1384">}</a>
+<a name="ln1385"> </a>
+<a name="ln1386">ResultResponse::RowsMetadata::RowsMetadata(const client::YBTableName&amp; table_name,</a>
+<a name="ln1387">                                           const vector&lt;ColumnSchema&gt;&amp; columns,</a>
+<a name="ln1388">                                           const string&amp; paging_state,</a>
+<a name="ln1389">                                           bool no_metadata)</a>
+<a name="ln1390">    : flags((no_metadata ? kNoMetadata : kHasGlobalTableSpec) |</a>
+<a name="ln1391">            (!paging_state.empty() ? kHasMorePages : 0)),</a>
+<a name="ln1392">      paging_state(paging_state),</a>
+<a name="ln1393">      global_table_spec(no_metadata ? &quot;&quot; : table_name.namespace_name(),</a>
+<a name="ln1394">                        no_metadata ? &quot;&quot; : table_name.table_name()),</a>
+<a name="ln1395">      col_count(columns.size()) {</a>
+<a name="ln1396">  if (!no_metadata) {</a>
+<a name="ln1397">    col_specs.reserve(col_count);</a>
+<a name="ln1398">    for (const auto&amp; column : columns) {</a>
+<a name="ln1399">      col_specs.emplace_back(column.name(), Type(column.type()));</a>
+<a name="ln1400">    }</a>
+<a name="ln1401">  }</a>
+<a name="ln1402">}</a>
+<a name="ln1403"> </a>
+<a name="ln1404">void ResultResponse::SerializeBody(faststring* mesg) const {</a>
+<a name="ln1405">  SerializeInt(static_cast&lt;int32_t&gt;(kind_), mesg);</a>
+<a name="ln1406">  SerializeResultBody(mesg);</a>
+<a name="ln1407">}</a>
+<a name="ln1408"> </a>
+<a name="ln1409">void ResultResponse::SerializeType(const RowsMetadata::Type* type, faststring* mesg) const {</a>
+<a name="ln1410">  SerializeShort(static_cast&lt;uint16_t&gt;(type-&gt;id), mesg);</a>
+<a name="ln1411">  switch (type-&gt;id) {</a>
+<a name="ln1412">    case RowsMetadata::Type::Id::CUSTOM:</a>
+<a name="ln1413">      SerializeString(type-&gt;custom_class_name, mesg);</a>
+<a name="ln1414">      return;</a>
+<a name="ln1415">    case RowsMetadata::Type::Id::ASCII:</a>
+<a name="ln1416">    case RowsMetadata::Type::Id::BIGINT:</a>
+<a name="ln1417">    case RowsMetadata::Type::Id::BLOB:</a>
+<a name="ln1418">    case RowsMetadata::Type::Id::BOOLEAN:</a>
+<a name="ln1419">    case RowsMetadata::Type::Id::COUNTER:</a>
+<a name="ln1420">    case RowsMetadata::Type::Id::DECIMAL:</a>
+<a name="ln1421">    case RowsMetadata::Type::Id::DOUBLE:</a>
+<a name="ln1422">    case RowsMetadata::Type::Id::FLOAT:</a>
+<a name="ln1423">    case RowsMetadata::Type::Id::INT:</a>
+<a name="ln1424">    case RowsMetadata::Type::Id::TIMESTAMP:</a>
+<a name="ln1425">    case RowsMetadata::Type::Id::UUID:</a>
+<a name="ln1426">    case RowsMetadata::Type::Id::VARCHAR:</a>
+<a name="ln1427">    case RowsMetadata::Type::Id::VARINT:</a>
+<a name="ln1428">    case RowsMetadata::Type::Id::TIMEUUID:</a>
+<a name="ln1429">    case RowsMetadata::Type::Id::INET:</a>
+<a name="ln1430">    case RowsMetadata::Type::Id::JSONB:</a>
+<a name="ln1431">    case RowsMetadata::Type::Id::DATE:</a>
+<a name="ln1432">    case RowsMetadata::Type::Id::TIME:</a>
+<a name="ln1433">    case RowsMetadata::Type::Id::SMALLINT:</a>
+<a name="ln1434">    case RowsMetadata::Type::Id::TINYINT:</a>
+<a name="ln1435">      return;</a>
+<a name="ln1436">    case RowsMetadata::Type::Id::LIST:</a>
+<a name="ln1437">    case RowsMetadata::Type::Id::SET:</a>
+<a name="ln1438">      SerializeType(type-&gt;element_type.get(), mesg);</a>
+<a name="ln1439">      return;</a>
+<a name="ln1440">    case RowsMetadata::Type::Id::MAP:</a>
+<a name="ln1441">      SerializeType(type-&gt;map_type-&gt;key_type.get(), mesg);</a>
+<a name="ln1442">      SerializeType(type-&gt;map_type-&gt;value_type.get(), mesg);</a>
+<a name="ln1443">      return;</a>
+<a name="ln1444">    case RowsMetadata::Type::Id::UDT:</a>
+<a name="ln1445">      SerializeString(type-&gt;udt_type-&gt;keyspace, mesg);</a>
+<a name="ln1446">      SerializeString(type-&gt;udt_type-&gt;name, mesg);</a>
+<a name="ln1447">      SerializeShort(type-&gt;udt_type-&gt;fields.size(), mesg);</a>
+<a name="ln1448">      for (const auto&amp; field : type-&gt;udt_type-&gt;fields) {</a>
+<a name="ln1449">        SerializeString(field.name, mesg);</a>
+<a name="ln1450">        SerializeType(field.type.get(), mesg);</a>
+<a name="ln1451">      }</a>
+<a name="ln1452">      return;</a>
+<a name="ln1453">    case RowsMetadata::Type::Id::TUPLE:</a>
+<a name="ln1454">      SerializeShort(type-&gt;tuple_component_types-&gt;size(), mesg);</a>
+<a name="ln1455">      for (const auto&amp; component_type : *type-&gt;tuple_component_types) {</a>
+<a name="ln1456">        SerializeType(component_type.get(), mesg);</a>
+<a name="ln1457">      }</a>
+<a name="ln1458">      return;</a>
+<a name="ln1459"> </a>
+<a name="ln1460">    // default: fall through</a>
+<a name="ln1461">  }</a>
+<a name="ln1462"> </a>
+<a name="ln1463">  LOG(ERROR) &lt;&lt; &quot;Internal error: unknown type id &quot; &lt;&lt; static_cast&lt;uint32_t&gt;(type-&gt;id);</a>
+<a name="ln1464">}</a>
+<a name="ln1465"> </a>
+<a name="ln1466">void ResultResponse::SerializeColSpecs(</a>
+<a name="ln1467">      const bool has_global_table_spec, const RowsMetadata::GlobalTableSpec&amp; global_table_spec,</a>
+<a name="ln1468">      const vector&lt;RowsMetadata::ColSpec&gt;&amp; col_specs, faststring* mesg) const {</a>
+<a name="ln1469">  if (has_global_table_spec) {</a>
+<a name="ln1470">    SerializeString(global_table_spec.keyspace, mesg);</a>
+<a name="ln1471">    SerializeString(global_table_spec.table, mesg);</a>
+<a name="ln1472">  }</a>
+<a name="ln1473">  for (const auto&amp; col_spec : col_specs) {</a>
+<a name="ln1474">    if (!has_global_table_spec) {</a>
+<a name="ln1475">      SerializeString(col_spec.keyspace, mesg);</a>
+<a name="ln1476">      SerializeString(col_spec.table, mesg);</a>
+<a name="ln1477">    }</a>
+<a name="ln1478">    SerializeString(col_spec.column, mesg);</a>
+<a name="ln1479">    SerializeType(&amp;col_spec.type, mesg);</a>
+<a name="ln1480">  }</a>
+<a name="ln1481">}</a>
+<a name="ln1482"> </a>
+<a name="ln1483">void ResultResponse::SerializeRowsMetadata(const RowsMetadata&amp; metadata, faststring* mesg) const {</a>
+<a name="ln1484">  SerializeInt(metadata.flags, mesg);</a>
+<a name="ln1485">  SerializeInt(metadata.col_count, mesg);</a>
+<a name="ln1486">  if (metadata.flags &amp; RowsMetadata::kHasMorePages) {</a>
+<a name="ln1487">    SerializeBytes(metadata.paging_state, mesg);</a>
+<a name="ln1488">  }</a>
+<a name="ln1489">  if (metadata.flags &amp; RowsMetadata::kNoMetadata) {</a>
+<a name="ln1490">    return;</a>
+<a name="ln1491">  }</a>
+<a name="ln1492">  CHECK_EQ(metadata.col_count, metadata.col_specs.size());</a>
+<a name="ln1493">  SerializeColSpecs(</a>
+<a name="ln1494">      metadata.flags &amp; RowsMetadata::kHasGlobalTableSpec, metadata.global_table_spec,</a>
+<a name="ln1495">      metadata.col_specs, mesg);</a>
+<a name="ln1496">}</a>
+<a name="ln1497"> </a>
+<a name="ln1498">//----------------------------------------------------------------------------------------</a>
+<a name="ln1499">VoidResultResponse::VoidResultResponse(const CQLRequest&amp; request)</a>
+<a name="ln1500">    : ResultResponse(request, Kind::VOID) {</a>
+<a name="ln1501">}</a>
+<a name="ln1502"> </a>
+<a name="ln1503">VoidResultResponse::~VoidResultResponse() {</a>
+<a name="ln1504">}</a>
+<a name="ln1505"> </a>
+<a name="ln1506">void VoidResultResponse::SerializeResultBody(faststring* mesg) const {</a>
+<a name="ln1507">  // Void result response body is empty</a>
+<a name="ln1508">}</a>
+<a name="ln1509"> </a>
+<a name="ln1510">//----------------------------------------------------------------------------------------</a>
+<a name="ln1511">RowsResultResponse::RowsResultResponse(</a>
+<a name="ln1512">    const QueryRequest&amp; request, const ql::RowsResult::SharedPtr&amp; result)</a>
+<a name="ln1513">    : ResultResponse(request, Kind::ROWS), result_(result),</a>
+<a name="ln1514">      skip_metadata_(request.params().flags &amp; CQLMessage::QueryParameters::kSkipMetadataFlag) {</a>
+<a name="ln1515">}</a>
+<a name="ln1516"> </a>
+<a name="ln1517">RowsResultResponse::RowsResultResponse(</a>
+<a name="ln1518">    const ExecuteRequest&amp; request, const ql::RowsResult::SharedPtr&amp; result)</a>
+<a name="ln1519">    : ResultResponse(request, Kind::ROWS), result_(result),</a>
+<a name="ln1520">      skip_metadata_(request.params().flags &amp; CQLMessage::QueryParameters::kSkipMetadataFlag) {</a>
+<a name="ln1521">}</a>
+<a name="ln1522"> </a>
+<a name="ln1523">RowsResultResponse::RowsResultResponse(</a>
+<a name="ln1524">    const BatchRequest&amp; request, const ql::RowsResult::SharedPtr&amp; result)</a>
+<a name="ln1525">    : ResultResponse(request, Kind::ROWS), result_(result),</a>
+<a name="ln1526">      skip_metadata_(false) { // Batches don't have the skip_metadata flag.</a>
+<a name="ln1527">}</a>
+<a name="ln1528"> </a>
+<a name="ln1529">RowsResultResponse::~RowsResultResponse() {</a>
+<a name="ln1530">}</a>
+<a name="ln1531"> </a>
+<a name="ln1532">void RowsResultResponse::SerializeResultBody(faststring* mesg) const {</a>
+<a name="ln1533">  SerializeRowsMetadata(</a>
+<a name="ln1534">      RowsMetadata(result_-&gt;table_name(), result_-&gt;column_schemas(),</a>
+<a name="ln1535">                   result_-&gt;paging_state(), skip_metadata_), mesg);</a>
+<a name="ln1536">  mesg-&gt;append(result_-&gt;rows_data());</a>
+<a name="ln1537">}</a>
+<a name="ln1538"> </a>
+<a name="ln1539">//----------------------------------------------------------------------------------------</a>
+<a name="ln1540">PreparedResultResponse::PreparedMetadata::PreparedMetadata() {</a>
+<a name="ln1541">}</a>
+<a name="ln1542"> </a>
+<a name="ln1543">PreparedResultResponse::PreparedMetadata::PreparedMetadata(</a>
+<a name="ln1544">    const client::YBTableName&amp; table_name, const std::vector&lt;int64_t&gt;&amp; hash_col_indices,</a>
+<a name="ln1545">    const vector&lt;client::YBTableName&gt;&amp; bind_table_names,</a>
+<a name="ln1546">    const vector&lt;ColumnSchema&gt;&amp; bind_variable_schemas)</a>
+<a name="ln1547">    : flags(table_name.empty() ? 0 : kHasGlobalTableSpec),</a>
+<a name="ln1548">      global_table_spec(table_name.namespace_name(), table_name.table_name()) {</a>
+<a name="ln1549">  this-&gt;pk_indices.reserve(hash_col_indices.size());</a>
+<a name="ln1550">  for (const size_t index : hash_col_indices) {</a>
+<a name="ln1551">    this-&gt;pk_indices.emplace_back(static_cast&lt;uint16_t&gt;(index));</a>
+<a name="ln1552">  }</a>
+<a name="ln1553">  col_specs.reserve(bind_variable_schemas.size());</a>
+<a name="ln1554">  for (int i = 0; i &lt; bind_variable_schemas.size(); i++) {</a>
+<a name="ln1555">    const ColumnSchema&amp; var = bind_variable_schemas[i];</a>
+<a name="ln1556">    if (flags &amp; kHasGlobalTableSpec) {</a>
+<a name="ln1557">      col_specs.emplace_back(var.name(), RowsMetadata::Type(var.type()));</a>
+<a name="ln1558">    } else {</a>
+<a name="ln1559">      col_specs.emplace_back(bind_table_names[i], var.name(), RowsMetadata::Type(var.type()));</a>
+<a name="ln1560">    }</a>
+<a name="ln1561">  }</a>
+<a name="ln1562">}</a>
+<a name="ln1563"> </a>
+<a name="ln1564">PreparedResultResponse::PreparedResultResponse(const CQLRequest&amp; request, const QueryId&amp; query_id)</a>
+<a name="ln1565">    : ResultResponse(request, Kind::PREPARED), query_id_(query_id) {</a>
+<a name="ln1566">}</a>
+<a name="ln1567"> </a>
+<a name="ln1568">PreparedResultResponse::PreparedResultResponse(</a>
+<a name="ln1569">    const CQLRequest&amp; request, const QueryId&amp; query_id, const ql::PreparedResult&amp; result)</a>
+<a name="ln1570">    : ResultResponse(request, Kind::PREPARED), query_id_(query_id),</a>
+<a name="ln1571">      prepared_metadata_(result.table_name(), result.hash_col_indices(),</a>
+<a name="ln1572">                         result.bind_table_names(), result.bind_variable_schemas()),</a>
+<a name="ln1573">      rows_metadata_(!result.column_schemas().empty() ?</a>
+<a name="ln1574">                     RowsMetadata(</a>
+<a name="ln1575">                         result.table_name(), result.column_schemas(),</a>
+<a name="ln1576">                         &quot;&quot; /* paging_state */, false /* no_metadata */) :</a>
+<a name="ln1577">                     RowsMetadata()) {</a>
+<a name="ln1578">}</a>
+<a name="ln1579"> </a>
+<a name="ln1580">PreparedResultResponse::~PreparedResultResponse() {</a>
+<a name="ln1581">}</a>
+<a name="ln1582"> </a>
+<a name="ln1583">void PreparedResultResponse::SerializePreparedMetadata(</a>
+<a name="ln1584">    const PreparedMetadata&amp; metadata, faststring* mesg) const {</a>
+<a name="ln1585">  SerializeInt(metadata.flags, mesg);</a>
+<a name="ln1586">  SerializeInt(metadata.col_specs.size(), mesg);</a>
+<a name="ln1587">  if (VersionIsCompatible(kV4Version)) {</a>
+<a name="ln1588">    SerializeInt(metadata.pk_indices.size(), mesg);</a>
+<a name="ln1589">    for (const auto&amp; pk_index : metadata.pk_indices) {</a>
+<a name="ln1590">      SerializeShort(pk_index, mesg);</a>
+<a name="ln1591">    }</a>
+<a name="ln1592">  }</a>
+<a name="ln1593">  SerializeColSpecs(</a>
+<a name="ln1594">      metadata.flags &amp; PreparedMetadata::kHasGlobalTableSpec, metadata.global_table_spec,</a>
+<a name="ln1595">      metadata.col_specs, mesg);</a>
+<a name="ln1596">}</a>
+<a name="ln1597"> </a>
+<a name="ln1598">void PreparedResultResponse::SerializeResultBody(faststring* mesg) const {</a>
+<a name="ln1599">  SerializeShortBytes(query_id_, mesg);</a>
+<a name="ln1600">  SerializePreparedMetadata(prepared_metadata_, mesg);</a>
+<a name="ln1601">  SerializeRowsMetadata(rows_metadata_, mesg);</a>
+<a name="ln1602">}</a>
+<a name="ln1603"> </a>
+<a name="ln1604">//----------------------------------------------------------------------------------------</a>
+<a name="ln1605">SetKeyspaceResultResponse::SetKeyspaceResultResponse(</a>
+<a name="ln1606">    const CQLRequest&amp; request, const ql::SetKeyspaceResult&amp; result)</a>
+<a name="ln1607">    : ResultResponse(request, Kind::SET_KEYSPACE), keyspace_(result.keyspace()) {</a>
+<a name="ln1608">}</a>
+<a name="ln1609"> </a>
+<a name="ln1610">SetKeyspaceResultResponse::~SetKeyspaceResultResponse() {</a>
+<a name="ln1611">}</a>
+<a name="ln1612"> </a>
+<a name="ln1613">void SetKeyspaceResultResponse::SerializeResultBody(faststring* mesg) const {</a>
+<a name="ln1614">  SerializeString(keyspace_, mesg);</a>
+<a name="ln1615">}</a>
+<a name="ln1616"> </a>
+<a name="ln1617">//----------------------------------------------------------------------------------------</a>
+<a name="ln1618">SchemaChangeResultResponse::SchemaChangeResultResponse(</a>
+<a name="ln1619">    const CQLRequest&amp; request, const ql::SchemaChangeResult&amp; result)</a>
+<a name="ln1620">    : ResultResponse(request, Kind::SCHEMA_CHANGE),</a>
+<a name="ln1621">      change_type_(result.change_type()), target_(result.object_type()),</a>
+<a name="ln1622">      keyspace_(result.keyspace_name()), object_(result.object_name()) {</a>
+<a name="ln1623">}</a>
+<a name="ln1624"> </a>
+<a name="ln1625">SchemaChangeResultResponse::~SchemaChangeResultResponse() {</a>
+<a name="ln1626">}</a>
+<a name="ln1627"> </a>
+<a name="ln1628">void SchemaChangeResultResponse::Serialize(const CompressionScheme compression_scheme,</a>
+<a name="ln1629">                                           faststring* mesg) const {</a>
+<a name="ln1630">  ResultResponse::Serialize(compression_scheme, mesg);</a>
+<a name="ln1631"> </a>
+<a name="ln1632">  if (registered_events() &amp; kSchemaChange) {</a>
+<a name="ln1633">    // TODO: Replace this hack that piggybacks a SCHEMA_CHANGE event along a SCHEMA_CHANGE result</a>
+<a name="ln1634">    // response with a formal event notification mechanism.</a>
+<a name="ln1635">    SchemaChangeEventResponse event(change_type_, target_, keyspace_, object_, argument_types_);</a>
+<a name="ln1636">    event.Serialize(compression_scheme, mesg);</a>
+<a name="ln1637">  }</a>
+<a name="ln1638">}</a>
+<a name="ln1639"> </a>
+<a name="ln1640">void SchemaChangeResultResponse::SerializeResultBody(faststring* mesg) const {</a>
+<a name="ln1641">  SerializeString(change_type_, mesg);</a>
+<a name="ln1642">  SerializeString(target_, mesg);</a>
+<a name="ln1643">  if (target_ == &quot;KEYSPACE&quot;) {</a>
+<a name="ln1644">    SerializeString(keyspace_, mesg);</a>
+<a name="ln1645">  } else if (target_ == &quot;TABLE&quot; || target_ == &quot;TYPE&quot;) {</a>
+<a name="ln1646">    SerializeString(keyspace_, mesg);</a>
+<a name="ln1647">    SerializeString(object_, mesg);</a>
+<a name="ln1648">  } else if (target_ == &quot;FUNCTION&quot; || target_ == &quot;AGGREGATE&quot;) {</a>
+<a name="ln1649">    SerializeString(keyspace_, mesg);</a>
+<a name="ln1650">    SerializeString(object_, mesg);</a>
+<a name="ln1651">    SerializeStringList(argument_types_, mesg);</a>
+<a name="ln1652">  }</a>
+<a name="ln1653">}</a>
+<a name="ln1654"> </a>
+<a name="ln1655">//----------------------------------------------------------------------------------------</a>
+<a name="ln1656">EventResponse::EventResponse(const string&amp; event_type)</a>
+<a name="ln1657">    : CQLResponse(kEventStreamId, Opcode::EVENT), event_type_(event_type) {</a>
+<a name="ln1658">}</a>
+<a name="ln1659"> </a>
+<a name="ln1660">EventResponse::~EventResponse() {</a>
+<a name="ln1661">}</a>
+<a name="ln1662"> </a>
+<a name="ln1663">void EventResponse::SerializeBody(faststring* mesg) const {</a>
+<a name="ln1664">  SerializeString(event_type_, mesg);</a>
+<a name="ln1665">  SerializeEventBody(mesg);</a>
+<a name="ln1666">}</a>
+<a name="ln1667"> </a>
+<a name="ln1668">std::string EventResponse::ToString() const {</a>
+<a name="ln1669">  return event_type_ + &quot;:&quot; + BodyToString();</a>
+<a name="ln1670">}</a>
+<a name="ln1671"> </a>
+<a name="ln1672">//----------------------------------------------------------------------------------------</a>
+<a name="ln1673">TopologyChangeEventResponse::TopologyChangeEventResponse(const string&amp; topology_change_type,</a>
+<a name="ln1674">                                                         const Endpoint&amp; node)</a>
+<a name="ln1675">    : EventResponse(kTopologyChangeEvent), topology_change_type_(topology_change_type),</a>
+<a name="ln1676">      node_(node) {</a>
+<a name="ln1677">}</a>
+<a name="ln1678"> </a>
+<a name="ln1679">TopologyChangeEventResponse::~TopologyChangeEventResponse() {</a>
+<a name="ln1680">}</a>
+<a name="ln1681"> </a>
+<a name="ln1682">void TopologyChangeEventResponse::SerializeEventBody(faststring* mesg) const {</a>
+<a name="ln1683">  SerializeString(topology_change_type_, mesg);</a>
+<a name="ln1684">  SerializeInet(node_, mesg);</a>
+<a name="ln1685">}</a>
+<a name="ln1686"> </a>
+<a name="ln1687">std::string TopologyChangeEventResponse::BodyToString() const {</a>
+<a name="ln1688">  return topology_change_type_;</a>
+<a name="ln1689">}</a>
+<a name="ln1690"> </a>
+<a name="ln1691">//----------------------------------------------------------------------------------------</a>
+<a name="ln1692">StatusChangeEventResponse::StatusChangeEventResponse(const string&amp; status_change_type,</a>
+<a name="ln1693">                                                     const Endpoint&amp; node)</a>
+<a name="ln1694">    : EventResponse(kStatusChangeEvent), status_change_type_(status_change_type),</a>
+<a name="ln1695">      node_(node) {</a>
+<a name="ln1696">}</a>
+<a name="ln1697"> </a>
+<a name="ln1698">StatusChangeEventResponse::~StatusChangeEventResponse() {</a>
+<a name="ln1699">}</a>
+<a name="ln1700"> </a>
+<a name="ln1701">void StatusChangeEventResponse::SerializeEventBody(faststring* mesg) const {</a>
+<a name="ln1702">  SerializeString(status_change_type_, mesg);</a>
+<a name="ln1703">  SerializeInet(node_, mesg);</a>
+<a name="ln1704">}</a>
+<a name="ln1705"> </a>
+<a name="ln1706">std::string StatusChangeEventResponse::BodyToString() const {</a>
+<a name="ln1707">  return status_change_type_;</a>
+<a name="ln1708">}</a>
+<a name="ln1709"> </a>
+<a name="ln1710">//----------------------------------------------------------------------------------------</a>
+<a name="ln1711">const vector&lt;string&gt; SchemaChangeEventResponse::kEmptyArgumentTypes = {};</a>
+<a name="ln1712"> </a>
+<a name="ln1713">SchemaChangeEventResponse::SchemaChangeEventResponse(</a>
+<a name="ln1714">    const string&amp; change_type, const string&amp; target,</a>
+<a name="ln1715">    const string&amp; keyspace, const string&amp; object, const vector&lt;string&gt;&amp; argument_types)</a>
+<a name="ln1716">    : EventResponse(kSchemaChangeEvent), change_type_(change_type), target_(target),</a>
+<a name="ln1717">      keyspace_(keyspace), object_(object), argument_types_(argument_types) {</a>
+<a name="ln1718">}</a>
+<a name="ln1719"> </a>
+<a name="ln1720">SchemaChangeEventResponse::~SchemaChangeEventResponse() {</a>
+<a name="ln1721">}</a>
+<a name="ln1722"> </a>
+<a name="ln1723">std::string SchemaChangeEventResponse::BodyToString() const {</a>
+<a name="ln1724">  return change_type_;</a>
+<a name="ln1725">}</a>
+<a name="ln1726"> </a>
+<a name="ln1727">void SchemaChangeEventResponse::SerializeEventBody(faststring* mesg) const {</a>
+<a name="ln1728">  SerializeString(change_type_, mesg);</a>
+<a name="ln1729">  SerializeString(target_, mesg);</a>
+<a name="ln1730">  if (target_ == &quot;KEYSPACE&quot;) {</a>
+<a name="ln1731">    SerializeString(keyspace_, mesg);</a>
+<a name="ln1732">  } else if (target_ == &quot;TABLE&quot; || target_ == &quot;TYPE&quot;) {</a>
+<a name="ln1733">    SerializeString(keyspace_, mesg);</a>
+<a name="ln1734">    SerializeString(object_, mesg);</a>
+<a name="ln1735">  } else if (target_ == &quot;FUNCTION&quot; || target_ == &quot;AGGREGATE&quot;) {</a>
+<a name="ln1736">    SerializeString(keyspace_, mesg);</a>
+<a name="ln1737">    SerializeString(object_, mesg);</a>
+<a name="ln1738">    SerializeStringList(argument_types_, mesg);</a>
+<a name="ln1739">  }</a>
+<a name="ln1740">}</a>
+<a name="ln1741"> </a>
+<a name="ln1742">//----------------------------------------------------------------------------------------</a>
+<a name="ln1743">AuthChallengeResponse::AuthChallengeResponse(const CQLRequest&amp; request, const string&amp; token)</a>
+<a name="ln1744">    : CQLResponse(request, Opcode::AUTH_CHALLENGE), token_(token) {</a>
+<a name="ln1745">}</a>
+<a name="ln1746"> </a>
+<a name="ln1747">AuthChallengeResponse::~AuthChallengeResponse() {</a>
+<a name="ln1748">}</a>
+<a name="ln1749"> </a>
+<a name="ln1750">void AuthChallengeResponse::SerializeBody(faststring* mesg) const {</a>
+<a name="ln1751">  SerializeBytes(token_, mesg);</a>
+<a name="ln1752">}</a>
+<a name="ln1753"> </a>
+<a name="ln1754">//----------------------------------------------------------------------------------------</a>
+<a name="ln1755">AuthSuccessResponse::AuthSuccessResponse(const CQLRequest&amp; request, const string&amp; token)</a>
+<a name="ln1756">    : CQLResponse(request, Opcode::AUTH_SUCCESS), token_(token) {</a>
+<a name="ln1757">}</a>
+<a name="ln1758"> </a>
+<a name="ln1759">AuthSuccessResponse::~AuthSuccessResponse() {</a>
+<a name="ln1760">}</a>
+<a name="ln1761"> </a>
+<a name="ln1762">void AuthSuccessResponse::SerializeBody(faststring* mesg) const {</a>
+<a name="ln1763">  SerializeBytes(token_, mesg);</a>
+<a name="ln1764">}</a>
+<a name="ln1765"> </a>
+<a name="ln1766">CQLServerEvent::CQLServerEvent(std::unique_ptr&lt;EventResponse&gt; event_response)</a>
+<a name="ln1767">    : event_response_(std::move(event_response)) {</a>
+<a name="ln1768">  CHECK_NOTNULL(event_response_.get());</a>
+<a name="ln1769">  faststring temp;</a>
+<a name="ln1770">  event_response_-&gt;Serialize(CQLMessage::CompressionScheme::kNone, &amp;temp);</a>
+<a name="ln1771">  serialized_response_ = RefCntBuffer(temp);</a>
+<a name="ln1772">}</a>
+<a name="ln1773"> </a>
+<a name="ln1774">void CQLServerEvent::Serialize(boost::container::small_vector_base&lt;RefCntBuffer&gt;* output) const {</a>
+<a name="ln1775">  output-&gt;push_back(serialized_response_);</a>
+<a name="ln1776">}</a>
+<a name="ln1777"> </a>
+<a name="ln1778">std::string CQLServerEvent::ToString() const {</a>
+<a name="ln1779">  return event_response_-&gt;ToString();</a>
+<a name="ln1780">}</a>
+<a name="ln1781"> </a>
+<a name="ln1782">CQLServerEventList::CQLServerEventList() {</a>
+<a name="ln1783">}</a>
+<a name="ln1784"> </a>
+<a name="ln1785">void CQLServerEventList::Transferred(const Status&amp; status, rpc::Connection*) {</a>
+<a name="ln1786">  if (!status.ok()) {</a>
+<a name="ln1787">    LOG(WARNING) &lt;&lt; &quot;Transfer of CQL server event failed: &quot; &lt;&lt; status.ToString();</a>
+<a name="ln1788">  }</a>
+<a name="ln1789">}</a>
+<a name="ln1790"> </a>
+<a name="ln1791">void CQLServerEventList::Serialize(</a>
+<a name="ln1792">    boost::container::small_vector_base&lt;RefCntBuffer&gt;* output) {</a>
+<a name="ln1793">  for (const auto&amp; cql_server_event : cql_server_events_) {</a>
+<a name="ln1794">    cql_server_event-&gt;Serialize(output);</a>
+<a name="ln1795">  }</a>
+<a name="ln1796">}</a>
+<a name="ln1797"> </a>
+<a name="ln1798">std::string CQLServerEventList::ToString() const {</a>
+<a name="ln1799">  std::string ret = &quot;&quot;;</a>
+<a name="ln1800">  for (const auto&amp; cql_server_event : cql_server_events_) {</a>
+<a name="ln1801">    if (!ret.empty()) {</a>
+<a name="ln1802">      ret += &quot;, &quot;;</a>
+<a name="ln1803">    }</a>
+<a name="ln1804">    ret += cql_server_event-&gt;ToString();</a>
+<a name="ln1805">  }</a>
+<a name="ln1806">  return ret;</a>
+<a name="ln1807">}</a>
+<a name="ln1808"> </a>
+<a name="ln1809">void CQLServerEventList::AddEvent(std::unique_ptr&lt;CQLServerEvent&gt; event) {</a>
+<a name="ln1810">  cql_server_events_.push_back(std::move(event));</a>
+<a name="ln1811">}</a>
+<a name="ln1812"> </a>
+<a name="ln1813">}  // namespace cqlserver</a>
+<a name="ln1814">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="213"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="394"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="402"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="407"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="438"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="443"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="456"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="470"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="483"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="497"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="518"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="728"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: events_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

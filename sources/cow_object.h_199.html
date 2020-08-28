@@ -1,0 +1,309 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>cow_object.h</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32">#ifndef YB_UTIL_COW_OBJECT_H</a>
+<a name="ln33">#define YB_UTIL_COW_OBJECT_H</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;algorithm&gt;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &lt;glog/logging.h&gt;</a>
+<a name="ln38"> </a>
+<a name="ln39">#include &quot;yb/gutil/gscoped_ptr.h&quot;</a>
+<a name="ln40">#include &quot;yb/gutil/macros.h&quot;</a>
+<a name="ln41">#include &quot;yb/util/rwc_lock.h&quot;</a>
+<a name="ln42">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln43"> </a>
+<a name="ln44">namespace yb {</a>
+<a name="ln45"> </a>
+<a name="ln46">// An object which manages its state via copy-on-write.</a>
+<a name="ln47">//</a>
+<a name="ln48">// Access to this object can be done more conveniently using the</a>
+<a name="ln49">// CowLock template class defined below.</a>
+<a name="ln50">//</a>
+<a name="ln51">// The 'State' template parameter must be swappable using std::swap.</a>
+<a name="ln52">template&lt;class State&gt;</a>
+<a name="ln53">class CowObject {</a>
+<a name="ln54"> public:</a>
+<a name="ln55">  CowObject() {}</a>
+<a name="ln56">  ~CowObject() {}</a>
+<a name="ln57"> </a>
+<a name="ln58">  void ReadLock() const {</a>
+<a name="ln59">    lock_.ReadLock();</a>
+<a name="ln60">  }</a>
+<a name="ln61"> </a>
+<a name="ln62">  void lock_shared() const {</a>
+<a name="ln63">    ReadLock();</a>
+<a name="ln64">  }</a>
+<a name="ln65"> </a>
+<a name="ln66">  void ReadUnlock() const {</a>
+<a name="ln67">    lock_.ReadUnlock();</a>
+<a name="ln68">  }</a>
+<a name="ln69"> </a>
+<a name="ln70">  void unlock_shared() const {</a>
+<a name="ln71">    ReadUnlock();</a>
+<a name="ln72">  }</a>
+<a name="ln73"> </a>
+<a name="ln74">  // Lock the object for write (preventing concurrent mutators), and make a safe</a>
+<a name="ln75">  // copy of the object to mutate.</a>
+<a name="ln76">  void StartMutation() {</a>
+<a name="ln77">    lock_.WriteLock();</a>
+<a name="ln78">    // Clone our object.</a>
+<a name="ln79">    dirty_state_.reset(new State(state_));</a>
+<a name="ln80">  }</a>
+<a name="ln81"> </a>
+<a name="ln82">  // Abort the current mutation. This drops the write lock without applying any</a>
+<a name="ln83">  // changes made to the mutable copy.</a>
+<a name="ln84">  void AbortMutation() {</a>
+<a name="ln85">    dirty_state_.reset();</a>
+<a name="ln86">    is_dirty_ = false;</a>
+<a name="ln87">    lock_.WriteUnlock();</a>
+<a name="ln88">  }</a>
+<a name="ln89"> </a>
+<a name="ln90">  // Commit the current mutation. This escalates to the &quot;Commit&quot; lock, which</a>
+<a name="ln91">  // blocks any concurrent readers or writers, swaps in the new version of the</a>
+<a name="ln92">  // State, and then drops the commit lock.</a>
+<a name="ln93">  void CommitMutation() {</a>
+<a name="ln94">    lock_.UpgradeToCommitLock();</a>
+<a name="ln95">    CHECK(dirty_state_);</a>
+<a name="ln96">    std::swap(state_, *dirty_state_);</a>
+<a name="ln97">    dirty_state_.reset();</a>
+<a name="ln98">    is_dirty_ = false;</a>
+<a name="ln99">    lock_.CommitUnlock();</a>
+<a name="ln100">  }</a>
+<a name="ln101"> </a>
+<a name="ln102">  // Return the current state, not reflecting any in-progress mutations.</a>
+<a name="ln103">  State&amp; state() {</a>
+<a name="ln104">    DCHECK(lock_.HasReaders() || lock_.HasWriteLock());</a>
+<a name="ln105">    return state_;</a>
+<a name="ln106">  }</a>
+<a name="ln107"> </a>
+<a name="ln108">  const State&amp; state() const {</a>
+<a name="ln109">    DCHECK(lock_.HasReaders() || lock_.HasWriteLock());</a>
+<a name="ln110">    return state_;</a>
+<a name="ln111">  }</a>
+<a name="ln112"> </a>
+<a name="ln113">  // Returns the current dirty state (i.e reflecting in-progress mutations).</a>
+<a name="ln114">  // Should only be called by a thread who previously called StartMutation().</a>
+<a name="ln115">  State* mutable_dirty() {</a>
+<a name="ln116">    DCHECK(lock_.HasWriteLock());</a>
+<a name="ln117">    is_dirty_ = true;</a>
+<a name="ln118">    return DCHECK_NOTNULL(dirty_state_.get());</a>
+<a name="ln119">  }</a>
+<a name="ln120"> </a>
+<a name="ln121">  const State&amp; dirty() const {</a>
+<a name="ln122">    return *DCHECK_NOTNULL(dirty_state_.get());</a>
+<a name="ln123">  }</a>
+<a name="ln124"> </a>
+<a name="ln125">  bool is_dirty() const {</a>
+<a name="ln126">    DCHECK(lock_.HasReaders() || lock_.HasWriteLock());</a>
+<a name="ln127">    return is_dirty_;</a>
+<a name="ln128">  }</a>
+<a name="ln129"> </a>
+<a name="ln130"> private:</a>
+<a name="ln131">  mutable RWCLock lock_;</a>
+<a name="ln132"> </a>
+<a name="ln133">  State state_;</a>
+<a name="ln134">  gscoped_ptr&lt;State&gt; dirty_state_;</a>
+<a name="ln135"> </a>
+<a name="ln136">  // Set only when mutable_dirty() method is called. Unset whenever dirty_state_ is reset().</a>
+<a name="ln137">  bool is_dirty_ = false;</a>
+<a name="ln138"> </a>
+<a name="ln139">  DISALLOW_COPY_AND_ASSIGN(CowObject);</a>
+<a name="ln140">};</a>
+<a name="ln141"> </a>
+<a name="ln142">// A lock-guard-like scoped object to acquire the lock on a CowObject,</a>
+<a name="ln143">// and obtain a pointer to the correct copy to read/write.</a>
+<a name="ln144">//</a>
+<a name="ln145">// Example usage:</a>
+<a name="ln146">//</a>
+<a name="ln147">//   CowObject&lt;Foo&gt; my_obj;</a>
+<a name="ln148">//   {</a>
+<a name="ln149">//     CowLock&lt;Foo&gt; l(&amp;my_obj, CowLock&lt;Foo&gt;::READ);</a>
+<a name="ln150">//     l.data().get_foo();</a>
+<a name="ln151">//     ...</a>
+<a name="ln152">//   }</a>
+<a name="ln153">//   {</a>
+<a name="ln154">//     CowLock&lt;Foo&gt; l(&amp;my_obj, CowLock&lt;Foo&gt;::WRITE);</a>
+<a name="ln155">//     l-&gt;mutable_data()-&gt;set_foo(...);</a>
+<a name="ln156">//     ...</a>
+<a name="ln157">//     l.Commit();</a>
+<a name="ln158">//   }</a>
+<a name="ln159">template&lt;class State&gt;</a>
+<a name="ln160">class CowLock {</a>
+<a name="ln161"> public:</a>
+<a name="ln162">  enum LockMode {</a>
+<a name="ln163">    READ, WRITE, RELEASED</a>
+<a name="ln164">  };</a>
+<a name="ln165"> </a>
+<a name="ln166">  // Lock in either read or write mode.</a>
+<a name="ln167">  CowLock(CowObject&lt;State&gt;* cow,</a>
+<a name="ln168">          LockMode mode)</a>
+<a name="ln169">    : cow_(cow),</a>
+<a name="ln170">      mode_(mode) {</a>
+<a name="ln171">    if (mode == READ) {</a>
+<a name="ln172">      cow_-&gt;ReadLock();</a>
+<a name="ln173">    } else if (mode_ == WRITE) {</a>
+<a name="ln174">      cow_-&gt;StartMutation();</a>
+<a name="ln175">    } else {</a>
+<a name="ln176">      LOG(FATAL) &lt;&lt; &quot;Cannot lock in mode &quot; &lt;&lt; mode;</a>
+<a name="ln177">    }</a>
+<a name="ln178">  }</a>
+<a name="ln179"> </a>
+<a name="ln180">  // Lock in read mode.</a>
+<a name="ln181">  // A const object may not be locked in write mode.</a>
+<a name="ln182">  CowLock(const CowObject&lt;State&gt;* info,</a>
+<a name="ln183">          LockMode mode)</a>
+<a name="ln184">    : cow_(const_cast&lt;CowObject&lt;State&gt;*&gt;(info)),</a>
+<a name="ln185">      mode_(mode) {</a>
+<a name="ln186">    if (mode == READ) {</a>
+<a name="ln187">      cow_-&gt;ReadLock();</a>
+<a name="ln188">    } else if (mode_ == WRITE) {</a>
+<a name="ln189">      LOG(FATAL) &lt;&lt; &quot;Cannot write-lock a const pointer&quot;;</a>
+<a name="ln190">    } else {</a>
+<a name="ln191">      LOG(FATAL) &lt;&lt; &quot;Cannot lock in mode &quot; &lt;&lt; mode;</a>
+<a name="ln192">    }</a>
+<a name="ln193">  }</a>
+<a name="ln194"> </a>
+<a name="ln195">  // Commit the underlying object.</a>
+<a name="ln196">  // Requires that the caller hold the lock in write mode.</a>
+<a name="ln197">  void Commit() {</a>
+<a name="ln198">    DCHECK_EQ(WRITE, mode_);</a>
+<a name="ln199">    cow_-&gt;CommitMutation();</a>
+<a name="ln200">    mode_ = RELEASED;</a>
+<a name="ln201">  }</a>
+<a name="ln202"> </a>
+<a name="ln203">  void Unlock() {</a>
+<a name="ln204">    if (mode_ == READ) {</a>
+<a name="ln205">      cow_-&gt;ReadUnlock();</a>
+<a name="ln206">    } else if (mode_ == WRITE) {</a>
+<a name="ln207">      cow_-&gt;AbortMutation();</a>
+<a name="ln208">    } else {</a>
+<a name="ln209">      DCHECK_EQ(RELEASED, mode_);</a>
+<a name="ln210">    }</a>
+<a name="ln211">    mode_ = RELEASED;</a>
+<a name="ln212">  }</a>
+<a name="ln213"> </a>
+<a name="ln214">  // Obtain the underlying data. In WRITE mode, this returns the</a>
+<a name="ln215">  // same data as mutable_data() (not the safe unchanging copy).</a>
+<a name="ln216">  const State&amp; data() const {</a>
+<a name="ln217">    if (mode_ == READ) {</a>
+<a name="ln218">      return cow_-&gt;state();</a>
+<a name="ln219">    } else if (mode_ == WRITE) {</a>
+<a name="ln220">      return cow_-&gt;dirty();</a>
+<a name="ln221">    } else {</a>
+<a name="ln222">      FATAL_ERROR(&quot;Cannot access data after committing&quot;);</a>
+<a name="ln223">    }</a>
+<a name="ln224">  }</a>
+<a name="ln225"> </a>
+<a name="ln226">  // Obtain the mutable data. This may only be called in WRITE mode.</a>
+<a name="ln227">  State* mutable_data() {</a>
+<a name="ln228">    if (mode_ == READ) {</a>
+<a name="ln229">      FATAL_ERROR(&quot;Cannot mutate data with READ lock&quot;);</a>
+<a name="ln230">    } else if (mode_ == WRITE) {</a>
+<a name="ln231">      return cow_-&gt;mutable_dirty();</a>
+<a name="ln232">    } else {</a>
+<a name="ln233">      FATAL_ERROR(&quot;Cannot access data after committing&quot;);</a>
+<a name="ln234">    }</a>
+<a name="ln235">  }</a>
+<a name="ln236"> </a>
+<a name="ln237">  bool is_write_locked() const {</a>
+<a name="ln238">    return mode_ == WRITE;</a>
+<a name="ln239">  }</a>
+<a name="ln240"> </a>
+<a name="ln241">  bool is_dirty() const {</a>
+<a name="ln242">    return cow_-&gt;is_dirty();</a>
+<a name="ln243">  }</a>
+<a name="ln244"> </a>
+<a name="ln245">  // Drop the lock. If the lock is held in WRITE mode, and the</a>
+<a name="ln246">  // lock has not yet been released, aborts the mutation, restoring</a>
+<a name="ln247">  // the underlying object to its original data.</a>
+<a name="ln248">  ~CowLock() {</a>
+<a name="ln249">    Unlock();</a>
+<a name="ln250">  }</a>
+<a name="ln251"> </a>
+<a name="ln252"> private:</a>
+<a name="ln253">  CowObject&lt;State&gt;* cow_;</a>
+<a name="ln254">  LockMode mode_;</a>
+<a name="ln255">  DISALLOW_COPY_AND_ASSIGN(CowLock);</a>
+<a name="ln256">};</a>
+<a name="ln257"> </a>
+<a name="ln258">} // namespace yb</a>
+<a name="ln259">#endif /* YB_UTIL_COW_OBJECT_H */</a>
+
+</code></pre>
+<div class="balloon" rel="95"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="104"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="109"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="116"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="126"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

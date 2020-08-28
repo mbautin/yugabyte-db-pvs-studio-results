@@ -1,0 +1,792 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>priority_thread_pool.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/util/priority_thread_pool.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;mutex&gt;</a>
+<a name="ln17">#include &lt;queue&gt;</a>
+<a name="ln18">#include &lt;set&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &lt;boost/container/stable_vector.hpp&gt;</a>
+<a name="ln21">#include &lt;boost/multi_index_container.hpp&gt;</a>
+<a name="ln22">#include &lt;boost/multi_index/composite_key.hpp&gt;</a>
+<a name="ln23">#include &lt;boost/multi_index/hashed_index.hpp&gt;</a>
+<a name="ln24">#include &lt;boost/multi_index/mem_fun.hpp&gt;</a>
+<a name="ln25">#include &lt;boost/multi_index/ordered_index.hpp&gt;</a>
+<a name="ln26">#include &lt;boost/multi_index/ranked_index.hpp&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/gutil/thread_annotations.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;yb/util/locks.h&quot;</a>
+<a name="ln31">#include &quot;yb/util/priority_queue.h&quot;</a>
+<a name="ln32">#include &quot;yb/util/scope_exit.h&quot;</a>
+<a name="ln33">#include &quot;yb/util/thread.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">using namespace std::placeholders;</a>
+<a name="ln36"> </a>
+<a name="ln37">namespace yb {</a>
+<a name="ln38"> </a>
+<a name="ln39">namespace {</a>
+<a name="ln40"> </a>
+<a name="ln41">const Status kRemoveTaskStatus = STATUS(Aborted, &quot;Task removed from priority thread pool&quot;);</a>
+<a name="ln42">const Status kShutdownStatus = STATUS(Aborted, &quot;Priority thread pool shutdown&quot;);</a>
+<a name="ln43">const Status kNoWorkersStatus = STATUS(Aborted, &quot;No workers to perform task&quot;);</a>
+<a name="ln44"> </a>
+<a name="ln45">typedef std::unique_ptr&lt;PriorityThreadPoolTask&gt; TaskPtr;</a>
+<a name="ln46">class PriorityThreadPoolWorker;</a>
+<a name="ln47"> </a>
+<a name="ln48">static constexpr int kEmptyQueuePriority = -1;</a>
+<a name="ln49"> </a>
+<a name="ln50">YB_STRONGLY_TYPED_BOOL(PickTask);</a>
+<a name="ln51"> </a>
+<a name="ln52">YB_DEFINE_ENUM(PriorityThreadPoolTaskState, (kPaused)(kNotStarted)(kRunning));</a>
+<a name="ln53"> </a>
+<a name="ln54">class PriorityThreadPoolInternalTask {</a>
+<a name="ln55"> public:</a>
+<a name="ln56">  PriorityThreadPoolInternalTask(int priority, TaskPtr task, PriorityThreadPoolWorker* worker)</a>
+<a name="ln57">      : priority_(priority),</a>
+<a name="ln58">        serial_no_(task-&gt;SerialNo()),</a>
+<a name="ln59">        state_(worker != nullptr ? PriorityThreadPoolTaskState::kRunning</a>
+<a name="ln60">                                 : PriorityThreadPoolTaskState::kNotStarted),</a>
+<a name="ln61">        task_(std::move(task)),</a>
+<a name="ln62">        worker_(worker) {}</a>
+<a name="ln63"> </a>
+<a name="ln64">  std::unique_ptr&lt;PriorityThreadPoolTask&gt;&amp; task() const {</a>
+<a name="ln65">    return task_;</a>
+<a name="ln66">  }</a>
+<a name="ln67"> </a>
+<a name="ln68">  PriorityThreadPoolWorker* worker() const {</a>
+<a name="ln69">    return worker_;</a>
+<a name="ln70">  }</a>
+<a name="ln71"> </a>
+<a name="ln72">  size_t serial_no() const {</a>
+<a name="ln73">    return serial_no_;</a>
+<a name="ln74">  }</a>
+<a name="ln75"> </a>
+<a name="ln76">  // Changes to priority does not require immediate effect, so</a>
+<a name="ln77">  // relaxed could be used.</a>
+<a name="ln78">  int priority() const {</a>
+<a name="ln79">    return priority_.load(std::memory_order_relaxed);</a>
+<a name="ln80">  }</a>
+<a name="ln81"> </a>
+<a name="ln82">  // Changes to state does not require immediate effect, so</a>
+<a name="ln83">  // relaxed could be used.</a>
+<a name="ln84">  PriorityThreadPoolTaskState state() const {</a>
+<a name="ln85">    return state_.load(std::memory_order_relaxed);</a>
+<a name="ln86">  }</a>
+<a name="ln87"> </a>
+<a name="ln88">  void SetWorker(PriorityThreadPoolWorker* worker) {</a>
+<a name="ln89">    // Task state could be only changed when thread pool lock is held.</a>
+<a name="ln90">    // So it is safe to avoid state caching for logging.</a>
+<a name="ln91">    LOG_IF(DFATAL, state() != PriorityThreadPoolTaskState::kNotStarted)</a>
+<a name="ln92">        &lt;&lt; &quot;Set worker in wrong state: &quot; &lt;&lt; state();</a>
+<a name="ln93">    worker_ = worker;</a>
+<a name="ln94">    SetState(PriorityThreadPoolTaskState::kRunning);</a>
+<a name="ln95">  }</a>
+<a name="ln96"> </a>
+<a name="ln97">  void SetPriority(int value) {</a>
+<a name="ln98">    priority_.store(value, std::memory_order_relaxed);</a>
+<a name="ln99">  }</a>
+<a name="ln100"> </a>
+<a name="ln101">  void SetState(PriorityThreadPoolTaskState value) {</a>
+<a name="ln102">    state_.store(value, std::memory_order_relaxed);</a>
+<a name="ln103">  }</a>
+<a name="ln104"> </a>
+<a name="ln105">  std::string ToString() const {</a>
+<a name="ln106">    return Format(&quot;{ task: $0 worker: $1 state: $2 priority: $3 serial: $4 }&quot;,</a>
+<a name="ln107">                  TaskToString(), worker_, state(), priority(), serial_no_);</a>
+<a name="ln108">  }</a>
+<a name="ln109"> </a>
+<a name="ln110"> private:</a>
+<a name="ln111">  const std::string&amp; TaskToString() const {</a>
+<a name="ln112">    if (!task_to_string_ready_.load(std::memory_order_acquire)) {</a>
+<a name="ln113">      std::lock_guard&lt;simple_spinlock&gt; lock(task_to_string_mutex_);</a>
+<a name="ln114">      if (!task_to_string_ready_.load(std::memory_order_acquire)) {</a>
+<a name="ln115">        task_to_string_ = task_-&gt;ToString();</a>
+<a name="ln116">        task_to_string_ready_.store(true, std::memory_order_release);</a>
+<a name="ln117">      }</a>
+<a name="ln118">    }</a>
+<a name="ln119">    return task_to_string_;</a>
+<a name="ln120">  }</a>
+<a name="ln121"> </a>
+<a name="ln122">  std::atomic&lt;int&gt; priority_;</a>
+<a name="ln123">  const size_t serial_no_;</a>
+<a name="ln124">  std::atomic&lt;PriorityThreadPoolTaskState&gt; state_{PriorityThreadPoolTaskState::kNotStarted};</a>
+<a name="ln125">  mutable TaskPtr task_;</a>
+<a name="ln126">  mutable PriorityThreadPoolWorker* worker_;</a>
+<a name="ln127"> </a>
+<a name="ln128">  mutable std::atomic&lt;bool&gt; task_to_string_ready_{false};</a>
+<a name="ln129">  mutable simple_spinlock task_to_string_mutex_;</a>
+<a name="ln130">  mutable std::string task_to_string_;</a>
+<a name="ln131">};</a>
+<a name="ln132"> </a>
+<a name="ln133">class PriorityThreadPoolWorkerContext {</a>
+<a name="ln134"> public:</a>
+<a name="ln135">  virtual void PauseIfNecessary(PriorityThreadPoolWorker* worker) = 0;</a>
+<a name="ln136">  virtual bool WorkerFinished(PriorityThreadPoolWorker* worker) = 0;</a>
+<a name="ln137">  virtual void TaskAborted(const PriorityThreadPoolInternalTask* task) = 0;</a>
+<a name="ln138">  virtual ~PriorityThreadPoolWorkerContext() {}</a>
+<a name="ln139">};</a>
+<a name="ln140"> </a>
+<a name="ln141">class PriorityThreadPoolWorker : public PriorityThreadPoolSuspender {</a>
+<a name="ln142"> public:</a>
+<a name="ln143">  explicit PriorityThreadPoolWorker(PriorityThreadPoolWorkerContext* context)</a>
+<a name="ln144">      : context_(context) {</a>
+<a name="ln145">  }</a>
+<a name="ln146"> </a>
+<a name="ln147">  void SetThread(ThreadPtr thread) {</a>
+<a name="ln148">    thread_ = std::move(thread);</a>
+<a name="ln149">  }</a>
+<a name="ln150"> </a>
+<a name="ln151">  // Perform provided task in this worker. Called on a fresh worker, or worker that was just picked</a>
+<a name="ln152">  // from the free workers list.</a>
+<a name="ln153">  void Perform(const PriorityThreadPoolInternalTask* task) {</a>
+<a name="ln154">    {</a>
+<a name="ln155">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln156">      DCHECK(!task_);</a>
+<a name="ln157">      if (!stopped_) {</a>
+<a name="ln158">        std::swap(task_, task);</a>
+<a name="ln159">      }</a>
+<a name="ln160">    }</a>
+<a name="ln161">    cond_.notify_one();</a>
+<a name="ln162">    if (task) {</a>
+<a name="ln163">      task-&gt;task()-&gt;Run(kShutdownStatus, nullptr /* suspender */);</a>
+<a name="ln164">      context_-&gt;TaskAborted(task);</a>
+<a name="ln165">    }</a>
+<a name="ln166">  }</a>
+<a name="ln167"> </a>
+<a name="ln168">  // It is invoked from WorkerFinished to directly assign a new task.</a>
+<a name="ln169">  void SetTask(const PriorityThreadPoolInternalTask* task) {</a>
+<a name="ln170">    task_ = task;</a>
+<a name="ln171">  }</a>
+<a name="ln172"> </a>
+<a name="ln173">  void Run() {</a>
+<a name="ln174">    std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln175">    while (!stopped_) {</a>
+<a name="ln176">      if (!task_) {</a>
+<a name="ln177">        cond_.wait(lock);</a>
+<a name="ln178">        continue;</a>
+<a name="ln179">      }</a>
+<a name="ln180">      running_task_ = true;</a>
+<a name="ln181">      auto se = ScopeExit([this] {</a>
+<a name="ln182">        running_task_ = false;</a>
+<a name="ln183">      });</a>
+<a name="ln184">      {</a>
+<a name="ln185">        yb::ReverseLock&lt;decltype(lock)&gt; rlock(lock);</a>
+<a name="ln186">        for (;;) {</a>
+<a name="ln187">          task_-&gt;task()-&gt;Run(Status::OK(), this);</a>
+<a name="ln188">          if (!context_-&gt;WorkerFinished(this)) {</a>
+<a name="ln189">            break;</a>
+<a name="ln190">          }</a>
+<a name="ln191">        }</a>
+<a name="ln192">      }</a>
+<a name="ln193">    }</a>
+<a name="ln194">    DCHECK(!task_);</a>
+<a name="ln195">  }</a>
+<a name="ln196"> </a>
+<a name="ln197">  void Stop() {</a>
+<a name="ln198">    const PriorityThreadPoolInternalTask* task = nullptr;</a>
+<a name="ln199">    {</a>
+<a name="ln200">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln201">      stopped_ = true;</a>
+<a name="ln202">      if (!running_task_) {</a>
+<a name="ln203">        std::swap(task, task_);</a>
+<a name="ln204">      }</a>
+<a name="ln205">    }</a>
+<a name="ln206">    cond_.notify_one();</a>
+<a name="ln207">    if (task) {</a>
+<a name="ln208">      task-&gt;task()-&gt;Run(kShutdownStatus, nullptr /* suspender */);</a>
+<a name="ln209">      context_-&gt;TaskAborted(task);</a>
+<a name="ln210">    }</a>
+<a name="ln211">  }</a>
+<a name="ln212"> </a>
+<a name="ln213">  void PauseIfNecessary() override {</a>
+<a name="ln214">    LOG_IF(DFATAL, yb::Thread::CurrentThreadId() != thread_-&gt;tid())</a>
+<a name="ln215">        &lt;&lt; &quot;PauseIfNecessary invoked not from worker thread&quot;;</a>
+<a name="ln216">    context_-&gt;PauseIfNecessary(this);</a>
+<a name="ln217">  }</a>
+<a name="ln218"> </a>
+<a name="ln219">  void Resumed() {</a>
+<a name="ln220">    cond_.notify_one();</a>
+<a name="ln221">  }</a>
+<a name="ln222"> </a>
+<a name="ln223">  const PriorityThreadPoolInternalTask* task() const {</a>
+<a name="ln224">    return task_;</a>
+<a name="ln225">  }</a>
+<a name="ln226"> </a>
+<a name="ln227">  void WaitResume(std::unique_lock&lt;std::mutex&gt;* lock) {</a>
+<a name="ln228">    cond_.wait(*lock, [this]() {</a>
+<a name="ln229">      return task_-&gt;state() != PriorityThreadPoolTaskState::kPaused;</a>
+<a name="ln230">    });</a>
+<a name="ln231">  }</a>
+<a name="ln232"> </a>
+<a name="ln233">  std::string ToString() const {</a>
+<a name="ln234">    std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln235">    return Format(&quot;{ worker: $0 }&quot;, static_cast&lt;const void*&gt;(this));</a>
+<a name="ln236">  }</a>
+<a name="ln237"> </a>
+<a name="ln238"> private:</a>
+<a name="ln239">  PriorityThreadPoolWorkerContext* const context_;</a>
+<a name="ln240">  yb::ThreadPtr thread_;</a>
+<a name="ln241">  // Cannot use thread safety annotations, because std::unique_lock is used with this mutex.</a>
+<a name="ln242">  mutable std::mutex mutex_;</a>
+<a name="ln243">  std::condition_variable cond_;</a>
+<a name="ln244">  bool stopped_ = false;</a>
+<a name="ln245">  bool running_task_ = false;</a>
+<a name="ln246">  const PriorityThreadPoolInternalTask* task_ = nullptr;</a>
+<a name="ln247">};</a>
+<a name="ln248"> </a>
+<a name="ln249">class PriorityTaskComparator {</a>
+<a name="ln250"> public:</a>
+<a name="ln251">  bool operator()(const PriorityThreadPoolInternalTask&amp; lhs,</a>
+<a name="ln252">                  const PriorityThreadPoolInternalTask&amp; rhs) const {</a>
+<a name="ln253">    auto lhs_priority = lhs.priority();</a>
+<a name="ln254">    auto rhs_priority = rhs.priority();</a>
+<a name="ln255">    // The task with highest priority is picked first, if priorities are equal the task that</a>
+<a name="ln256">    // was added earlier is picked.</a>
+<a name="ln257">    return lhs_priority &gt; rhs_priority ||</a>
+<a name="ln258">           (lhs_priority == rhs_priority &amp;&amp; lhs.serial_no() &lt; rhs.serial_no());</a>
+<a name="ln259">  }</a>
+<a name="ln260">};</a>
+<a name="ln261"> </a>
+<a name="ln262">// The order is the following:</a>
+<a name="ln263">// Not running tasks (i.e. paused or not started) go first, ordered by priority, state and serial.</a>
+<a name="ln264">// After them running tasks, ordered by priority, state and serial.</a>
+<a name="ln265">// I.e. paused tasks goes before not started tasks with the same priority.</a>
+<a name="ln266">class StateAndPriorityTaskComparator {</a>
+<a name="ln267"> public:</a>
+<a name="ln268">  bool operator()(const PriorityThreadPoolInternalTask&amp; lhs,</a>
+<a name="ln269">                  const PriorityThreadPoolInternalTask&amp; rhs) const {</a>
+<a name="ln270">    auto lhs_state = lhs.state();</a>
+<a name="ln271">    auto rhs_state = rhs.state();</a>
+<a name="ln272">    auto lhs_running = lhs_state == PriorityThreadPoolTaskState::kRunning;</a>
+<a name="ln273">    if (lhs_running != (rhs_state == PriorityThreadPoolTaskState::kRunning)) {</a>
+<a name="ln274">      return !lhs_running;</a>
+<a name="ln275">    }</a>
+<a name="ln276">    auto lhs_priority = lhs.priority();</a>
+<a name="ln277">    auto rhs_priority = rhs.priority();</a>
+<a name="ln278">    if (lhs_priority &gt; rhs_priority) {</a>
+<a name="ln279">      return true;</a>
+<a name="ln280">    } else if (lhs_priority &lt; rhs_priority) {</a>
+<a name="ln281">      return false;</a>
+<a name="ln282">    }</a>
+<a name="ln283">    if (lhs_state &lt; rhs_state) {</a>
+<a name="ln284">      return true;</a>
+<a name="ln285">    } else if (lhs_state &gt; rhs_state) {</a>
+<a name="ln286">      return false;</a>
+<a name="ln287">    }</a>
+<a name="ln288">    return lhs.serial_no() &lt; rhs.serial_no();</a>
+<a name="ln289">  }</a>
+<a name="ln290">};</a>
+<a name="ln291"> </a>
+<a name="ln292">std::atomic&lt;size_t&gt; task_serial_no_(1);</a>
+<a name="ln293"> </a>
+<a name="ln294">} // namespace</a>
+<a name="ln295"> </a>
+<a name="ln296">PriorityThreadPoolTask::PriorityThreadPoolTask()</a>
+<a name="ln297">    : serial_no_(task_serial_no_.fetch_add(1, std::memory_order_acq_rel)) {</a>
+<a name="ln298">}</a>
+<a name="ln299"> </a>
+<a name="ln300">// Maintains priority queue of added tasks and vector of free workers.</a>
+<a name="ln301">// One of them is always empty.</a>
+<a name="ln302">//</a>
+<a name="ln303">// When a task is added it tries to pick a free worker or launch a new one.</a>
+<a name="ln304">// If it is impossible the task is added to the task priority queue.</a>
+<a name="ln305">//</a>
+<a name="ln306">// When worker finishes it tries to pick a task from the priority queue.</a>
+<a name="ln307">// If the queue is empty, the worker is added to the vector of free workers.</a>
+<a name="ln308">class PriorityThreadPool::Impl : public PriorityThreadPoolWorkerContext {</a>
+<a name="ln309"> public:</a>
+<a name="ln310">  explicit Impl(size_t max_running_tasks) : max_running_tasks_(max_running_tasks) {</a>
+<a name="ln311">    CHECK_GE(max_running_tasks, 1);</a>
+<a name="ln312">  }</a>
+<a name="ln313"> </a>
+<a name="ln314">  ~Impl() {</a>
+<a name="ln315">    StartShutdown();</a>
+<a name="ln316">    CompleteShutdown();</a>
+<a name="ln317"> </a>
+<a name="ln318">#ifndef NDEBUG</a>
+<a name="ln319">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln320">    DCHECK(tasks_.empty());</a>
+<a name="ln321">#endif</a>
+<a name="ln322">  }</a>
+<a name="ln323"> </a>
+<a name="ln324">  CHECKED_STATUS Submit(int priority, TaskPtr* task) {</a>
+<a name="ln325">    PriorityThreadPoolWorker* worker = nullptr;</a>
+<a name="ln326">    const PriorityThreadPoolInternalTask* internal_task = nullptr;</a>
+<a name="ln327">    {</a>
+<a name="ln328">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln329">      if (stopping_.load(std::memory_order_acquire)) {</a>
+<a name="ln330">        VLOG(3) &lt;&lt; (**task).ToString() &lt;&lt; &quot; rejected because of shutdown&quot;;</a>
+<a name="ln331">        return kShutdownStatus;</a>
+<a name="ln332">      }</a>
+<a name="ln333">      worker = PickWorker();</a>
+<a name="ln334">      if (worker == nullptr) {</a>
+<a name="ln335">        if (workers_.empty()) {</a>
+<a name="ln336">          // Empty workers here means that we are unable to start even one worker thread.</a>
+<a name="ln337">          // So have to abort task in this case.</a>
+<a name="ln338">          VLOG(3) &lt;&lt; (**task).ToString() &lt;&lt; &quot; rejected because cannot start even one worker&quot;;</a>
+<a name="ln339">          return kNoWorkersStatus;</a>
+<a name="ln340">        }</a>
+<a name="ln341">        VLOG(4) &lt;&lt; &quot;Added &quot; &lt;&lt; (**task).ToString() &lt;&lt; &quot; to queue&quot;;</a>
+<a name="ln342">      }</a>
+<a name="ln343"> </a>
+<a name="ln344">      internal_task = AddTask(priority, std::move(*task), worker);</a>
+<a name="ln345">    }</a>
+<a name="ln346"> </a>
+<a name="ln347">    if (worker) {</a>
+<a name="ln348">      VLOG(4) &lt;&lt; &quot;Passing &quot; &lt;&lt; internal_task-&gt;ToString() &lt;&lt; &quot; to worker: &quot; &lt;&lt; worker;</a>
+<a name="ln349">      worker-&gt;Perform(internal_task);</a>
+<a name="ln350">    }</a>
+<a name="ln351"> </a>
+<a name="ln352">    return Status::OK();</a>
+<a name="ln353">  }</a>
+<a name="ln354"> </a>
+<a name="ln355">  void Remove(void* key) {</a>
+<a name="ln356">    std::vector&lt;TaskPtr&gt; abort_tasks;</a>
+<a name="ln357">    {</a>
+<a name="ln358">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln359">      for (auto it = tasks_.begin(); it != tasks_.end();) {</a>
+<a name="ln360">        if (it-&gt;state() == PriorityThreadPoolTaskState::kNotStarted &amp;&amp; it-&gt;task()-&gt;BelongsTo(key)) {</a>
+<a name="ln361">          abort_tasks.push_back(std::move(it-&gt;task()));</a>
+<a name="ln362">          it = tasks_.erase(it);</a>
+<a name="ln363">        } else {</a>
+<a name="ln364">          ++it;</a>
+<a name="ln365">        }</a>
+<a name="ln366">      }</a>
+<a name="ln367">      UpdateMaxPriorityToDefer();</a>
+<a name="ln368">    }</a>
+<a name="ln369">    AbortTasks(abort_tasks, kRemoveTaskStatus);</a>
+<a name="ln370">  }</a>
+<a name="ln371"> </a>
+<a name="ln372">  void StartShutdown() {</a>
+<a name="ln373">    if (stopping_.exchange(true, std::memory_order_acq_rel)) {</a>
+<a name="ln374">      return;</a>
+<a name="ln375">    }</a>
+<a name="ln376">    std::vector&lt;TaskPtr&gt; abort_tasks;</a>
+<a name="ln377">    std::vector&lt;PriorityThreadPoolWorker*&gt; workers;</a>
+<a name="ln378">    {</a>
+<a name="ln379">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln380">      for (auto it = tasks_.begin(); it != tasks_.end();) {</a>
+<a name="ln381">        auto state = it-&gt;state();</a>
+<a name="ln382">        if (state == PriorityThreadPoolTaskState::kNotStarted) {</a>
+<a name="ln383">          abort_tasks.push_back(std::move(it-&gt;task()));</a>
+<a name="ln384">          it = tasks_.erase(it);</a>
+<a name="ln385">        } else {</a>
+<a name="ln386">          if (state == PriorityThreadPoolTaskState::kPaused) {</a>
+<a name="ln387">            // On shutdown we should resume all workers, so they could complete their current tasks.</a>
+<a name="ln388">            ResumeWorker(it);</a>
+<a name="ln389">          }</a>
+<a name="ln390">          ++it;</a>
+<a name="ln391">        }</a>
+<a name="ln392">      }</a>
+<a name="ln393">      workers.reserve(workers_.size());</a>
+<a name="ln394">      for (auto&amp; worker : workers_) {</a>
+<a name="ln395">        workers.push_back(&amp;worker);</a>
+<a name="ln396">      }</a>
+<a name="ln397">      UpdateMaxPriorityToDefer();</a>
+<a name="ln398">    }</a>
+<a name="ln399">    for (auto* worker : workers) {</a>
+<a name="ln400">      worker-&gt;Stop();</a>
+<a name="ln401">    }</a>
+<a name="ln402">    AbortTasks(abort_tasks, kShutdownStatus);</a>
+<a name="ln403">  }</a>
+<a name="ln404"> </a>
+<a name="ln405">  void CompleteShutdown() {</a>
+<a name="ln406">    decltype(threads_) threads;</a>
+<a name="ln407">    decltype(workers_) workers;</a>
+<a name="ln408">    {</a>
+<a name="ln409">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln410">      threads.swap(threads_);</a>
+<a name="ln411">      workers.swap(workers_);</a>
+<a name="ln412">    }</a>
+<a name="ln413">    for (auto&amp; thread : threads) {</a>
+<a name="ln414">      thread-&gt;Join();</a>
+<a name="ln415">    }</a>
+<a name="ln416">  }</a>
+<a name="ln417"> </a>
+<a name="ln418">  void PauseIfNecessary(PriorityThreadPoolWorker* worker) override {</a>
+<a name="ln419">    auto worker_task_priority = worker-&gt;task()-&gt;priority();</a>
+<a name="ln420">    if (max_priority_to_defer_.load(std::memory_order_acquire) &lt; worker_task_priority) {</a>
+<a name="ln421">      return;</a>
+<a name="ln422">    }</a>
+<a name="ln423"> </a>
+<a name="ln424">    PriorityThreadPoolWorker* higher_pri_worker = nullptr;</a>
+<a name="ln425">    const PriorityThreadPoolInternalTask* task;</a>
+<a name="ln426">    {</a>
+<a name="ln427">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln428">      if (max_priority_to_defer_.load(std::memory_order_acquire) &lt; worker_task_priority ||</a>
+<a name="ln429">          stopping_.load(std::memory_order_acquire)) {</a>
+<a name="ln430">        return;</a>
+<a name="ln431">      }</a>
+<a name="ln432"> </a>
+<a name="ln433">      // Check the highest priority of a a task that is not running.</a>
+<a name="ln434">      auto it = tasks_.get&lt;StateAndPriorityTag&gt;().begin();</a>
+<a name="ln435">      if (it-&gt;priority() &lt;= worker_task_priority) {</a>
+<a name="ln436">        return;</a>
+<a name="ln437">      }</a>
+<a name="ln438"> </a>
+<a name="ln439">      LOG(INFO) &lt;&lt; &quot;Pausing &quot; &lt;&lt; worker-&gt;task()-&gt;ToString()</a>
+<a name="ln440">                &lt;&lt; &quot; in favor of &quot; &lt;&lt; it-&gt;ToString() &lt;&lt; &quot;, max to defer: &quot;</a>
+<a name="ln441">                &lt;&lt; max_priority_to_defer_.load(std::memory_order_acquire);</a>
+<a name="ln442"> </a>
+<a name="ln443">      ++paused_workers_;</a>
+<a name="ln444">      switch (it-&gt;state()) {</a>
+<a name="ln445">        case PriorityThreadPoolTaskState::kPaused:</a>
+<a name="ln446">          VLOG(4) &lt;&lt; &quot;Resuming &quot; &lt;&lt; it-&gt;worker();</a>
+<a name="ln447">          ResumeWorker(tasks_.project&lt;PriorityTag&gt;(it));</a>
+<a name="ln448">          break;</a>
+<a name="ln449">        case PriorityThreadPoolTaskState::kNotStarted:</a>
+<a name="ln450">          higher_pri_worker = PickWorker();</a>
+<a name="ln451">          if (!higher_pri_worker) {</a>
+<a name="ln452">            LOG(DFATAL) &lt;&lt; Format(</a>
+<a name="ln453">                &quot;Unable to pick a worker for a higher priority task when trying to pause a lower &quot;</a>
+<a name="ln454">                    &quot;priority task, paused: $1, free: $2, max: $3&quot;,</a>
+<a name="ln455">                workers_.size(), paused_workers_, free_workers_.size(), max_running_tasks_);</a>
+<a name="ln456">            worker-&gt;Resumed();</a>
+<a name="ln457">            return;</a>
+<a name="ln458">          }</a>
+<a name="ln459">          task = &amp;*it;</a>
+<a name="ln460">          SetWorker(tasks_.project&lt;PriorityTag&gt;(it), higher_pri_worker);</a>
+<a name="ln461">          break;</a>
+<a name="ln462">        case PriorityThreadPoolTaskState::kRunning:</a>
+<a name="ln463">          --paused_workers_;</a>
+<a name="ln464">          LOG(DFATAL) &lt;&lt; &quot;Pausing in favor of already running task: &quot; &lt;&lt; it-&gt;ToString()</a>
+<a name="ln465">                      &lt;&lt; &quot;, state: &quot; &lt;&lt; DoStateToString();</a>
+<a name="ln466">          return;</a>
+<a name="ln467">      }</a>
+<a name="ln468"> </a>
+<a name="ln469">      auto worker_task_it = tasks_.iterator_to(*worker-&gt;task());</a>
+<a name="ln470">      ModifyState(worker_task_it, PriorityThreadPoolTaskState::kPaused);</a>
+<a name="ln471">    }</a>
+<a name="ln472"> </a>
+<a name="ln473">    if (higher_pri_worker) {</a>
+<a name="ln474">      VLOG(4) &lt;&lt; &quot;Passing &quot; &lt;&lt; task-&gt;ToString() &lt;&lt; &quot; to &quot; &lt;&lt; higher_pri_worker;</a>
+<a name="ln475">      higher_pri_worker-&gt;Perform(task);</a>
+<a name="ln476">    }</a>
+<a name="ln477">    {</a>
+<a name="ln478">      std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln479">      worker-&gt;WaitResume(&amp;lock);</a>
+<a name="ln480">      LOG(INFO) &lt;&lt; &quot;Resumed &quot; &lt;&lt; worker &lt;&lt; &quot; with &quot; &lt;&lt; worker-&gt;task()-&gt;ToString();</a>
+<a name="ln481">    }</a>
+<a name="ln482">  }</a>
+<a name="ln483"> </a>
+<a name="ln484">  bool ChangeTaskPriority(size_t serial_no, int priority) {</a>
+<a name="ln485">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln486">    auto&amp; index = tasks_.get&lt;SerialNoTag&gt;();</a>
+<a name="ln487">    auto it = index.find(serial_no);</a>
+<a name="ln488">    if (it == index.end()) {</a>
+<a name="ln489">      return false;</a>
+<a name="ln490">    }</a>
+<a name="ln491"> </a>
+<a name="ln492">    index.modify(it, [priority](PriorityThreadPoolInternalTask&amp; task) {</a>
+<a name="ln493">      task.SetPriority(priority);</a>
+<a name="ln494">    });</a>
+<a name="ln495">    UpdateMaxPriorityToDefer();</a>
+<a name="ln496"> </a>
+<a name="ln497">    LOG(INFO) &lt;&lt; &quot;Changed priority &quot; &lt;&lt; serial_no &lt;&lt; &quot;: &quot; &lt;&lt; it-&gt;ToString();</a>
+<a name="ln498"> </a>
+<a name="ln499">    return true;</a>
+<a name="ln500">  }</a>
+<a name="ln501"> </a>
+<a name="ln502">  std::string StateToString() {</a>
+<a name="ln503">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln504">    return DoStateToString();</a>
+<a name="ln505">  }</a>
+<a name="ln506"> </a>
+<a name="ln507"> private:</a>
+<a name="ln508">  std::string DoStateToString() REQUIRES(mutex_) {</a>
+<a name="ln509">    return Format(</a>
+<a name="ln510">        &quot;{ max_running_tasks: $0 tasks: $1 workers: $2 paused_workers: $3 free_workers: $4 &quot;</a>
+<a name="ln511">            &quot;stopping: $5 max_priority_to_defer: $6 }&quot;,</a>
+<a name="ln512">        max_running_tasks_, tasks_, workers_, paused_workers_, free_workers_,</a>
+<a name="ln513">        stopping_.load(), max_priority_to_defer_.load());</a>
+<a name="ln514">  }</a>
+<a name="ln515"> </a>
+<a name="ln516">  void AbortTasks(const std::vector&lt;TaskPtr&gt;&amp; tasks, const Status&amp; abort_status) {</a>
+<a name="ln517">    for (const auto&amp; task : tasks) {</a>
+<a name="ln518">      task-&gt;Run(abort_status, nullptr /* suspender */);</a>
+<a name="ln519">    }</a>
+<a name="ln520">  }</a>
+<a name="ln521"> </a>
+<a name="ln522">  bool WorkerFinished(PriorityThreadPoolWorker* worker) override {</a>
+<a name="ln523">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln524">    TaskFinished(worker-&gt;task());</a>
+<a name="ln525">    if (!DoWorkerFinished(worker)) {</a>
+<a name="ln526">      free_workers_.push_back(worker);</a>
+<a name="ln527">      worker-&gt;SetTask(nullptr);</a>
+<a name="ln528">      return false;</a>
+<a name="ln529">    }</a>
+<a name="ln530"> </a>
+<a name="ln531">    return true;</a>
+<a name="ln532">  }</a>
+<a name="ln533"> </a>
+<a name="ln534">  bool DoWorkerFinished(PriorityThreadPoolWorker* worker) REQUIRES(mutex_) {</a>
+<a name="ln535">    if (tasks_.empty()) {</a>
+<a name="ln536">      VLOG(4) &lt;&lt; &quot;No tasks left for &quot; &lt;&lt; worker;</a>
+<a name="ln537">      return false;</a>
+<a name="ln538">    }</a>
+<a name="ln539"> </a>
+<a name="ln540">    auto it = tasks_.get&lt;StateAndPriorityTag&gt;().begin();</a>
+<a name="ln541">    switch (it-&gt;state()) {</a>
+<a name="ln542">      case PriorityThreadPoolTaskState::kPaused:</a>
+<a name="ln543">        VLOG(4) &lt;&lt; &quot;Resume other worker after &quot; &lt;&lt; worker &lt;&lt; &quot; finished&quot;;</a>
+<a name="ln544">        ResumeWorker(tasks_.project&lt;PriorityTag&gt;(it));</a>
+<a name="ln545">        return false;</a>
+<a name="ln546">      case PriorityThreadPoolTaskState::kNotStarted:</a>
+<a name="ln547">        worker-&gt;SetTask(&amp;*it);</a>
+<a name="ln548">        SetWorker(tasks_.project&lt;PriorityTag&gt;(it), worker);</a>
+<a name="ln549">        VLOG(4) &lt;&lt; &quot;Picked task for &quot; &lt;&lt; worker;</a>
+<a name="ln550">        return true;</a>
+<a name="ln551">      case PriorityThreadPoolTaskState::kRunning:</a>
+<a name="ln552">        VLOG(4) &lt;&lt; &quot;Only running tasks left, nothing for &quot; &lt;&lt; worker;</a>
+<a name="ln553">        return false;</a>
+<a name="ln554">    }</a>
+<a name="ln555"> </a>
+<a name="ln556">    FATAL_INVALID_ENUM_VALUE(PriorityThreadPoolTaskState, it-&gt;state());</a>
+<a name="ln557">  }</a>
+<a name="ln558"> </a>
+<a name="ln559">  // Task finished, adjust desired and unwanted tasks.</a>
+<a name="ln560">  void TaskFinished(const PriorityThreadPoolInternalTask* task) REQUIRES(mutex_) {</a>
+<a name="ln561">    VLOG(4) &lt;&lt; &quot;Finished &quot; &lt;&lt; task-&gt;ToString();</a>
+<a name="ln562">    tasks_.erase(tasks_.iterator_to(*task));</a>
+<a name="ln563">    UpdateMaxPriorityToDefer();</a>
+<a name="ln564">  }</a>
+<a name="ln565"> </a>
+<a name="ln566">  // Task finished, adjust desired and unwanted tasks.</a>
+<a name="ln567">  void TaskAborted(const PriorityThreadPoolInternalTask* task) override {</a>
+<a name="ln568">    VLOG(3) &lt;&lt; &quot;Aborted &quot; &lt;&lt; task-&gt;ToString();</a>
+<a name="ln569">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln570">    TaskFinished(task);</a>
+<a name="ln571">  }</a>
+<a name="ln572"> </a>
+<a name="ln573">  template &lt;class It&gt;</a>
+<a name="ln574">  void ResumeWorker(It it) REQUIRES(mutex_) {</a>
+<a name="ln575">    LOG_IF(DFATAL, it-&gt;state() != PriorityThreadPoolTaskState::kPaused)</a>
+<a name="ln576">        &lt;&lt; &quot;Resuming not paused worker&quot;;</a>
+<a name="ln577">    --paused_workers_;</a>
+<a name="ln578">    ModifyState(it, PriorityThreadPoolTaskState::kRunning);</a>
+<a name="ln579">    it-&gt;worker()-&gt;Resumed();</a>
+<a name="ln580">  }</a>
+<a name="ln581"> </a>
+<a name="ln582">  PriorityThreadPoolWorker* PickWorker() REQUIRES(mutex_) {</a>
+<a name="ln583">    if (workers_.size() - paused_workers_ - free_workers_.size() &gt;= max_running_tasks_) {</a>
+<a name="ln584">      VLOG(1) &lt;&lt; &quot;We already have &quot; &lt;&lt; workers_.size() &lt;&lt; &quot; - &quot; &lt;&lt; paused_workers_ &lt;&lt; &quot; - &quot;</a>
+<a name="ln585">              &lt;&lt; free_workers_.size() &lt;&lt; &quot; &gt;= &quot; &lt;&lt; max_running_tasks_</a>
+<a name="ln586">              &lt;&lt; &quot; workers running, we could not run a new worker.&quot;;</a>
+<a name="ln587">      return nullptr;</a>
+<a name="ln588">    }</a>
+<a name="ln589">    if (!free_workers_.empty()) {</a>
+<a name="ln590">      auto worker = free_workers_.back();</a>
+<a name="ln591">      free_workers_.pop_back();</a>
+<a name="ln592">      VLOG(4) &lt;&lt; &quot;Has free worker: &quot; &lt;&lt; worker;</a>
+<a name="ln593">      return worker;</a>
+<a name="ln594">    }</a>
+<a name="ln595">    workers_.emplace_back(this);</a>
+<a name="ln596">    auto worker = &amp;workers_.back();</a>
+<a name="ln597">    auto thread = yb::Thread::Make(</a>
+<a name="ln598">        &quot;priority_thread_pool&quot;, &quot;worker&quot;,</a>
+<a name="ln599">        std::bind(&amp;PriorityThreadPoolWorker::Run, worker));</a>
+<a name="ln600">    if (!thread.ok()) {</a>
+<a name="ln601">      LOG(WARNING) &lt;&lt; &quot;Failed to launch new worker: &quot; &lt;&lt; thread.status();</a>
+<a name="ln602">      workers_.pop_back();</a>
+<a name="ln603">      return nullptr;</a>
+<a name="ln604">    } else {</a>
+<a name="ln605">      worker-&gt;SetThread(*thread);</a>
+<a name="ln606">      threads_.push_back(std::move(*thread));</a>
+<a name="ln607">      VLOG(3) &lt;&lt; &quot;Created new worker: &quot; &lt;&lt; worker;</a>
+<a name="ln608">    }</a>
+<a name="ln609">    return worker;</a>
+<a name="ln610">  }</a>
+<a name="ln611"> </a>
+<a name="ln612">  const PriorityThreadPoolInternalTask* AddTask(</a>
+<a name="ln613">      int priority, TaskPtr task, PriorityThreadPoolWorker* worker) REQUIRES(mutex_) {</a>
+<a name="ln614">    auto it = tasks_.emplace(priority, std::move(task), worker).first;</a>
+<a name="ln615">    UpdateMaxPriorityToDefer();</a>
+<a name="ln616">    VLOG(4) &lt;&lt; &quot;New task added &quot; &lt;&lt; task-&gt;ToString() &lt;&lt; &quot;, max to defer: &quot;</a>
+<a name="ln617">            &lt;&lt; max_priority_to_defer_.load(std::memory_order_acquire);</a>
+<a name="ln618">    return &amp;*it;</a>
+<a name="ln619">  }</a>
+<a name="ln620"> </a>
+<a name="ln621">  void UpdateMaxPriorityToDefer() REQUIRES(mutex_) {</a>
+<a name="ln622">    // We could pause a worker when both of the following conditions are met:</a>
+<a name="ln623">    // 1) Number of active tasks is greater than max_running_tasks_.</a>
+<a name="ln624">    // 2) Priority of the worker's current task is less than top max_running_tasks_ priorities.</a>
+<a name="ln625">    int priority = tasks_.size() &lt;= max_running_tasks_</a>
+<a name="ln626">        ? kEmptyQueuePriority</a>
+<a name="ln627">        : tasks_.nth(max_running_tasks_)-&gt;priority();</a>
+<a name="ln628">    max_priority_to_defer_.store(priority, std::memory_order_release);</a>
+<a name="ln629">  }</a>
+<a name="ln630"> </a>
+<a name="ln631">  template &lt;class It&gt;</a>
+<a name="ln632">  void ModifyState(It it, PriorityThreadPoolTaskState new_state) REQUIRES(mutex_) {</a>
+<a name="ln633">    tasks_.modify(it, [new_state](PriorityThreadPoolInternalTask&amp; task) {</a>
+<a name="ln634">      task.SetState(new_state);</a>
+<a name="ln635">    });</a>
+<a name="ln636">  }</a>
+<a name="ln637"> </a>
+<a name="ln638">  template &lt;class It&gt;</a>
+<a name="ln639">  void SetWorker(It it, PriorityThreadPoolWorker* worker) REQUIRES(mutex_) {</a>
+<a name="ln640">    tasks_.modify(it, [worker](PriorityThreadPoolInternalTask&amp; task) {</a>
+<a name="ln641">      task.SetWorker(worker);</a>
+<a name="ln642">    });</a>
+<a name="ln643">  }</a>
+<a name="ln644"> </a>
+<a name="ln645">  const size_t max_running_tasks_;</a>
+<a name="ln646">  std::mutex mutex_;</a>
+<a name="ln647"> </a>
+<a name="ln648">  // Number of paused workers.</a>
+<a name="ln649">  size_t paused_workers_ GUARDED_BY(mutex_) = 0;</a>
+<a name="ln650"> </a>
+<a name="ln651">  std::vector&lt;yb::ThreadPtr&gt; threads_ GUARDED_BY(mutex_);</a>
+<a name="ln652">  boost::container::stable_vector&lt;PriorityThreadPoolWorker&gt; workers_ GUARDED_BY(mutex_);</a>
+<a name="ln653">  std::vector&lt;PriorityThreadPoolWorker*&gt; free_workers_ GUARDED_BY(mutex_);</a>
+<a name="ln654">  std::atomic&lt;bool&gt; stopping_{false};</a>
+<a name="ln655"> </a>
+<a name="ln656">  // Used for quick check, whether task with provided priority should be paused.</a>
+<a name="ln657">  std::atomic&lt;int&gt; max_priority_to_defer_{kEmptyQueuePriority};</a>
+<a name="ln658"> </a>
+<a name="ln659">  // Tag for index ordered by original priority and serial no.</a>
+<a name="ln660">  // Used to determine desired tasks to run.</a>
+<a name="ln661">  class PriorityTag;</a>
+<a name="ln662"> </a>
+<a name="ln663">  // Tag for index ordered by state, priority and serial no.</a>
+<a name="ln664">  // Used to determine which task should be started/resumed when worker is paused.</a>
+<a name="ln665">  class StateAndPriorityTag;</a>
+<a name="ln666"> </a>
+<a name="ln667">  // Tag for index hashed by serial no.</a>
+<a name="ln668">  // Used to find task for priority change.</a>
+<a name="ln669">  class SerialNoTag;</a>
+<a name="ln670"> </a>
+<a name="ln671">  boost::multi_index_container&lt;</a>
+<a name="ln672">    PriorityThreadPoolInternalTask,</a>
+<a name="ln673">    boost::multi_index::indexed_by&lt;</a>
+<a name="ln674">      boost::multi_index::ranked_unique&lt;</a>
+<a name="ln675">        boost::multi_index::tag&lt;PriorityTag&gt;,</a>
+<a name="ln676">        boost::multi_index::identity&lt;PriorityThreadPoolInternalTask&gt;,</a>
+<a name="ln677">        PriorityTaskComparator</a>
+<a name="ln678">      &gt;,</a>
+<a name="ln679">      boost::multi_index::ordered_unique&lt;</a>
+<a name="ln680">        boost::multi_index::tag&lt;StateAndPriorityTag&gt;,</a>
+<a name="ln681">        boost::multi_index::identity&lt;PriorityThreadPoolInternalTask&gt;,</a>
+<a name="ln682">        StateAndPriorityTaskComparator</a>
+<a name="ln683">      &gt;,</a>
+<a name="ln684">      boost::multi_index::hashed_unique&lt;</a>
+<a name="ln685">        boost::multi_index::tag&lt;SerialNoTag&gt;,</a>
+<a name="ln686">        boost::multi_index::const_mem_fun&lt;</a>
+<a name="ln687">          PriorityThreadPoolInternalTask, size_t, &amp;PriorityThreadPoolInternalTask::serial_no&gt;</a>
+<a name="ln688">      &gt;</a>
+<a name="ln689">    &gt;</a>
+<a name="ln690">  &gt; tasks_ GUARDED_BY(mutex_);</a>
+<a name="ln691">};</a>
+<a name="ln692"> </a>
+<a name="ln693">PriorityThreadPool::PriorityThreadPool(size_t max_running_tasks)</a>
+<a name="ln694">    : impl_(new Impl(max_running_tasks)) {</a>
+<a name="ln695">}</a>
+<a name="ln696"> </a>
+<a name="ln697">PriorityThreadPool::~PriorityThreadPool() {</a>
+<a name="ln698">}</a>
+<a name="ln699"> </a>
+<a name="ln700">Status PriorityThreadPool::Submit(int priority, std::unique_ptr&lt;PriorityThreadPoolTask&gt;* task) {</a>
+<a name="ln701">  return impl_-&gt;Submit(priority, task);</a>
+<a name="ln702">}</a>
+<a name="ln703"> </a>
+<a name="ln704">void PriorityThreadPool::Remove(void* key) {</a>
+<a name="ln705">  impl_-&gt;Remove(key);</a>
+<a name="ln706">}</a>
+<a name="ln707"> </a>
+<a name="ln708">void PriorityThreadPool::StartShutdown() {</a>
+<a name="ln709">  impl_-&gt;StartShutdown();</a>
+<a name="ln710">}</a>
+<a name="ln711"> </a>
+<a name="ln712">void PriorityThreadPool::CompleteShutdown() {</a>
+<a name="ln713">  impl_-&gt;CompleteShutdown();</a>
+<a name="ln714">}</a>
+<a name="ln715"> </a>
+<a name="ln716">std::string PriorityThreadPool::StateToString() {</a>
+<a name="ln717">  return impl_-&gt;StateToString();</a>
+<a name="ln718">}</a>
+<a name="ln719"> </a>
+<a name="ln720">bool PriorityThreadPool::ChangeTaskPriority(size_t serial_no, int priority) {</a>
+<a name="ln721">  return impl_-&gt;ChangeTaskPriority(serial_no, priority);</a>
+<a name="ln722">}</a>
+<a name="ln723"> </a>
+<a name="ln724">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="91"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="156"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="194"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="214"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="320"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="330"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="338"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="341"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="348"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="446"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="474"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="536"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="543"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="549"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="552"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="561"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="568"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="575"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="584"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="592"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="607"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="616"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v522/" target="_blank">V522</a> Dereferencing of the null pointer 'task' might take place.</p></div>
+<div class="balloon" rel="616"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

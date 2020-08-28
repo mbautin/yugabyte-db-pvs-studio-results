@@ -1,0 +1,530 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>subdocument.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/docdb/subdocument.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;map&gt;</a>
+<a name="ln17">#include &lt;sstream&gt;</a>
+<a name="ln18">#include &lt;vector&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/common/ql_bfunc.h&quot;</a>
+<a name="ln21">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">using std::endl;</a>
+<a name="ln24">using std::make_pair;</a>
+<a name="ln25">using std::map;</a>
+<a name="ln26">using std::ostringstream;</a>
+<a name="ln27">using std::shared_ptr;</a>
+<a name="ln28">using std::string;</a>
+<a name="ln29">using std::vector;</a>
+<a name="ln30"> </a>
+<a name="ln31">using yb::bfql::TSOpcode;</a>
+<a name="ln32"> </a>
+<a name="ln33">namespace yb {</a>
+<a name="ln34">namespace docdb {</a>
+<a name="ln35"> </a>
+<a name="ln36">SubDocument::SubDocument(ValueType value_type) : PrimitiveValue(value_type) {</a>
+<a name="ln37">  if (IsCollectionType(value_type)) {</a>
+<a name="ln38">    EnsureContainerAllocated();</a>
+<a name="ln39">  }</a>
+<a name="ln40">}</a>
+<a name="ln41"> </a>
+<a name="ln42">SubDocument::~SubDocument() {</a>
+<a name="ln43">  switch (type_) {</a>
+<a name="ln44">    case ValueType::kObject: FALLTHROUGH_INTENDED;</a>
+<a name="ln45">    case ValueType::kRedisList: FALLTHROUGH_INTENDED;</a>
+<a name="ln46">    case ValueType::kRedisSortedSet: FALLTHROUGH_INTENDED;</a>
+<a name="ln47">    case ValueType::kRedisSet: FALLTHROUGH_INTENDED;</a>
+<a name="ln48">    case ValueType::kRedisTS: FALLTHROUGH_INTENDED;</a>
+<a name="ln49">    case ValueType::kSSForward: FALLTHROUGH_INTENDED;</a>
+<a name="ln50">    case ValueType::kSSReverse:</a>
+<a name="ln51">      if (has_valid_container()) {</a>
+<a name="ln52">        delete &amp;object_container();</a>
+<a name="ln53">      }</a>
+<a name="ln54">      break;</a>
+<a name="ln55">    case ValueType::kArray:</a>
+<a name="ln56">      if (has_valid_container()) {</a>
+<a name="ln57">        delete &amp;array_container();</a>
+<a name="ln58">      }</a>
+<a name="ln59">      break;</a>
+<a name="ln60">    default:</a>
+<a name="ln61">      break;</a>
+<a name="ln62">  }</a>
+<a name="ln63">}</a>
+<a name="ln64"> </a>
+<a name="ln65">SubDocument::SubDocument(const SubDocument&amp; other) {</a>
+<a name="ln66">  if (IsPrimitiveValueType(other.type_) ||</a>
+<a name="ln67">      other.type_ == ValueType::kInvalid ||</a>
+<a name="ln68">      other.type_ == ValueType::kTombstone) {</a>
+<a name="ln69">    new(this) PrimitiveValue(other);</a>
+<a name="ln70">  } else {</a>
+<a name="ln71">    type_ = other.type_;</a>
+<a name="ln72">    ttl_seconds_ = other.ttl_seconds_;</a>
+<a name="ln73">    write_time_ = other.write_time_;</a>
+<a name="ln74">    complex_data_structure_ = nullptr;</a>
+<a name="ln75">    switch (type_) {</a>
+<a name="ln76">      case ValueType::kObject:</a>
+<a name="ln77">        if (other.has_valid_object_container()) {</a>
+<a name="ln78">          complex_data_structure_ = new ObjectContainer(other.object_container());</a>
+<a name="ln79">        }</a>
+<a name="ln80">        break;</a>
+<a name="ln81">      case ValueType::kArray:</a>
+<a name="ln82">        if (other.has_valid_array_container()) {</a>
+<a name="ln83">          complex_data_structure_ = new ArrayContainer(other.array_container());</a>
+<a name="ln84">        }</a>
+<a name="ln85">        break;</a>
+<a name="ln86">      default:</a>
+<a name="ln87">        LOG(FATAL) &lt;&lt; &quot;Trying to copy an invalid/unsupported SubDocument type: &quot;</a>
+<a name="ln88">                   &lt;&lt; docdb::ToString(type_);</a>
+<a name="ln89">    }</a>
+<a name="ln90">  }</a>
+<a name="ln91">}</a>
+<a name="ln92"> </a>
+<a name="ln93">bool SubDocument::operator ==(const SubDocument&amp; other) const {</a>
+<a name="ln94">  if (type_ != other.type_) {</a>
+<a name="ln95">    return false;</a>
+<a name="ln96">  }</a>
+<a name="ln97">  if (IsPrimitiveValueType(type_)) {</a>
+<a name="ln98">    return this-&gt;PrimitiveValue::operator==(other);</a>
+<a name="ln99">  }</a>
+<a name="ln100">  switch (type_) {</a>
+<a name="ln101">    case ValueType::kObject:</a>
+<a name="ln102">      if (has_valid_container() != other.has_valid_container()) {</a>
+<a name="ln103">        return has_valid_container() ? object_container().empty()</a>
+<a name="ln104">                                     : other.object_container().empty();</a>
+<a name="ln105">      }</a>
+<a name="ln106">      if (has_valid_container()) {</a>
+<a name="ln107">        return object_container() == other.object_container();</a>
+<a name="ln108">      } else {</a>
+<a name="ln109">        return true;  // Both container pointers are nullptr.</a>
+<a name="ln110">      }</a>
+<a name="ln111">    case ValueType::kArray:</a>
+<a name="ln112">      if (has_valid_container() != other.has_valid_container()) {</a>
+<a name="ln113">        return has_valid_container() ? array_container().empty()</a>
+<a name="ln114">                                     : other.array_container().empty();</a>
+<a name="ln115">      }</a>
+<a name="ln116">      if (has_valid_container()) {</a>
+<a name="ln117">        return array_container() == other.array_container();</a>
+<a name="ln118">      } else {</a>
+<a name="ln119">        return true;</a>
+<a name="ln120">      }</a>
+<a name="ln121">    default:</a>
+<a name="ln122">      LOG(FATAL) &lt;&lt; &quot;Trying to compare SubDocuments of invalid type: &quot; &lt;&lt; docdb::ToString(type_);</a>
+<a name="ln123">  }</a>
+<a name="ln124">  // We'll get here if both container pointers are null.</a>
+<a name="ln125">  return true;</a>
+<a name="ln126">}</a>
+<a name="ln127"> </a>
+<a name="ln128">Status SubDocument::ConvertToCollection(ValueType value_type) {</a>
+<a name="ln129">  if (!has_valid_object_container()) {</a>
+<a name="ln130">    return STATUS(InvalidArgument, &quot;Subdocument doesn't have valid object container&quot;);</a>
+<a name="ln131">  }</a>
+<a name="ln132">  type_ = value_type;</a>
+<a name="ln133">  return Status::OK();</a>
+<a name="ln134">}</a>
+<a name="ln135"> </a>
+<a name="ln136">void SubDocument::MoveFrom(SubDocument* other) {</a>
+<a name="ln137">  if (this == other) {</a>
+<a name="ln138">    return;</a>
+<a name="ln139">  }</a>
+<a name="ln140"> </a>
+<a name="ln141">  if (IsPrimitiveValueType(other-&gt;type_)) {</a>
+<a name="ln142">    new(this) PrimitiveValue(std::move(*other));</a>
+<a name="ln143">  } else {</a>
+<a name="ln144">    // For objects/arrays the internal state is just a type and a pointer.</a>
+<a name="ln145">    extend_order_ = other-&gt;extend_order_;</a>
+<a name="ln146">    type_ = other-&gt;type_;</a>
+<a name="ln147">    ttl_seconds_ = other-&gt;ttl_seconds_;</a>
+<a name="ln148">    write_time_ = other-&gt;write_time_;</a>
+<a name="ln149">    complex_data_structure_ = other-&gt;complex_data_structure_;</a>
+<a name="ln150">    // The internal state of the other subdocument is now owned by this one.</a>
+<a name="ln151">#ifndef NDEBUG</a>
+<a name="ln152">    // Another layer of protection against trying to use the old state in debug mode.</a>
+<a name="ln153">    memset(static_cast&lt;void*&gt;(other), 0xab, sizeof(SubDocument));  // Fill with a random value.</a>
+<a name="ln154">#endif</a>
+<a name="ln155">    other-&gt;type_ = ValueType::kNullLow;  // To avoid deallocation of the old object's memory.</a>
+<a name="ln156">  }</a>
+<a name="ln157">}</a>
+<a name="ln158"> </a>
+<a name="ln159">Status SubDocument::ConvertToRedisTS() {</a>
+<a name="ln160">  return ConvertToCollection(ValueType::kRedisTS);</a>
+<a name="ln161">}</a>
+<a name="ln162"> </a>
+<a name="ln163">Status SubDocument::ConvertToRedisSet() {</a>
+<a name="ln164">  return ConvertToCollection(ValueType::kRedisSet);</a>
+<a name="ln165">}</a>
+<a name="ln166"> </a>
+<a name="ln167">Status SubDocument::ConvertToRedisSortedSet() {</a>
+<a name="ln168">  return ConvertToCollection(ValueType::kRedisSortedSet);</a>
+<a name="ln169">}</a>
+<a name="ln170"> </a>
+<a name="ln171">Status SubDocument::ConvertToRedisList() {</a>
+<a name="ln172">  return ConvertToCollection(ValueType::kRedisList);</a>
+<a name="ln173">}</a>
+<a name="ln174"> </a>
+<a name="ln175">Status SubDocument::NumChildren(size_t *num_children) {</a>
+<a name="ln176">  if (!has_valid_object_container()) {</a>
+<a name="ln177">    return STATUS(IllegalState, &quot;Not a valid object container&quot;);</a>
+<a name="ln178">  }</a>
+<a name="ln179">  *num_children = object_container().size();</a>
+<a name="ln180">  return Status::OK();</a>
+<a name="ln181">}</a>
+<a name="ln182"> </a>
+<a name="ln183">SubDocument* SubDocument::GetChild(const PrimitiveValue&amp; key) {</a>
+<a name="ln184">  if (!has_valid_object_container()) {</a>
+<a name="ln185">    return nullptr;</a>
+<a name="ln186">  }</a>
+<a name="ln187">  auto&amp; obj_container = object_container();</a>
+<a name="ln188">  auto iter = obj_container.find(key);</a>
+<a name="ln189">  if (iter == obj_container.end()) {</a>
+<a name="ln190">    return nullptr;</a>
+<a name="ln191">  } else {</a>
+<a name="ln192">    return &amp;iter-&gt;second;</a>
+<a name="ln193">  }</a>
+<a name="ln194">}</a>
+<a name="ln195"> </a>
+<a name="ln196">const SubDocument* SubDocument::GetChild(const PrimitiveValue&amp; key) const {</a>
+<a name="ln197">  if (!has_valid_object_container()) {</a>
+<a name="ln198">    return nullptr;</a>
+<a name="ln199">  }</a>
+<a name="ln200">  const auto&amp; obj_container = object_container();</a>
+<a name="ln201">  auto iter = obj_container.find(key);</a>
+<a name="ln202">  if (iter == obj_container.end()) {</a>
+<a name="ln203">    return nullptr;</a>
+<a name="ln204">  } else {</a>
+<a name="ln205">    return &amp;iter-&gt;second;</a>
+<a name="ln206">  }</a>
+<a name="ln207">}</a>
+<a name="ln208"> </a>
+<a name="ln209">pair&lt;SubDocument*, bool&gt; SubDocument::GetOrAddChild(const PrimitiveValue&amp; key) {</a>
+<a name="ln210">  DCHECK(IsObjectType(type_));</a>
+<a name="ln211">  EnsureContainerAllocated();</a>
+<a name="ln212">  auto&amp; obj_container = object_container();</a>
+<a name="ln213">  auto iter = obj_container.find(key);</a>
+<a name="ln214">  if (iter == obj_container.end()) {</a>
+<a name="ln215">    auto ret = obj_container.insert(make_pair(key, SubDocument()));</a>
+<a name="ln216">    CHECK(ret.second);</a>
+<a name="ln217">    return make_pair(&amp;ret.first-&gt;second, true);  // New subdocument created.</a>
+<a name="ln218">  } else {</a>
+<a name="ln219">    return make_pair(&amp;iter-&gt;second, false);  // No new subdocument created.</a>
+<a name="ln220">  }</a>
+<a name="ln221">}</a>
+<a name="ln222"> </a>
+<a name="ln223">void SubDocument::AddListElement(SubDocument&amp;&amp; value) {</a>
+<a name="ln224">  DCHECK_EQ(ValueType::kArray, type_);</a>
+<a name="ln225">  EnsureContainerAllocated();</a>
+<a name="ln226">  array_container().emplace_back(std::move(value));</a>
+<a name="ln227">}</a>
+<a name="ln228"> </a>
+<a name="ln229">void SubDocument::SetChild(const PrimitiveValue&amp; key, SubDocument&amp;&amp; value) {</a>
+<a name="ln230">  type_ = ValueType::kObject;</a>
+<a name="ln231">  EnsureContainerAllocated();</a>
+<a name="ln232">  auto&amp; obj_container = object_container();</a>
+<a name="ln233">  auto existing_element = obj_container.find(key);</a>
+<a name="ln234">  if (existing_element == obj_container.end()) {</a>
+<a name="ln235">    const bool inserted_value = obj_container.emplace(key, std::move(value)).second;</a>
+<a name="ln236">    CHECK(inserted_value);</a>
+<a name="ln237">  } else {</a>
+<a name="ln238">    existing_element-&gt;second = std::move(value);</a>
+<a name="ln239">  }</a>
+<a name="ln240">}</a>
+<a name="ln241"> </a>
+<a name="ln242">bool SubDocument::DeleteChild(const PrimitiveValue&amp; key) {</a>
+<a name="ln243">  CHECK_EQ(ValueType::kObject, type_);</a>
+<a name="ln244">  if (!has_valid_object_container())</a>
+<a name="ln245">    return false;</a>
+<a name="ln246">  return object_container().erase(key) &gt; 0;</a>
+<a name="ln247">}</a>
+<a name="ln248"> </a>
+<a name="ln249">string SubDocument::ToString() const {</a>
+<a name="ln250">  ostringstream ss;</a>
+<a name="ln251">  ss &lt;&lt; *this;</a>
+<a name="ln252">  return ss.str();</a>
+<a name="ln253">}</a>
+<a name="ln254"> </a>
+<a name="ln255">ostream&amp; operator &lt;&lt;(ostream&amp; out, const SubDocument&amp; subdoc) {</a>
+<a name="ln256">  SubDocumentToStreamInternal(out, subdoc, 0);</a>
+<a name="ln257">  return out;</a>
+<a name="ln258">}</a>
+<a name="ln259"> </a>
+<a name="ln260">void SubDocumentToStreamInternal(ostream&amp; out,</a>
+<a name="ln261">                                 const SubDocument&amp; subdoc,</a>
+<a name="ln262">                                 const int indent) {</a>
+<a name="ln263">  if (subdoc.IsPrimitive() ||</a>
+<a name="ln264">      subdoc.value_type() == ValueType::kInvalid ||</a>
+<a name="ln265">      subdoc.value_type() == ValueType::kTombstone) {</a>
+<a name="ln266">    out &lt;&lt; static_cast&lt;const PrimitiveValue*&gt;(&amp;subdoc)-&gt;ToString();</a>
+<a name="ln267">    return;</a>
+<a name="ln268">  }</a>
+<a name="ln269">  switch (subdoc.value_type()) {</a>
+<a name="ln270">    case ValueType::kRedisSortedSet: FALLTHROUGH_INTENDED;</a>
+<a name="ln271">    case ValueType::kObject: {</a>
+<a name="ln272">      out &lt;&lt; &quot;{&quot;;</a>
+<a name="ln273">      if (subdoc.container_allocated()) {</a>
+<a name="ln274">        bool first_pair = true;</a>
+<a name="ln275">        for (const auto&amp; key_value : subdoc.object_container()) {</a>
+<a name="ln276">          if (!first_pair) {</a>
+<a name="ln277">            out &lt;&lt; &quot;,&quot;;</a>
+<a name="ln278">          }</a>
+<a name="ln279">          first_pair = false;</a>
+<a name="ln280">          out &lt;&lt; &quot;\n&quot; &lt;&lt; string(indent + 2, ' ') &lt;&lt; key_value.first.ToString() &lt;&lt; &quot;: &quot;;</a>
+<a name="ln281">          SubDocumentToStreamInternal(out, key_value.second, indent + 2);</a>
+<a name="ln282">        }</a>
+<a name="ln283">        if (!first_pair) {</a>
+<a name="ln284">          out &lt;&lt; &quot;\n&quot; &lt;&lt; string(indent, ' ');</a>
+<a name="ln285">        }</a>
+<a name="ln286">      }</a>
+<a name="ln287">      out &lt;&lt; &quot;}&quot;;</a>
+<a name="ln288">      break;</a>
+<a name="ln289">    }</a>
+<a name="ln290">    case ValueType::kArray: {</a>
+<a name="ln291">      out &lt;&lt; &quot;[&quot;;</a>
+<a name="ln292">      if (subdoc.container_allocated()) {</a>
+<a name="ln293">        out &lt;&lt; (subdoc.GetExtendOrder() == ListExtendOrder::APPEND ? &quot;APPEND&quot; : &quot;PREPEND&quot;) &lt;&lt; &quot;\n&quot;;</a>
+<a name="ln294">        const auto&amp; list = subdoc.array_container();</a>
+<a name="ln295">        int i = 0;</a>
+<a name="ln296">        for (; i &lt; list.size(); i++) {</a>
+<a name="ln297">          if (i != 0) {</a>
+<a name="ln298">            out &lt;&lt; &quot;,&quot;;</a>
+<a name="ln299">          }</a>
+<a name="ln300">          out &lt;&lt; &quot;\n&quot; &lt;&lt; string(indent + 2, ' ') &lt;&lt; i &lt;&lt; &quot;: &quot;;</a>
+<a name="ln301">          SubDocumentToStreamInternal(out, list[i], indent + 2);</a>
+<a name="ln302">        }</a>
+<a name="ln303">        if (i &gt; 0) {</a>
+<a name="ln304">          out &lt;&lt; &quot;\n&quot; &lt;&lt; string(indent, ' ');</a>
+<a name="ln305">        }</a>
+<a name="ln306">      }</a>
+<a name="ln307">      out &lt;&lt; &quot;]&quot;;</a>
+<a name="ln308">      break;</a>
+<a name="ln309">    }</a>
+<a name="ln310">    case ValueType::kRedisSet: {</a>
+<a name="ln311">      SubDocCollectionToStreamInternal(out, subdoc, indent, &quot;(&quot;, &quot;)&quot;);</a>
+<a name="ln312">      break;</a>
+<a name="ln313">    }</a>
+<a name="ln314">    case ValueType::kRedisList: {</a>
+<a name="ln315">      SubDocCollectionToStreamInternal(out, subdoc, indent, &quot;[&quot;, &quot;]&quot;);</a>
+<a name="ln316">      break;</a>
+<a name="ln317">    }</a>
+<a name="ln318">    case ValueType::kRedisTS: {</a>
+<a name="ln319">      SubDocCollectionToStreamInternal(out, subdoc, indent, &quot;&lt;&quot;, &quot;&gt;&quot;);</a>
+<a name="ln320">      break;</a>
+<a name="ln321">    }</a>
+<a name="ln322">    default:</a>
+<a name="ln323">      LOG(FATAL) &lt;&lt; &quot;Invalid subdocument type: &quot; &lt;&lt; ToString(subdoc.value_type());</a>
+<a name="ln324">  }</a>
+<a name="ln325">}</a>
+<a name="ln326"> </a>
+<a name="ln327">void SubDocCollectionToStreamInternal(ostream&amp; out,</a>
+<a name="ln328">                                      const SubDocument&amp; subdoc,</a>
+<a name="ln329">                                      const int indent,</a>
+<a name="ln330">                                      const string&amp; begin_delim,</a>
+<a name="ln331">                                      const string&amp; end_delim) {</a>
+<a name="ln332">  out &lt;&lt; begin_delim;</a>
+<a name="ln333">  if (subdoc.container_allocated()) {</a>
+<a name="ln334">    const auto&amp; keys = subdoc.object_container();</a>
+<a name="ln335">    for (auto iter = keys.begin(); iter != keys.end(); iter++) {</a>
+<a name="ln336">      if (iter != keys.begin()) {</a>
+<a name="ln337">        out &lt;&lt; &quot;,&quot;;</a>
+<a name="ln338">      }</a>
+<a name="ln339">      out &lt;&lt; &quot;\n&quot; &lt;&lt; string(indent + 2, ' ') &lt;&lt; (*iter).first.ToString();</a>
+<a name="ln340">    }</a>
+<a name="ln341">    if (!keys.empty()) {</a>
+<a name="ln342">      out &lt;&lt; &quot;\n&quot; &lt;&lt; string(indent, ' ');</a>
+<a name="ln343">    }</a>
+<a name="ln344">  }</a>
+<a name="ln345">  out &lt;&lt; end_delim;</a>
+<a name="ln346">}</a>
+<a name="ln347"> </a>
+<a name="ln348">void SubDocument::EnsureContainerAllocated() {</a>
+<a name="ln349">  if (complex_data_structure_ == nullptr) {</a>
+<a name="ln350">    if (IsObjectType(type_)) {</a>
+<a name="ln351">      complex_data_structure_ = new ObjectContainer();</a>
+<a name="ln352">    } else if (type_ == ValueType::kArray) {</a>
+<a name="ln353">      complex_data_structure_ = new ArrayContainer();</a>
+<a name="ln354">    }</a>
+<a name="ln355">  }</a>
+<a name="ln356">}</a>
+<a name="ln357"> </a>
+<a name="ln358">SubDocument SubDocument::FromQLValuePB(const QLValuePB&amp; value,</a>
+<a name="ln359">                                       ColumnSchema::SortingType sorting_type,</a>
+<a name="ln360">                                       TSOpcode write_instr) {</a>
+<a name="ln361">  switch (value.value_case()) {</a>
+<a name="ln362">    case QLValuePB::kMapValue: {</a>
+<a name="ln363">      QLMapValuePB map = value.map_value();</a>
+<a name="ln364">      // this equality should be ensured by checks before getting here</a>
+<a name="ln365">      DCHECK_EQ(map.keys_size(), map.values_size());</a>
+<a name="ln366"> </a>
+<a name="ln367">      SubDocument map_doc;</a>
+<a name="ln368">      for (int i = 0; i &lt; map.keys_size(); i++) {</a>
+<a name="ln369">        PrimitiveValue pv_key = PrimitiveValue::FromQLValuePB(map.keys(i), sorting_type);</a>
+<a name="ln370">        SubDocument pv_val = SubDocument::FromQLValuePB(map.values(i), sorting_type, write_instr);</a>
+<a name="ln371">        map_doc.SetChild(pv_key, std::move(pv_val));</a>
+<a name="ln372">      }</a>
+<a name="ln373">      // ensure container allocated even if map is empty</a>
+<a name="ln374">      map_doc.EnsureContainerAllocated();</a>
+<a name="ln375">      return map_doc;</a>
+<a name="ln376">    }</a>
+<a name="ln377">    case QLValuePB::kSetValue: {</a>
+<a name="ln378">      QLSeqValuePB set = value.set_value();</a>
+<a name="ln379">      SubDocument set_doc;</a>
+<a name="ln380">      for (auto&amp; elem : set.elems()) {</a>
+<a name="ln381">        PrimitiveValue pv_key = PrimitiveValue::FromQLValuePB(elem, sorting_type);</a>
+<a name="ln382">        if (write_instr == TSOpcode::kSetRemove || write_instr == TSOpcode::kMapRemove ) {</a>
+<a name="ln383">          // representing sets elems as keys pointing to tombstones to remove those entries</a>
+<a name="ln384">          set_doc.SetChildPrimitive(pv_key, PrimitiveValue::kTombstone);</a>
+<a name="ln385">        }  else {</a>
+<a name="ln386">          // representing sets elems as keys pointing to empty (null) values</a>
+<a name="ln387">          set_doc.SetChildPrimitive(pv_key, PrimitiveValue());</a>
+<a name="ln388">        }</a>
+<a name="ln389">      }</a>
+<a name="ln390">      // ensure container allocated even if set is empty</a>
+<a name="ln391">      set_doc.EnsureContainerAllocated();</a>
+<a name="ln392">      return set_doc;</a>
+<a name="ln393">    }</a>
+<a name="ln394">    case QLValuePB::kListValue: {</a>
+<a name="ln395">      QLSeqValuePB list = value.list_value();</a>
+<a name="ln396">      SubDocument list_doc(ValueType::kArray);</a>
+<a name="ln397">      // ensure container allocated even if list is empty</a>
+<a name="ln398">      list_doc.EnsureContainerAllocated();</a>
+<a name="ln399">      for (int i = 0; i &lt; list.elems_size(); i++) {</a>
+<a name="ln400">        SubDocument pv_val = SubDocument::FromQLValuePB(list.elems(i), sorting_type, write_instr);</a>
+<a name="ln401">        list_doc.AddListElement(std::move(pv_val));</a>
+<a name="ln402">      }</a>
+<a name="ln403">      return list_doc;</a>
+<a name="ln404">    }</a>
+<a name="ln405"> </a>
+<a name="ln406">    default:</a>
+<a name="ln407">      return SubDocument(PrimitiveValue::FromQLValuePB(value, sorting_type));</a>
+<a name="ln408">  }</a>
+<a name="ln409">}</a>
+<a name="ln410"> </a>
+<a name="ln411">void SubDocument::ToQLValuePB(const SubDocument&amp; doc,</a>
+<a name="ln412">                              const shared_ptr&lt;QLType&gt;&amp; ql_type,</a>
+<a name="ln413">                              QLValuePB* ql_value) {</a>
+<a name="ln414">  // interpreting empty collections as null values following Cassandra semantics</a>
+<a name="ln415">  if (ql_type-&gt;HasComplexValues() &amp;&amp; (!doc.has_valid_object_container() ||</a>
+<a name="ln416">                                       doc.object_num_keys() == 0)) {</a>
+<a name="ln417">    SetNull(ql_value);</a>
+<a name="ln418">    return;</a>
+<a name="ln419">  }</a>
+<a name="ln420"> </a>
+<a name="ln421">  switch (ql_type-&gt;main()) {</a>
+<a name="ln422">    case MAP: {</a>
+<a name="ln423">      const shared_ptr&lt;QLType&gt;&amp; keys_type = ql_type-&gt;params()[0];</a>
+<a name="ln424">      const shared_ptr&lt;QLType&gt;&amp; values_type = ql_type-&gt;params()[1];</a>
+<a name="ln425">      QLMapValuePB *value_pb = ql_value-&gt;mutable_map_value();</a>
+<a name="ln426">      value_pb-&gt;clear_keys();</a>
+<a name="ln427">      value_pb-&gt;clear_values();</a>
+<a name="ln428">      for (auto &amp;pair : doc.object_container()) {</a>
+<a name="ln429">        QLValuePB *key = value_pb-&gt;add_keys();</a>
+<a name="ln430">        PrimitiveValue::ToQLValuePB(pair.first, keys_type, key);</a>
+<a name="ln431">        QLValuePB *value = value_pb-&gt;add_values();</a>
+<a name="ln432">        SubDocument::ToQLValuePB(pair.second, values_type, value);</a>
+<a name="ln433">      }</a>
+<a name="ln434">      return;</a>
+<a name="ln435">    }</a>
+<a name="ln436">    case SET: {</a>
+<a name="ln437">      const shared_ptr&lt;QLType&gt;&amp; elems_type = ql_type-&gt;params()[0];</a>
+<a name="ln438">      QLSeqValuePB *value_pb = ql_value-&gt;mutable_set_value();</a>
+<a name="ln439">      value_pb-&gt;clear_elems();</a>
+<a name="ln440">      for (auto &amp;pair : doc.object_container()) {</a>
+<a name="ln441">        QLValuePB *elem = value_pb-&gt;add_elems();</a>
+<a name="ln442">        PrimitiveValue::ToQLValuePB(pair.first, elems_type, elem);</a>
+<a name="ln443">        // set elems are represented as subdocument keys so we ignore the (empty) values</a>
+<a name="ln444">      }</a>
+<a name="ln445">      return;</a>
+<a name="ln446">    }</a>
+<a name="ln447">    case LIST: {</a>
+<a name="ln448">      const shared_ptr&lt;QLType&gt;&amp; elems_type = ql_type-&gt;params()[0];</a>
+<a name="ln449">      QLSeqValuePB *value_pb = ql_value-&gt;mutable_list_value();</a>
+<a name="ln450">      value_pb-&gt;clear_elems();</a>
+<a name="ln451">      for (auto &amp;pair : doc.object_container()) {</a>
+<a name="ln452">        // list elems are represented as subdocument values with keys only used for ordering</a>
+<a name="ln453">        QLValuePB *elem = value_pb-&gt;add_elems();</a>
+<a name="ln454">        SubDocument::ToQLValuePB(pair.second, elems_type, elem);</a>
+<a name="ln455">      }</a>
+<a name="ln456">      return;</a>
+<a name="ln457">    }</a>
+<a name="ln458">    case USER_DEFINED_TYPE: {</a>
+<a name="ln459">      const shared_ptr&lt;QLType&gt;&amp; keys_type = QLType::Create(INT16);</a>
+<a name="ln460">      QLMapValuePB *value_pb = ql_value-&gt;mutable_map_value();</a>
+<a name="ln461">      value_pb-&gt;clear_keys();</a>
+<a name="ln462">      value_pb-&gt;clear_values();</a>
+<a name="ln463">      for (auto &amp;pair : doc.object_container()) {</a>
+<a name="ln464">        QLValuePB *key = value_pb-&gt;add_keys();</a>
+<a name="ln465">        PrimitiveValue::ToQLValuePB(pair.first, keys_type, key);</a>
+<a name="ln466">        QLValuePB *value = value_pb-&gt;add_values();</a>
+<a name="ln467">        SubDocument::ToQLValuePB(pair.second, ql_type-&gt;param_type(key-&gt;int16_value()), value);</a>
+<a name="ln468">      }</a>
+<a name="ln469">      return;</a>
+<a name="ln470">    }</a>
+<a name="ln471">    case TUPLE:</a>
+<a name="ln472">      break;</a>
+<a name="ln473"> </a>
+<a name="ln474">    default: {</a>
+<a name="ln475">      return PrimitiveValue::ToQLValuePB(doc, ql_type, ql_value);</a>
+<a name="ln476">    }</a>
+<a name="ln477">  }</a>
+<a name="ln478">  LOG(FATAL) &lt;&lt; &quot;Unsupported datatype in SubDocument: &quot; &lt;&lt; ql_type-&gt;ToString();</a>
+<a name="ln479">}</a>
+<a name="ln480"> </a>
+<a name="ln481">}  // namespace docdb</a>
+<a name="ln482">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="210"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="216"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="236"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

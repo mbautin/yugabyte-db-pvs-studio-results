@@ -1,0 +1,335 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>eval_aggr.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/util/decimal.h&quot;</a>
+<a name="ln19">#include &quot;yb/yql/cql/ql/exec/executor.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">namespace yb {</a>
+<a name="ln22">namespace ql {</a>
+<a name="ln23"> </a>
+<a name="ln24">using std::shared_ptr;</a>
+<a name="ln25">using yb::bfql::TSOpcode;</a>
+<a name="ln26">using yb::util::Decimal;</a>
+<a name="ln27"> </a>
+<a name="ln28">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln29"> </a>
+<a name="ln30">Status Executor::AggregateResultSets(const PTSelectStmt* pt_select, TnodeContext* tnode_context) {</a>
+<a name="ln31">  if (!pt_select-&gt;is_aggregate()) {</a>
+<a name="ln32">    return Status::OK();</a>
+<a name="ln33">  }</a>
+<a name="ln34"> </a>
+<a name="ln35">  shared_ptr&lt;RowsResult&gt; rows_result = tnode_context-&gt;rows_result();</a>
+<a name="ln36">  DCHECK(rows_result-&gt;client() == QLClient::YQL_CLIENT_CQL);</a>
+<a name="ln37">  shared_ptr&lt;QLRowBlock&gt; row_block = rows_result-&gt;GetRowBlock();</a>
+<a name="ln38">  int column_index = 0;</a>
+<a name="ln39">  faststring buffer;</a>
+<a name="ln40"> </a>
+<a name="ln41">  CQLEncodeLength(1, &amp;buffer);</a>
+<a name="ln42">  for (auto expr_node : pt_select-&gt;selected_exprs()) {</a>
+<a name="ln43">    QLValue ql_value;</a>
+<a name="ln44"> </a>
+<a name="ln45">    switch (expr_node-&gt;aggregate_opcode()) {</a>
+<a name="ln46">      case TSOpcode::kNoOp:</a>
+<a name="ln47">        break;</a>
+<a name="ln48">      case TSOpcode::kAvg:</a>
+<a name="ln49">        RETURN_NOT_OK(EvalAvg(row_block, column_index, expr_node-&gt;ql_type()-&gt;main(),</a>
+<a name="ln50">                              &amp;ql_value));</a>
+<a name="ln51">        // Change type back from MAP to basic type for result of Avg</a>
+<a name="ln52">        rows_result-&gt;set_column_schema(column_index, expr_node-&gt;ql_type());</a>
+<a name="ln53">        break;</a>
+<a name="ln54">      case TSOpcode::kCount:</a>
+<a name="ln55">        RETURN_NOT_OK(EvalCount(row_block, column_index, &amp;ql_value));</a>
+<a name="ln56">        break;</a>
+<a name="ln57">      case TSOpcode::kMax:</a>
+<a name="ln58">        RETURN_NOT_OK(EvalMax(row_block, column_index, &amp;ql_value));</a>
+<a name="ln59">        break;</a>
+<a name="ln60">      case TSOpcode::kMin:</a>
+<a name="ln61">        RETURN_NOT_OK(EvalMin(row_block, column_index, &amp;ql_value));</a>
+<a name="ln62">        break;</a>
+<a name="ln63">      case TSOpcode::kSum:</a>
+<a name="ln64">        RETURN_NOT_OK(EvalSum(row_block, column_index, expr_node-&gt;ql_type()-&gt;main(), &amp;ql_value));</a>
+<a name="ln65">        break;</a>
+<a name="ln66">      default:</a>
+<a name="ln67">        return STATUS(RuntimeError, &quot;Unexpected operator while evaluating aggregate expressions&quot;);</a>
+<a name="ln68">    }</a>
+<a name="ln69"> </a>
+<a name="ln70">    // Serialize the return value.</a>
+<a name="ln71">    ql_value.Serialize(expr_node-&gt;ql_type(), rows_result-&gt;client(), &amp;buffer);</a>
+<a name="ln72">    column_index++;</a>
+<a name="ln73">  }</a>
+<a name="ln74"> </a>
+<a name="ln75">  // Change the result set to the aggregate result.</a>
+<a name="ln76">  rows_result-&gt;set_rows_data(buffer.c_str(), buffer.size());</a>
+<a name="ln77">  return Status::OK();</a>
+<a name="ln78">}</a>
+<a name="ln79"> </a>
+<a name="ln80">Status Executor::EvalCount(const shared_ptr&lt;QLRowBlock&gt;&amp; row_block,</a>
+<a name="ln81">                           int column_index,</a>
+<a name="ln82">                           QLValue *ql_value) {</a>
+<a name="ln83">  int64_t total_count = 0;</a>
+<a name="ln84">  for (auto row : row_block-&gt;rows()) {</a>
+<a name="ln85">    if (!row.column(column_index).IsNull()) {</a>
+<a name="ln86">      // Summing up the sub-counts from individual partitions.</a>
+<a name="ln87">      // For details see DocExprExecutor::EvalTSCall() and DocExprExecutor::EvalCount().</a>
+<a name="ln88">      total_count += row.column(column_index).int64_value();</a>
+<a name="ln89">    }</a>
+<a name="ln90">  }</a>
+<a name="ln91">  ql_value-&gt;set_int64_value(total_count);</a>
+<a name="ln92">  return Status::OK();</a>
+<a name="ln93">}</a>
+<a name="ln94"> </a>
+<a name="ln95">Status Executor::EvalMax(const shared_ptr&lt;QLRowBlock&gt;&amp; row_block,</a>
+<a name="ln96">                         int column_index,</a>
+<a name="ln97">                         QLValue *ql_value) {</a>
+<a name="ln98">  for (auto row : row_block-&gt;rows()) {</a>
+<a name="ln99">    if (ql_value-&gt;IsNull() ||</a>
+<a name="ln100">        (!row.column(column_index).IsNull() &amp;&amp; *ql_value &lt; row.column(column_index))) {</a>
+<a name="ln101">      *ql_value = row.column(column_index);</a>
+<a name="ln102">    }</a>
+<a name="ln103">  }</a>
+<a name="ln104">  return Status::OK();</a>
+<a name="ln105">}</a>
+<a name="ln106"> </a>
+<a name="ln107">Status Executor::EvalMin(const shared_ptr&lt;QLRowBlock&gt;&amp; row_block,</a>
+<a name="ln108">                         int column_index,</a>
+<a name="ln109">                         QLValue *ql_value) {</a>
+<a name="ln110">  for (auto row : row_block-&gt;rows()) {</a>
+<a name="ln111">    if (ql_value-&gt;IsNull() ||</a>
+<a name="ln112">        (!row.column(column_index).IsNull() &amp;&amp; *ql_value &gt; row.column(column_index))) {</a>
+<a name="ln113">      *ql_value = row.column(column_index);</a>
+<a name="ln114">    }</a>
+<a name="ln115">  }</a>
+<a name="ln116">  return Status::OK();</a>
+<a name="ln117">}</a>
+<a name="ln118"> </a>
+<a name="ln119">Status Executor::EvalSum(const shared_ptr&lt;QLRowBlock&gt;&amp; row_block,</a>
+<a name="ln120">                         int column_index,</a>
+<a name="ln121">                         DataType data_type,</a>
+<a name="ln122">                         QLValue *ql_value) {</a>
+<a name="ln123">  // CQL doesn't return overflow for sum.</a>
+<a name="ln124">  for (auto row : row_block-&gt;rows()) {</a>
+<a name="ln125">    if (row.column(column_index).IsNull()) {</a>
+<a name="ln126">      continue;</a>
+<a name="ln127">    }</a>
+<a name="ln128">    if (ql_value-&gt;IsNull()) {</a>
+<a name="ln129">      *ql_value = row.column(column_index);</a>
+<a name="ln130">      continue;</a>
+<a name="ln131">    }</a>
+<a name="ln132">    switch (data_type) {</a>
+<a name="ln133">      case DataType::INT8:</a>
+<a name="ln134">        ql_value-&gt;set_int8_value(ql_value-&gt;int8_value() + row.column(column_index).int8_value());</a>
+<a name="ln135">        break;</a>
+<a name="ln136">      case DataType::INT16:</a>
+<a name="ln137">        ql_value-&gt;set_int16_value(ql_value-&gt;int16_value() + row.column(column_index).int16_value());</a>
+<a name="ln138">        break;</a>
+<a name="ln139">      case DataType::INT32:</a>
+<a name="ln140">        ql_value-&gt;set_int32_value(ql_value-&gt;int32_value() + row.column(column_index).int32_value());</a>
+<a name="ln141">        break;</a>
+<a name="ln142">      case DataType::INT64:</a>
+<a name="ln143">        ql_value-&gt;set_int64_value(ql_value-&gt;int64_value() + row.column(column_index).int64_value());</a>
+<a name="ln144">        break;</a>
+<a name="ln145">      case DataType::VARINT:</a>
+<a name="ln146">        ql_value-&gt;set_varint_value(ql_value-&gt;varint_value() +</a>
+<a name="ln147">                                   row.column(column_index).varint_value());</a>
+<a name="ln148">        break;</a>
+<a name="ln149">      case DataType::FLOAT:</a>
+<a name="ln150">        ql_value-&gt;set_float_value(ql_value-&gt;float_value() + row.column(column_index).float_value());</a>
+<a name="ln151">        break;</a>
+<a name="ln152">      case DataType::DOUBLE:</a>
+<a name="ln153">        ql_value-&gt;set_double_value(ql_value-&gt;double_value() +</a>
+<a name="ln154">                                   row.column(column_index).double_value());</a>
+<a name="ln155">        break;</a>
+<a name="ln156">      case DataType::DECIMAL: {</a>
+<a name="ln157">        Decimal sum, value;</a>
+<a name="ln158">        RETURN_NOT_OK(sum.DecodeFromComparable(ql_value-&gt;decimal_value()));</a>
+<a name="ln159">        RETURN_NOT_OK(value.DecodeFromComparable(row.column(column_index).decimal_value()));</a>
+<a name="ln160">        sum = sum + value;</a>
+<a name="ln161">        ql_value-&gt;set_decimal_value(sum.EncodeToComparable());</a>
+<a name="ln162">        break;</a>
+<a name="ln163">      }</a>
+<a name="ln164">      default:</a>
+<a name="ln165">        return STATUS(RuntimeError, &quot;Unexpected datatype for argument of SUM()&quot;);</a>
+<a name="ln166">    }</a>
+<a name="ln167">  }</a>
+<a name="ln168">  if (ql_value-&gt;IsNull()) {</a>
+<a name="ln169">    switch (data_type) {</a>
+<a name="ln170">      case DataType::INT8:</a>
+<a name="ln171">        ql_value-&gt;set_int8_value(0);</a>
+<a name="ln172">        break;</a>
+<a name="ln173">      case DataType::INT16:</a>
+<a name="ln174">        ql_value-&gt;set_int16_value(0);</a>
+<a name="ln175">        break;</a>
+<a name="ln176">      case DataType::INT32:</a>
+<a name="ln177">        ql_value-&gt;set_int32_value(0);</a>
+<a name="ln178">        break;</a>
+<a name="ln179">      case DataType::INT64:</a>
+<a name="ln180">        ql_value-&gt;set_int64_value(0);</a>
+<a name="ln181">        break;</a>
+<a name="ln182">      case DataType::VARINT: {</a>
+<a name="ln183">        int64_t tsum;</a>
+<a name="ln184">        tsum = 0;</a>
+<a name="ln185">        util::VarInt varint(tsum);</a>
+<a name="ln186">        ql_value-&gt;set_varint_value(varint);</a>
+<a name="ln187">      }</a>
+<a name="ln188">        break;</a>
+<a name="ln189">      case DataType::FLOAT:</a>
+<a name="ln190">        ql_value-&gt;set_float_value(0);</a>
+<a name="ln191">        break;</a>
+<a name="ln192">      case DataType::DOUBLE:</a>
+<a name="ln193">        ql_value-&gt;set_double_value(0);</a>
+<a name="ln194">        break;</a>
+<a name="ln195">      case DataType::DECIMAL: {</a>
+<a name="ln196">        Decimal sum;</a>
+<a name="ln197">        ql_value-&gt;set_decimal_value(sum.EncodeToComparable());</a>
+<a name="ln198">        break;</a>
+<a name="ln199">      }</a>
+<a name="ln200">      default:</a>
+<a name="ln201">        return STATUS(RuntimeError, &quot;Unexpected datatype for argument of SUM()&quot;);</a>
+<a name="ln202">    }</a>
+<a name="ln203">  }</a>
+<a name="ln204">  return Status::OK();</a>
+<a name="ln205">}</a>
+<a name="ln206"> </a>
+<a name="ln207">Status Executor::EvalAvg(const shared_ptr&lt;QLRowBlock&gt;&amp; row_block,</a>
+<a name="ln208">                         int column_index,</a>
+<a name="ln209">                         DataType data_type,</a>
+<a name="ln210">                         QLValue *ql_value) {</a>
+<a name="ln211">  QLValue sum, count;</a>
+<a name="ln212"> </a>
+<a name="ln213">  for (auto row : row_block-&gt;rows()) {</a>
+<a name="ln214">    if (row.column(column_index).IsNull()) {</a>
+<a name="ln215">      continue;</a>
+<a name="ln216">    }</a>
+<a name="ln217">    QLMapValuePB map = row.column(column_index).map_value();</a>
+<a name="ln218">    if (count.IsNull()) {</a>
+<a name="ln219">      count = QLValue(map.keys(0));</a>
+<a name="ln220">      sum = QLValue(map.values(0));</a>
+<a name="ln221">      continue;</a>
+<a name="ln222">    }</a>
+<a name="ln223"> </a>
+<a name="ln224">    count.set_int64_value(count.int64_value() + map.keys(0).int64_value());</a>
+<a name="ln225">    switch (data_type) {</a>
+<a name="ln226">      case DataType::INT8:</a>
+<a name="ln227">        sum.set_int8_value(sum.int8_value() + map.values(0).int8_value());</a>
+<a name="ln228">        break;</a>
+<a name="ln229">      case DataType::INT16:</a>
+<a name="ln230">        sum.set_int16_value(sum.int16_value() + map.values(0).int16_value());</a>
+<a name="ln231">        break;</a>
+<a name="ln232">      case DataType::INT32:</a>
+<a name="ln233">        sum.set_int32_value(sum.int32_value() + map.values(0).int32_value());</a>
+<a name="ln234">        break;</a>
+<a name="ln235">      case DataType::INT64:</a>
+<a name="ln236">        sum.set_int64_value(sum.int64_value() + map.values(0).int64_value());</a>
+<a name="ln237">        break;</a>
+<a name="ln238">      case DataType::VARINT:</a>
+<a name="ln239">        sum.set_varint_value(sum.varint_value() + QLValue(map.values(0)).varint_value());</a>
+<a name="ln240">        break;</a>
+<a name="ln241">      case DataType::FLOAT:</a>
+<a name="ln242">        sum.set_float_value(sum.float_value() + map.values(0).float_value());</a>
+<a name="ln243">        break;</a>
+<a name="ln244">      case DataType::DOUBLE:</a>
+<a name="ln245">        sum.set_double_value(sum.double_value() + map.values(0).double_value());</a>
+<a name="ln246">        break;</a>
+<a name="ln247">      default:</a>
+<a name="ln248">        return STATUS(RuntimeError, &quot;Unexpected datatype for argument of AVG()&quot;);</a>
+<a name="ln249">    }</a>
+<a name="ln250">  }</a>
+<a name="ln251"> </a>
+<a name="ln252">  switch (data_type) {</a>
+<a name="ln253">    case DataType::INT8:</a>
+<a name="ln254">      ql_value-&gt;set_int8_value(sum.IsNull() ? 0 : sum.int8_value() / count.int64_value());</a>
+<a name="ln255">      break;</a>
+<a name="ln256">    case DataType::INT16:</a>
+<a name="ln257">      ql_value-&gt;set_int16_value(sum.IsNull() ? 0 : sum.int16_value() / count.int64_value());</a>
+<a name="ln258">      break;</a>
+<a name="ln259">    case DataType::INT32:</a>
+<a name="ln260">      ql_value-&gt;set_int32_value(sum.IsNull() ? 0 : sum.int32_value() / count.int64_value());</a>
+<a name="ln261">      break;</a>
+<a name="ln262">    case DataType::INT64:</a>
+<a name="ln263">      ql_value-&gt;set_int64_value(sum.IsNull() ? 0 : sum.int64_value() / count.int64_value());</a>
+<a name="ln264">      break;</a>
+<a name="ln265">    case DataType::VARINT:</a>
+<a name="ln266">      if (sum.IsNull()) {</a>
+<a name="ln267">        util::VarInt varint(0);</a>
+<a name="ln268">        ql_value-&gt;set_varint_value(varint);</a>
+<a name="ln269">      } else {</a>
+<a name="ln270">        int64_t tsum = VERIFY_RESULT(sum.varint_value().ToInt64());</a>
+<a name="ln271">        int64_t tcount = VERIFY_RESULT(count.varint_value().ToInt64());</a>
+<a name="ln272">        util::VarInt average(tsum / tcount);</a>
+<a name="ln273">        ql_value-&gt;set_varint_value(average);</a>
+<a name="ln274">      }</a>
+<a name="ln275">      break;</a>
+<a name="ln276">    case DataType::FLOAT:</a>
+<a name="ln277">      ql_value-&gt;set_float_value(sum.IsNull() ? 0 :sum.float_value() / count.int64_value());</a>
+<a name="ln278">      break;</a>
+<a name="ln279">    case DataType::DOUBLE:</a>
+<a name="ln280">      ql_value-&gt;set_double_value(sum.IsNull() ? 0 :sum.double_value() / count.int64_value());</a>
+<a name="ln281">      break;</a>
+<a name="ln282">    default:</a>
+<a name="ln283">      return STATUS(RuntimeError, &quot;Unexpected datatype for argument of AVG()&quot;);</a>
+<a name="ln284">  }</a>
+<a name="ln285">  return Status::OK();</a>
+<a name="ln286">}</a>
+<a name="ln287"> </a>
+<a name="ln288">}  // namespace ql</a>
+<a name="ln289">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="36"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

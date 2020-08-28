@@ -1,0 +1,781 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>mock_env.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Copyright (c) 2011 The LevelDB Authors. All rights reserved.</a>
+<a name="ln21">// Use of this source code is governed by a BSD-style license that can be</a>
+<a name="ln22">// found in the LICENSE file. See the AUTHORS file for names of contributors.</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;algorithm&gt;</a>
+<a name="ln25">#include &lt;chrono&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;yb/rocksdb/util/mock_env.h&quot;</a>
+<a name="ln28">#include &quot;yb/rocksdb/port/sys_time.h&quot;</a>
+<a name="ln29">#include &quot;yb/rocksdb/util/rate_limiter.h&quot;</a>
+<a name="ln30">#include &quot;yb/rocksdb/util/random.h&quot;</a>
+<a name="ln31">#include &quot;yb/rocksdb/util/murmurhash.h&quot;</a>
+<a name="ln32"> </a>
+<a name="ln33">namespace rocksdb {</a>
+<a name="ln34"> </a>
+<a name="ln35">class MemFile {</a>
+<a name="ln36"> public:</a>
+<a name="ln37">  explicit MemFile(Env* env, const std::string&amp; fn, bool _is_lock_file = false)</a>
+<a name="ln38">      : env_(env),</a>
+<a name="ln39">        fn_(fn),</a>
+<a name="ln40">        refs_(0),</a>
+<a name="ln41">        is_lock_file_(_is_lock_file),</a>
+<a name="ln42">        locked_(false),</a>
+<a name="ln43">        size_(0),</a>
+<a name="ln44">        modified_time_(Now()),</a>
+<a name="ln45">        rnd_(static_cast&lt;uint32_t&gt;(</a>
+<a name="ln46">            MurmurHash(fn.data(), static_cast&lt;int&gt;(fn.size()), 0))),</a>
+<a name="ln47">        fsynced_bytes_(0) {}</a>
+<a name="ln48"> </a>
+<a name="ln49">  void Ref() {</a>
+<a name="ln50">    MutexLock lock(&amp;mutex_);</a>
+<a name="ln51">    ++refs_;</a>
+<a name="ln52">  }</a>
+<a name="ln53"> </a>
+<a name="ln54">  bool is_lock_file() const { return is_lock_file_; }</a>
+<a name="ln55"> </a>
+<a name="ln56">  bool Lock() {</a>
+<a name="ln57">    assert(is_lock_file_);</a>
+<a name="ln58">    MutexLock lock(&amp;mutex_);</a>
+<a name="ln59">    if (locked_) {</a>
+<a name="ln60">      return false;</a>
+<a name="ln61">    } else {</a>
+<a name="ln62">      locked_ = true;</a>
+<a name="ln63">      return true;</a>
+<a name="ln64">    }</a>
+<a name="ln65">  }</a>
+<a name="ln66"> </a>
+<a name="ln67">  void Unlock() {</a>
+<a name="ln68">    assert(is_lock_file_);</a>
+<a name="ln69">    MutexLock lock(&amp;mutex_);</a>
+<a name="ln70">    locked_ = false;</a>
+<a name="ln71">  }</a>
+<a name="ln72"> </a>
+<a name="ln73">  void Unref() {</a>
+<a name="ln74">    bool do_delete = false;</a>
+<a name="ln75">    {</a>
+<a name="ln76">      MutexLock lock(&amp;mutex_);</a>
+<a name="ln77">      --refs_;</a>
+<a name="ln78">      assert(refs_ &gt;= 0);</a>
+<a name="ln79">      if (refs_ &lt;= 0) {</a>
+<a name="ln80">        do_delete = true;</a>
+<a name="ln81">      }</a>
+<a name="ln82">    }</a>
+<a name="ln83"> </a>
+<a name="ln84">    if (do_delete) {</a>
+<a name="ln85">      delete this;</a>
+<a name="ln86">    }</a>
+<a name="ln87">  }</a>
+<a name="ln88"> </a>
+<a name="ln89">  uint64_t Size() const {</a>
+<a name="ln90">    return size_;</a>
+<a name="ln91">  }</a>
+<a name="ln92"> </a>
+<a name="ln93">  void Truncate(size_t size) {</a>
+<a name="ln94">    MutexLock lock(&amp;mutex_);</a>
+<a name="ln95">    if (size &lt; size_) {</a>
+<a name="ln96">      data_.resize(size);</a>
+<a name="ln97">      size_ = size;</a>
+<a name="ln98">    }</a>
+<a name="ln99">  }</a>
+<a name="ln100"> </a>
+<a name="ln101">  void CorruptBuffer() {</a>
+<a name="ln102">    if (fsynced_bytes_ &gt;= size_) {</a>
+<a name="ln103">      return;</a>
+<a name="ln104">    }</a>
+<a name="ln105">    uint64_t buffered_bytes = size_ - fsynced_bytes_;</a>
+<a name="ln106">    uint64_t start =</a>
+<a name="ln107">        fsynced_bytes_ + rnd_.Uniform(static_cast&lt;int&gt;(buffered_bytes));</a>
+<a name="ln108">    uint64_t end = std::min(start + 512, size_.load());</a>
+<a name="ln109">    MutexLock lock(&amp;mutex_);</a>
+<a name="ln110">    for (uint64_t pos = start; pos &lt; end; ++pos) {</a>
+<a name="ln111">      data_[pos] = static_cast&lt;char&gt;(rnd_.Uniform(256));</a>
+<a name="ln112">    }</a>
+<a name="ln113">  }</a>
+<a name="ln114"> </a>
+<a name="ln115">  Status Read(uint64_t offset, size_t n, Slice* result, uint8_t* scratch) const {</a>
+<a name="ln116">    MutexLock lock(&amp;mutex_);</a>
+<a name="ln117">    if (offset &gt; Size()) {</a>
+<a name="ln118">      return STATUS(IOError, &quot;Offset greater than file size.&quot;);</a>
+<a name="ln119">    }</a>
+<a name="ln120">    const uint64_t available = Size() - offset;</a>
+<a name="ln121">    if (n &gt; available) {</a>
+<a name="ln122">      n = available;</a>
+<a name="ln123">    }</a>
+<a name="ln124">    if (n == 0) {</a>
+<a name="ln125">      *result = Slice();</a>
+<a name="ln126">      return Status::OK();</a>
+<a name="ln127">    }</a>
+<a name="ln128">    if (scratch) {</a>
+<a name="ln129">      memcpy(scratch, &amp;(data_[offset]), n);</a>
+<a name="ln130">      *result = Slice(scratch, n);</a>
+<a name="ln131">    } else {</a>
+<a name="ln132">      *result = Slice(&amp;(data_[offset]), n);</a>
+<a name="ln133">    }</a>
+<a name="ln134">    return Status::OK();</a>
+<a name="ln135">  }</a>
+<a name="ln136"> </a>
+<a name="ln137">  Status Append(const Slice&amp; data) {</a>
+<a name="ln138">    MutexLock lock(&amp;mutex_);</a>
+<a name="ln139">    data_.append(data.cdata(), data.size());</a>
+<a name="ln140">    size_ = data_.size();</a>
+<a name="ln141">    modified_time_ = Now();</a>
+<a name="ln142">    return Status::OK();</a>
+<a name="ln143">  }</a>
+<a name="ln144"> </a>
+<a name="ln145">  Status Fsync() {</a>
+<a name="ln146">    fsynced_bytes_ = size_.load();</a>
+<a name="ln147">    return Status::OK();</a>
+<a name="ln148">  }</a>
+<a name="ln149"> </a>
+<a name="ln150">  uint64_t ModifiedTime() const {</a>
+<a name="ln151">    return modified_time_;</a>
+<a name="ln152">  }</a>
+<a name="ln153"> </a>
+<a name="ln154"> private:</a>
+<a name="ln155">  uint64_t Now() {</a>
+<a name="ln156">    int64_t unix_time;</a>
+<a name="ln157">    auto s = env_-&gt;GetCurrentTime(&amp;unix_time);</a>
+<a name="ln158">    assert(s.ok());</a>
+<a name="ln159">    return static_cast&lt;uint64_t&gt;(unix_time);</a>
+<a name="ln160">  }</a>
+<a name="ln161"> </a>
+<a name="ln162">  // Private since only Unref() should be used to delete it.</a>
+<a name="ln163">  ~MemFile() {</a>
+<a name="ln164">    assert(refs_ == 0);</a>
+<a name="ln165">  }</a>
+<a name="ln166"> </a>
+<a name="ln167">  // No copying allowed.</a>
+<a name="ln168">  MemFile(const MemFile&amp;);</a>
+<a name="ln169">  void operator=(const MemFile&amp;);</a>
+<a name="ln170"> </a>
+<a name="ln171">  Env* env_;</a>
+<a name="ln172">  const std::string fn_;</a>
+<a name="ln173">  mutable port::Mutex mutex_;</a>
+<a name="ln174">  int refs_;</a>
+<a name="ln175">  bool is_lock_file_;</a>
+<a name="ln176">  bool locked_;</a>
+<a name="ln177"> </a>
+<a name="ln178">  // Data written into this file, all bytes before fsynced_bytes are</a>
+<a name="ln179">  // persistent.</a>
+<a name="ln180">  std::string data_;</a>
+<a name="ln181">  std::atomic&lt;uint64_t&gt; size_;</a>
+<a name="ln182">  std::atomic&lt;uint64_t&gt; modified_time_;</a>
+<a name="ln183"> </a>
+<a name="ln184">  Random rnd_;</a>
+<a name="ln185">  std::atomic&lt;uint64_t&gt; fsynced_bytes_;</a>
+<a name="ln186">};</a>
+<a name="ln187"> </a>
+<a name="ln188">namespace {</a>
+<a name="ln189"> </a>
+<a name="ln190">class MockSequentialFile : public SequentialFile {</a>
+<a name="ln191"> public:</a>
+<a name="ln192">  explicit MockSequentialFile(MemFile* file) : file_(file), pos_(0) {</a>
+<a name="ln193">    file_-&gt;Ref();</a>
+<a name="ln194">  }</a>
+<a name="ln195"> </a>
+<a name="ln196">  ~MockSequentialFile() {</a>
+<a name="ln197">    file_-&gt;Unref();</a>
+<a name="ln198">  }</a>
+<a name="ln199"> </a>
+<a name="ln200">  Status Read(size_t n, Slice* result, uint8_t* scratch) override {</a>
+<a name="ln201">    Status s = file_-&gt;Read(pos_, n, result, scratch);</a>
+<a name="ln202">    if (s.ok()) {</a>
+<a name="ln203">      pos_ += result-&gt;size();</a>
+<a name="ln204">    }</a>
+<a name="ln205">    return s;</a>
+<a name="ln206">  }</a>
+<a name="ln207"> </a>
+<a name="ln208">  Status Skip(uint64_t n) override {</a>
+<a name="ln209">    if (pos_ &gt; file_-&gt;Size()) {</a>
+<a name="ln210">      return STATUS(IOError, &quot;pos_ &gt; file_-&gt;Size()&quot;);</a>
+<a name="ln211">    }</a>
+<a name="ln212">    const size_t available = file_-&gt;Size() - pos_;</a>
+<a name="ln213">    if (n &gt; available) {</a>
+<a name="ln214">      n = available;</a>
+<a name="ln215">    }</a>
+<a name="ln216">    pos_ += n;</a>
+<a name="ln217">    return Status::OK();</a>
+<a name="ln218">  }</a>
+<a name="ln219"> </a>
+<a name="ln220">  const std::string&amp; filename() const override {</a>
+<a name="ln221">    static const std::string kFilename = &quot;MockSequentialFile&quot;;</a>
+<a name="ln222">    return kFilename;</a>
+<a name="ln223">  }</a>
+<a name="ln224"> </a>
+<a name="ln225"> private:</a>
+<a name="ln226">  MemFile* file_;</a>
+<a name="ln227">  size_t pos_;</a>
+<a name="ln228">};</a>
+<a name="ln229"> </a>
+<a name="ln230">class MockRandomAccessFile : public RandomAccessFile {</a>
+<a name="ln231"> public:</a>
+<a name="ln232">  explicit MockRandomAccessFile(MemFile* file) : file_(file) {</a>
+<a name="ln233">    file_-&gt;Ref();</a>
+<a name="ln234">  }</a>
+<a name="ln235"> </a>
+<a name="ln236">  ~MockRandomAccessFile() {</a>
+<a name="ln237">    file_-&gt;Unref();</a>
+<a name="ln238">  }</a>
+<a name="ln239"> </a>
+<a name="ln240">  Status Read(uint64_t offset, size_t n, Slice* result, uint8_t* scratch) const override {</a>
+<a name="ln241">    return file_-&gt;Read(offset, n, result, scratch);</a>
+<a name="ln242">  }</a>
+<a name="ln243"> </a>
+<a name="ln244">  yb::Result&lt;uint64_t&gt; Size() const override { return file_-&gt;Size(); }</a>
+<a name="ln245"> </a>
+<a name="ln246">  yb::Result&lt;uint64_t&gt; INode() const override { return STATUS(NotSupported, &quot;Not supported&quot;); };</a>
+<a name="ln247"> </a>
+<a name="ln248">  const std::string&amp; filename() const override { return filename_; }</a>
+<a name="ln249"> </a>
+<a name="ln250">  size_t memory_footprint() const override { return 0; }</a>
+<a name="ln251"> </a>
+<a name="ln252"> private:</a>
+<a name="ln253">  std::string filename_ = &quot;MockRandomAccessFile&quot;;</a>
+<a name="ln254">  MemFile* file_;</a>
+<a name="ln255">};</a>
+<a name="ln256"> </a>
+<a name="ln257">class MockWritableFile : public WritableFile {</a>
+<a name="ln258"> public:</a>
+<a name="ln259">  MockWritableFile(MemFile* file, RateLimiter* rate_limiter)</a>
+<a name="ln260">    : file_(file),</a>
+<a name="ln261">      rate_limiter_(rate_limiter) {</a>
+<a name="ln262">    file_-&gt;Ref();</a>
+<a name="ln263">  }</a>
+<a name="ln264"> </a>
+<a name="ln265">  ~MockWritableFile() {</a>
+<a name="ln266">    file_-&gt;Unref();</a>
+<a name="ln267">  }</a>
+<a name="ln268"> </a>
+<a name="ln269">  Status Append(const Slice&amp; data) override {</a>
+<a name="ln270">    uint64_t bytes_written = 0;</a>
+<a name="ln271">    while (bytes_written &lt; data.size()) {</a>
+<a name="ln272">      auto bytes = RequestToken(data.size() - bytes_written);</a>
+<a name="ln273">      Status s = file_-&gt;Append(Slice(data.data() + bytes_written, bytes));</a>
+<a name="ln274">      if (!s.ok()) {</a>
+<a name="ln275">        return s;</a>
+<a name="ln276">      }</a>
+<a name="ln277">      bytes_written += bytes;</a>
+<a name="ln278">    }</a>
+<a name="ln279">    return Status::OK();</a>
+<a name="ln280">  }</a>
+<a name="ln281">  Status Truncate(uint64_t size) override {</a>
+<a name="ln282">    return Status::OK();</a>
+<a name="ln283">  }</a>
+<a name="ln284">  Status Close() override { return file_-&gt;Fsync(); }</a>
+<a name="ln285"> </a>
+<a name="ln286">  Status Flush() override { return Status::OK(); }</a>
+<a name="ln287"> </a>
+<a name="ln288">  Status Sync() override { return file_-&gt;Fsync(); }</a>
+<a name="ln289"> </a>
+<a name="ln290">  uint64_t GetFileSize() override { return file_-&gt;Size(); }</a>
+<a name="ln291"> </a>
+<a name="ln292"> private:</a>
+<a name="ln293">  inline size_t RequestToken(size_t bytes) {</a>
+<a name="ln294">    if (rate_limiter_ &amp;&amp; io_priority_ &lt; Env::IO_TOTAL) {</a>
+<a name="ln295">      bytes = std::min(bytes,</a>
+<a name="ln296">          static_cast&lt;size_t&gt;(rate_limiter_-&gt;GetSingleBurstBytes()));</a>
+<a name="ln297">      rate_limiter_-&gt;Request(bytes, io_priority_);</a>
+<a name="ln298">    }</a>
+<a name="ln299">    return bytes;</a>
+<a name="ln300">  }</a>
+<a name="ln301"> </a>
+<a name="ln302">  MemFile* file_;</a>
+<a name="ln303">  RateLimiter* rate_limiter_;</a>
+<a name="ln304">};</a>
+<a name="ln305"> </a>
+<a name="ln306">class MockEnvDirectory : public Directory {</a>
+<a name="ln307"> public:</a>
+<a name="ln308">  Status Fsync() override { return Status::OK(); }</a>
+<a name="ln309">};</a>
+<a name="ln310"> </a>
+<a name="ln311">class MockEnvFileLock : public FileLock {</a>
+<a name="ln312"> public:</a>
+<a name="ln313">  explicit MockEnvFileLock(const std::string&amp; fname)</a>
+<a name="ln314">    : fname_(fname) {}</a>
+<a name="ln315"> </a>
+<a name="ln316">  std::string FileName() const {</a>
+<a name="ln317">    return fname_;</a>
+<a name="ln318">  }</a>
+<a name="ln319"> </a>
+<a name="ln320"> private:</a>
+<a name="ln321">  const std::string fname_;</a>
+<a name="ln322">};</a>
+<a name="ln323"> </a>
+<a name="ln324">class TestMemLogger : public Logger {</a>
+<a name="ln325"> private:</a>
+<a name="ln326">  std::unique_ptr&lt;WritableFile&gt; file_;</a>
+<a name="ln327">  std::atomic_size_t log_size_;</a>
+<a name="ln328">  static const uint64_t flush_every_seconds_ = 5;</a>
+<a name="ln329">  std::atomic_uint_fast64_t last_flush_micros_;</a>
+<a name="ln330">  Env* env_;</a>
+<a name="ln331">  bool flush_pending_;</a>
+<a name="ln332"> </a>
+<a name="ln333"> public:</a>
+<a name="ln334">  TestMemLogger(std::unique_ptr&lt;WritableFile&gt; f, Env* env,</a>
+<a name="ln335">                const InfoLogLevel log_level = InfoLogLevel::ERROR_LEVEL)</a>
+<a name="ln336">      : Logger(log_level),</a>
+<a name="ln337">        file_(std::move(f)),</a>
+<a name="ln338">        log_size_(0),</a>
+<a name="ln339">        last_flush_micros_(0),</a>
+<a name="ln340">        env_(env),</a>
+<a name="ln341">        flush_pending_(false) {}</a>
+<a name="ln342">  virtual ~TestMemLogger() {</a>
+<a name="ln343">  }</a>
+<a name="ln344"> </a>
+<a name="ln345">  void Flush() override {</a>
+<a name="ln346">    if (flush_pending_) {</a>
+<a name="ln347">      flush_pending_ = false;</a>
+<a name="ln348">    }</a>
+<a name="ln349">    last_flush_micros_ = env_-&gt;NowMicros();</a>
+<a name="ln350">  }</a>
+<a name="ln351"> </a>
+<a name="ln352">  using Logger::Logv;</a>
+<a name="ln353">  void Logv(const char* format, va_list ap) override {</a>
+<a name="ln354">    // We try twice: the first time with a fixed-size stack allocated buffer,</a>
+<a name="ln355">    // and the second time with a much larger dynamically allocated buffer.</a>
+<a name="ln356">    char buffer[500];</a>
+<a name="ln357">    for (int iter = 0; iter &lt; 2; iter++) {</a>
+<a name="ln358">      char* base;</a>
+<a name="ln359">      int bufsize;</a>
+<a name="ln360">      if (iter == 0) {</a>
+<a name="ln361">        bufsize = sizeof(buffer);</a>
+<a name="ln362">        base = buffer;</a>
+<a name="ln363">      } else {</a>
+<a name="ln364">        bufsize = 30000;</a>
+<a name="ln365">        base = new char[bufsize];</a>
+<a name="ln366">      }</a>
+<a name="ln367">      char* p = base;</a>
+<a name="ln368">      char* limit = base + bufsize;</a>
+<a name="ln369"> </a>
+<a name="ln370">      struct timeval now_tv;</a>
+<a name="ln371">      gettimeofday(&amp;now_tv, nullptr);</a>
+<a name="ln372">      const time_t seconds = now_tv.tv_sec;</a>
+<a name="ln373">      struct tm t;</a>
+<a name="ln374">      localtime_r(&amp;seconds, &amp;t);</a>
+<a name="ln375">      p += snprintf(p, limit - p,</a>
+<a name="ln376">                    &quot;%04d/%02d/%02d-%02d:%02d:%02d.%06d &quot;,</a>
+<a name="ln377">                    t.tm_year + 1900,</a>
+<a name="ln378">                    t.tm_mon + 1,</a>
+<a name="ln379">                    t.tm_mday,</a>
+<a name="ln380">                    t.tm_hour,</a>
+<a name="ln381">                    t.tm_min,</a>
+<a name="ln382">                    t.tm_sec,</a>
+<a name="ln383">                    static_cast&lt;int&gt;(now_tv.tv_usec));</a>
+<a name="ln384"> </a>
+<a name="ln385">      // Print the message</a>
+<a name="ln386">      if (p &lt; limit) {</a>
+<a name="ln387">        va_list backup_ap;</a>
+<a name="ln388">        va_copy(backup_ap, ap);</a>
+<a name="ln389">        p += vsnprintf(p, limit - p, format, backup_ap);</a>
+<a name="ln390">        va_end(backup_ap);</a>
+<a name="ln391">      }</a>
+<a name="ln392"> </a>
+<a name="ln393">      // Truncate to available space if necessary</a>
+<a name="ln394">      if (p &gt;= limit) {</a>
+<a name="ln395">        if (iter == 0) {</a>
+<a name="ln396">          continue;       // Try again with larger buffer</a>
+<a name="ln397">        } else {</a>
+<a name="ln398">          p = limit - 1;</a>
+<a name="ln399">        }</a>
+<a name="ln400">      }</a>
+<a name="ln401"> </a>
+<a name="ln402">      // Add newline if necessary</a>
+<a name="ln403">      if (p == base || p[-1] != '\n') {</a>
+<a name="ln404">        *p++ = '\n';</a>
+<a name="ln405">      }</a>
+<a name="ln406"> </a>
+<a name="ln407">      assert(p &lt;= limit);</a>
+<a name="ln408">      const size_t write_size = p - base;</a>
+<a name="ln409"> </a>
+<a name="ln410">      CHECK_OK(file_-&gt;Append(Slice(base, write_size)));</a>
+<a name="ln411">      flush_pending_ = true;</a>
+<a name="ln412">      log_size_ += write_size;</a>
+<a name="ln413">      uint64_t now_micros = static_cast&lt;uint64_t&gt;(now_tv.tv_sec) * 1000000 +</a>
+<a name="ln414">        now_tv.tv_usec;</a>
+<a name="ln415">      if (now_micros - last_flush_micros_ &gt;= flush_every_seconds_ * 1000000) {</a>
+<a name="ln416">        flush_pending_ = false;</a>
+<a name="ln417">        last_flush_micros_ = now_micros;</a>
+<a name="ln418">      }</a>
+<a name="ln419">      if (base != buffer) {</a>
+<a name="ln420">        delete[] base;</a>
+<a name="ln421">      }</a>
+<a name="ln422">      break;</a>
+<a name="ln423">    }</a>
+<a name="ln424">  }</a>
+<a name="ln425">  size_t GetLogFileSize() const override { return log_size_; }</a>
+<a name="ln426">};</a>
+<a name="ln427"> </a>
+<a name="ln428">}  // Anonymous namespace</a>
+<a name="ln429"> </a>
+<a name="ln430">MockEnv::MockEnv(Env* base_env) : EnvWrapper(base_env), fake_sleep_micros_(0) {}</a>
+<a name="ln431"> </a>
+<a name="ln432">MockEnv::~MockEnv() {</a>
+<a name="ln433">  for (FileSystem::iterator i = file_map_.begin(); i != file_map_.end(); ++i) {</a>
+<a name="ln434">    i-&gt;second-&gt;Unref();</a>
+<a name="ln435">  }</a>
+<a name="ln436">}</a>
+<a name="ln437"> </a>
+<a name="ln438">  // Partial implementation of the Env interface.</a>
+<a name="ln439">Status MockEnv::NewSequentialFile(const std::string&amp; fname,</a>
+<a name="ln440">                                     unique_ptr&lt;SequentialFile&gt;* result,</a>
+<a name="ln441">                                     const EnvOptions&amp; soptions) {</a>
+<a name="ln442">  auto fn = NormalizePath(fname);</a>
+<a name="ln443">  MutexLock lock(&amp;mutex_);</a>
+<a name="ln444">  if (file_map_.find(fn) == file_map_.end()) {</a>
+<a name="ln445">    *result = NULL;</a>
+<a name="ln446">    return STATUS(IOError, fn, &quot;File not found&quot;);</a>
+<a name="ln447">  }</a>
+<a name="ln448">  auto* f = file_map_[fn];</a>
+<a name="ln449">  if (f-&gt;is_lock_file()) {</a>
+<a name="ln450">    return STATUS(InvalidArgument, fn, &quot;Cannot open a lock file.&quot;);</a>
+<a name="ln451">  }</a>
+<a name="ln452">  result-&gt;reset(new MockSequentialFile(f));</a>
+<a name="ln453">  return Status::OK();</a>
+<a name="ln454">}</a>
+<a name="ln455"> </a>
+<a name="ln456">Status MockEnv::NewRandomAccessFile(const std::string&amp; fname,</a>
+<a name="ln457">                                       unique_ptr&lt;RandomAccessFile&gt;* result,</a>
+<a name="ln458">                                       const EnvOptions&amp; soptions) {</a>
+<a name="ln459">  auto fn = NormalizePath(fname);</a>
+<a name="ln460">  MutexLock lock(&amp;mutex_);</a>
+<a name="ln461">  if (file_map_.find(fn) == file_map_.end()) {</a>
+<a name="ln462">    *result = NULL;</a>
+<a name="ln463">    return STATUS(IOError, fn, &quot;File not found&quot;);</a>
+<a name="ln464">  }</a>
+<a name="ln465">  auto* f = file_map_[fn];</a>
+<a name="ln466">  if (f-&gt;is_lock_file()) {</a>
+<a name="ln467">    return STATUS(InvalidArgument, fn, &quot;Cannot open a lock file.&quot;);</a>
+<a name="ln468">  }</a>
+<a name="ln469">  result-&gt;reset(new MockRandomAccessFile(f));</a>
+<a name="ln470">  return Status::OK();</a>
+<a name="ln471">}</a>
+<a name="ln472"> </a>
+<a name="ln473">Status MockEnv::NewWritableFile(const std::string&amp; fname,</a>
+<a name="ln474">                                   unique_ptr&lt;WritableFile&gt;* result,</a>
+<a name="ln475">                                   const EnvOptions&amp; env_options) {</a>
+<a name="ln476">  auto fn = NormalizePath(fname);</a>
+<a name="ln477">  MutexLock lock(&amp;mutex_);</a>
+<a name="ln478">  if (file_map_.find(fn) != file_map_.end()) {</a>
+<a name="ln479">    DeleteFileInternal(fn);</a>
+<a name="ln480">  }</a>
+<a name="ln481">  MemFile* file = new MemFile(this, fn, false);</a>
+<a name="ln482">  file-&gt;Ref();</a>
+<a name="ln483">  file_map_[fn] = file;</a>
+<a name="ln484"> </a>
+<a name="ln485">  result-&gt;reset(new MockWritableFile(file, env_options.rate_limiter));</a>
+<a name="ln486">  return Status::OK();</a>
+<a name="ln487">}</a>
+<a name="ln488"> </a>
+<a name="ln489">Status MockEnv::NewDirectory(const std::string&amp; name,</a>
+<a name="ln490">                                unique_ptr&lt;Directory&gt;* result) {</a>
+<a name="ln491">  result-&gt;reset(new MockEnvDirectory());</a>
+<a name="ln492">  return Status::OK();</a>
+<a name="ln493">}</a>
+<a name="ln494"> </a>
+<a name="ln495">Status MockEnv::FileExists(const std::string&amp; fname) {</a>
+<a name="ln496">  auto fn = NormalizePath(fname);</a>
+<a name="ln497">  MutexLock lock(&amp;mutex_);</a>
+<a name="ln498">  if (file_map_.find(fn) != file_map_.end()) {</a>
+<a name="ln499">    // File exists</a>
+<a name="ln500">    return Status::OK();</a>
+<a name="ln501">  }</a>
+<a name="ln502">  // Now also check if fn exists as a dir</a>
+<a name="ln503">  for (const auto&amp; iter : file_map_) {</a>
+<a name="ln504">    const std::string&amp; filename = iter.first;</a>
+<a name="ln505">    if (filename.size() &gt;= fn.size() + 1 &amp;&amp;</a>
+<a name="ln506">        filename[fn.size()] == '/' &amp;&amp;</a>
+<a name="ln507">        Slice(filename).starts_with(Slice(fn))) {</a>
+<a name="ln508">      return Status::OK();</a>
+<a name="ln509">    }</a>
+<a name="ln510">  }</a>
+<a name="ln511">  return STATUS(NotFound, &quot;&quot;);</a>
+<a name="ln512">}</a>
+<a name="ln513"> </a>
+<a name="ln514">Status MockEnv::GetChildren(const std::string&amp; dir,</a>
+<a name="ln515">                               std::vector&lt;std::string&gt;* result) {</a>
+<a name="ln516">  auto d = NormalizePath(dir);</a>
+<a name="ln517">  {</a>
+<a name="ln518">    MutexLock lock(&amp;mutex_);</a>
+<a name="ln519">    result-&gt;clear();</a>
+<a name="ln520">    for (const auto&amp; iter : file_map_) {</a>
+<a name="ln521">      const std::string&amp; filename = iter.first;</a>
+<a name="ln522"> </a>
+<a name="ln523">      if (filename.size() &gt;= d.size() + 1 &amp;&amp; filename[d.size()] == '/' &amp;&amp;</a>
+<a name="ln524">          Slice(filename).starts_with(Slice(d))) {</a>
+<a name="ln525">        size_t next_slash = filename.find('/', d.size() + 1);</a>
+<a name="ln526">        if (next_slash != std::string::npos) {</a>
+<a name="ln527">          result-&gt;push_back(filename.substr(</a>
+<a name="ln528">                d.size() + 1, next_slash - d.size() - 1));</a>
+<a name="ln529">        } else {</a>
+<a name="ln530">          result-&gt;push_back(filename.substr(d.size() + 1));</a>
+<a name="ln531">        }</a>
+<a name="ln532">      }</a>
+<a name="ln533">    }</a>
+<a name="ln534">  }</a>
+<a name="ln535">  result-&gt;erase(std::unique(result-&gt;begin(), result-&gt;end()), result-&gt;end());</a>
+<a name="ln536">  return Status::OK();</a>
+<a name="ln537">}</a>
+<a name="ln538"> </a>
+<a name="ln539">void MockEnv::DeleteFileInternal(const std::string&amp; fname) {</a>
+<a name="ln540">  assert(fname == NormalizePath(fname));</a>
+<a name="ln541">  const auto&amp; pair = file_map_.find(fname);</a>
+<a name="ln542">  if (pair != file_map_.end()) {</a>
+<a name="ln543">    pair-&gt;second-&gt;Unref();</a>
+<a name="ln544">    file_map_.erase(fname);</a>
+<a name="ln545">  }</a>
+<a name="ln546">}</a>
+<a name="ln547"> </a>
+<a name="ln548">Status MockEnv::DeleteFile(const std::string&amp; fname) {</a>
+<a name="ln549">  auto fn = NormalizePath(fname);</a>
+<a name="ln550">  MutexLock lock(&amp;mutex_);</a>
+<a name="ln551">  if (file_map_.find(fn) == file_map_.end()) {</a>
+<a name="ln552">    return STATUS(IOError, fn, &quot;File not found&quot;);</a>
+<a name="ln553">  }</a>
+<a name="ln554"> </a>
+<a name="ln555">  DeleteFileInternal(fn);</a>
+<a name="ln556">  return Status::OK();</a>
+<a name="ln557">}</a>
+<a name="ln558"> </a>
+<a name="ln559">Status MockEnv::CreateDir(const std::string&amp; dirname) {</a>
+<a name="ln560">  return Status::OK();</a>
+<a name="ln561">}</a>
+<a name="ln562"> </a>
+<a name="ln563">Status MockEnv::CreateDirIfMissing(const std::string&amp; dirname) {</a>
+<a name="ln564">  return Status::OK();</a>
+<a name="ln565">}</a>
+<a name="ln566"> </a>
+<a name="ln567">Status MockEnv::DeleteDir(const std::string&amp; dirname) {</a>
+<a name="ln568">  return Status::OK();</a>
+<a name="ln569">}</a>
+<a name="ln570"> </a>
+<a name="ln571">Status MockEnv::GetFileSize(const std::string&amp; fname, uint64_t* file_size) {</a>
+<a name="ln572">  auto fn = NormalizePath(fname);</a>
+<a name="ln573">  MutexLock lock(&amp;mutex_);</a>
+<a name="ln574">  auto iter = file_map_.find(fn);</a>
+<a name="ln575">  if (iter == file_map_.end()) {</a>
+<a name="ln576">    return STATUS(IOError, fn, &quot;File not found&quot;);</a>
+<a name="ln577">  }</a>
+<a name="ln578"> </a>
+<a name="ln579">  *file_size = iter-&gt;second-&gt;Size();</a>
+<a name="ln580">  return Status::OK();</a>
+<a name="ln581">}</a>
+<a name="ln582"> </a>
+<a name="ln583">Status MockEnv::GetFileModificationTime(const std::string&amp; fname,</a>
+<a name="ln584">                                           uint64_t* time) {</a>
+<a name="ln585">  auto fn = NormalizePath(fname);</a>
+<a name="ln586">  MutexLock lock(&amp;mutex_);</a>
+<a name="ln587">  auto iter = file_map_.find(fn);</a>
+<a name="ln588">  if (iter == file_map_.end()) {</a>
+<a name="ln589">    return STATUS(IOError, fn, &quot;File not found&quot;);</a>
+<a name="ln590">  }</a>
+<a name="ln591">  *time = iter-&gt;second-&gt;ModifiedTime();</a>
+<a name="ln592">  return Status::OK();</a>
+<a name="ln593">}</a>
+<a name="ln594"> </a>
+<a name="ln595">Status MockEnv::RenameFile(const std::string&amp; src, const std::string&amp; dest) {</a>
+<a name="ln596">  auto s = NormalizePath(src);</a>
+<a name="ln597">  auto t = NormalizePath(dest);</a>
+<a name="ln598">  MutexLock lock(&amp;mutex_);</a>
+<a name="ln599">  if (file_map_.find(s) == file_map_.end()) {</a>
+<a name="ln600">    return STATUS(IOError, s, &quot;File not found&quot;);</a>
+<a name="ln601">  }</a>
+<a name="ln602"> </a>
+<a name="ln603">  DeleteFileInternal(t);</a>
+<a name="ln604">  file_map_[t] = file_map_[s];</a>
+<a name="ln605">  file_map_.erase(s);</a>
+<a name="ln606">  return Status::OK();</a>
+<a name="ln607">}</a>
+<a name="ln608"> </a>
+<a name="ln609">Status MockEnv::LinkFile(const std::string&amp; src, const std::string&amp; dest) {</a>
+<a name="ln610">  auto s = NormalizePath(src);</a>
+<a name="ln611">  auto t = NormalizePath(dest);</a>
+<a name="ln612">  MutexLock lock(&amp;mutex_);</a>
+<a name="ln613">  if (file_map_.find(s) == file_map_.end()) {</a>
+<a name="ln614">    return STATUS(IOError, s, &quot;File not found&quot;);</a>
+<a name="ln615">  }</a>
+<a name="ln616"> </a>
+<a name="ln617">  DeleteFileInternal(t);</a>
+<a name="ln618">  file_map_[t] = file_map_[s];</a>
+<a name="ln619">  return Status::OK();</a>
+<a name="ln620">}</a>
+<a name="ln621"> </a>
+<a name="ln622">Status MockEnv::NewLogger(const std::string&amp; fname,</a>
+<a name="ln623">                             shared_ptr&lt;Logger&gt;* result) {</a>
+<a name="ln624">  auto fn = NormalizePath(fname);</a>
+<a name="ln625">  MutexLock lock(&amp;mutex_);</a>
+<a name="ln626">  auto iter = file_map_.find(fn);</a>
+<a name="ln627">  MemFile* file = nullptr;</a>
+<a name="ln628">  if (iter == file_map_.end()) {</a>
+<a name="ln629">    file = new MemFile(this, fn, false);</a>
+<a name="ln630">    file-&gt;Ref();</a>
+<a name="ln631">    file_map_[fn] = file;</a>
+<a name="ln632">  } else {</a>
+<a name="ln633">    file = iter-&gt;second;</a>
+<a name="ln634">  }</a>
+<a name="ln635">  std::unique_ptr&lt;WritableFile&gt; f(new MockWritableFile(file, nullptr));</a>
+<a name="ln636">  result-&gt;reset(new TestMemLogger(std::move(f), this));</a>
+<a name="ln637">  return Status::OK();</a>
+<a name="ln638">}</a>
+<a name="ln639"> </a>
+<a name="ln640">Status MockEnv::LockFile(const std::string&amp; fname, FileLock** flock) {</a>
+<a name="ln641">  auto fn = NormalizePath(fname);</a>
+<a name="ln642">  {</a>
+<a name="ln643">    MutexLock lock(&amp;mutex_);</a>
+<a name="ln644">    if (file_map_.find(fn) != file_map_.end()) {</a>
+<a name="ln645">      if (!file_map_[fn]-&gt;is_lock_file()) {</a>
+<a name="ln646">        return STATUS(InvalidArgument, fname, &quot;Not a lock file.&quot;);</a>
+<a name="ln647">      }</a>
+<a name="ln648">      if (!file_map_[fn]-&gt;Lock()) {</a>
+<a name="ln649">        return STATUS(IOError, fn, &quot;Lock is already held.&quot;);</a>
+<a name="ln650">      }</a>
+<a name="ln651">    } else {</a>
+<a name="ln652">      auto* file = new MemFile(this, fn, true);</a>
+<a name="ln653">      file-&gt;Ref();</a>
+<a name="ln654">      file-&gt;Lock();</a>
+<a name="ln655">      file_map_[fn] = file;</a>
+<a name="ln656">    }</a>
+<a name="ln657">  }</a>
+<a name="ln658">  *flock = new MockEnvFileLock(fn);</a>
+<a name="ln659">  return Status::OK();</a>
+<a name="ln660">}</a>
+<a name="ln661"> </a>
+<a name="ln662">Status MockEnv::UnlockFile(FileLock* flock) {</a>
+<a name="ln663">  std::string fn = dynamic_cast&lt;MockEnvFileLock*&gt;(flock)-&gt;FileName();</a>
+<a name="ln664">  {</a>
+<a name="ln665">    MutexLock lock(&amp;mutex_);</a>
+<a name="ln666">    if (file_map_.find(fn) != file_map_.end()) {</a>
+<a name="ln667">      if (!file_map_[fn]-&gt;is_lock_file()) {</a>
+<a name="ln668">        return STATUS(InvalidArgument, fn, &quot;Not a lock file.&quot;);</a>
+<a name="ln669">      }</a>
+<a name="ln670">      file_map_[fn]-&gt;Unlock();</a>
+<a name="ln671">    }</a>
+<a name="ln672">  }</a>
+<a name="ln673">  delete flock;</a>
+<a name="ln674">  return Status::OK();</a>
+<a name="ln675">}</a>
+<a name="ln676"> </a>
+<a name="ln677">Status MockEnv::GetTestDirectory(std::string* path) {</a>
+<a name="ln678">  *path = &quot;/test&quot;;</a>
+<a name="ln679">  return Status::OK();</a>
+<a name="ln680">}</a>
+<a name="ln681"> </a>
+<a name="ln682">Status MockEnv::GetCurrentTime(int64_t* unix_time) {</a>
+<a name="ln683">  auto s = EnvWrapper::GetCurrentTime(unix_time);</a>
+<a name="ln684">  *unix_time += fake_sleep_micros_.load() / (1000 * 1000);</a>
+<a name="ln685">  return s;</a>
+<a name="ln686">}</a>
+<a name="ln687"> </a>
+<a name="ln688">uint64_t MockEnv::NowMicros() {</a>
+<a name="ln689">  return EnvWrapper::NowMicros() + fake_sleep_micros_.load();</a>
+<a name="ln690">}</a>
+<a name="ln691"> </a>
+<a name="ln692">uint64_t MockEnv::NowNanos() {</a>
+<a name="ln693">  return EnvWrapper::NowNanos() + fake_sleep_micros_.load() * 1000;</a>
+<a name="ln694">}</a>
+<a name="ln695"> </a>
+<a name="ln696">// Non-virtual functions, specific to MockEnv</a>
+<a name="ln697">Status MockEnv::Truncate(const std::string&amp; fname, size_t size) {</a>
+<a name="ln698">  auto fn = NormalizePath(fname);</a>
+<a name="ln699">  MutexLock lock(&amp;mutex_);</a>
+<a name="ln700">  auto iter = file_map_.find(fn);</a>
+<a name="ln701">  if (iter == file_map_.end()) {</a>
+<a name="ln702">    return STATUS(IOError, fn, &quot;File not found&quot;);</a>
+<a name="ln703">  }</a>
+<a name="ln704">  iter-&gt;second-&gt;Truncate(size);</a>
+<a name="ln705">  return Status::OK();</a>
+<a name="ln706">}</a>
+<a name="ln707"> </a>
+<a name="ln708">Status MockEnv::CorruptBuffer(const std::string&amp; fname) {</a>
+<a name="ln709">  auto fn = NormalizePath(fname);</a>
+<a name="ln710">  MutexLock lock(&amp;mutex_);</a>
+<a name="ln711">  auto iter = file_map_.find(fn);</a>
+<a name="ln712">  if (iter == file_map_.end()) {</a>
+<a name="ln713">    return STATUS(IOError, fn, &quot;File not found&quot;);</a>
+<a name="ln714">  }</a>
+<a name="ln715">  iter-&gt;second-&gt;CorruptBuffer();</a>
+<a name="ln716">  return Status::OK();</a>
+<a name="ln717">}</a>
+<a name="ln718"> </a>
+<a name="ln719">std::string MockEnv::NormalizePath(const std::string path) {</a>
+<a name="ln720">  std::string dst;</a>
+<a name="ln721">  for (auto c : path) {</a>
+<a name="ln722">    if (!dst.empty() &amp;&amp; c == '/' &amp;&amp; dst.back() == '/') {</a>
+<a name="ln723">      continue;</a>
+<a name="ln724">    }</a>
+<a name="ln725">    dst.push_back(c);</a>
+<a name="ln726">  }</a>
+<a name="ln727">  return dst;</a>
+<a name="ln728">}</a>
+<a name="ln729"> </a>
+<a name="ln730">void MockEnv::FakeSleepForMicroseconds(int64_t micros) {</a>
+<a name="ln731">  fake_sleep_micros_.fetch_add(micros);</a>
+<a name="ln732">}</a>
+<a name="ln733"> </a>
+<a name="ln734">}  // namespace rocksdb</a>
+
+</code></pre>
+<div class="balloon" rel="410"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="663"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v522/" target="_blank">V522</a> There might be dereferencing of a potential null pointer.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

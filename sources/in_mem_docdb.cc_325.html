@@ -1,0 +1,336 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>in_mem_docdb.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/docdb/in_mem_docdb.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;sstream&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/rocksdb/db.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/common/hybrid_time.h&quot;</a>
+<a name="ln21">#include &quot;yb/docdb/doc_reader.h&quot;</a>
+<a name="ln22">#include &quot;yb/docdb/docdb.h&quot;</a>
+<a name="ln23">#include &quot;yb/docdb/docdb_debug.h&quot;</a>
+<a name="ln24">#include &quot;yb/docdb/docdb_rocksdb_util.h&quot;</a>
+<a name="ln25">#include &quot;yb/docdb/docdb_test_util.h&quot;</a>
+<a name="ln26">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln27">#include &quot;yb/rocksutil/yb_rocksdb.h&quot;</a>
+<a name="ln28"> </a>
+<a name="ln29">using std::endl;</a>
+<a name="ln30">using std::string;</a>
+<a name="ln31">using std::stringstream;</a>
+<a name="ln32">using strings::Substitute;</a>
+<a name="ln33"> </a>
+<a name="ln34">namespace yb {</a>
+<a name="ln35">namespace docdb {</a>
+<a name="ln36"> </a>
+<a name="ln37">Status InMemDocDbState::SetPrimitive(const DocPath&amp; doc_path, const PrimitiveValue&amp; value) {</a>
+<a name="ln38">  VLOG(2) &lt;&lt; __func__ &lt;&lt; &quot;: doc_path=&quot; &lt;&lt; doc_path.ToString() &lt;&lt; &quot;, value=&quot; &lt;&lt; value.ToString();</a>
+<a name="ln39">  const PrimitiveValue encoded_doc_key_as_primitive(doc_path.encoded_doc_key().AsSlice());</a>
+<a name="ln40">  const bool is_deletion = value.value_type() == ValueType::kTombstone;</a>
+<a name="ln41">  if (doc_path.num_subkeys() == 0) {</a>
+<a name="ln42">    if (is_deletion) {</a>
+<a name="ln43">      root_.DeleteChild(encoded_doc_key_as_primitive);</a>
+<a name="ln44">    } else {</a>
+<a name="ln45">      root_.SetChildPrimitive(encoded_doc_key_as_primitive, value);</a>
+<a name="ln46">    }</a>
+<a name="ln47"> </a>
+<a name="ln48">    return Status::OK();</a>
+<a name="ln49">  }</a>
+<a name="ln50">  SubDocument* current_subdoc = nullptr;</a>
+<a name="ln51"> </a>
+<a name="ln52">  if (is_deletion) {</a>
+<a name="ln53">    current_subdoc = root_.GetChild(encoded_doc_key_as_primitive);</a>
+<a name="ln54">    if (current_subdoc == nullptr) {</a>
+<a name="ln55">      // The subdocument we're trying to delete does not exist, nothing to do.</a>
+<a name="ln56">      return Status::OK();</a>
+<a name="ln57">    }</a>
+<a name="ln58">  } else {</a>
+<a name="ln59">    current_subdoc = root_.GetOrAddChild(encoded_doc_key_as_primitive).first;</a>
+<a name="ln60">  }</a>
+<a name="ln61"> </a>
+<a name="ln62">  const int num_subkeys = doc_path.num_subkeys();</a>
+<a name="ln63">  for (int subkey_index = 0; subkey_index &lt; num_subkeys - 1; ++subkey_index) {</a>
+<a name="ln64">    const PrimitiveValue&amp; subkey = doc_path.subkey(subkey_index);</a>
+<a name="ln65">    if (subkey.value_type() == ValueType::kArrayIndex) {</a>
+<a name="ln66">      return STATUS(NotSupported, &quot;Setting values at a given array index is not supported yet.&quot;);</a>
+<a name="ln67">    }</a>
+<a name="ln68"> </a>
+<a name="ln69">    if (current_subdoc-&gt;value_type() != ValueType::kObject) {</a>
+<a name="ln70">      return STATUS_FORMAT(IllegalState,</a>
+<a name="ln71">          &quot;Cannot set or delete values inside a subdocument of type $0&quot;,</a>
+<a name="ln72">          current_subdoc-&gt;value_type());</a>
+<a name="ln73">    }</a>
+<a name="ln74"> </a>
+<a name="ln75">    if (is_deletion) {</a>
+<a name="ln76">      current_subdoc = current_subdoc-&gt;GetChild(subkey);</a>
+<a name="ln77">      if (current_subdoc == nullptr) {</a>
+<a name="ln78">        // Document does not exist, nothing to do.</a>
+<a name="ln79">        return Status::OK();</a>
+<a name="ln80">      }</a>
+<a name="ln81">    } else {</a>
+<a name="ln82">      current_subdoc = current_subdoc-&gt;GetOrAddChild(subkey).first;</a>
+<a name="ln83">    }</a>
+<a name="ln84">  }</a>
+<a name="ln85"> </a>
+<a name="ln86">  if (is_deletion) {</a>
+<a name="ln87">    current_subdoc-&gt;DeleteChild(doc_path.last_subkey());</a>
+<a name="ln88">  } else {</a>
+<a name="ln89">    current_subdoc-&gt;SetChildPrimitive(doc_path.last_subkey(), value);</a>
+<a name="ln90">  }</a>
+<a name="ln91"> </a>
+<a name="ln92">  return Status::OK();</a>
+<a name="ln93">}</a>
+<a name="ln94"> </a>
+<a name="ln95">Status InMemDocDbState::DeleteSubDoc(const DocPath &amp;doc_path) {</a>
+<a name="ln96">  return SetPrimitive(doc_path, PrimitiveValue::kTombstone);</a>
+<a name="ln97">}</a>
+<a name="ln98"> </a>
+<a name="ln99">void InMemDocDbState::SetDocument(const KeyBytes&amp; encoded_doc_key, SubDocument&amp;&amp; doc) {</a>
+<a name="ln100">  root_.SetChild(PrimitiveValue(encoded_doc_key.AsSlice()), std::move(doc));</a>
+<a name="ln101">}</a>
+<a name="ln102"> </a>
+<a name="ln103">const SubDocument* InMemDocDbState::GetSubDocument(const SubDocKey&amp; subdoc_key) const {</a>
+<a name="ln104">  const SubDocument* current =</a>
+<a name="ln105">      root_.GetChild(PrimitiveValue(subdoc_key.doc_key().Encode().AsSlice()));</a>
+<a name="ln106">  for (const auto&amp; subkey : subdoc_key.subkeys()) {</a>
+<a name="ln107">    if (current == nullptr) {</a>
+<a name="ln108">      return nullptr;</a>
+<a name="ln109">    }</a>
+<a name="ln110">    current = current-&gt;GetChild(subkey);</a>
+<a name="ln111">  }</a>
+<a name="ln112">  return current;</a>
+<a name="ln113">}</a>
+<a name="ln114"> </a>
+<a name="ln115">void InMemDocDbState::CaptureAt(const DocDB&amp; doc_db, HybridTime hybrid_time,</a>
+<a name="ln116">                                rocksdb::QueryId query_id) {</a>
+<a name="ln117">  // Clear the internal state.</a>
+<a name="ln118">  root_ = SubDocument();</a>
+<a name="ln119"> </a>
+<a name="ln120">  auto rocksdb_iter = CreateRocksDBIterator(</a>
+<a name="ln121">      doc_db.regular, doc_db.key_bounds, BloomFilterMode::DONT_USE_BLOOM_FILTER,</a>
+<a name="ln122">      boost::none /* user_key_for_filter */, query_id);</a>
+<a name="ln123">  rocksdb_iter.SeekToFirst();</a>
+<a name="ln124">  KeyBytes prev_key;</a>
+<a name="ln125">  while (rocksdb_iter.Valid()) {</a>
+<a name="ln126">    const auto key = rocksdb_iter.key();</a>
+<a name="ln127">    CHECK_NE(0, prev_key.CompareTo(key)) &lt;&lt; &quot;Infinite loop detected on key &quot; &lt;&lt; prev_key.ToString();</a>
+<a name="ln128">    prev_key = KeyBytes(key);</a>
+<a name="ln129"> </a>
+<a name="ln130">    SubDocKey subdoc_key;</a>
+<a name="ln131">    CHECK_OK(subdoc_key.FullyDecodeFrom(key));</a>
+<a name="ln132">    CHECK_EQ(0, subdoc_key.num_subkeys())</a>
+<a name="ln133">        &lt;&lt; &quot;Expected to be positioned at the first key of a new document with no subkeys, &quot;</a>
+<a name="ln134">        &lt;&lt; &quot;but found &quot; &lt;&lt; subdoc_key.num_subkeys() &lt;&lt; &quot; subkeys: &quot; &lt;&lt; subdoc_key.ToString();</a>
+<a name="ln135">    subdoc_key.remove_hybrid_time();</a>
+<a name="ln136"> </a>
+<a name="ln137">    bool doc_found = false;</a>
+<a name="ln138">    SubDocument subdoc;</a>
+<a name="ln139">    // TODO: It would be good to be able to refer to a slice of the original key whenever we need</a>
+<a name="ln140">    //       to extract document key out of a subdocument key.</a>
+<a name="ln141">    auto encoded_doc_key = subdoc_key.doc_key().Encode();</a>
+<a name="ln142">    // TODO(dtxn) Pass real TransactionOperationContext when we need to support cross-shard</a>
+<a name="ln143">    // transactions write intents resolution during DocDbState capturing.</a>
+<a name="ln144">    // For now passing kNonTransactionalOperationContext in order to fail if there are any intents,</a>
+<a name="ln145">    // since this is not supported.</a>
+<a name="ln146">    auto encoded_subdoc_key = subdoc_key.EncodeWithoutHt();</a>
+<a name="ln147">    GetSubDocumentData data = { encoded_subdoc_key, &amp;subdoc, &amp;doc_found };</a>
+<a name="ln148">    const Status get_doc_status = yb::docdb::GetSubDocument(</a>
+<a name="ln149">        doc_db, data, query_id, kNonTransactionalOperationContext,</a>
+<a name="ln150">        CoarseTimePoint::max() /* deadline */, ReadHybridTime::SingleTime(hybrid_time));</a>
+<a name="ln151">    if (!get_doc_status.ok()) {</a>
+<a name="ln152">      // This will help with debugging the GetSubDocument failure.</a>
+<a name="ln153">      LOG(WARNING)</a>
+<a name="ln154">          &lt;&lt; &quot;DocDB state:\n&quot;</a>
+<a name="ln155">          &lt;&lt; DocDBDebugDumpToStr(doc_db.regular, StorageDbType::kRegular, IncludeBinary::kTrue);</a>
+<a name="ln156">    }</a>
+<a name="ln157">    CHECK_OK(get_doc_status);</a>
+<a name="ln158">    // doc_found can be false for deleted documents, and that is perfectly valid.</a>
+<a name="ln159">    if (doc_found) {</a>
+<a name="ln160">      SetDocument(encoded_doc_key, std::move(subdoc));</a>
+<a name="ln161">    }</a>
+<a name="ln162">    // Go to the next top-level document key.</a>
+<a name="ln163">    ROCKSDB_SEEK(&amp;rocksdb_iter, subdoc_key.AdvanceOutOfSubDoc().AsSlice());</a>
+<a name="ln164"> </a>
+<a name="ln165">    VLOG(4) &lt;&lt; &quot;After performing a seek: IsValid=&quot; &lt;&lt; rocksdb_iter.Valid();</a>
+<a name="ln166">    if (VLOG_IS_ON(4) &amp;&amp; rocksdb_iter.Valid()) {</a>
+<a name="ln167">      VLOG(4) &lt;&lt; &quot;Next key: &quot; &lt;&lt; FormatSliceAsStr(rocksdb_iter.key());</a>
+<a name="ln168">      SubDocKey tmp_subdoc_key;</a>
+<a name="ln169">      CHECK_OK(tmp_subdoc_key.FullyDecodeFrom(rocksdb_iter.key()));</a>
+<a name="ln170">      VLOG(4) &lt;&lt; &quot;Parsed as SubDocKey: &quot; &lt;&lt; tmp_subdoc_key.ToString();</a>
+<a name="ln171">    }</a>
+<a name="ln172">  }</a>
+<a name="ln173"> </a>
+<a name="ln174">  // Initialize the &quot;captured at&quot; hybrid_time now, even though we expect it to be overwritten in</a>
+<a name="ln175">  // many cases. One common usage pattern is that this will be called with HybridTime::kMax, but</a>
+<a name="ln176">  // we'll later call SetCaptureHybridTime and set the hybrid_time to the last known hybrid_time of</a>
+<a name="ln177">  // an operation performed on DocDB.</a>
+<a name="ln178">  captured_at_ = hybrid_time;</a>
+<a name="ln179"> </a>
+<a name="ln180">  // Ensure we don't get any funny value types in the root node (had a test failure like this).</a>
+<a name="ln181">  CHECK_EQ(root_.value_type(), ValueType::kObject);</a>
+<a name="ln182">}</a>
+<a name="ln183"> </a>
+<a name="ln184">void InMemDocDbState::SetCaptureHybridTime(HybridTime hybrid_time) {</a>
+<a name="ln185">  CHECK(hybrid_time.is_valid());</a>
+<a name="ln186">  captured_at_ = hybrid_time;</a>
+<a name="ln187">}</a>
+<a name="ln188"> </a>
+<a name="ln189">bool InMemDocDbState::EqualsAndLogDiff(const InMemDocDbState &amp;expected, bool log_diff) {</a>
+<a name="ln190">  bool matches = true;</a>
+<a name="ln191">  if (num_docs() != expected.num_docs()) {</a>
+<a name="ln192">    if (log_diff) {</a>
+<a name="ln193">      LOG(WARNING) &lt;&lt; &quot;Found &quot; &lt;&lt; num_docs() &lt;&lt; &quot; documents but expected to find &quot;</a>
+<a name="ln194">                   &lt;&lt; expected.num_docs();</a>
+<a name="ln195">    }</a>
+<a name="ln196">    matches = false;</a>
+<a name="ln197">  }</a>
+<a name="ln198"> </a>
+<a name="ln199">  // As an optimization, a SubDocument won't even maintain a map if it is an empty object that no</a>
+<a name="ln200">  // operations have been performed on. As we are using a SubDocument to represent the top-level</a>
+<a name="ln201">  // mapping of encoded document keys to SubDocuments here, we need to check for that situation.</a>
+<a name="ln202">  if (expected.root_.has_valid_object_container()) {</a>
+<a name="ln203">    for (const auto&amp; expected_kv : expected.root_.object_container()) {</a>
+<a name="ln204">      const KeyBytes encoded_doc_key(expected_kv.first.GetString());</a>
+<a name="ln205">      const SubDocument&amp; expected_doc = expected_kv.second;</a>
+<a name="ln206">      DocKey doc_key;</a>
+<a name="ln207">      CHECK_OK(doc_key.FullyDecodeFrom(encoded_doc_key.AsSlice()));</a>
+<a name="ln208">      const SubDocument* child_from_this = GetDocument(doc_key);</a>
+<a name="ln209">      if (child_from_this == nullptr) {</a>
+<a name="ln210">        if (log_diff) {</a>
+<a name="ln211">          LOG(WARNING) &lt;&lt; &quot;Document with key &quot; &lt;&lt; doc_key.ToString() &lt;&lt; &quot; is missing but is &quot;</a>
+<a name="ln212">                       &lt;&lt; &quot;expected to be &quot; &lt;&lt; expected_doc.ToString();</a>
+<a name="ln213">        }</a>
+<a name="ln214">        matches = false;</a>
+<a name="ln215">        continue;</a>
+<a name="ln216">      }</a>
+<a name="ln217">      if (*child_from_this != expected_kv.second) {</a>
+<a name="ln218">        if (log_diff) {</a>
+<a name="ln219">          LOG(WARNING) &lt;&lt; &quot;Expected document with key &quot; &lt;&lt; doc_key.ToString() &lt;&lt; &quot; to be &quot;</a>
+<a name="ln220">                       &lt;&lt; expected_doc.ToString() &lt;&lt; &quot; but found &quot; &lt;&lt; *child_from_this;</a>
+<a name="ln221">        }</a>
+<a name="ln222">        matches = false;</a>
+<a name="ln223">      }</a>
+<a name="ln224">    }</a>
+<a name="ln225">  }</a>
+<a name="ln226"> </a>
+<a name="ln227">  // Also report all document keys that are present in this (&quot;actual&quot;) database but are absent from</a>
+<a name="ln228">  // the other (&quot;expected&quot;) database.</a>
+<a name="ln229">  if (root_.has_valid_object_container()) {</a>
+<a name="ln230">    for (const auto&amp; actual_kv : root_.object_container()) {</a>
+<a name="ln231">      const KeyBytes encoded_doc_key(actual_kv.first.GetString());</a>
+<a name="ln232">      DocKey doc_key;</a>
+<a name="ln233">      CHECK_OK(doc_key.FullyDecodeFrom(encoded_doc_key.AsSlice()));</a>
+<a name="ln234">      const SubDocument* child_from_expected = GetDocument(doc_key);</a>
+<a name="ln235">      if (child_from_expected == nullptr) {</a>
+<a name="ln236">        DocKey doc_key;</a>
+<a name="ln237">        CHECK_OK(doc_key.FullyDecodeFrom(encoded_doc_key.AsSlice()));</a>
+<a name="ln238">        if (log_diff) {</a>
+<a name="ln239">          LOG(WARNING) &lt;&lt; &quot;Unexpected document found with key &quot; &lt;&lt; doc_key.ToString() &lt;&lt; &quot;:&quot;</a>
+<a name="ln240">                       &lt;&lt; actual_kv.second.ToString();</a>
+<a name="ln241">        }</a>
+<a name="ln242">        matches = false;</a>
+<a name="ln243">      }</a>
+<a name="ln244">    }</a>
+<a name="ln245">  }</a>
+<a name="ln246"> </a>
+<a name="ln247">  // A brute-force way to check that the comparison logic above is correct.</a>
+<a name="ln248">  // TODO: disable this if it makes tests much slower.</a>
+<a name="ln249">  CHECK_EQ(matches, ToDebugString() == expected.ToDebugString());</a>
+<a name="ln250">  return matches;</a>
+<a name="ln251">}</a>
+<a name="ln252"> </a>
+<a name="ln253">string InMemDocDbState::ToDebugString() const {</a>
+<a name="ln254">  stringstream ss;</a>
+<a name="ln255">  if (root_.has_valid_object_container()) {</a>
+<a name="ln256">    int i = 1;</a>
+<a name="ln257">    for (const auto&amp; kv : root_.object_container()) {</a>
+<a name="ln258">      DocKey doc_key;</a>
+<a name="ln259">      CHECK_OK(doc_key.FullyDecodeFrom(rocksdb::Slice(kv.first.GetString())));</a>
+<a name="ln260">      ss &lt;&lt; i &lt;&lt; &quot;. &quot; &lt;&lt; doc_key.ToString() &lt;&lt; &quot; =&gt; &quot; &lt;&lt; kv.second.ToString() &lt;&lt; endl;</a>
+<a name="ln261">      ++i;</a>
+<a name="ln262">    }</a>
+<a name="ln263">  }</a>
+<a name="ln264">  string dump_str = ss.str();</a>
+<a name="ln265">  return dump_str.empty() ? &quot;&lt;Empty&gt;&quot; : dump_str;</a>
+<a name="ln266">}</a>
+<a name="ln267"> </a>
+<a name="ln268">HybridTime InMemDocDbState::captured_at() const {</a>
+<a name="ln269">  CHECK(captured_at_.is_valid());</a>
+<a name="ln270">  return captured_at_;</a>
+<a name="ln271">}</a>
+<a name="ln272"> </a>
+<a name="ln273">void InMemDocDbState::SanityCheck() const {</a>
+<a name="ln274">  CHECK_EQ(root_.value_type(), ValueType::kObject);</a>
+<a name="ln275">}</a>
+<a name="ln276"> </a>
+<a name="ln277">}  // namespace docdb</a>
+<a name="ln278">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="38"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="131"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="157"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="165"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="167"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="169"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="170"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="185"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="207"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="233"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="237"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="259"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="269"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

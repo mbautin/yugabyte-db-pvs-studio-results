@@ -1,0 +1,407 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>docdb_util.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;iostream&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/rocksdb/util/statistics.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/docdb/consensus_frontier.h&quot;</a>
+<a name="ln19">#include &quot;yb/docdb/docdb_debug.h&quot;</a>
+<a name="ln20">#include &quot;yb/docdb/docdb_rocksdb_util.h&quot;</a>
+<a name="ln21">#include &quot;yb/docdb/docdb_util.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/rocksutil/write_batch_formatter.h&quot;</a>
+<a name="ln24">#include &quot;yb/rocksutil/yb_rocksdb.h&quot;</a>
+<a name="ln25">#include &quot;yb/tablet/tablet_options.h&quot;</a>
+<a name="ln26">#include &quot;yb/util/env.h&quot;</a>
+<a name="ln27">#include &quot;yb/util/path_util.h&quot;</a>
+<a name="ln28">#include &quot;yb/util/string_trim.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">using std::string;</a>
+<a name="ln31">using std::make_shared;</a>
+<a name="ln32">using std::endl;</a>
+<a name="ln33">using strings::Substitute;</a>
+<a name="ln34">using yb::FormatBytesAsStr;</a>
+<a name="ln35">using yb::util::ApplyEagerLineContinuation;</a>
+<a name="ln36">using std::vector;</a>
+<a name="ln37"> </a>
+<a name="ln38">namespace yb {</a>
+<a name="ln39">namespace docdb {</a>
+<a name="ln40"> </a>
+<a name="ln41">rocksdb::DB* DocDBRocksDBUtil::rocksdb() {</a>
+<a name="ln42">  return DCHECK_NOTNULL(regular_db_.get());</a>
+<a name="ln43">}</a>
+<a name="ln44"> </a>
+<a name="ln45">rocksdb::DB* DocDBRocksDBUtil::intents_db() {</a>
+<a name="ln46">  return DCHECK_NOTNULL(intents_db_.get());</a>
+<a name="ln47">}</a>
+<a name="ln48"> </a>
+<a name="ln49">std::string DocDBRocksDBUtil::IntentsDBDir() {</a>
+<a name="ln50">  return rocksdb_dir_ + &quot;.intents&quot;;</a>
+<a name="ln51">}</a>
+<a name="ln52"> </a>
+<a name="ln53">Status DocDBRocksDBUtil::OpenRocksDB() {</a>
+<a name="ln54">  // Init the directory if needed.</a>
+<a name="ln55">  if (rocksdb_dir_.empty()) {</a>
+<a name="ln56">    RETURN_NOT_OK(InitRocksDBDir());</a>
+<a name="ln57">  }</a>
+<a name="ln58"> </a>
+<a name="ln59">  rocksdb::DB* rocksdb = nullptr;</a>
+<a name="ln60">  RETURN_NOT_OK(rocksdb::DB::Open(regular_db_options_, rocksdb_dir_, &amp;rocksdb));</a>
+<a name="ln61">  LOG(INFO) &lt;&lt; &quot;Opened RocksDB at &quot; &lt;&lt; rocksdb_dir_;</a>
+<a name="ln62">  regular_db_.reset(rocksdb);</a>
+<a name="ln63"> </a>
+<a name="ln64">  rocksdb = nullptr;</a>
+<a name="ln65">  RETURN_NOT_OK(rocksdb::DB::Open(intents_db_options_, IntentsDBDir(), &amp;rocksdb));</a>
+<a name="ln66">  intents_db_.reset(rocksdb);</a>
+<a name="ln67"> </a>
+<a name="ln68">  return Status::OK();</a>
+<a name="ln69">}</a>
+<a name="ln70"> </a>
+<a name="ln71">void DocDBRocksDBUtil::CloseRocksDB() {</a>
+<a name="ln72">  intents_db_.reset();</a>
+<a name="ln73">  regular_db_.reset();</a>
+<a name="ln74">}</a>
+<a name="ln75"> </a>
+<a name="ln76">Status DocDBRocksDBUtil::ReopenRocksDB() {</a>
+<a name="ln77">  CloseRocksDB();</a>
+<a name="ln78">  return OpenRocksDB();</a>
+<a name="ln79">}</a>
+<a name="ln80"> </a>
+<a name="ln81">Status DocDBRocksDBUtil::DestroyRocksDB() {</a>
+<a name="ln82">  CloseRocksDB();</a>
+<a name="ln83">  LOG(INFO) &lt;&lt; &quot;Destroying RocksDB database at &quot; &lt;&lt; rocksdb_dir_;</a>
+<a name="ln84">  RETURN_NOT_OK(rocksdb::DestroyDB(rocksdb_dir_, regular_db_options_));</a>
+<a name="ln85">  RETURN_NOT_OK(rocksdb::DestroyDB(IntentsDBDir(), intents_db_options_));</a>
+<a name="ln86">  return Status::OK();</a>
+<a name="ln87">}</a>
+<a name="ln88"> </a>
+<a name="ln89">void DocDBRocksDBUtil::ResetMonotonicCounter() {</a>
+<a name="ln90">  monotonic_counter_.store(0);</a>
+<a name="ln91">}</a>
+<a name="ln92"> </a>
+<a name="ln93">Status DocDBRocksDBUtil::PopulateRocksDBWriteBatch(</a>
+<a name="ln94">    const DocWriteBatch&amp; dwb,</a>
+<a name="ln95">    rocksdb::WriteBatch *rocksdb_write_batch,</a>
+<a name="ln96">    HybridTime hybrid_time,</a>
+<a name="ln97">    bool decode_dockey,</a>
+<a name="ln98">    bool increment_write_id,</a>
+<a name="ln99">    PartialRangeKeyIntents partial_range_key_intents) const {</a>
+<a name="ln100">  if (decode_dockey) {</a>
+<a name="ln101">    for (const auto&amp; entry : dwb.key_value_pairs()) {</a>
+<a name="ln102">      SubDocKey subdoc_key;</a>
+<a name="ln103">      // We don't expect any invalid encoded keys in the write batch. However, these encoded keys</a>
+<a name="ln104">      // don't contain the HybridTime.</a>
+<a name="ln105">      RETURN_NOT_OK_PREPEND(subdoc_key.FullyDecodeFromKeyWithOptionalHybridTime(entry.first),</a>
+<a name="ln106">          Substitute(&quot;when decoding key: $0&quot;, FormatBytesAsStr(entry.first)));</a>
+<a name="ln107">    }</a>
+<a name="ln108">  }</a>
+<a name="ln109"> </a>
+<a name="ln110">  if (current_txn_id_.is_initialized()) {</a>
+<a name="ln111">    if (!increment_write_id) {</a>
+<a name="ln112">      return STATUS(</a>
+<a name="ln113">          InternalError, &quot;For transactional write only increment_write_id=true is supported&quot;);</a>
+<a name="ln114">    }</a>
+<a name="ln115">    KeyValueWriteBatchPB kv_write_batch;</a>
+<a name="ln116">    dwb.TEST_CopyToWriteBatchPB(&amp;kv_write_batch);</a>
+<a name="ln117">    PrepareTransactionWriteBatch(</a>
+<a name="ln118">        kv_write_batch, hybrid_time, rocksdb_write_batch, *current_txn_id_, txn_isolation_level_,</a>
+<a name="ln119">        partial_range_key_intents, /* replicated_batches_state= */ Slice(), &amp;intra_txn_write_id_);</a>
+<a name="ln120">  } else {</a>
+<a name="ln121">    // TODO: this block has common code with docdb::PrepareNonTransactionWriteBatch and probably</a>
+<a name="ln122">    // can be refactored, so common code is reused.</a>
+<a name="ln123">    IntraTxnWriteId write_id = 0;</a>
+<a name="ln124">    for (const auto&amp; entry : dwb.key_value_pairs()) {</a>
+<a name="ln125">      string rocksdb_key;</a>
+<a name="ln126">      if (hybrid_time.is_valid()) {</a>
+<a name="ln127">        // HybridTime provided. Append a PrimitiveValue with the HybridTime to the key.</a>
+<a name="ln128">        const KeyBytes encoded_ht =</a>
+<a name="ln129">            PrimitiveValue(DocHybridTime(hybrid_time, write_id)).ToKeyBytes();</a>
+<a name="ln130">        rocksdb_key = entry.first + encoded_ht.ToStringBuffer();</a>
+<a name="ln131">      } else {</a>
+<a name="ln132">        // Useful when printing out a write batch that does not yet know the HybridTime it will be</a>
+<a name="ln133">        // committed with.</a>
+<a name="ln134">        rocksdb_key = entry.first;</a>
+<a name="ln135">      }</a>
+<a name="ln136">      rocksdb_write_batch-&gt;Put(rocksdb_key, entry.second);</a>
+<a name="ln137">      if (increment_write_id) {</a>
+<a name="ln138">        ++write_id;</a>
+<a name="ln139">      }</a>
+<a name="ln140">    }</a>
+<a name="ln141">  }</a>
+<a name="ln142">  return Status::OK();</a>
+<a name="ln143">}</a>
+<a name="ln144"> </a>
+<a name="ln145">Status DocDBRocksDBUtil::WriteToRocksDB(</a>
+<a name="ln146">    const DocWriteBatch&amp; doc_write_batch,</a>
+<a name="ln147">    const HybridTime&amp; hybrid_time,</a>
+<a name="ln148">    bool decode_dockey,</a>
+<a name="ln149">    bool increment_write_id,</a>
+<a name="ln150">    PartialRangeKeyIntents partial_range_key_intents) {</a>
+<a name="ln151">  if (doc_write_batch.IsEmpty()) {</a>
+<a name="ln152">    return Status::OK();</a>
+<a name="ln153">  }</a>
+<a name="ln154">  if (!hybrid_time.is_valid()) {</a>
+<a name="ln155">    return STATUS_SUBSTITUTE(InvalidArgument, &quot;Hybrid time is not valid: $0&quot;,</a>
+<a name="ln156">                             hybrid_time.ToString());</a>
+<a name="ln157">  }</a>
+<a name="ln158"> </a>
+<a name="ln159">  ConsensusFrontiers frontiers;</a>
+<a name="ln160">  rocksdb::WriteBatch rocksdb_write_batch;</a>
+<a name="ln161">  if (op_id_) {</a>
+<a name="ln162">    ++op_id_.index;</a>
+<a name="ln163">    set_op_id(op_id_, &amp;frontiers);</a>
+<a name="ln164">    set_hybrid_time(hybrid_time, &amp;frontiers);</a>
+<a name="ln165">    rocksdb_write_batch.SetFrontiers(&amp;frontiers);</a>
+<a name="ln166">  }</a>
+<a name="ln167"> </a>
+<a name="ln168">  RETURN_NOT_OK(PopulateRocksDBWriteBatch(</a>
+<a name="ln169">      doc_write_batch, &amp;rocksdb_write_batch, hybrid_time, decode_dockey, increment_write_id,</a>
+<a name="ln170">      partial_range_key_intents));</a>
+<a name="ln171"> </a>
+<a name="ln172">  rocksdb::DB* db = current_txn_id_ ? intents_db_.get() : regular_db_.get();</a>
+<a name="ln173">  rocksdb::Status rocksdb_write_status = db-&gt;Write(write_options(), &amp;rocksdb_write_batch);</a>
+<a name="ln174"> </a>
+<a name="ln175">  if (!rocksdb_write_status.ok()) {</a>
+<a name="ln176">    LOG(ERROR) &lt;&lt; &quot;Failed writing to RocksDB: &quot; &lt;&lt; rocksdb_write_status.ToString();</a>
+<a name="ln177">    return STATUS_SUBSTITUTE(RuntimeError,</a>
+<a name="ln178">                             &quot;Error writing to RocksDB: $0&quot;, rocksdb_write_status.ToString());</a>
+<a name="ln179">  }</a>
+<a name="ln180">  return Status::OK();</a>
+<a name="ln181">}</a>
+<a name="ln182"> </a>
+<a name="ln183">Status DocDBRocksDBUtil::InitCommonRocksDBOptions() {</a>
+<a name="ln184">  // TODO(bojanserafimov): create MemoryMonitor?</a>
+<a name="ln185">  const size_t cache_size = block_cache_size();</a>
+<a name="ln186">  if (cache_size &gt; 0) {</a>
+<a name="ln187">    block_cache_ = rocksdb::NewLRUCache(cache_size);</a>
+<a name="ln188">  }</a>
+<a name="ln189"> </a>
+<a name="ln190">  regular_db_options_.statistics = rocksdb::CreateDBStatistics();</a>
+<a name="ln191">  intents_db_options_.statistics = rocksdb::CreateDBStatistics();</a>
+<a name="ln192">  RETURN_NOT_OK(ReinitDBOptions());</a>
+<a name="ln193">  InitRocksDBWriteOptions(&amp;write_options_);</a>
+<a name="ln194">  return Status::OK();</a>
+<a name="ln195">}</a>
+<a name="ln196"> </a>
+<a name="ln197">Status DocDBRocksDBUtil::WriteToRocksDBAndClear(</a>
+<a name="ln198">    DocWriteBatch* dwb,</a>
+<a name="ln199">    const HybridTime&amp; hybrid_time,</a>
+<a name="ln200">    bool decode_dockey, bool increment_write_id) {</a>
+<a name="ln201">  RETURN_NOT_OK(WriteToRocksDB(*dwb, hybrid_time, decode_dockey, increment_write_id));</a>
+<a name="ln202">  dwb-&gt;Clear();</a>
+<a name="ln203">  return Status::OK();</a>
+<a name="ln204">}</a>
+<a name="ln205"> </a>
+<a name="ln206">Status DocDBRocksDBUtil::WriteSimple(int index) {</a>
+<a name="ln207">  auto encoded_doc_key = DocKey(PrimitiveValues(Format(&quot;row$0&quot;, index), 11111 * index)).Encode();</a>
+<a name="ln208">  op_id_.term = index / 2;</a>
+<a name="ln209">  op_id_.index = index;</a>
+<a name="ln210">  auto&amp; dwb = DefaultDocWriteBatch();</a>
+<a name="ln211">  RETURN_NOT_OK(dwb.SetPrimitive(</a>
+<a name="ln212">      DocPath(encoded_doc_key, PrimitiveValue(ColumnId(10))), PrimitiveValue(index)));</a>
+<a name="ln213">  return WriteToRocksDBAndClear(&amp;dwb, HybridTime::FromMicros(1000 * index));</a>
+<a name="ln214">}</a>
+<a name="ln215"> </a>
+<a name="ln216">void DocDBRocksDBUtil::SetHistoryCutoffHybridTime(HybridTime history_cutoff) {</a>
+<a name="ln217">  retention_policy_-&gt;SetHistoryCutoff(history_cutoff);</a>
+<a name="ln218">}</a>
+<a name="ln219"> </a>
+<a name="ln220">void DocDBRocksDBUtil::SetTableTTL(uint64_t ttl_msec) {</a>
+<a name="ln221">  schema_.SetDefaultTimeToLive(ttl_msec);</a>
+<a name="ln222">  retention_policy_-&gt;SetTableTTLForTests(MonoDelta::FromMilliseconds(ttl_msec));</a>
+<a name="ln223">}</a>
+<a name="ln224"> </a>
+<a name="ln225">string DocDBRocksDBUtil::DocDBDebugDumpToStr() {</a>
+<a name="ln226">  return yb::docdb::DocDBDebugDumpToStr(rocksdb()) +</a>
+<a name="ln227">         yb::docdb::DocDBDebugDumpToStr(intents_db(), StorageDbType::kIntents);</a>
+<a name="ln228">}</a>
+<a name="ln229"> </a>
+<a name="ln230">Status DocDBRocksDBUtil::SetPrimitive(</a>
+<a name="ln231">    const DocPath&amp; doc_path,</a>
+<a name="ln232">    const Value&amp; value,</a>
+<a name="ln233">    const HybridTime hybrid_time,</a>
+<a name="ln234">    const ReadHybridTime&amp; read_ht) {</a>
+<a name="ln235">  auto dwb = MakeDocWriteBatch();</a>
+<a name="ln236">  RETURN_NOT_OK(dwb.SetPrimitive(doc_path, value, read_ht));</a>
+<a name="ln237">  return WriteToRocksDB(dwb, hybrid_time);</a>
+<a name="ln238">}</a>
+<a name="ln239"> </a>
+<a name="ln240">Status DocDBRocksDBUtil::SetPrimitive(</a>
+<a name="ln241">    const DocPath&amp; doc_path,</a>
+<a name="ln242">    const PrimitiveValue&amp; primitive_value,</a>
+<a name="ln243">    const HybridTime hybrid_time,</a>
+<a name="ln244">    const ReadHybridTime&amp; read_ht) {</a>
+<a name="ln245">  return SetPrimitive(doc_path, Value(primitive_value), hybrid_time, read_ht);</a>
+<a name="ln246">}</a>
+<a name="ln247"> </a>
+<a name="ln248">Status DocDBRocksDBUtil::InsertSubDocument(</a>
+<a name="ln249">    const DocPath&amp; doc_path,</a>
+<a name="ln250">    const SubDocument&amp; value,</a>
+<a name="ln251">    const HybridTime hybrid_time,</a>
+<a name="ln252">    MonoDelta ttl,</a>
+<a name="ln253">    const ReadHybridTime&amp; read_ht) {</a>
+<a name="ln254">  auto dwb = MakeDocWriteBatch();</a>
+<a name="ln255">  RETURN_NOT_OK(dwb.InsertSubDocument(doc_path, value, read_ht,</a>
+<a name="ln256">                                      CoarseTimePoint::max(), rocksdb::kDefaultQueryId, ttl));</a>
+<a name="ln257">  return WriteToRocksDB(dwb, hybrid_time);</a>
+<a name="ln258">}</a>
+<a name="ln259"> </a>
+<a name="ln260">Status DocDBRocksDBUtil::ExtendSubDocument(</a>
+<a name="ln261">    const DocPath&amp; doc_path,</a>
+<a name="ln262">    const SubDocument&amp; value,</a>
+<a name="ln263">    const HybridTime hybrid_time,</a>
+<a name="ln264">    MonoDelta ttl,</a>
+<a name="ln265">    const ReadHybridTime&amp; read_ht) {</a>
+<a name="ln266">  auto dwb = MakeDocWriteBatch();</a>
+<a name="ln267">  RETURN_NOT_OK(dwb.ExtendSubDocument(doc_path, value, read_ht,</a>
+<a name="ln268">                                      CoarseTimePoint::max(), rocksdb::kDefaultQueryId, ttl));</a>
+<a name="ln269">  return WriteToRocksDB(dwb, hybrid_time);</a>
+<a name="ln270">}</a>
+<a name="ln271"> </a>
+<a name="ln272">Status DocDBRocksDBUtil::ExtendList(</a>
+<a name="ln273">    const DocPath&amp; doc_path,</a>
+<a name="ln274">    const SubDocument&amp; value,</a>
+<a name="ln275">    HybridTime hybrid_time,</a>
+<a name="ln276">    const ReadHybridTime&amp; read_ht) {</a>
+<a name="ln277">  auto dwb = MakeDocWriteBatch();</a>
+<a name="ln278">  RETURN_NOT_OK(dwb.ExtendList(doc_path, value, read_ht, CoarseTimePoint::max()));</a>
+<a name="ln279">  return WriteToRocksDB(dwb, hybrid_time);</a>
+<a name="ln280">}</a>
+<a name="ln281"> </a>
+<a name="ln282">Status DocDBRocksDBUtil::ReplaceInList(</a>
+<a name="ln283">    const DocPath &amp;doc_path,</a>
+<a name="ln284">    const std::vector&lt;int&gt;&amp; indexes,</a>
+<a name="ln285">    const std::vector&lt;SubDocument&gt;&amp; values,</a>
+<a name="ln286">    const ReadHybridTime&amp; read_ht,</a>
+<a name="ln287">    const HybridTime&amp; hybrid_time,</a>
+<a name="ln288">    const rocksdb::QueryId query_id,</a>
+<a name="ln289">    MonoDelta default_ttl,</a>
+<a name="ln290">    MonoDelta ttl,</a>
+<a name="ln291">    UserTimeMicros user_timestamp) {</a>
+<a name="ln292">  auto dwb = MakeDocWriteBatch();</a>
+<a name="ln293">  RETURN_NOT_OK(dwb.ReplaceCqlInList(</a>
+<a name="ln294">      doc_path, indexes, values, read_ht, CoarseTimePoint::max(), query_id, default_ttl, ttl));</a>
+<a name="ln295">  return WriteToRocksDB(dwb, hybrid_time);</a>
+<a name="ln296">}</a>
+<a name="ln297"> </a>
+<a name="ln298">Status DocDBRocksDBUtil::DeleteSubDoc(</a>
+<a name="ln299">    const DocPath&amp; doc_path,</a>
+<a name="ln300">    HybridTime hybrid_time,</a>
+<a name="ln301">    const ReadHybridTime&amp; read_ht) {</a>
+<a name="ln302">  auto dwb = MakeDocWriteBatch();</a>
+<a name="ln303">  RETURN_NOT_OK(dwb.DeleteSubDoc(doc_path, read_ht));</a>
+<a name="ln304">  return WriteToRocksDB(dwb, hybrid_time);</a>
+<a name="ln305">}</a>
+<a name="ln306"> </a>
+<a name="ln307">void DocDBRocksDBUtil::DocDBDebugDumpToConsole() {</a>
+<a name="ln308">  DocDBDebugDump(regular_db_.get(), std::cerr, StorageDbType::kRegular);</a>
+<a name="ln309">}</a>
+<a name="ln310"> </a>
+<a name="ln311">Status DocDBRocksDBUtil::FlushRocksDbAndWait() {</a>
+<a name="ln312">  rocksdb::FlushOptions flush_options;</a>
+<a name="ln313">  flush_options.wait = true;</a>
+<a name="ln314">  return rocksdb()-&gt;Flush(flush_options);</a>
+<a name="ln315">}</a>
+<a name="ln316"> </a>
+<a name="ln317">Status DocDBRocksDBUtil::ReinitDBOptions() {</a>
+<a name="ln318">  tablet::TabletOptions tablet_options;</a>
+<a name="ln319">  tablet_options.block_cache = block_cache_;</a>
+<a name="ln320">  docdb::InitRocksDBOptions(</a>
+<a name="ln321">      &amp;regular_db_options_, &quot;[R] &quot; /* log_prefix */, regular_db_options_.statistics,</a>
+<a name="ln322">      tablet_options);</a>
+<a name="ln323">  docdb::InitRocksDBOptions(</a>
+<a name="ln324">      &amp;intents_db_options_, &quot;[I] &quot; /* log_prefix */, intents_db_options_.statistics,</a>
+<a name="ln325">      tablet_options);</a>
+<a name="ln326">  regular_db_options_.compaction_filter_factory =</a>
+<a name="ln327">      std::make_shared&lt;docdb::DocDBCompactionFilterFactory&gt;(</a>
+<a name="ln328">          retention_policy_, &amp;KeyBounds::kNoBounds);</a>
+<a name="ln329">  if (!regular_db_) {</a>
+<a name="ln330">    return Status::OK();</a>
+<a name="ln331">  }</a>
+<a name="ln332">  return ReopenRocksDB();</a>
+<a name="ln333">}</a>
+<a name="ln334"> </a>
+<a name="ln335">DocWriteBatch DocDBRocksDBUtil::MakeDocWriteBatch() {</a>
+<a name="ln336">  return DocWriteBatch(</a>
+<a name="ln337">      DocDB::FromRegularUnbounded(regular_db_.get()), init_marker_behavior_, &amp;monotonic_counter_);</a>
+<a name="ln338">}</a>
+<a name="ln339"> </a>
+<a name="ln340">DocWriteBatch DocDBRocksDBUtil::MakeDocWriteBatch(InitMarkerBehavior init_marker_behavior) {</a>
+<a name="ln341">  return DocWriteBatch(</a>
+<a name="ln342">      DocDB::FromRegularUnbounded(regular_db_.get()), init_marker_behavior, &amp;monotonic_counter_);</a>
+<a name="ln343">}</a>
+<a name="ln344"> </a>
+<a name="ln345">DocWriteBatch&amp; DocDBRocksDBUtil::DefaultDocWriteBatch() {</a>
+<a name="ln346">  if (!doc_write_batch_) {</a>
+<a name="ln347">    doc_write_batch_ = MakeDocWriteBatch();</a>
+<a name="ln348">  }</a>
+<a name="ln349"> </a>
+<a name="ln350">  return *doc_write_batch_;</a>
+<a name="ln351">}</a>
+<a name="ln352"> </a>
+<a name="ln353">void DocDBRocksDBUtil::SetInitMarkerBehavior(InitMarkerBehavior init_marker_behavior) {</a>
+<a name="ln354">  if (init_marker_behavior_ != init_marker_behavior) {</a>
+<a name="ln355">    LOG(INFO) &lt;&lt; &quot;Setting init marker behavior to &quot; &lt;&lt; init_marker_behavior;</a>
+<a name="ln356">    init_marker_behavior_ = init_marker_behavior;</a>
+<a name="ln357">  }</a>
+<a name="ln358">}</a>
+<a name="ln359"> </a>
+<a name="ln360">}  // namespace docdb</a>
+<a name="ln361">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="313"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1048/" target="_blank">V1048</a> The 'flush_options.wait' variable was assigned the same value.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

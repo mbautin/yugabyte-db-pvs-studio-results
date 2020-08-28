@@ -1,0 +1,667 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>log_reader.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/consensus/log_reader.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;sys/statvfs.h&gt;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &lt;algorithm&gt;</a>
+<a name="ln38">#include &lt;mutex&gt;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &quot;yb/consensus/consensus_util.h&quot;</a>
+<a name="ln41">#include &quot;yb/consensus/log_index.h&quot;</a>
+<a name="ln42">#include &quot;yb/consensus/opid_util.h&quot;</a>
+<a name="ln43"> </a>
+<a name="ln44">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln45">#include &quot;yb/gutil/stl_util.h&quot;</a>
+<a name="ln46">#include &quot;yb/gutil/strings/util.h&quot;</a>
+<a name="ln47">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln48"> </a>
+<a name="ln49">#include &quot;yb/util/coding.h&quot;</a>
+<a name="ln50">#include &quot;yb/util/env_util.h&quot;</a>
+<a name="ln51">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln52">#include &quot;yb/util/hexdump.h&quot;</a>
+<a name="ln53">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln54">#include &quot;yb/util/metrics.h&quot;</a>
+<a name="ln55">#include &quot;yb/util/path_util.h&quot;</a>
+<a name="ln56">#include &quot;yb/util/pb_util.h&quot;</a>
+<a name="ln57"> </a>
+<a name="ln58">DEFINE_bool(enable_log_retention_by_op_idx, false,</a>
+<a name="ln59">            &quot;If true, logs will be retained based on an op id passed by the cdc service&quot;);</a>
+<a name="ln60"> </a>
+<a name="ln61">DEFINE_int32(log_max_seconds_to_retain, 24 * 3600, &quot;Log files that are older will be &quot;</a>
+<a name="ln62">             &quot;deleted even if they contain cdc unreplicated entries. If 0, this flag will be &quot;</a>
+<a name="ln63">             &quot;ignored. This flag is ignored if a log segment contains entries that haven't been&quot;</a>
+<a name="ln64">             &quot;flushed to RocksDB.&quot;);</a>
+<a name="ln65"> </a>
+<a name="ln66">DEFINE_int64(log_stop_retaining_min_disk_mb, 100 * 1024, &quot;Stop retaining logs if the space &quot;</a>
+<a name="ln67">             &quot;available for the logs falls below this limit. This flag is ignored if a log segment &quot;</a>
+<a name="ln68">             &quot;contains unflushed entries.&quot;);</a>
+<a name="ln69"> </a>
+<a name="ln70">METRIC_DEFINE_counter(tablet, log_reader_bytes_read, &quot;Bytes Read From Log&quot;,</a>
+<a name="ln71">                      yb::MetricUnit::kBytes,</a>
+<a name="ln72">                      &quot;Data read from the WAL since tablet start&quot;);</a>
+<a name="ln73"> </a>
+<a name="ln74">METRIC_DEFINE_counter(tablet, log_reader_entries_read, &quot;Entries Read From Log&quot;,</a>
+<a name="ln75">                      yb::MetricUnit::kEntries,</a>
+<a name="ln76">                      &quot;Number of entries read from the WAL since tablet start&quot;);</a>
+<a name="ln77"> </a>
+<a name="ln78">METRIC_DEFINE_histogram(tablet, log_reader_read_batch_latency, &quot;Log Read Latency&quot;,</a>
+<a name="ln79">                        yb::MetricUnit::kBytes,</a>
+<a name="ln80">                        &quot;Microseconds spent reading log entry batches&quot;,</a>
+<a name="ln81">                        60000000LU, 2);</a>
+<a name="ln82"> </a>
+<a name="ln83">DEFINE_test_flag(bool, record_segments_violate_max_time_policy, false,</a>
+<a name="ln84">    &quot;If set, everytime GetSegmentPrefixNotIncluding runs, segments that violate the max time &quot;</a>
+<a name="ln85">    &quot;policy will be appended to LogReader::segments_violate_max_time_policy_.&quot;);</a>
+<a name="ln86"> </a>
+<a name="ln87">DEFINE_test_flag(bool, record_segments_violate_min_space_policy, false,</a>
+<a name="ln88">    &quot;If set, everytime GetSegmentPrefixNotIncluding runs, segments that violate the max time &quot;</a>
+<a name="ln89">    &quot;policy will be appended to LogReader::segments_violate_min_space_policy_.&quot;);</a>
+<a name="ln90"> </a>
+<a name="ln91">namespace yb {</a>
+<a name="ln92">namespace log {</a>
+<a name="ln93"> </a>
+<a name="ln94">namespace {</a>
+<a name="ln95">struct LogSegmentSeqnoComparator {</a>
+<a name="ln96">  bool operator() (const scoped_refptr&lt;ReadableLogSegment&gt;&amp; a,</a>
+<a name="ln97">                   const scoped_refptr&lt;ReadableLogSegment&gt;&amp; b) {</a>
+<a name="ln98">    return a-&gt;header().sequence_number() &lt; b-&gt;header().sequence_number();</a>
+<a name="ln99">  }</a>
+<a name="ln100">};</a>
+<a name="ln101">}</a>
+<a name="ln102"> </a>
+<a name="ln103">using consensus::ReplicateMsg;</a>
+<a name="ln104">using env_util::ReadFully;</a>
+<a name="ln105">using strings::Substitute;</a>
+<a name="ln106"> </a>
+<a name="ln107">const int64_t LogReader::kNoSizeLimit = -1;</a>
+<a name="ln108"> </a>
+<a name="ln109">Status LogReader::Open(Env *env,</a>
+<a name="ln110">                       const scoped_refptr&lt;LogIndex&gt;&amp; index,</a>
+<a name="ln111">                       const std::string&amp; tablet_id,</a>
+<a name="ln112">                       const std::string&amp; tablet_wal_path,</a>
+<a name="ln113">                       const std::string&amp; peer_uuid,</a>
+<a name="ln114">                       const scoped_refptr&lt;MetricEntity&gt;&amp; metric_entity,</a>
+<a name="ln115">                       std::unique_ptr&lt;LogReader&gt; *reader) {</a>
+<a name="ln116">  std::unique_ptr&lt;LogReader&gt; log_reader(new LogReader(</a>
+<a name="ln117">      env, index, tablet_id, peer_uuid, metric_entity));</a>
+<a name="ln118"> </a>
+<a name="ln119">  RETURN_NOT_OK(log_reader-&gt;Init(tablet_wal_path));</a>
+<a name="ln120">  *reader = std::move(log_reader);</a>
+<a name="ln121">  return Status::OK();</a>
+<a name="ln122">}</a>
+<a name="ln123"> </a>
+<a name="ln124">LogReader::LogReader(Env* env,</a>
+<a name="ln125">                     const scoped_refptr&lt;LogIndex&gt;&amp; index,</a>
+<a name="ln126">                     string tablet_id,</a>
+<a name="ln127">                     string peer_uuid,</a>
+<a name="ln128">                     const scoped_refptr&lt;MetricEntity&gt;&amp; metric_entity)</a>
+<a name="ln129">    : env_(env),</a>
+<a name="ln130">      log_index_(index),</a>
+<a name="ln131">      tablet_id_(std::move(tablet_id)),</a>
+<a name="ln132">      log_prefix_(consensus::MakeTabletLogPrefix(tablet_id_, peer_uuid)),</a>
+<a name="ln133">      state_(kLogReaderInitialized) {</a>
+<a name="ln134">  if (metric_entity) {</a>
+<a name="ln135">    bytes_read_ = METRIC_log_reader_bytes_read.Instantiate(metric_entity);</a>
+<a name="ln136">    entries_read_ = METRIC_log_reader_entries_read.Instantiate(metric_entity);</a>
+<a name="ln137">    read_batch_latency_ = METRIC_log_reader_read_batch_latency.Instantiate(metric_entity);</a>
+<a name="ln138">  }</a>
+<a name="ln139">  if (PREDICT_FALSE(FLAGS_enable_log_retention_by_op_idx &amp;&amp;</a>
+<a name="ln140">                        (FLAGS_TEST_record_segments_violate_max_time_policy ||</a>
+<a name="ln141">                         FLAGS_TEST_record_segments_violate_min_space_policy))) {</a>
+<a name="ln142">    segments_violate_max_time_policy_ = std::make_unique&lt;SegmentSequence&gt;();</a>
+<a name="ln143">    segments_violate_min_space_policy_ = std::make_unique&lt;SegmentSequence&gt;();</a>
+<a name="ln144">  }</a>
+<a name="ln145">}</a>
+<a name="ln146"> </a>
+<a name="ln147">LogReader::~LogReader() {</a>
+<a name="ln148">}</a>
+<a name="ln149"> </a>
+<a name="ln150">Status LogReader::Init(const string&amp; tablet_wal_path) {</a>
+<a name="ln151">  {</a>
+<a name="ln152">    std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln153">    CHECK_EQ(state_, kLogReaderInitialized) &lt;&lt; &quot;bad state for Init(): &quot; &lt;&lt; state_;</a>
+<a name="ln154">  }</a>
+<a name="ln155">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Reading wal from path:&quot; &lt;&lt; tablet_wal_path;</a>
+<a name="ln156"> </a>
+<a name="ln157">  if (!env_-&gt;FileExists(tablet_wal_path)) {</a>
+<a name="ln158">    return STATUS(IllegalState, &quot;Cannot find wal location at&quot;, tablet_wal_path);</a>
+<a name="ln159">  }</a>
+<a name="ln160"> </a>
+<a name="ln161">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Parsing segments from path: &quot; &lt;&lt; tablet_wal_path;</a>
+<a name="ln162"> </a>
+<a name="ln163">  std::vector&lt;string&gt; files_from_log_directory;</a>
+<a name="ln164">  RETURN_NOT_OK_PREPEND(env_-&gt;GetChildren(tablet_wal_path, &amp;files_from_log_directory),</a>
+<a name="ln165">                        &quot;Unable to read children from path&quot;);</a>
+<a name="ln166"> </a>
+<a name="ln167">  SegmentSequence read_segments;</a>
+<a name="ln168"> </a>
+<a name="ln169">  // Build a log segment from log files, ignoring non log files.</a>
+<a name="ln170">  for (const string &amp;potential_log_file : files_from_log_directory) {</a>
+<a name="ln171">    if (!IsLogFileName(potential_log_file)) {</a>
+<a name="ln172">      continue;</a>
+<a name="ln173">    }</a>
+<a name="ln174"> </a>
+<a name="ln175">    string fqp = JoinPathSegments(tablet_wal_path, potential_log_file);</a>
+<a name="ln176">    scoped_refptr&lt;ReadableLogSegment&gt; segment;</a>
+<a name="ln177">    RETURN_NOT_OK_PREPEND(ReadableLogSegment::Open(env_, fqp, &amp;segment),</a>
+<a name="ln178">                          Format(&quot;Unable to open readable log segment: $0&quot;, fqp));</a>
+<a name="ln179">    DCHECK(segment);</a>
+<a name="ln180">    CHECK(segment-&gt;IsInitialized()) &lt;&lt; &quot;Uninitialized segment at: &quot; &lt;&lt; segment-&gt;path();</a>
+<a name="ln181"> </a>
+<a name="ln182">    if (!segment-&gt;HasFooter()) {</a>
+<a name="ln183">      LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln184">          &lt;&lt; &quot;Log segment &quot; &lt;&lt; fqp &lt;&lt; &quot; was likely left in-progress &quot;</a>
+<a name="ln185">             &quot;after a previous crash. Will try to rebuild footer by scanning data.&quot;;</a>
+<a name="ln186">      RETURN_NOT_OK(segment-&gt;RebuildFooterByScanning());</a>
+<a name="ln187">    }</a>
+<a name="ln188"> </a>
+<a name="ln189">    read_segments.push_back(segment);</a>
+<a name="ln190">  }</a>
+<a name="ln191"> </a>
+<a name="ln192">  // Sort the segments by sequence number.</a>
+<a name="ln193">  std::sort(read_segments.begin(), read_segments.end(), LogSegmentSeqnoComparator());</a>
+<a name="ln194"> </a>
+<a name="ln195">  {</a>
+<a name="ln196">    std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln197"> </a>
+<a name="ln198">    string previous_seg_path;</a>
+<a name="ln199">    int64_t previous_seg_seqno = -1;</a>
+<a name="ln200">    for (const SegmentSequence::value_type&amp; entry : read_segments) {</a>
+<a name="ln201">      VLOG_WITH_PREFIX(1) &lt;&lt; &quot; Log Reader Indexed: &quot; &lt;&lt; entry-&gt;footer().ShortDebugString();</a>
+<a name="ln202">      // Check that the log segments are in sequence.</a>
+<a name="ln203">      if (previous_seg_seqno != -1 &amp;&amp; entry-&gt;header().sequence_number() != previous_seg_seqno + 1) {</a>
+<a name="ln204">        return STATUS(Corruption, Substitute(&quot;Segment sequence numbers are not consecutive. &quot;</a>
+<a name="ln205">            &quot;Previous segment: seqno $0, path $1; Current segment: seqno $2, path $3&quot;,</a>
+<a name="ln206">            previous_seg_seqno, previous_seg_path,</a>
+<a name="ln207">            entry-&gt;header().sequence_number(), entry-&gt;path()));</a>
+<a name="ln208">        previous_seg_seqno++;</a>
+<a name="ln209">      } else {</a>
+<a name="ln210">        previous_seg_seqno = entry-&gt;header().sequence_number();</a>
+<a name="ln211">      }</a>
+<a name="ln212">      previous_seg_path = entry-&gt;path();</a>
+<a name="ln213">      RETURN_NOT_OK(AppendSegmentUnlocked(entry));</a>
+<a name="ln214">    }</a>
+<a name="ln215"> </a>
+<a name="ln216">    state_ = kLogReaderReading;</a>
+<a name="ln217">  }</a>
+<a name="ln218">  return Status::OK();</a>
+<a name="ln219">}</a>
+<a name="ln220"> </a>
+<a name="ln221">Status LogReader::InitEmptyReaderForTests() {</a>
+<a name="ln222">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln223">  state_ = kLogReaderReading;</a>
+<a name="ln224">  return Status::OK();</a>
+<a name="ln225">}</a>
+<a name="ln226"> </a>
+<a name="ln227">bool LogReader::ViolatesMaxTimePolicy(const scoped_refptr&lt;ReadableLogSegment&gt;&amp; segment) const {</a>
+<a name="ln228">  if (FLAGS_log_max_seconds_to_retain &lt;= 0) {</a>
+<a name="ln229">    return false;</a>
+<a name="ln230">  }</a>
+<a name="ln231"> </a>
+<a name="ln232">  if (!segment-&gt;HasFooter()) {</a>
+<a name="ln233">    return false;</a>
+<a name="ln234">  }</a>
+<a name="ln235"> </a>
+<a name="ln236">  int64_t now = GetCurrentTimeMicros();</a>
+<a name="ln237">  int64_t age_seconds = (now - segment-&gt;footer().close_timestamp_micros()) / 1000000;</a>
+<a name="ln238">  if (age_seconds &gt; FLAGS_log_max_seconds_to_retain) {</a>
+<a name="ln239">    LOG(WARNING) &lt;&lt; &quot;Segment &quot; &lt;&lt; segment-&gt;path() &lt;&lt; &quot; violates max retention time policy. &quot;</a>
+<a name="ln240">                 &lt;&lt; &quot;Segment age: &quot; &lt;&lt; age_seconds &lt;&lt; &quot; seconds. &quot;</a>
+<a name="ln241">                 &lt;&lt; &quot;log_max_seconds_to_retain: &quot; &lt;&lt; FLAGS_log_max_seconds_to_retain;</a>
+<a name="ln242">    if (PREDICT_FALSE(FLAGS_TEST_record_segments_violate_max_time_policy)) {</a>
+<a name="ln243">      segments_violate_max_time_policy_-&gt;push_back(segment);</a>
+<a name="ln244">    }</a>
+<a name="ln245">    return true;</a>
+<a name="ln246">  }</a>
+<a name="ln247">  return false;</a>
+<a name="ln248">}</a>
+<a name="ln249"> </a>
+<a name="ln250">bool LogReader::ViolatesMinSpacePolicy(const scoped_refptr&lt;ReadableLogSegment&gt;&amp; segment,</a>
+<a name="ln251">                                       int64_t *potential_reclaimed_space) const {</a>
+<a name="ln252">  if (FLAGS_log_stop_retaining_min_disk_mb &lt;= 0) {</a>
+<a name="ln253">    return false;</a>
+<a name="ln254">  }</a>
+<a name="ln255">  auto free_space_result = env_-&gt;GetFreeSpaceBytes(segment-&gt;path());</a>
+<a name="ln256">  if (!free_space_result.ok()) {</a>
+<a name="ln257">    LOG(WARNING) &lt;&lt; &quot;Unable to get free space: &quot; &lt;&lt; free_space_result;</a>
+<a name="ln258">    return false;</a>
+<a name="ln259">  } else {</a>
+<a name="ln260">    uint64_t free_space = *free_space_result;</a>
+<a name="ln261">    if ((free_space + *potential_reclaimed_space) / 1024 &lt; FLAGS_log_stop_retaining_min_disk_mb) {</a>
+<a name="ln262">      LOG(WARNING) &lt;&lt; &quot;Segment &quot; &lt;&lt; segment-&gt;path() &lt;&lt; &quot; violates minimum free space policy &quot;</a>
+<a name="ln263">                   &lt;&lt; &quot;specified by log_stop_retaining_min_disk_mb: &quot;</a>
+<a name="ln264">                   &lt;&lt; FLAGS_log_stop_retaining_min_disk_mb;</a>
+<a name="ln265">      *potential_reclaimed_space += segment-&gt;file_size();</a>
+<a name="ln266">      if (PREDICT_FALSE(FLAGS_TEST_record_segments_violate_min_space_policy)) {</a>
+<a name="ln267">        segments_violate_min_space_policy_-&gt;push_back(segment);</a>
+<a name="ln268">      }</a>
+<a name="ln269">      return true;</a>
+<a name="ln270">    }</a>
+<a name="ln271">  }</a>
+<a name="ln272">  return false;</a>
+<a name="ln273">}</a>
+<a name="ln274"> </a>
+<a name="ln275">Status LogReader::GetSegmentPrefixNotIncluding(int64_t index, SegmentSequence* segments) const {</a>
+<a name="ln276">  return GetSegmentPrefixNotIncluding(index, index, segments);</a>
+<a name="ln277">}</a>
+<a name="ln278"> </a>
+<a name="ln279">Status LogReader::GetSegmentPrefixNotIncluding(int64_t index, int64_t cdc_max_replicated_index,</a>
+<a name="ln280">                                               SegmentSequence* segments) const {</a>
+<a name="ln281">  DCHECK_GE(index, 0);</a>
+<a name="ln282">  DCHECK(segments);</a>
+<a name="ln283">  segments-&gt;clear();</a>
+<a name="ln284"> </a>
+<a name="ln285">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln286">  CHECK_EQ(state_, kLogReaderReading);</a>
+<a name="ln287"> </a>
+<a name="ln288">  int64_t reclaimed_space = 0;</a>
+<a name="ln289">  for (const scoped_refptr&lt;ReadableLogSegment&gt;&amp; segment : segments_) {</a>
+<a name="ln290">    // The last segment doesn't have a footer. Never include that one.</a>
+<a name="ln291">    if (!segment-&gt;HasFooter()) {</a>
+<a name="ln292">      break;</a>
+<a name="ln293">    }</a>
+<a name="ln294"> </a>
+<a name="ln295">    // Never garbage collect log segments with unflushed entries.</a>
+<a name="ln296">    if (segment-&gt;footer().max_replicate_index() &gt;= index) {</a>
+<a name="ln297">      break;</a>
+<a name="ln298">    }</a>
+<a name="ln299"> </a>
+<a name="ln300">    // This log segment contains cdc unreplicated entries. Don't GC it unless the file is too old</a>
+<a name="ln301">    // (controlled by flag FLAGS_log_max_seconds_to_retain) or we don't have enough space for the</a>
+<a name="ln302">    // logs (controlled by flag FLAGS_log_stop_retaining_min_disk_mb).</a>
+<a name="ln303">    if (FLAGS_enable_log_retention_by_op_idx &amp;&amp;</a>
+<a name="ln304">        segment-&gt;footer().max_replicate_index() &gt;= cdc_max_replicated_index) {</a>
+<a name="ln305"> </a>
+<a name="ln306">      // Since this log file contains cdc unreplicated entries, we don't want to GC it unless</a>
+<a name="ln307">      // it's too old, or we don't have enough space to store log files.</a>
+<a name="ln308"> </a>
+<a name="ln309">      if (!ViolatesMaxTimePolicy(segment) &amp;&amp; !ViolatesMinSpacePolicy(segment, &amp;reclaimed_space)) {</a>
+<a name="ln310">        // We exit the loop since this log segment already contains cdc unreplicated entries and so</a>
+<a name="ln311">        // do all subsequent files.</a>
+<a name="ln312">        break;</a>
+<a name="ln313">      }</a>
+<a name="ln314">    }</a>
+<a name="ln315"> </a>
+<a name="ln316">    // TODO: tests for edge cases here with backwards ordered replicates.</a>
+<a name="ln317">    segments-&gt;push_back(segment);</a>
+<a name="ln318">  }</a>
+<a name="ln319"> </a>
+<a name="ln320">  return Status::OK();</a>
+<a name="ln321">}</a>
+<a name="ln322"> </a>
+<a name="ln323">int64_t LogReader::GetMinReplicateIndex() const {</a>
+<a name="ln324">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln325">  int64_t min_remaining_op_idx = -1;</a>
+<a name="ln326"> </a>
+<a name="ln327">  for (const scoped_refptr&lt;ReadableLogSegment&gt;&amp; segment : segments_) {</a>
+<a name="ln328">    if (!segment-&gt;HasFooter()) continue;</a>
+<a name="ln329">    if (!segment-&gt;footer().has_min_replicate_index()) continue;</a>
+<a name="ln330">    if (min_remaining_op_idx == -1 ||</a>
+<a name="ln331">        segment-&gt;footer().min_replicate_index() &lt; min_remaining_op_idx) {</a>
+<a name="ln332">      min_remaining_op_idx = segment-&gt;footer().min_replicate_index();</a>
+<a name="ln333">    }</a>
+<a name="ln334">  }</a>
+<a name="ln335">  return min_remaining_op_idx;</a>
+<a name="ln336">}</a>
+<a name="ln337"> </a>
+<a name="ln338">void LogReader::GetMaxIndexesToSegmentSizeMap(int64_t min_op_idx, int32_t segments_count,</a>
+<a name="ln339">                                              int64_t max_close_time_us,</a>
+<a name="ln340">                                              std::map&lt;int64_t, int64_t&gt;*</a>
+<a name="ln341">                                              max_idx_to_segment_size) const {</a>
+<a name="ln342">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln343">  DCHECK_GE(segments_count, 0);</a>
+<a name="ln344">  for (const scoped_refptr&lt;ReadableLogSegment&gt;&amp; segment : segments_) {</a>
+<a name="ln345">    if (max_idx_to_segment_size-&gt;size() == segments_count) {</a>
+<a name="ln346">      break;</a>
+<a name="ln347">    }</a>
+<a name="ln348">    DCHECK(segment-&gt;HasFooter());</a>
+<a name="ln349">    if (segment-&gt;footer().max_replicate_index() &lt; min_op_idx) {</a>
+<a name="ln350">      // This means we found a log we can GC. Adjust the expected number of logs.</a>
+<a name="ln351">      segments_count--;</a>
+<a name="ln352">      continue;</a>
+<a name="ln353">    }</a>
+<a name="ln354"> </a>
+<a name="ln355">    if (max_close_time_us &lt; segment-&gt;footer().close_timestamp_micros()) {</a>
+<a name="ln356">      int64_t age_seconds = segment-&gt;footer().close_timestamp_micros() / 1000000;</a>
+<a name="ln357">      VLOG_WITH_PREFIX(2)</a>
+<a name="ln358">          &lt;&lt; &quot;Segment &quot; &lt;&lt; segment-&gt;path() &lt;&lt; &quot; is only &quot; &lt;&lt; age_seconds &lt;&lt; &quot;s old: &quot;</a>
+<a name="ln359">          &lt;&lt; &quot;won't be counted towards log retention&quot;;</a>
+<a name="ln360">      break;</a>
+<a name="ln361">    }</a>
+<a name="ln362">    (*max_idx_to_segment_size)[segment-&gt;footer().max_replicate_index()] = segment-&gt;file_size();</a>
+<a name="ln363">  }</a>
+<a name="ln364">}</a>
+<a name="ln365"> </a>
+<a name="ln366">scoped_refptr&lt;ReadableLogSegment&gt; LogReader::GetSegmentBySequenceNumber(int64_t seq) const {</a>
+<a name="ln367">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln368">  if (segments_.empty()) {</a>
+<a name="ln369">    return nullptr;</a>
+<a name="ln370">  }</a>
+<a name="ln371"> </a>
+<a name="ln372">  // We always have a contiguous set of log segments, so we can find the requested</a>
+<a name="ln373">  // segment in our vector by calculating its offset vs the first element.</a>
+<a name="ln374">  int64_t first_seqno = segments_[0]-&gt;header().sequence_number();</a>
+<a name="ln375">  int64_t relative = seq - first_seqno;</a>
+<a name="ln376">  if (relative &lt; 0 || relative &gt;= segments_.size()) {</a>
+<a name="ln377">    return nullptr;</a>
+<a name="ln378">  }</a>
+<a name="ln379"> </a>
+<a name="ln380">  DCHECK_EQ(segments_[relative]-&gt;header().sequence_number(), seq);</a>
+<a name="ln381">  return segments_[relative];</a>
+<a name="ln382">}</a>
+<a name="ln383"> </a>
+<a name="ln384">Status LogReader::ReadBatchUsingIndexEntry(const LogIndexEntry&amp; index_entry,</a>
+<a name="ln385">                                           faststring* tmp_buf,</a>
+<a name="ln386">                                           LogEntryBatchPB* batch) const {</a>
+<a name="ln387">  const int64_t index = index_entry.op_id.index;</a>
+<a name="ln388"> </a>
+<a name="ln389">  scoped_refptr&lt;ReadableLogSegment&gt; segment = GetSegmentBySequenceNumber(</a>
+<a name="ln390">    index_entry.segment_sequence_number);</a>
+<a name="ln391">  if (PREDICT_FALSE(!segment)) {</a>
+<a name="ln392">    return STATUS(NotFound, Substitute(&quot;Segment $0 which contained index $1 has been GCed&quot;,</a>
+<a name="ln393">                                       index_entry.segment_sequence_number,</a>
+<a name="ln394">                                       index));</a>
+<a name="ln395">  }</a>
+<a name="ln396"> </a>
+<a name="ln397">  CHECK_GT(index_entry.offset_in_segment, 0);</a>
+<a name="ln398">  int64_t offset = index_entry.offset_in_segment;</a>
+<a name="ln399">  ScopedLatencyMetric scoped(read_batch_latency_.get());</a>
+<a name="ln400">  RETURN_NOT_OK_PREPEND(segment-&gt;ReadEntryHeaderAndBatch(&amp;offset, tmp_buf, batch),</a>
+<a name="ln401">                        Substitute(&quot;Failed to read LogEntry for index $0 from log segment &quot;</a>
+<a name="ln402">                                   &quot;$1 offset $2&quot;,</a>
+<a name="ln403">                                   index,</a>
+<a name="ln404">                                   index_entry.segment_sequence_number,</a>
+<a name="ln405">                                   index_entry.offset_in_segment));</a>
+<a name="ln406"> </a>
+<a name="ln407">  if (bytes_read_) {</a>
+<a name="ln408">    bytes_read_-&gt;IncrementBy(kEntryHeaderSize + tmp_buf-&gt;length());</a>
+<a name="ln409">    entries_read_-&gt;IncrementBy(batch-&gt;entry_size());</a>
+<a name="ln410">  }</a>
+<a name="ln411"> </a>
+<a name="ln412">  return Status::OK();</a>
+<a name="ln413">}</a>
+<a name="ln414"> </a>
+<a name="ln415">Status LogReader::ReadReplicatesInRange(</a>
+<a name="ln416">    const int64_t starting_at,</a>
+<a name="ln417">    const int64_t up_to,</a>
+<a name="ln418">    int64_t max_bytes_to_read,</a>
+<a name="ln419">    ReplicateMsgs* replicates) const {</a>
+<a name="ln420">  DCHECK_GT(starting_at, 0);</a>
+<a name="ln421">  DCHECK_GE(up_to, starting_at);</a>
+<a name="ln422">  DCHECK(log_index_) &lt;&lt; &quot;Require an index to random-read logs&quot;;</a>
+<a name="ln423"> </a>
+<a name="ln424">  ReplicateMsgs replicates_tmp;</a>
+<a name="ln425">  LogIndexEntry prev_index_entry;</a>
+<a name="ln426">  prev_index_entry.segment_sequence_number = -1;</a>
+<a name="ln427">  prev_index_entry.offset_in_segment = -1;</a>
+<a name="ln428"> </a>
+<a name="ln429">  int64_t total_size = 0;</a>
+<a name="ln430">  bool limit_exceeded = false;</a>
+<a name="ln431">  faststring tmp_buf;</a>
+<a name="ln432">  LogEntryBatchPB batch;</a>
+<a name="ln433">  for (int64_t index = starting_at; index &lt;= up_to &amp;&amp; !limit_exceeded; index++) {</a>
+<a name="ln434">    LogIndexEntry index_entry;</a>
+<a name="ln435">    RETURN_NOT_OK_PREPEND(log_index_-&gt;GetEntry(index, &amp;index_entry),</a>
+<a name="ln436">                          Substitute(&quot;Failed to read log index for op $0&quot;, index));</a>
+<a name="ln437"> </a>
+<a name="ln438">    // Since a given LogEntryBatch may contain multiple REPLICATE messages,</a>
+<a name="ln439">    // it's likely that this index entry points to the same batch as the previous</a>
+<a name="ln440">    // one. If that's the case, we've already read this REPLICATE and we can</a>
+<a name="ln441">    // skip reading the batch again.</a>
+<a name="ln442">    if (index == starting_at ||</a>
+<a name="ln443">        index_entry.segment_sequence_number != prev_index_entry.segment_sequence_number ||</a>
+<a name="ln444">        index_entry.offset_in_segment != prev_index_entry.offset_in_segment) {</a>
+<a name="ln445">      RETURN_NOT_OK(ReadBatchUsingIndexEntry(index_entry, &amp;tmp_buf, &amp;batch));</a>
+<a name="ln446"> </a>
+<a name="ln447">      // Sanity-check the property that a batch should only have increasing indexes.</a>
+<a name="ln448">      int64_t prev_index = 0;</a>
+<a name="ln449">      for (int i = 0; i &lt; batch.entry_size(); ++i) {</a>
+<a name="ln450">        LogEntryPB* entry = batch.mutable_entry(i);</a>
+<a name="ln451">        if (!entry-&gt;has_replicate()) continue;</a>
+<a name="ln452">        int64_t this_index = entry-&gt;replicate().id().index();</a>
+<a name="ln453">        CHECK_GT(this_index, prev_index)</a>
+<a name="ln454">          &lt;&lt; &quot;Expected that an entry batch should only include increasing log indexes: &quot;</a>
+<a name="ln455">          &lt;&lt; index_entry.ToString()</a>
+<a name="ln456">          &lt;&lt; &quot;\nBatch: &quot; &lt;&lt; batch.DebugString();</a>
+<a name="ln457">        prev_index = this_index;</a>
+<a name="ln458">      }</a>
+<a name="ln459">    }</a>
+<a name="ln460"> </a>
+<a name="ln461">    bool found = false;</a>
+<a name="ln462">    for (int i = 0; i &lt; batch.entry_size(); ++i) {</a>
+<a name="ln463">      LogEntryPB* entry = batch.mutable_entry(i);</a>
+<a name="ln464">      if (!entry-&gt;has_replicate()) {</a>
+<a name="ln465">        continue;</a>
+<a name="ln466">      }</a>
+<a name="ln467"> </a>
+<a name="ln468">      if (entry-&gt;replicate().id().index() != index) {</a>
+<a name="ln469">        continue;</a>
+<a name="ln470">      }</a>
+<a name="ln471"> </a>
+<a name="ln472">      int64_t space_required = entry-&gt;replicate().SpaceUsed();</a>
+<a name="ln473">      if (replicates_tmp.empty() ||</a>
+<a name="ln474">          max_bytes_to_read &lt;= 0 ||</a>
+<a name="ln475">          total_size + space_required &lt; max_bytes_to_read) {</a>
+<a name="ln476">        total_size += space_required;</a>
+<a name="ln477">        replicates_tmp.emplace_back(entry-&gt;release_replicate());</a>
+<a name="ln478">      } else {</a>
+<a name="ln479">        limit_exceeded = true;</a>
+<a name="ln480">      }</a>
+<a name="ln481">      found = true;</a>
+<a name="ln482">      break;</a>
+<a name="ln483">    }</a>
+<a name="ln484">    CHECK(found) &lt;&lt; &quot;Incorrect index entry didn't yield expected log entry: &quot;</a>
+<a name="ln485">                 &lt;&lt; index_entry.ToString();</a>
+<a name="ln486"> </a>
+<a name="ln487">    prev_index_entry = index_entry;</a>
+<a name="ln488">  }</a>
+<a name="ln489"> </a>
+<a name="ln490">  replicates-&gt;swap(replicates_tmp);</a>
+<a name="ln491">  return Status::OK();</a>
+<a name="ln492">}</a>
+<a name="ln493"> </a>
+<a name="ln494">Result&lt;yb::OpId&gt; LogReader::LookupOpId(int64_t op_index) const {</a>
+<a name="ln495">  LogIndexEntry index_entry;</a>
+<a name="ln496">  RETURN_NOT_OK_PREPEND(log_index_-&gt;GetEntry(op_index, &amp;index_entry),</a>
+<a name="ln497">                        strings::Substitute(&quot;Failed to read log index for op $0&quot;, op_index));</a>
+<a name="ln498">  return index_entry.op_id;</a>
+<a name="ln499">}</a>
+<a name="ln500"> </a>
+<a name="ln501">Status LogReader::GetSegmentsSnapshot(SegmentSequence* segments) const {</a>
+<a name="ln502">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln503">  CHECK_EQ(state_, kLogReaderReading);</a>
+<a name="ln504">  segments-&gt;assign(segments_.begin(), segments_.end());</a>
+<a name="ln505">  return Status::OK();</a>
+<a name="ln506">}</a>
+<a name="ln507"> </a>
+<a name="ln508">Status LogReader::TrimSegmentsUpToAndIncluding(int64_t segment_sequence_number) {</a>
+<a name="ln509">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln510">  CHECK_EQ(state_, kLogReaderReading);</a>
+<a name="ln511">  auto iter = segments_.begin();</a>
+<a name="ln512">  std::vector&lt;int64_t&gt; deleted_segments;</a>
+<a name="ln513"> </a>
+<a name="ln514">  while (iter != segments_.end()) {</a>
+<a name="ln515">    auto current_seq_no = (*iter)-&gt;header().sequence_number();</a>
+<a name="ln516">    if (current_seq_no &gt; segment_sequence_number) {</a>
+<a name="ln517">      break;</a>
+<a name="ln518">    }</a>
+<a name="ln519">    deleted_segments.push_back(current_seq_no);</a>
+<a name="ln520">    iter = segments_.erase(iter);</a>
+<a name="ln521">  }</a>
+<a name="ln522">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Removed log segment sequence numbers from log reader: &quot;</a>
+<a name="ln523">                        &lt;&lt; yb::ToString(deleted_segments);</a>
+<a name="ln524">  return Status::OK();</a>
+<a name="ln525">}</a>
+<a name="ln526"> </a>
+<a name="ln527">void LogReader::UpdateLastSegmentOffset(int64_t readable_to_offset) {</a>
+<a name="ln528">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln529">  CHECK_EQ(state_, kLogReaderReading);</a>
+<a name="ln530">  DCHECK(!segments_.empty());</a>
+<a name="ln531">  // Get the last segment</a>
+<a name="ln532">  ReadableLogSegment* segment = segments_.back().get();</a>
+<a name="ln533">  DCHECK(!segment-&gt;HasFooter());</a>
+<a name="ln534">  segment-&gt;UpdateReadableToOffset(readable_to_offset);</a>
+<a name="ln535">}</a>
+<a name="ln536"> </a>
+<a name="ln537">Status LogReader::ReplaceLastSegment(const scoped_refptr&lt;ReadableLogSegment&gt;&amp; segment) {</a>
+<a name="ln538">  // This is used to replace the last segment once we close it properly so it must</a>
+<a name="ln539">  // have a footer.</a>
+<a name="ln540">  DCHECK(segment-&gt;HasFooter());</a>
+<a name="ln541"> </a>
+<a name="ln542">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln543">  CHECK_EQ(state_, kLogReaderReading);</a>
+<a name="ln544">  // Make sure the segment we're replacing has the same sequence number</a>
+<a name="ln545">  CHECK(!segments_.empty());</a>
+<a name="ln546">  CHECK_EQ(segment-&gt;header().sequence_number(), segments_.back()-&gt;header().sequence_number());</a>
+<a name="ln547">  segments_[segments_.size() - 1] = segment;</a>
+<a name="ln548"> </a>
+<a name="ln549">  return Status::OK();</a>
+<a name="ln550">}</a>
+<a name="ln551"> </a>
+<a name="ln552">Status LogReader::AppendSegment(const scoped_refptr&lt;ReadableLogSegment&gt;&amp; segment) {</a>
+<a name="ln553">  DCHECK(segment-&gt;IsInitialized());</a>
+<a name="ln554">  if (PREDICT_FALSE(!segment-&gt;HasFooter())) {</a>
+<a name="ln555">    RETURN_NOT_OK(segment-&gt;RebuildFooterByScanning());</a>
+<a name="ln556">  }</a>
+<a name="ln557">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln558">  return AppendSegmentUnlocked(segment);</a>
+<a name="ln559">}</a>
+<a name="ln560"> </a>
+<a name="ln561">Status LogReader::AppendSegmentUnlocked(const scoped_refptr&lt;ReadableLogSegment&gt;&amp; segment) {</a>
+<a name="ln562">  DCHECK(segment-&gt;IsInitialized());</a>
+<a name="ln563">  DCHECK(segment-&gt;HasFooter());</a>
+<a name="ln564"> </a>
+<a name="ln565">  if (!segments_.empty()) {</a>
+<a name="ln566">    CHECK_EQ(segments_.back()-&gt;header().sequence_number() + 1,</a>
+<a name="ln567">             segment-&gt;header().sequence_number());</a>
+<a name="ln568">  }</a>
+<a name="ln569">  segments_.push_back(segment);</a>
+<a name="ln570">  return Status::OK();</a>
+<a name="ln571">}</a>
+<a name="ln572"> </a>
+<a name="ln573">Status LogReader::AppendEmptySegment(const scoped_refptr&lt;ReadableLogSegment&gt;&amp; segment) {</a>
+<a name="ln574">  DCHECK(segment-&gt;IsInitialized());</a>
+<a name="ln575">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln576">  CHECK_EQ(state_, kLogReaderReading);</a>
+<a name="ln577">  if (!segments_.empty()) {</a>
+<a name="ln578">    CHECK_EQ(segments_.back()-&gt;header().sequence_number() + 1,</a>
+<a name="ln579">             segment-&gt;header().sequence_number());</a>
+<a name="ln580">  }</a>
+<a name="ln581">  segments_.push_back(segment);</a>
+<a name="ln582">  return Status::OK();</a>
+<a name="ln583">}</a>
+<a name="ln584"> </a>
+<a name="ln585">const int LogReader::num_segments() const {</a>
+<a name="ln586">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln587">  return segments_.size();</a>
+<a name="ln588">}</a>
+<a name="ln589"> </a>
+<a name="ln590">string LogReader::ToString() const {</a>
+<a name="ln591">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln592">  string ret = &quot;Reader's SegmentSequence: \n&quot;;</a>
+<a name="ln593">  for (const SegmentSequence::value_type&amp; entry : segments_) {</a>
+<a name="ln594">    ret.append(Substitute(&quot;Segment: $0 Footer: $1\n&quot;,</a>
+<a name="ln595">                          entry-&gt;header().sequence_number(),</a>
+<a name="ln596">                          !entry-&gt;HasFooter() ? &quot;NONE&quot; : entry-&gt;footer().ShortDebugString()));</a>
+<a name="ln597">  }</a>
+<a name="ln598">  return ret;</a>
+<a name="ln599">}</a>
+<a name="ln600"> </a>
+<a name="ln601">}  // namespace log</a>
+<a name="ln602">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="155"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="161"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="179"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="180"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="201"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="208"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v779/" target="_blank">V779</a> Unreachable code detected. It is possible that an error is present.</p></div>
+<div class="balloon" rel="282"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="283"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1004/" target="_blank">V1004</a> The 'segments' pointer was used unsafely after it was verified against nullptr. Check lines: 282, 283.</p></div>
+<div class="balloon" rel="348"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="357"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="422"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="484"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="530"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="533"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="540"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="545"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="553"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="562"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="563"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="574"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

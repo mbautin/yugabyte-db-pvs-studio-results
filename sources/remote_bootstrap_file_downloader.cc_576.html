@@ -1,0 +1,296 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>remote_bootstrap_file_downloader.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/tserver/remote_bootstrap_file_downloader.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/fs/fs_manager.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/rpc/rpc_controller.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/tserver/remote_bootstrap.proxy.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;yb/util/crc.h&quot;</a>
+<a name="ln25">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln26">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln27">#include &quot;yb/util/size_literals.h&quot;</a>
+<a name="ln28">#include &quot;yb/util/net/rate_limiter.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">using namespace yb::size_literals;</a>
+<a name="ln31"> </a>
+<a name="ln32">DECLARE_int32(rpc_max_message_size);</a>
+<a name="ln33">DEFINE_int32(remote_bootstrap_max_chunk_size, 1_MB,</a>
+<a name="ln34">             &quot;Maximum chunk size to be transferred at a time during remote bootstrap.&quot;);</a>
+<a name="ln35"> </a>
+<a name="ln36">// Deprecated because it's misspelled.  But if set, this flag takes precedence over</a>
+<a name="ln37">// remote_bootstrap_rate_limit_bytes_per_sec for compatibility.</a>
+<a name="ln38">DEFINE_int64(remote_boostrap_rate_limit_bytes_per_sec, 0,</a>
+<a name="ln39">             &quot;DEPRECATED. Replaced by flag remote_bootstrap_rate_limit_bytes_per_sec.&quot;);</a>
+<a name="ln40">TAG_FLAG(remote_boostrap_rate_limit_bytes_per_sec, hidden);</a>
+<a name="ln41"> </a>
+<a name="ln42">DEFINE_int64(remote_bootstrap_rate_limit_bytes_per_sec, 256_MB,</a>
+<a name="ln43">             &quot;Maximum transmission rate during a remote bootstrap. This is across all the remote &quot;</a>
+<a name="ln44">             &quot;bootstrap sessions for which this process is acting as a sender or receiver. So &quot;</a>
+<a name="ln45">             &quot;the total limit will be 2 * remote_bootstrap_rate_limit_bytes_per_sec because a &quot;</a>
+<a name="ln46">             &quot;tserver or master can act both as a sender and receiver at the same time.&quot;);</a>
+<a name="ln47"> </a>
+<a name="ln48">DEFINE_int32(bytes_remote_bootstrap_durable_write_mb, 8,</a>
+<a name="ln49">             &quot;Explicitly call fsync after downloading the specified amount of data in MB &quot;</a>
+<a name="ln50">             &quot;during a remote bootstrap session. If 0 fsync() is not called.&quot;);</a>
+<a name="ln51"> </a>
+<a name="ln52">// RETURN_NOT_OK_PREPEND() with a remote-error unwinding step.</a>
+<a name="ln53">#define RETURN_NOT_OK_UNWIND_PREPEND(status, controller, msg) \</a>
+<a name="ln54">  RETURN_NOT_OK_PREPEND(UnwindRemoteError(status, controller), msg)</a>
+<a name="ln55"> </a>
+<a name="ln56">namespace yb {</a>
+<a name="ln57">namespace tserver {</a>
+<a name="ln58"> </a>
+<a name="ln59">namespace {</a>
+<a name="ln60"> </a>
+<a name="ln61">// Decode the remote error into a human-readable Status object.</a>
+<a name="ln62">CHECKED_STATUS ExtractRemoteError(</a>
+<a name="ln63">    const rpc::ErrorStatusPB&amp; remote_error, const Status&amp; original_status) {</a>
+<a name="ln64">  if (!remote_error.HasExtension(RemoteBootstrapErrorPB::remote_bootstrap_error_ext)) {</a>
+<a name="ln65">    return original_status;</a>
+<a name="ln66">  }</a>
+<a name="ln67"> </a>
+<a name="ln68">  const RemoteBootstrapErrorPB&amp; error =</a>
+<a name="ln69">      remote_error.GetExtension(RemoteBootstrapErrorPB::remote_bootstrap_error_ext);</a>
+<a name="ln70">  LOG(INFO) &lt;&lt; &quot;ExtractRemoteError: &quot; &lt;&lt; error.ShortDebugString();</a>
+<a name="ln71">  return StatusFromPB(error.status()).CloneAndPrepend(</a>
+<a name="ln72">      &quot;Received error code &quot; + RemoteBootstrapErrorPB::Code_Name(error.code()) +</a>
+<a name="ln73">          &quot; from remote service&quot;);</a>
+<a name="ln74">}</a>
+<a name="ln75"> </a>
+<a name="ln76">} // namespace</a>
+<a name="ln77"> </a>
+<a name="ln78">extern std::atomic&lt;int32_t&gt; remote_bootstrap_clients_started_;</a>
+<a name="ln79"> </a>
+<a name="ln80">RemoteBootstrapFileDownloader::RemoteBootstrapFileDownloader(</a>
+<a name="ln81">    const std::string* log_prefix, FsManager* fs_manager)</a>
+<a name="ln82">    : log_prefix_(*log_prefix), fs_manager_(*fs_manager) {</a>
+<a name="ln83">}</a>
+<a name="ln84"> </a>
+<a name="ln85">void RemoteBootstrapFileDownloader::Start(</a>
+<a name="ln86">    std::shared_ptr&lt;RemoteBootstrapServiceProxy&gt; proxy, std::string session_id,</a>
+<a name="ln87">    MonoDelta session_idle_timeout) {</a>
+<a name="ln88">  proxy_ = std::move(proxy);</a>
+<a name="ln89">  session_id_ = std::move(session_id);</a>
+<a name="ln90">  session_idle_timeout_ = session_idle_timeout;</a>
+<a name="ln91">}</a>
+<a name="ln92"> </a>
+<a name="ln93">Env&amp; RemoteBootstrapFileDownloader::env() const {</a>
+<a name="ln94">  return *fs_manager_.env();</a>
+<a name="ln95">}</a>
+<a name="ln96"> </a>
+<a name="ln97">Status RemoteBootstrapFileDownloader::DownloadFile(</a>
+<a name="ln98">    const tablet::FilePB&amp; file_pb, const std::string&amp; dir, DataIdPB *data_id) {</a>
+<a name="ln99">  auto file_path = JoinPathSegments(dir, file_pb.name());</a>
+<a name="ln100">  RETURN_NOT_OK(env().CreateDirs(DirName(file_path)));</a>
+<a name="ln101"> </a>
+<a name="ln102">  if (file_pb.inode() != 0) {</a>
+<a name="ln103">    auto it = inode2file_.find(file_pb.inode());</a>
+<a name="ln104">    if (it != inode2file_.end()) {</a>
+<a name="ln105">      VLOG_WITH_PREFIX(2) &lt;&lt; &quot;File with the same inode already found: &quot; &lt;&lt; file_path</a>
+<a name="ln106">                          &lt;&lt; &quot; =&gt; &quot; &lt;&lt; it-&gt;second;</a>
+<a name="ln107">      auto link_status = env().LinkFile(it-&gt;second, file_path);</a>
+<a name="ln108">      if (link_status.ok()) {</a>
+<a name="ln109">        return Status::OK();</a>
+<a name="ln110">      }</a>
+<a name="ln111">      // TODO fallback to copy.</a>
+<a name="ln112">      LOG_WITH_PREFIX(ERROR) &lt;&lt; &quot;Failed to link file: &quot; &lt;&lt; file_path &lt;&lt; &quot; =&gt; &quot; &lt;&lt; it-&gt;second</a>
+<a name="ln113">                             &lt;&lt; &quot;: &quot; &lt;&lt; link_status;</a>
+<a name="ln114">    }</a>
+<a name="ln115">  }</a>
+<a name="ln116"> </a>
+<a name="ln117">  WritableFileOptions opts;</a>
+<a name="ln118">  opts.sync_on_close = true;</a>
+<a name="ln119">  std::unique_ptr&lt;WritableFile&gt; file;</a>
+<a name="ln120">  RETURN_NOT_OK(env().NewWritableFile(opts, file_path, &amp;file));</a>
+<a name="ln121"> </a>
+<a name="ln122">  data_id-&gt;set_file_name(file_pb.name());</a>
+<a name="ln123">  RETURN_NOT_OK_PREPEND(DownloadFile(*data_id, file.get()),</a>
+<a name="ln124">                        Format(&quot;Unable to download $0 file $1&quot;,</a>
+<a name="ln125">                               DataIdPB::IdType_Name(data_id-&gt;type()), file_path));</a>
+<a name="ln126">  VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Downloaded file &quot; &lt;&lt; file_path;</a>
+<a name="ln127"> </a>
+<a name="ln128">  if (file_pb.inode() != 0) {</a>
+<a name="ln129">    inode2file_.emplace(file_pb.inode(), file_path);</a>
+<a name="ln130">  }</a>
+<a name="ln131"> </a>
+<a name="ln132">  return Status::OK();</a>
+<a name="ln133">}</a>
+<a name="ln134"> </a>
+<a name="ln135">template&lt;class Appendable&gt;</a>
+<a name="ln136">Status RemoteBootstrapFileDownloader::DownloadFile(</a>
+<a name="ln137">    const DataIdPB&amp; data_id, Appendable* appendable) {</a>
+<a name="ln138">  constexpr int kBytesReservedForMessageHeaders = 16384;</a>
+<a name="ln139"> </a>
+<a name="ln140">  // For periodic sync, indicates number of bytes which need to be sync'ed.</a>
+<a name="ln141">  size_t periodic_sync_unsynced_bytes = 0;</a>
+<a name="ln142">  uint64_t offset = 0;</a>
+<a name="ln143">  int32_t max_length = std::min(FLAGS_remote_bootstrap_max_chunk_size,</a>
+<a name="ln144">                                FLAGS_rpc_max_message_size - kBytesReservedForMessageHeaders);</a>
+<a name="ln145"> </a>
+<a name="ln146">  std::unique_ptr&lt;RateLimiter&gt; rate_limiter;</a>
+<a name="ln147"> </a>
+<a name="ln148">  if (FLAGS_remote_bootstrap_rate_limit_bytes_per_sec &gt; 0) {</a>
+<a name="ln149">    static auto rate_updater = []() {</a>
+<a name="ln150">      auto remote_bootstrap_clients_started =</a>
+<a name="ln151">          remote_bootstrap_clients_started_.load(std::memory_order_acquire);</a>
+<a name="ln152">      if (remote_bootstrap_clients_started &lt; 1) {</a>
+<a name="ln153">        YB_LOG_EVERY_N(ERROR, 100) &lt;&lt; &quot;Invalid number of remote bootstrap sessions: &quot;</a>
+<a name="ln154">                                   &lt;&lt; remote_bootstrap_clients_started;</a>
+<a name="ln155">        return static_cast&lt;uint64_t&gt;(FLAGS_remote_bootstrap_rate_limit_bytes_per_sec);</a>
+<a name="ln156">      }</a>
+<a name="ln157">      return static_cast&lt;uint64_t&gt;(</a>
+<a name="ln158">          FLAGS_remote_bootstrap_rate_limit_bytes_per_sec / remote_bootstrap_clients_started);</a>
+<a name="ln159">    };</a>
+<a name="ln160"> </a>
+<a name="ln161">    rate_limiter = std::make_unique&lt;RateLimiter&gt;(rate_updater);</a>
+<a name="ln162">  } else {</a>
+<a name="ln163">    // Inactive RateLimiter.</a>
+<a name="ln164">    rate_limiter = std::make_unique&lt;RateLimiter&gt;();</a>
+<a name="ln165">  }</a>
+<a name="ln166"> </a>
+<a name="ln167">  rpc::RpcController controller;</a>
+<a name="ln168">  controller.set_timeout(session_idle_timeout_);</a>
+<a name="ln169">  FetchDataRequestPB req;</a>
+<a name="ln170"> </a>
+<a name="ln171">  bool done = false;</a>
+<a name="ln172">  while (!done) {</a>
+<a name="ln173">    controller.Reset();</a>
+<a name="ln174">    req.set_session_id(session_id_);</a>
+<a name="ln175">    req.mutable_data_id()-&gt;CopyFrom(data_id);</a>
+<a name="ln176">    req.set_offset(offset);</a>
+<a name="ln177">    if (rate_limiter-&gt;active()) {</a>
+<a name="ln178">      auto max_size = rate_limiter-&gt;GetMaxSizeForNextTransmission();</a>
+<a name="ln179">      if (max_size &gt; std::numeric_limits&lt;decltype(max_length)&gt;::max()) {</a>
+<a name="ln180">        max_size = std::numeric_limits&lt;decltype(max_length)&gt;::max();</a>
+<a name="ln181">      }</a>
+<a name="ln182">      max_length = std::min(max_length, decltype(max_length)(max_size));</a>
+<a name="ln183">    }</a>
+<a name="ln184">    req.set_max_length(max_length);</a>
+<a name="ln185"> </a>
+<a name="ln186">    FetchDataResponsePB resp;</a>
+<a name="ln187">    auto status = rate_limiter-&gt;SendOrReceiveData([this, &amp;req, &amp;resp, &amp;controller]() {</a>
+<a name="ln188">      return proxy_-&gt;FetchData(req, &amp;resp, &amp;controller);</a>
+<a name="ln189">    }, [&amp;resp]() { return resp.ByteSize(); });</a>
+<a name="ln190">    RETURN_NOT_OK_UNWIND_PREPEND(status, controller, &quot;Unable to fetch data from remote&quot;);</a>
+<a name="ln191">    DCHECK_LE(resp.chunk().data().size(), max_length);</a>
+<a name="ln192"> </a>
+<a name="ln193">    // Sanity-check for corruption.</a>
+<a name="ln194">    RETURN_NOT_OK_PREPEND(VerifyData(offset, resp.chunk()),</a>
+<a name="ln195">                          Format(&quot;Error validating data item $0&quot;, data_id));</a>
+<a name="ln196"> </a>
+<a name="ln197">    // Write the data.</a>
+<a name="ln198">    RETURN_NOT_OK(appendable-&gt;Append(resp.chunk().data()));</a>
+<a name="ln199">    VLOG_WITH_PREFIX(3)</a>
+<a name="ln200">        &lt;&lt; &quot;resp size: &quot; &lt;&lt; resp.ByteSize() &lt;&lt; &quot;, chunk size: &quot; &lt;&lt; resp.chunk().data().size();</a>
+<a name="ln201"> </a>
+<a name="ln202">    if (offset + resp.chunk().data().size() == resp.chunk().total_data_length()) {</a>
+<a name="ln203">      done = true;</a>
+<a name="ln204">    }</a>
+<a name="ln205">    offset += resp.chunk().data().size();</a>
+<a name="ln206">    if (FLAGS_bytes_remote_bootstrap_durable_write_mb != 0) {</a>
+<a name="ln207">      periodic_sync_unsynced_bytes += resp.chunk().data().size();</a>
+<a name="ln208">      if (periodic_sync_unsynced_bytes &gt; FLAGS_bytes_remote_bootstrap_durable_write_mb * 1_MB) {</a>
+<a name="ln209">        RETURN_NOT_OK(appendable-&gt;Sync());</a>
+<a name="ln210">        periodic_sync_unsynced_bytes = 0;</a>
+<a name="ln211">      }</a>
+<a name="ln212">    }</a>
+<a name="ln213">  }</a>
+<a name="ln214"> </a>
+<a name="ln215">  VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Transmission rate: &quot; &lt;&lt; rate_limiter-&gt;GetRate();</a>
+<a name="ln216"> </a>
+<a name="ln217">  return Status::OK();</a>
+<a name="ln218">}</a>
+<a name="ln219"> </a>
+<a name="ln220">Status RemoteBootstrapFileDownloader::VerifyData(uint64_t offset, const DataChunkPB&amp; chunk) {</a>
+<a name="ln221">  // Verify the offset is what we expected.</a>
+<a name="ln222">  if (offset != chunk.offset()) {</a>
+<a name="ln223">    return STATUS_FORMAT(</a>
+<a name="ln224">        InvalidArgument, &quot;Offset did not match what was asked for $0 vs $1&quot;,</a>
+<a name="ln225">        offset, chunk.offset());</a>
+<a name="ln226">  }</a>
+<a name="ln227"> </a>
+<a name="ln228">  // Verify the checksum.</a>
+<a name="ln229">  uint32_t crc32 = crc::Crc32c(chunk.data().data(), chunk.data().length());</a>
+<a name="ln230">  if (PREDICT_FALSE(crc32 != chunk.crc32())) {</a>
+<a name="ln231">    return STATUS_FORMAT(</a>
+<a name="ln232">        Corruption, &quot;CRC32 does not match at offset $0 size $1: $2 vs $3&quot;,</a>
+<a name="ln233">        offset, chunk.data().size(), crc32, chunk.crc32());</a>
+<a name="ln234">  }</a>
+<a name="ln235">  return Status::OK();</a>
+<a name="ln236">}</a>
+<a name="ln237"> </a>
+<a name="ln238">// Enhance a RemoteError Status message with additional details from the remote.</a>
+<a name="ln239">Status UnwindRemoteError(const Status&amp; status, const rpc::RpcController&amp; controller) {</a>
+<a name="ln240">  if (!status.IsRemoteError()) {</a>
+<a name="ln241">    return status;</a>
+<a name="ln242">  }</a>
+<a name="ln243">  return ExtractRemoteError(*controller.error_response(), status);</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246">} // namespace tserver</a>
+<a name="ln247">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="105"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="126"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="199"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="215"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

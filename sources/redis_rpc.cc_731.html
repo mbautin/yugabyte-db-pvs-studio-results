@@ -1,0 +1,463 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>redis_rpc.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15">#include &quot;yb/yql/redis/redisserver/redis_rpc.h&quot;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &quot;yb/client/client_fwd.h&quot;</a>
+<a name="ln18">#include &quot;yb/client/meta_cache.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/common/redis_protocol.pb.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/yql/redis/redisserver/redis_encoding.h&quot;</a>
+<a name="ln23">#include &quot;yb/yql/redis/redisserver/redis_parser.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;yb/rpc/connection.h&quot;</a>
+<a name="ln26">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln27">#include &quot;yb/rpc/reactor.h&quot;</a>
+<a name="ln28">#include &quot;yb/rpc/rpc_introspection.pb.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln31">#include &quot;yb/util/size_literals.h&quot;</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/util/debug/trace_event.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &quot;yb/util/memory/memory.h&quot;</a>
+<a name="ln36"> </a>
+<a name="ln37">using namespace std::literals;</a>
+<a name="ln38">using namespace std::placeholders;</a>
+<a name="ln39">using namespace yb::size_literals;</a>
+<a name="ln40"> </a>
+<a name="ln41">DECLARE_bool(rpc_dump_all_traces);</a>
+<a name="ln42">DECLARE_int32(rpc_slow_query_threshold_ms);</a>
+<a name="ln43">DEFINE_uint64(redis_max_concurrent_commands, 1,</a>
+<a name="ln44">              &quot;Max number of redis commands received from single connection, &quot;</a>
+<a name="ln45">              &quot;that could be processed concurrently&quot;);</a>
+<a name="ln46">DEFINE_uint64(redis_max_batch, 500, &quot;Max number of redis commands that forms batch&quot;);</a>
+<a name="ln47">DEFINE_int32(rpcz_max_redis_query_dump_size, 4_KB,</a>
+<a name="ln48">             &quot;The maximum size of the Redis query string in the RPCZ dump.&quot;);</a>
+<a name="ln49">DEFINE_uint64(redis_max_read_buffer_size, 128_MB,</a>
+<a name="ln50">              &quot;Max read buffer size for Redis connections.&quot;);</a>
+<a name="ln51"> </a>
+<a name="ln52">DEFINE_uint64(redis_max_queued_bytes, 128_MB,</a>
+<a name="ln53">              &quot;Max number of bytes in queued redis commands.&quot;);</a>
+<a name="ln54"> </a>
+<a name="ln55">DEFINE_int32(</a>
+<a name="ln56">    redis_connection_soft_limit_grace_period_sec, 60,</a>
+<a name="ln57">    &quot;The duration for which the outbound data needs to exceeed the softlimit &quot;</a>
+<a name="ln58">    &quot;before the connection gets closed down.&quot;);</a>
+<a name="ln59"> </a>
+<a name="ln60">namespace yb {</a>
+<a name="ln61">namespace redisserver {</a>
+<a name="ln62"> </a>
+<a name="ln63">RedisConnectionContext::RedisConnectionContext(</a>
+<a name="ln64">    rpc::GrowableBufferAllocator* allocator,</a>
+<a name="ln65">    const MemTrackerPtr&amp; call_tracker)</a>
+<a name="ln66">    : ConnectionContextWithQueue(</a>
+<a name="ln67">          FLAGS_redis_max_concurrent_commands, FLAGS_redis_max_queued_bytes),</a>
+<a name="ln68">      read_buffer_(allocator, FLAGS_redis_max_read_buffer_size),</a>
+<a name="ln69">      call_mem_tracker_(call_tracker) {}</a>
+<a name="ln70"> </a>
+<a name="ln71">RedisConnectionContext::~RedisConnectionContext() {}</a>
+<a name="ln72"> </a>
+<a name="ln73">Result&lt;rpc::ProcessDataResult&gt; RedisConnectionContext::ProcessCalls(</a>
+<a name="ln74">    const rpc::ConnectionPtr&amp; connection, const IoVecs&amp; data,</a>
+<a name="ln75">    rpc::ReadBufferFull read_buffer_full) {</a>
+<a name="ln76">  if (!can_enqueue()) {</a>
+<a name="ln77">    return rpc::ProcessDataResult{0, Slice()};</a>
+<a name="ln78">  }</a>
+<a name="ln79"> </a>
+<a name="ln80">  if (!parser_) {</a>
+<a name="ln81">    parser_.reset(new RedisParser(data));</a>
+<a name="ln82">  } else {</a>
+<a name="ln83">    parser_-&gt;Update(data);</a>
+<a name="ln84">  }</a>
+<a name="ln85">  RedisParser&amp; parser = *parser_;</a>
+<a name="ln86">  size_t begin_of_batch = 0;</a>
+<a name="ln87">  // Try to parse all received commands to a single RedisInboundCall.</a>
+<a name="ln88">  for (;;) {</a>
+<a name="ln89">    auto end_of_command = VERIFY_RESULT(parser.NextCommand());</a>
+<a name="ln90">    if (end_of_command == 0) {</a>
+<a name="ln91">      break;</a>
+<a name="ln92">    }</a>
+<a name="ln93">    end_of_batch_ = end_of_command;</a>
+<a name="ln94">    if (++commands_in_batch_ &gt;= FLAGS_redis_max_batch) {</a>
+<a name="ln95">      rpc::CallData call_data(end_of_batch_ - begin_of_batch);</a>
+<a name="ln96">      IoVecsToBuffer(data, begin_of_batch, end_of_batch_, call_data.data());</a>
+<a name="ln97">      RETURN_NOT_OK(HandleInboundCall(connection, commands_in_batch_, &amp;call_data));</a>
+<a name="ln98">      begin_of_batch = end_of_batch_;</a>
+<a name="ln99">      commands_in_batch_ = 0;</a>
+<a name="ln100">    }</a>
+<a name="ln101">  }</a>
+<a name="ln102">  // Create call for rest of commands.</a>
+<a name="ln103">  // Do not form new call if we are in a middle of command.</a>
+<a name="ln104">  // It means that soon we should receive remaining data for this command and could wait.</a>
+<a name="ln105">  if (commands_in_batch_ &gt; 0 &amp;&amp; (end_of_batch_ == IoVecsFullSize(data) || read_buffer_full)) {</a>
+<a name="ln106">    rpc::CallData call_data(end_of_batch_ - begin_of_batch);</a>
+<a name="ln107">    IoVecsToBuffer(data, begin_of_batch, end_of_batch_, call_data.data());</a>
+<a name="ln108">    RETURN_NOT_OK(HandleInboundCall(connection, commands_in_batch_, &amp;call_data));</a>
+<a name="ln109">    begin_of_batch = end_of_batch_;</a>
+<a name="ln110">    commands_in_batch_ = 0;</a>
+<a name="ln111">  }</a>
+<a name="ln112">  parser.Consume(begin_of_batch);</a>
+<a name="ln113">  end_of_batch_ -= begin_of_batch;</a>
+<a name="ln114">  return rpc::ProcessDataResult{begin_of_batch, Slice()};</a>
+<a name="ln115">}</a>
+<a name="ln116"> </a>
+<a name="ln117">Status RedisConnectionContext::HandleInboundCall(const rpc::ConnectionPtr&amp; connection,</a>
+<a name="ln118">                                                 size_t commands_in_batch,</a>
+<a name="ln119">                                                 rpc::CallData* data) {</a>
+<a name="ln120">  auto reactor = connection-&gt;reactor();</a>
+<a name="ln121">  DCHECK(reactor-&gt;IsCurrentThread());</a>
+<a name="ln122"> </a>
+<a name="ln123">  auto call = rpc::InboundCall::Create&lt;RedisInboundCall&gt;(</a>
+<a name="ln124">      connection, data-&gt;size(), call_processed_listener());</a>
+<a name="ln125"> </a>
+<a name="ln126">  Status s = call-&gt;ParseFrom(call_mem_tracker_, commands_in_batch, data);</a>
+<a name="ln127">  if (!s.ok()) {</a>
+<a name="ln128">    return s;</a>
+<a name="ln129">  }</a>
+<a name="ln130"> </a>
+<a name="ln131">  Enqueue(std::move(call));</a>
+<a name="ln132"> </a>
+<a name="ln133">  return Status::OK();</a>
+<a name="ln134">}</a>
+<a name="ln135"> </a>
+<a name="ln136">Status RedisConnectionContext::ReportPendingWriteBytes(size_t pending_bytes) {</a>
+<a name="ln137">  static constexpr size_t kHardLimit = 32_MB;</a>
+<a name="ln138">  static constexpr size_t kSoftLimit = 8_MB;</a>
+<a name="ln139">  auto mode = ClientMode();</a>
+<a name="ln140">  DVLOG(3) &lt;&lt; &quot;Connection in mode &quot; &lt;&lt; ToString(mode) &lt;&lt; &quot; has &quot; &lt;&lt; pending_bytes</a>
+<a name="ln141">           &lt;&lt; &quot; bytes in the queue.&quot;;</a>
+<a name="ln142">  if (mode == RedisClientMode::kNormal) {</a>
+<a name="ln143">    return Status::OK();</a>
+<a name="ln144">  }</a>
+<a name="ln145"> </a>
+<a name="ln146">  // We use the same buffering logic for subscribers and monitoring clients.</a>
+<a name="ln147">  // Close a client if:</a>
+<a name="ln148">  // 1) it exceeds the hard limit of 32MB. or</a>
+<a name="ln149">  // 2) it has been over the soft limit of 8MB for longer than 1min.</a>
+<a name="ln150">  if (pending_bytes &gt; kHardLimit) {</a>
+<a name="ln151">    LOG(INFO) &lt;&lt; &quot;Connection in mode &quot; &lt;&lt; ToString(mode) &lt;&lt; &quot; has reached the HardLimit. &quot;</a>
+<a name="ln152">              &lt;&lt; pending_bytes &lt;&lt; &quot; bytes in the queue.&quot;;</a>
+<a name="ln153">    return STATUS(NetworkError, &quot;Slow Redis Client: HardLimit exceeded.&quot;);</a>
+<a name="ln154">  } else if (pending_bytes &gt; kSoftLimit) {</a>
+<a name="ln155">    auto now = CoarseMonoClock::Now();</a>
+<a name="ln156">    static const CoarseDuration kGracePeriod =</a>
+<a name="ln157">        std::chrono::seconds(FLAGS_redis_connection_soft_limit_grace_period_sec);</a>
+<a name="ln158">    if (soft_limit_exceeded_since_ == CoarseTimePoint::max()) {</a>
+<a name="ln159">      DVLOG(1) &lt;&lt; &quot;Connection in mode &quot; &lt;&lt; ToString(mode) &lt;&lt; &quot; has reached the Softlimit now. &quot;</a>
+<a name="ln160">               &lt;&lt; pending_bytes &lt;&lt; &quot; bytes in the queue.&quot;;</a>
+<a name="ln161">      soft_limit_exceeded_since_ = now;</a>
+<a name="ln162">    } else if (now &gt; soft_limit_exceeded_since_ + kGracePeriod) {</a>
+<a name="ln163">      LOG(INFO) &lt;&lt; &quot;Connection in mode &quot; &lt;&lt; ToString(mode) &lt;&lt; &quot; has reached the Softlimit &gt; &quot;</a>
+<a name="ln164">                &lt;&lt; yb::ToString(kGracePeriod) &lt;&lt; &quot; ago. &quot; &lt;&lt; pending_bytes</a>
+<a name="ln165">                &lt;&lt; &quot; bytes in the queue.&quot;;</a>
+<a name="ln166">      return STATUS(NetworkError, &quot;Slow Redis Client: Softlimit exceeded.&quot;);</a>
+<a name="ln167">    } else {</a>
+<a name="ln168">      DVLOG(1) &lt;&lt; &quot;Connection in mode &quot; &lt;&lt; ToString(mode)</a>
+<a name="ln169">               &lt;&lt; &quot; has reached the Softlimit less than  &quot; &lt;&lt; yb::ToString(kGracePeriod) &lt;&lt; &quot; ago. &quot;</a>
+<a name="ln170">               &lt;&lt; pending_bytes;</a>
+<a name="ln171">    }</a>
+<a name="ln172">  } else {</a>
+<a name="ln173">    if (soft_limit_exceeded_since_ != CoarseTimePoint::max()) {</a>
+<a name="ln174">      DVLOG(1) &lt;&lt; &quot;Connection in mode &quot; &lt;&lt; ToString(mode) &lt;&lt; &quot; has dropped below the Softlimit. &quot;</a>
+<a name="ln175">               &lt;&lt; pending_bytes &lt;&lt; &quot; bytes in the queue.&quot;;</a>
+<a name="ln176">      soft_limit_exceeded_since_ = CoarseTimePoint::max();</a>
+<a name="ln177">    }</a>
+<a name="ln178">  }</a>
+<a name="ln179">  return Status::OK();</a>
+<a name="ln180">}</a>
+<a name="ln181"> </a>
+<a name="ln182">void RedisConnectionContext::Shutdown(const Status&amp; status) {</a>
+<a name="ln183">  if (cleanup_hook_) {</a>
+<a name="ln184">    cleanup_hook_();</a>
+<a name="ln185">  }</a>
+<a name="ln186">  rpc::ConnectionContextWithQueue::Shutdown(status);</a>
+<a name="ln187">}</a>
+<a name="ln188"> </a>
+<a name="ln189">RedisInboundCall::RedisInboundCall(rpc::ConnectionPtr conn,</a>
+<a name="ln190">                                   size_t weight_in_bytes,</a>
+<a name="ln191">                                   CallProcessedListener call_processed_listener)</a>
+<a name="ln192">    : QueueableInboundCall(std::move(conn), weight_in_bytes, std::move(call_processed_listener)) {}</a>
+<a name="ln193"> </a>
+<a name="ln194">RedisInboundCall::~RedisInboundCall() {</a>
+<a name="ln195">  Status status;</a>
+<a name="ln196">  if (quit_.load(std::memory_order_acquire)) {</a>
+<a name="ln197">    rpc::ConnectionPtr conn = connection();</a>
+<a name="ln198">    rpc::Reactor* reactor = conn-&gt;reactor();</a>
+<a name="ln199">    auto scheduled = reactor-&gt;ScheduleReactorTask(</a>
+<a name="ln200">        MakeFunctorReactorTask(std::bind(&amp;rpc::Reactor::DestroyConnection,</a>
+<a name="ln201">                                         reactor,</a>
+<a name="ln202">                                         conn.get(),</a>
+<a name="ln203">                                         status),</a>
+<a name="ln204">                               conn, SOURCE_LOCATION()));</a>
+<a name="ln205">    LOG_IF(WARNING, !scheduled) &lt;&lt; &quot;Failed to schedule destroy&quot;;</a>
+<a name="ln206">  }</a>
+<a name="ln207">}</a>
+<a name="ln208"> </a>
+<a name="ln209">Status RedisInboundCall::ParseFrom(</a>
+<a name="ln210">    const MemTrackerPtr&amp; mem_tracker, size_t commands, rpc::CallData* data) {</a>
+<a name="ln211">  TRACE_EVENT_FLOW_BEGIN0(&quot;rpc&quot;, &quot;RedisInboundCall&quot;, this);</a>
+<a name="ln212">  TRACE_EVENT0(&quot;rpc&quot;, &quot;RedisInboundCall::ParseFrom&quot;);</a>
+<a name="ln213"> </a>
+<a name="ln214">  consumption_ = ScopedTrackedConsumption(mem_tracker, data-&gt;size());</a>
+<a name="ln215"> </a>
+<a name="ln216">  request_data_ = std::move(*data);</a>
+<a name="ln217">  serialized_request_ = Slice(request_data_.data(), request_data_.size());</a>
+<a name="ln218"> </a>
+<a name="ln219">  client_batch_.resize(commands);</a>
+<a name="ln220">  responses_.resize(commands);</a>
+<a name="ln221">  ready_.reserve(commands);</a>
+<a name="ln222">  for (size_t i = 0; i != commands; ++i) {</a>
+<a name="ln223">    ready_.emplace_back(0);</a>
+<a name="ln224">  }</a>
+<a name="ln225">  RedisParser parser(IoVecs(1, iovec{request_data_.data(), request_data_.size()}));</a>
+<a name="ln226">  size_t end_of_command = 0;</a>
+<a name="ln227">  for (size_t i = 0; i != commands; ++i) {</a>
+<a name="ln228">    parser.SetArgs(&amp;client_batch_[i]);</a>
+<a name="ln229">    end_of_command = VERIFY_RESULT(parser.NextCommand());</a>
+<a name="ln230">    DCHECK_NE(0, client_batch_[i].size());</a>
+<a name="ln231">    if (client_batch_[i].empty()) { // Should not be there.</a>
+<a name="ln232">      return STATUS(Corruption, &quot;Empty command&quot;);</a>
+<a name="ln233">    }</a>
+<a name="ln234">    if (!end_of_command) {</a>
+<a name="ln235">      break;</a>
+<a name="ln236">    }</a>
+<a name="ln237">  }</a>
+<a name="ln238">  if (end_of_command != request_data_.size()) {</a>
+<a name="ln239">    return STATUS_FORMAT(Corruption,</a>
+<a name="ln240">                         &quot;Parsed size $0 does not match source size $1&quot;,</a>
+<a name="ln241">                         end_of_command, request_data_.size());</a>
+<a name="ln242">  }</a>
+<a name="ln243"> </a>
+<a name="ln244">  parsed_.store(true, std::memory_order_release);</a>
+<a name="ln245">  return Status::OK();</a>
+<a name="ln246">}</a>
+<a name="ln247"> </a>
+<a name="ln248">const std::string&amp; RedisInboundCall::service_name() const {</a>
+<a name="ln249">  static std::string result = &quot;yb.redisserver.RedisServerService&quot;s;</a>
+<a name="ln250">  return result;</a>
+<a name="ln251">}</a>
+<a name="ln252"> </a>
+<a name="ln253">const std::string&amp; RedisInboundCall::method_name() const {</a>
+<a name="ln254">  static std::string result = &quot;anyMethod&quot;s;</a>
+<a name="ln255">  return result;</a>
+<a name="ln256">}</a>
+<a name="ln257"> </a>
+<a name="ln258">CoarseTimePoint RedisInboundCall::GetClientDeadline() const {</a>
+<a name="ln259">  return CoarseTimePoint::max();  // No timeout specified in the protocol for Redis.</a>
+<a name="ln260">}</a>
+<a name="ln261"> </a>
+<a name="ln262">void RedisInboundCall::GetCallDetails(rpc::RpcCallInProgressPB *call_in_progress_pb) const {</a>
+<a name="ln263">    rpc::RedisCallDetailsPB* redis_details = call_in_progress_pb-&gt;mutable_redis_details();</a>
+<a name="ln264">    for (const RedisClientCommand&amp; command : client_batch_) {</a>
+<a name="ln265">        string query;</a>
+<a name="ln266">        for (const Slice&amp; arg : command) {</a>
+<a name="ln267">            query += &quot; &quot; + arg.ToDebugString(FLAGS_rpcz_max_redis_query_dump_size);</a>
+<a name="ln268">        }</a>
+<a name="ln269">        redis_details-&gt;add_call_details()-&gt;set_redis_string(query);</a>
+<a name="ln270">    }</a>
+<a name="ln271">}</a>
+<a name="ln272"> </a>
+<a name="ln273">void RedisInboundCall::LogTrace() const {</a>
+<a name="ln274">  MonoTime now = MonoTime::Now();</a>
+<a name="ln275">  auto total_time = now.GetDeltaSince(timing_.time_received).ToMilliseconds();</a>
+<a name="ln276"> </a>
+<a name="ln277">  if (PREDICT_FALSE(FLAGS_rpc_dump_all_traces || total_time &gt; FLAGS_rpc_slow_query_threshold_ms)) {</a>
+<a name="ln278">    LOG(WARNING) &lt;&lt; ToString() &lt;&lt; &quot; took &quot; &lt;&lt; total_time &lt;&lt; &quot;ms. Details:&quot;;</a>
+<a name="ln279">    rpc::RpcCallInProgressPB call_in_progress_pb;</a>
+<a name="ln280">    GetCallDetails(&amp;call_in_progress_pb);</a>
+<a name="ln281">    LOG(WARNING) &lt;&lt; call_in_progress_pb.DebugString() &lt;&lt; &quot;Trace: &quot;;</a>
+<a name="ln282">    trace_-&gt;Dump(&amp;LOG(WARNING), /* include_time_deltas */ true);</a>
+<a name="ln283">  }</a>
+<a name="ln284">}</a>
+<a name="ln285"> </a>
+<a name="ln286">string RedisInboundCall::ToString() const {</a>
+<a name="ln287">  return Format(&quot;Redis Call from $0&quot;, connection()-&gt;remote());</a>
+<a name="ln288">}</a>
+<a name="ln289"> </a>
+<a name="ln290">bool RedisInboundCall::DumpPB(const rpc::DumpRunningRpcsRequestPB&amp; req,</a>
+<a name="ln291">                              rpc::RpcCallInProgressPB* resp) {</a>
+<a name="ln292">  if (req.include_traces() &amp;&amp; trace_) {</a>
+<a name="ln293">    resp-&gt;set_trace_buffer(trace_-&gt;DumpToString(true));</a>
+<a name="ln294">  }</a>
+<a name="ln295">  resp-&gt;set_elapsed_millis(MonoTime::Now().GetDeltaSince(timing_.time_received)</a>
+<a name="ln296">      .ToMilliseconds());</a>
+<a name="ln297"> </a>
+<a name="ln298">  if (!parsed_.load(std::memory_order_acquire)) {</a>
+<a name="ln299">    return true;</a>
+<a name="ln300">  }</a>
+<a name="ln301"> </a>
+<a name="ln302">  GetCallDetails(resp);</a>
+<a name="ln303">  return true;</a>
+<a name="ln304">}</a>
+<a name="ln305"> </a>
+<a name="ln306">template &lt;class Collection, class Out&gt;</a>
+<a name="ln307">Out DoSerializeResponses(const Collection&amp; responses, Out out) {</a>
+<a name="ln308">  // TODO(Amit): As and when we implement get/set and its h* equivalents, we would have to</a>
+<a name="ln309">  // handle arrays, hashes etc. For now, we only support the string response.</a>
+<a name="ln310"> </a>
+<a name="ln311">  for (const auto&amp; redis_response : responses) {</a>
+<a name="ln312">    string error_message = redis_response.error_message();</a>
+<a name="ln313">    if (error_message == &quot;&quot;) {</a>
+<a name="ln314">      error_message = &quot;Unknown error&quot;;</a>
+<a name="ln315">    }</a>
+<a name="ln316">    // Several types of error cases:</a>
+<a name="ln317">    //    1) Parsing error: The command is malformed (eg. too few arguments &quot;SET a&quot;)</a>
+<a name="ln318">    //    2) Server error: Request to server failed due to reasons not related to the command</a>
+<a name="ln319">    //    3) Execution error: The command ran into problem during execution (eg. WrongType errors,</a>
+<a name="ln320">    //       HSET on a key that isn't a hash).</a>
+<a name="ln321"> </a>
+<a name="ln322">    if (redis_response.code() == RedisResponsePB_RedisStatusCode_PARSING_ERROR) {</a>
+<a name="ln323">      out = SerializeError(error_message, out);</a>
+<a name="ln324">    } else if (redis_response.code() == RedisResponsePB_RedisStatusCode_SERVER_ERROR) {</a>
+<a name="ln325">      out = SerializeError(error_message, out);</a>
+<a name="ln326">    } else if (redis_response.code() == RedisResponsePB_RedisStatusCode_NIL) {</a>
+<a name="ln327">      out = SerializeEncoded(kNilResponse, out);</a>
+<a name="ln328">    } else if (redis_response.code() != RedisResponsePB_RedisStatusCode_OK) {</a>
+<a name="ln329">      out = SerializeError(error_message, out);</a>
+<a name="ln330">    } else if (redis_response.has_string_response()) {</a>
+<a name="ln331">      out = SerializeBulkString(redis_response.string_response(), out);</a>
+<a name="ln332">    } else if (redis_response.has_status_response()) {</a>
+<a name="ln333">      out = SerializeSimpleString(redis_response.status_response(), out);</a>
+<a name="ln334">    } else if (redis_response.has_int_response()) {</a>
+<a name="ln335">      out = SerializeInteger(redis_response.int_response(), out);</a>
+<a name="ln336">    } else if (redis_response.has_array_response()) {</a>
+<a name="ln337">      if (redis_response.array_response().has_encoded() &amp;&amp;</a>
+<a name="ln338">          redis_response.array_response().encoded()) {</a>
+<a name="ln339">        out = SerializeEncodedArray(redis_response.array_response().elements(), out);</a>
+<a name="ln340">      } else {</a>
+<a name="ln341">        out = SerializeArray(redis_response.array_response().elements(), out);</a>
+<a name="ln342">      }</a>
+<a name="ln343">    } else if (redis_response.has_encoded_response()) {</a>
+<a name="ln344">      out = SerializeEncoded(redis_response.encoded_response(), out);</a>
+<a name="ln345">    } else {</a>
+<a name="ln346">      out = SerializeEncoded(kOkResponse, out);</a>
+<a name="ln347">    }</a>
+<a name="ln348">  }</a>
+<a name="ln349">  return out;</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352">template &lt;class Collection&gt;</a>
+<a name="ln353">RefCntBuffer SerializeResponses(const Collection&amp; responses) {</a>
+<a name="ln354">  constexpr size_t kZero = 0;</a>
+<a name="ln355">  size_t size = DoSerializeResponses(responses, kZero);</a>
+<a name="ln356">  RefCntBuffer result(size);</a>
+<a name="ln357">  uint8_t* end = DoSerializeResponses(responses, result.udata());</a>
+<a name="ln358">  DCHECK_EQ(result.uend(), end);</a>
+<a name="ln359">  return result;</a>
+<a name="ln360">}</a>
+<a name="ln361"> </a>
+<a name="ln362">void RedisInboundCall::Serialize(boost::container::small_vector_base&lt;RefCntBuffer&gt;* output) {</a>
+<a name="ln363">  output-&gt;push_back(SerializeResponses(responses_));</a>
+<a name="ln364">}</a>
+<a name="ln365"> </a>
+<a name="ln366">RedisConnectionContext&amp; RedisInboundCall::connection_context() const {</a>
+<a name="ln367">  return static_cast&lt;RedisConnectionContext&amp;&gt;(connection()-&gt;context());</a>
+<a name="ln368">}</a>
+<a name="ln369"> </a>
+<a name="ln370">void RedisInboundCall::RespondFailure(rpc::ErrorStatusPB::RpcErrorCodePB error_code,</a>
+<a name="ln371">                                      const Status&amp; status) {</a>
+<a name="ln372">  for (size_t i = 0; i != client_batch_.size(); ++i) {</a>
+<a name="ln373">    RespondFailure(i, status);</a>
+<a name="ln374">  }</a>
+<a name="ln375">}</a>
+<a name="ln376"> </a>
+<a name="ln377">// We wait until all responses are ready for batch embedded in this call.</a>
+<a name="ln378">void RedisInboundCall::Respond(size_t idx, bool is_success, RedisResponsePB* resp) {</a>
+<a name="ln379">  // Did we set response for command at this index already?</a>
+<a name="ln380">  VLOG(2) &lt;&lt; &quot;Responding to '&quot; &lt;&lt; client_batch_[idx][0] &lt;&lt; &quot;' with &quot; &lt;&lt; resp-&gt;ShortDebugString();</a>
+<a name="ln381">  if (ready_[idx].fetch_add(1, std::memory_order_relaxed) == 0) {</a>
+<a name="ln382">    if (!is_success) {</a>
+<a name="ln383">      had_failures_.store(true, std::memory_order_release);</a>
+<a name="ln384">    }</a>
+<a name="ln385">    responses_[idx].Swap(resp);</a>
+<a name="ln386">    // Did we get all responses and ready to send data.</a>
+<a name="ln387">    size_t responded = ready_count_.fetch_add(1, std::memory_order_release) + 1;</a>
+<a name="ln388">    if (responded == client_batch_.size()) {</a>
+<a name="ln389">      RecordHandlingCompleted(/* handler_run_time */ nullptr);</a>
+<a name="ln390">      QueueResponse(!had_failures_.load(std::memory_order_acquire));</a>
+<a name="ln391">    }</a>
+<a name="ln392">  }</a>
+<a name="ln393">}</a>
+<a name="ln394"> </a>
+<a name="ln395">void RedisInboundCall::RespondSuccess(size_t idx,</a>
+<a name="ln396">                                      const rpc::RpcMethodMetrics&amp; metrics,</a>
+<a name="ln397">                                      RedisResponsePB* resp) {</a>
+<a name="ln398">  Respond(idx, true, resp);</a>
+<a name="ln399">  metrics.handler_latency-&gt;Increment((MonoTime::Now() - timing_.time_handled).ToMicroseconds());</a>
+<a name="ln400">}</a>
+<a name="ln401"> </a>
+<a name="ln402">void RedisInboundCall::RespondFailure(size_t idx, const Status&amp; status) {</a>
+<a name="ln403">  RedisResponsePB resp;</a>
+<a name="ln404">  Slice message = status.message();</a>
+<a name="ln405">  resp.set_code(RedisResponsePB_RedisStatusCode_PARSING_ERROR);</a>
+<a name="ln406">  resp.set_error_message(message.data(), message.size());</a>
+<a name="ln407">  Respond(idx, false, &amp;resp);</a>
+<a name="ln408">}</a>
+<a name="ln409"> </a>
+<a name="ln410">} // namespace redisserver</a>
+<a name="ln411">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="121"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="140"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="159"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="168"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="174"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="205"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="380"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

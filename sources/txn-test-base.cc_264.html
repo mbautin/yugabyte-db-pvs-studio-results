@@ -1,0 +1,402 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>txn-test-base.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/client/txn-test-base.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/client/session.h&quot;</a>
+<a name="ln19">#include &quot;yb/client/transaction.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln22">#include &quot;yb/consensus/consensus.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;yb/tserver/mini_tablet_server.h&quot;</a>
+<a name="ln25">#include &quot;yb/tserver/tablet_server.h&quot;</a>
+<a name="ln26">#include &quot;yb/tserver/ts_tablet_manager.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/yql/cql/ql/util/statement_result.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">using namespace std::literals;</a>
+<a name="ln31"> </a>
+<a name="ln32">DECLARE_double(transaction_max_missed_heartbeat_periods);</a>
+<a name="ln33">DECLARE_uint64(transaction_status_tablet_log_segment_size_bytes);</a>
+<a name="ln34">DECLARE_int32(log_min_seconds_to_retain);</a>
+<a name="ln35">DECLARE_bool(transaction_disable_heartbeat_in_tests);</a>
+<a name="ln36">DECLARE_double(TEST_transaction_ignore_applying_probability_in_tests);</a>
+<a name="ln37">DECLARE_string(time_source);</a>
+<a name="ln38">DECLARE_int32(intents_flush_max_delay_ms);</a>
+<a name="ln39">DECLARE_int32(load_balancer_max_concurrent_adds);</a>
+<a name="ln40">DECLARE_bool(TEST_combine_batcher_errors);</a>
+<a name="ln41"> </a>
+<a name="ln42">namespace yb {</a>
+<a name="ln43">namespace client {</a>
+<a name="ln44"> </a>
+<a name="ln45">const MonoDelta kTransactionApplyTime = 6s * kTimeMultiplier;</a>
+<a name="ln46">const MonoDelta kIntentsCleanupTime = 6s * kTimeMultiplier;</a>
+<a name="ln47"> </a>
+<a name="ln48">// We use different sign to distinguish inserted and updated values for testing.</a>
+<a name="ln49">int32_t GetMultiplier(const WriteOpType op_type) {</a>
+<a name="ln50">  switch (op_type) {</a>
+<a name="ln51">    case WriteOpType::INSERT:</a>
+<a name="ln52">      return 1;</a>
+<a name="ln53">    case WriteOpType::UPDATE:</a>
+<a name="ln54">      return -1;</a>
+<a name="ln55">    case WriteOpType::DELETE:</a>
+<a name="ln56">      return 0; // Value is not used in delete path.</a>
+<a name="ln57">  }</a>
+<a name="ln58">  FATAL_INVALID_ENUM_VALUE(WriteOpType, op_type);</a>
+<a name="ln59">}</a>
+<a name="ln60"> </a>
+<a name="ln61">int32_t KeyForTransactionAndIndex(size_t transaction, size_t index) {</a>
+<a name="ln62">  return static_cast&lt;int32_t&gt;(transaction * 10 + index);</a>
+<a name="ln63">}</a>
+<a name="ln64"> </a>
+<a name="ln65">int32_t ValueForTransactionAndIndex(size_t transaction, size_t index, const WriteOpType op_type) {</a>
+<a name="ln66">  return static_cast&lt;int32_t&gt;(transaction * 10 + index + 2) * GetMultiplier(op_type);</a>
+<a name="ln67">}</a>
+<a name="ln68"> </a>
+<a name="ln69">void SetIgnoreApplyingProbability(double value) {</a>
+<a name="ln70">  SetAtomicFlag(value, &amp;FLAGS_TEST_transaction_ignore_applying_probability_in_tests);</a>
+<a name="ln71">}</a>
+<a name="ln72"> </a>
+<a name="ln73">void SetDisableHeartbeatInTests(bool value) {</a>
+<a name="ln74">  SetAtomicFlag(value, &amp;FLAGS_transaction_disable_heartbeat_in_tests);</a>
+<a name="ln75">}</a>
+<a name="ln76"> </a>
+<a name="ln77">void DisableApplyingIntents() {</a>
+<a name="ln78">  SetIgnoreApplyingProbability(1.0);</a>
+<a name="ln79">}</a>
+<a name="ln80"> </a>
+<a name="ln81">void CommitAndResetSync(YBTransactionPtr *txn) {</a>
+<a name="ln82">  CountDownLatch latch(1);</a>
+<a name="ln83">  (*txn)-&gt;Commit(TransactionRpcDeadline(), [&amp;latch](const Status&amp; status) {</a>
+<a name="ln84">    ASSERT_OK(status);</a>
+<a name="ln85">    latch.CountDown(1);</a>
+<a name="ln86">  });</a>
+<a name="ln87">  txn-&gt;reset();</a>
+<a name="ln88">  latch.Wait();</a>
+<a name="ln89">}</a>
+<a name="ln90"> </a>
+<a name="ln91">void DisableTransactionTimeout() {</a>
+<a name="ln92">  SetAtomicFlag(std::numeric_limits&lt;double&gt;::max(),</a>
+<a name="ln93">                &amp;FLAGS_transaction_max_missed_heartbeat_periods);</a>
+<a name="ln94">}</a>
+<a name="ln95"> </a>
+<a name="ln96">void TransactionTestBase::SetUp() {</a>
+<a name="ln97">  FLAGS_TEST_combine_batcher_errors = true;</a>
+<a name="ln98">  FLAGS_transaction_status_tablet_log_segment_size_bytes = log_segment_size_bytes();</a>
+<a name="ln99">  FLAGS_log_min_seconds_to_retain = 5;</a>
+<a name="ln100">  FLAGS_intents_flush_max_delay_ms = 250;</a>
+<a name="ln101"> </a>
+<a name="ln102">  server::SkewedClock::Register();</a>
+<a name="ln103">  FLAGS_time_source = server::SkewedClock::kName;</a>
+<a name="ln104">  FLAGS_load_balancer_max_concurrent_adds = 100;</a>
+<a name="ln105">  ASSERT_NO_FATALS(KeyValueTableTest::SetUp());</a>
+<a name="ln106"> </a>
+<a name="ln107">  if (create_table_) {</a>
+<a name="ln108">    CreateTable();</a>
+<a name="ln109">  }</a>
+<a name="ln110"> </a>
+<a name="ln111">  HybridTime::TEST_SetPrettyToString(true);</a>
+<a name="ln112"> </a>
+<a name="ln113">  ASSERT_OK(clock_-&gt;Init());</a>
+<a name="ln114">  transaction_manager_.emplace(client_.get(), clock_, client::LocalTabletFilter());</a>
+<a name="ln115"> </a>
+<a name="ln116">  server::ClockPtr clock2(new server::HybridClock(skewed_clock_));</a>
+<a name="ln117">  ASSERT_OK(clock2-&gt;Init());</a>
+<a name="ln118">  transaction_manager2_.emplace(client_.get(), clock2, client::LocalTabletFilter());</a>
+<a name="ln119">}</a>
+<a name="ln120"> </a>
+<a name="ln121">void TransactionTestBase::CreateTable() {</a>
+<a name="ln122">  KeyValueTableTest::CreateTable(</a>
+<a name="ln123">      Transactional(GetIsolationLevel() != IsolationLevel::NON_TRANSACTIONAL));</a>
+<a name="ln124">}</a>
+<a name="ln125"> </a>
+<a name="ln126">uint64_t TransactionTestBase::log_segment_size_bytes() const {</a>
+<a name="ln127">  return 128;</a>
+<a name="ln128">}</a>
+<a name="ln129"> </a>
+<a name="ln130">Status TransactionTestBase::WriteRows(</a>
+<a name="ln131">    const YBSessionPtr&amp; session, size_t transaction, const WriteOpType op_type, Flush flush) {</a>
+<a name="ln132">  for (size_t r = 0; r != kNumRows; ++r) {</a>
+<a name="ln133">    RETURN_NOT_OK(WriteRow(</a>
+<a name="ln134">        session,</a>
+<a name="ln135">        KeyForTransactionAndIndex(transaction, r),</a>
+<a name="ln136">        ValueForTransactionAndIndex(transaction, r, op_type),</a>
+<a name="ln137">        op_type,</a>
+<a name="ln138">        flush));</a>
+<a name="ln139">  }</a>
+<a name="ln140">  return Status::OK();</a>
+<a name="ln141">}</a>
+<a name="ln142"> </a>
+<a name="ln143">void TransactionTestBase::VerifyRow(</a>
+<a name="ln144">    int line, const YBSessionPtr&amp; session, int32_t key, int32_t value,</a>
+<a name="ln145">    const std::string&amp; column) {</a>
+<a name="ln146">  VLOG(4) &lt;&lt; &quot;Calling SelectRow&quot;;</a>
+<a name="ln147">  auto row = SelectRow(session, key, column);</a>
+<a name="ln148">  ASSERT_TRUE(row.ok()) &lt;&lt; &quot;Bad status: &quot; &lt;&lt; row &lt;&lt; &quot;, originator: &quot; &lt;&lt; __FILE__ &lt;&lt; &quot;:&quot; &lt;&lt; line;</a>
+<a name="ln149">  VLOG(4) &lt;&lt; &quot;SelectRow returned: &quot; &lt;&lt; *row;</a>
+<a name="ln150">  ASSERT_EQ(value, *row) &lt;&lt; &quot;Originator: &quot; &lt;&lt; __FILE__ &lt;&lt; &quot;:&quot; &lt;&lt; line;</a>
+<a name="ln151">}</a>
+<a name="ln152"> </a>
+<a name="ln153">void TransactionTestBase::WriteData(const WriteOpType op_type, size_t transaction) {</a>
+<a name="ln154">  auto txn = CreateTransaction();</a>
+<a name="ln155">  ASSERT_OK(WriteRows(CreateSession(txn), transaction, op_type));</a>
+<a name="ln156">  ASSERT_OK(txn-&gt;CommitFuture().get());</a>
+<a name="ln157">  LOG(INFO) &lt;&lt; &quot;Committed: &quot; &lt;&lt; txn-&gt;id();</a>
+<a name="ln158">}</a>
+<a name="ln159"> </a>
+<a name="ln160">void TransactionTestBase::WriteDataWithRepetition() {</a>
+<a name="ln161">  auto txn = CreateTransaction();</a>
+<a name="ln162">  auto session = CreateSession(txn);</a>
+<a name="ln163">  for (size_t r = 0; r != kNumRows; ++r) {</a>
+<a name="ln164">    for (int j = 10; j--;) {</a>
+<a name="ln165">      ASSERT_OK(WriteRow(</a>
+<a name="ln166">          session,</a>
+<a name="ln167">          KeyForTransactionAndIndex(0, r),</a>
+<a name="ln168">          ValueForTransactionAndIndex(0, r, WriteOpType::INSERT) + j));</a>
+<a name="ln169">    }</a>
+<a name="ln170">  }</a>
+<a name="ln171">  ASSERT_OK(txn-&gt;CommitFuture().get());</a>
+<a name="ln172">}</a>
+<a name="ln173"> </a>
+<a name="ln174">namespace {</a>
+<a name="ln175"> </a>
+<a name="ln176">YBTransactionPtr CreateTransactionHelper(</a>
+<a name="ln177">    TransactionManager* transaction_manager,</a>
+<a name="ln178">    SetReadTime set_read_time,</a>
+<a name="ln179">    IsolationLevel isolation_level) {</a>
+<a name="ln180">  if (isolation_level == IsolationLevel::NON_TRANSACTIONAL) {</a>
+<a name="ln181">    return nullptr;</a>
+<a name="ln182">  }</a>
+<a name="ln183">  auto result = std::make_shared&lt;YBTransaction&gt;(transaction_manager);</a>
+<a name="ln184">  ReadHybridTime read_time;</a>
+<a name="ln185">  if (set_read_time) {</a>
+<a name="ln186">    read_time = ReadHybridTime::FromHybridTimeRange(transaction_manager-&gt;clock()-&gt;NowRange());</a>
+<a name="ln187">  }</a>
+<a name="ln188">  EXPECT_OK(result-&gt;Init(isolation_level, read_time));</a>
+<a name="ln189">  return result;</a>
+<a name="ln190">}</a>
+<a name="ln191"> </a>
+<a name="ln192">}  // anonymous namespace</a>
+<a name="ln193"> </a>
+<a name="ln194">YBTransactionPtr TransactionTestBase::CreateTransaction(SetReadTime set_read_time) {</a>
+<a name="ln195">  return CreateTransactionHelper(</a>
+<a name="ln196">      transaction_manager_.get_ptr(), set_read_time, GetIsolationLevel());</a>
+<a name="ln197">}</a>
+<a name="ln198"> </a>
+<a name="ln199">YBTransactionPtr TransactionTestBase::CreateTransaction2(SetReadTime set_read_time) {</a>
+<a name="ln200">  return CreateTransactionHelper(</a>
+<a name="ln201">      transaction_manager2_.get_ptr(), set_read_time, GetIsolationLevel());</a>
+<a name="ln202">}</a>
+<a name="ln203"> </a>
+<a name="ln204">void TransactionTestBase::VerifyRows(</a>
+<a name="ln205">    const YBSessionPtr&amp; session, size_t transaction, const WriteOpType op_type,</a>
+<a name="ln206">    const std::string&amp; column) {</a>
+<a name="ln207">  std::vector&lt;client::YBqlReadOpPtr&gt; ops;</a>
+<a name="ln208">  for (size_t r = 0; r != kNumRows; ++r) {</a>
+<a name="ln209">    ops.push_back(ReadRow(session, KeyForTransactionAndIndex(transaction, r), column));</a>
+<a name="ln210">  }</a>
+<a name="ln211">  ASSERT_OK(session-&gt;Flush());</a>
+<a name="ln212">  for (size_t r = 0; r != kNumRows; ++r) {</a>
+<a name="ln213">    SCOPED_TRACE(Format(&quot;Row: $0, key: $1&quot;, r, KeyForTransactionAndIndex(transaction, r)));</a>
+<a name="ln214">    auto&amp; op = ops[r];</a>
+<a name="ln215">    ASSERT_EQ(op-&gt;response().status(), QLResponsePB::YQL_STATUS_OK)</a>
+<a name="ln216">        &lt;&lt; QLResponsePB_QLStatus_Name(op-&gt;response().status());</a>
+<a name="ln217">    auto rowblock = yb::ql::RowsResult(op.get()).GetRowBlock();</a>
+<a name="ln218">    ASSERT_EQ(rowblock-&gt;row_count(), 1);</a>
+<a name="ln219">    const auto&amp; first_column = rowblock-&gt;row(0).column(0);</a>
+<a name="ln220">    ASSERT_EQ(InternalType::kInt32Value, first_column.type());</a>
+<a name="ln221">    ASSERT_EQ(first_column.int32_value(), ValueForTransactionAndIndex(transaction, r, op_type));</a>
+<a name="ln222">  }</a>
+<a name="ln223">}</a>
+<a name="ln224"> </a>
+<a name="ln225">YBqlReadOpPtr TransactionTestBase::ReadRow(</a>
+<a name="ln226">    const YBSessionPtr&amp; session, int32_t key, const std::string&amp; column) {</a>
+<a name="ln227">  auto op = table_.NewReadOp();</a>
+<a name="ln228">  auto* const req = op-&gt;mutable_request();</a>
+<a name="ln229">  QLAddInt32HashValue(req, key);</a>
+<a name="ln230">  table_.AddColumns({column}, req);</a>
+<a name="ln231">  EXPECT_OK(session-&gt;Apply(op));</a>
+<a name="ln232">  return op;</a>
+<a name="ln233">}</a>
+<a name="ln234"> </a>
+<a name="ln235">void TransactionTestBase::VerifyData(</a>
+<a name="ln236">    size_t num_transactions, const WriteOpType op_type, const std::string&amp; column) {</a>
+<a name="ln237">  VLOG(4) &lt;&lt; &quot;Verifying data...&quot; &lt;&lt; std::endl;</a>
+<a name="ln238">  auto session = CreateSession();</a>
+<a name="ln239">  for (size_t i = 0; i != num_transactions; ++i) {</a>
+<a name="ln240">    VerifyRows(session, i, op_type, column);</a>
+<a name="ln241">  }</a>
+<a name="ln242">}</a>
+<a name="ln243"> </a>
+<a name="ln244">bool TransactionTestBase::HasTransactions() {</a>
+<a name="ln245">  for (int i = 0; i != cluster_-&gt;num_tablet_servers(); ++i) {</a>
+<a name="ln246">    auto* tablet_manager = cluster_-&gt;mini_tablet_server(i)-&gt;server()-&gt;tablet_manager();</a>
+<a name="ln247">    auto peers = tablet_manager-&gt;GetTabletPeers();</a>
+<a name="ln248">    for (const auto&amp; peer : peers) {</a>
+<a name="ln249">      if (!peer-&gt;consensus()) {</a>
+<a name="ln250">        return true; // Report true, since we could have transactions on this non ready peer.</a>
+<a name="ln251">      }</a>
+<a name="ln252">      if (peer-&gt;consensus()-&gt;GetLeaderStatus() !=</a>
+<a name="ln253">              consensus::LeaderStatus::NOT_LEADER &amp;&amp;</a>
+<a name="ln254">          peer-&gt;tablet()-&gt;transaction_coordinator() &amp;&amp;</a>
+<a name="ln255">          peer-&gt;tablet()-&gt;transaction_coordinator()-&gt;test_count_transactions()) {</a>
+<a name="ln256">        return true;</a>
+<a name="ln257">      }</a>
+<a name="ln258">    }</a>
+<a name="ln259">  }</a>
+<a name="ln260">  return false;</a>
+<a name="ln261">}</a>
+<a name="ln262"> </a>
+<a name="ln263">size_t TransactionTestBase::CountRunningTransactions() {</a>
+<a name="ln264">  size_t result = 0;</a>
+<a name="ln265">  auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kAll);</a>
+<a name="ln266">  for (const auto &amp;peer : peers) {</a>
+<a name="ln267">    auto participant = peer-&gt;tablet()-&gt;transaction_participant();</a>
+<a name="ln268">    result += participant ? participant-&gt;TEST_GetNumRunningTransactions() : 0;</a>
+<a name="ln269">  }</a>
+<a name="ln270">  return result;</a>
+<a name="ln271">}</a>
+<a name="ln272"> </a>
+<a name="ln273">void TransactionTestBase::CheckNoRunningTransactions() {</a>
+<a name="ln274">  MonoTime deadline = MonoTime::Now() + 7s * kTimeMultiplier;</a>
+<a name="ln275">  bool has_bad = false;</a>
+<a name="ln276">  for (int i = 0; i != cluster_-&gt;num_tablet_servers(); ++i) {</a>
+<a name="ln277">    auto server = cluster_-&gt;mini_tablet_server(i)-&gt;server();</a>
+<a name="ln278">    std::vector&lt;std::shared_ptr&lt;tablet::TabletPeer&gt;&gt; tablets;</a>
+<a name="ln279">    auto status = Wait([server, &amp;tablets] {</a>
+<a name="ln280">      tablets.clear();</a>
+<a name="ln281">      server-&gt;tablet_manager()-&gt;GetTabletPeers(&amp;tablets);</a>
+<a name="ln282">      for (const auto&amp; peer : tablets) {</a>
+<a name="ln283">        if (peer-&gt;tablet() == nullptr) {</a>
+<a name="ln284">          return false;</a>
+<a name="ln285">        }</a>
+<a name="ln286">      }</a>
+<a name="ln287">      return true;</a>
+<a name="ln288">    }, deadline, &quot;Wait until all peers have tablets&quot;);</a>
+<a name="ln289">    if (!status.ok()) {</a>
+<a name="ln290">      has_bad = true;</a>
+<a name="ln291">      for (const auto&amp; peer : tablets) {</a>
+<a name="ln292">        if (peer-&gt;tablet() == nullptr) {</a>
+<a name="ln293">          LOG(ERROR) &lt;&lt; Format(</a>
+<a name="ln294">              &quot;T $1 P $0: Tablet object is not created&quot;,</a>
+<a name="ln295">              server-&gt;permanent_uuid(), peer-&gt;tablet_id());</a>
+<a name="ln296">        }</a>
+<a name="ln297">      }</a>
+<a name="ln298">      continue;</a>
+<a name="ln299">    }</a>
+<a name="ln300">    for (const auto&amp; peer : tablets) {</a>
+<a name="ln301">      auto participant = peer-&gt;tablet()-&gt;transaction_participant();</a>
+<a name="ln302">      if (participant) {</a>
+<a name="ln303">        auto status = Wait([participant] {</a>
+<a name="ln304">              return participant-&gt;TEST_GetNumRunningTransactions() == 0;</a>
+<a name="ln305">            },</a>
+<a name="ln306">            deadline,</a>
+<a name="ln307">            &quot;Wait until no transactions are running&quot;);</a>
+<a name="ln308">        if (!status.ok()) {</a>
+<a name="ln309">          LOG(ERROR) &lt;&lt; Format(</a>
+<a name="ln310">              &quot;T $1 P $0: Transactions: $2&quot;,</a>
+<a name="ln311">              server-&gt;permanent_uuid(), peer-&gt;tablet_id(),</a>
+<a name="ln312">              participant-&gt;TEST_GetNumRunningTransactions());</a>
+<a name="ln313">          has_bad = true;</a>
+<a name="ln314">        }</a>
+<a name="ln315">      }</a>
+<a name="ln316">    }</a>
+<a name="ln317">  }</a>
+<a name="ln318">  ASSERT_EQ(false, has_bad);</a>
+<a name="ln319">}</a>
+<a name="ln320"> </a>
+<a name="ln321">bool TransactionTestBase::CheckAllTabletsRunning() {</a>
+<a name="ln322">  bool result = true;</a>
+<a name="ln323">  size_t count = 0;</a>
+<a name="ln324">  for (int i = 0; i != cluster_-&gt;num_tablet_servers(); ++i) {</a>
+<a name="ln325">    auto peers = cluster_-&gt;mini_tablet_server(i)-&gt;server()-&gt;tablet_manager()-&gt;GetTabletPeers();</a>
+<a name="ln326">    if (i == 0) {</a>
+<a name="ln327">      count = peers.size();</a>
+<a name="ln328">    } else if (count != peers.size()) {</a>
+<a name="ln329">      LOG(WARNING) &lt;&lt; &quot;Different number of tablets in tservers: &quot;</a>
+<a name="ln330">                   &lt;&lt; count &lt;&lt; &quot; vs &quot; &lt;&lt; peers.size() &lt;&lt; &quot; at &quot; &lt;&lt; i;</a>
+<a name="ln331">      result = false;</a>
+<a name="ln332">    }</a>
+<a name="ln333">    for (const auto&amp; peer : peers) {</a>
+<a name="ln334">      auto status = peer-&gt;CheckRunning();</a>
+<a name="ln335">      if (!status.ok()) {</a>
+<a name="ln336">        LOG(WARNING) &lt;&lt; Format(&quot;T $0 P $1 is not running: $2&quot;, peer-&gt;tablet_id(),</a>
+<a name="ln337">                               peer-&gt;permanent_uuid(), status);</a>
+<a name="ln338">        result = false;</a>
+<a name="ln339">      }</a>
+<a name="ln340">    }</a>
+<a name="ln341">  }</a>
+<a name="ln342">  return result;</a>
+<a name="ln343">}</a>
+<a name="ln344"> </a>
+<a name="ln345">IsolationLevel TransactionTestBase::GetIsolationLevel() {</a>
+<a name="ln346">  return isolation_level_;</a>
+<a name="ln347">}</a>
+<a name="ln348"> </a>
+<a name="ln349">void TransactionTestBase::SetIsolationLevel(IsolationLevel isolation_level) {</a>
+<a name="ln350">  isolation_level_ = isolation_level;</a>
+<a name="ln351">}</a>
+<a name="ln352"> </a>
+<a name="ln353">} // namespace client</a>
+<a name="ln354">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="146"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="149"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="237"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

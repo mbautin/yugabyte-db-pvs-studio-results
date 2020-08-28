@@ -1,0 +1,633 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>retryable_requests.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/consensus/retryable_requests.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;boost/multi_index_container.hpp&gt;</a>
+<a name="ln17">#include &lt;boost/multi_index/member.hpp&gt;</a>
+<a name="ln18">#include &lt;boost/multi_index/hashed_index.hpp&gt;</a>
+<a name="ln19">#include &lt;boost/multi_index/ordered_index.hpp&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln22">#include &quot;yb/consensus/consensus.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;yb/util/atomic.h&quot;</a>
+<a name="ln25">#include &quot;yb/util/metrics.h&quot;</a>
+<a name="ln26">#include &quot;yb/util/opid.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">DEFINE_int32(retryable_request_timeout_secs, 120,</a>
+<a name="ln29">             &quot;Amount of time to keep write request in index, to prevent duplicate writes.&quot;);</a>
+<a name="ln30"> </a>
+<a name="ln31">// We use this limit to prevent request range from infinite grow, because it will block log</a>
+<a name="ln32">// cleanup. I.e. even we have continous request range, it will be split by blocks, that could be</a>
+<a name="ln33">// dropped independently.</a>
+<a name="ln34">DEFINE_int32(retryable_request_range_time_limit_secs, 30,</a>
+<a name="ln35">             &quot;Max delta in time for single op id range.&quot;);</a>
+<a name="ln36"> </a>
+<a name="ln37">METRIC_DEFINE_gauge_int64(tablet, running_retryable_requests,</a>
+<a name="ln38">                          &quot;Number of running retryable requests.&quot;,</a>
+<a name="ln39">                          yb::MetricUnit::kRequests,</a>
+<a name="ln40">                          &quot;Number of running retryable requests.&quot;);</a>
+<a name="ln41"> </a>
+<a name="ln42">METRIC_DEFINE_gauge_int64(tablet, replicated_retryable_request_ranges,</a>
+<a name="ln43">                          &quot;Number of replicated retryable request ranges.&quot;,</a>
+<a name="ln44">                          yb::MetricUnit::kRequests,</a>
+<a name="ln45">                          &quot;Number of replicated retryable request ranges.&quot;);</a>
+<a name="ln46"> </a>
+<a name="ln47">namespace yb {</a>
+<a name="ln48">namespace consensus {</a>
+<a name="ln49"> </a>
+<a name="ln50">namespace {</a>
+<a name="ln51"> </a>
+<a name="ln52">struct RunningRetryableRequest {</a>
+<a name="ln53">  RetryableRequestId request_id;</a>
+<a name="ln54">  yb::OpId op_id;</a>
+<a name="ln55">  RestartSafeCoarseTimePoint time;</a>
+<a name="ln56">  mutable std::vector&lt;ConsensusRoundPtr&gt; duplicate_rounds;</a>
+<a name="ln57"> </a>
+<a name="ln58">  RunningRetryableRequest(</a>
+<a name="ln59">      RetryableRequestId request_id_, const OpIdPB&amp; op_id_, RestartSafeCoarseTimePoint time_)</a>
+<a name="ln60">      : request_id(request_id_), op_id(yb::OpId::FromPB(op_id_)), time(time_) {}</a>
+<a name="ln61"> </a>
+<a name="ln62">  std::string ToString() const {</a>
+<a name="ln63">    return Format(&quot;{ request_id: $0 op_id $1 time: $2 }&quot;, request_id, op_id, time);</a>
+<a name="ln64">  }</a>
+<a name="ln65">};</a>
+<a name="ln66"> </a>
+<a name="ln67">struct ReplicatedRetryableRequestRange {</a>
+<a name="ln68">  mutable RetryableRequestId first_id;</a>
+<a name="ln69">  RetryableRequestId last_id;</a>
+<a name="ln70">  yb::OpId min_op_id;</a>
+<a name="ln71">  mutable RestartSafeCoarseTimePoint min_time;</a>
+<a name="ln72">  mutable RestartSafeCoarseTimePoint max_time;</a>
+<a name="ln73"> </a>
+<a name="ln74">  ReplicatedRetryableRequestRange(RetryableRequestId id, const yb::OpId&amp; op_id,</a>
+<a name="ln75">                              RestartSafeCoarseTimePoint time)</a>
+<a name="ln76">      : first_id(id), last_id(id), min_op_id(op_id), min_time(time),</a>
+<a name="ln77">        max_time(time) {}</a>
+<a name="ln78"> </a>
+<a name="ln79">  void InsertTime(const RestartSafeCoarseTimePoint&amp; time) const {</a>
+<a name="ln80">    min_time = std::min(min_time, time);</a>
+<a name="ln81">    max_time = std::max(max_time, time);</a>
+<a name="ln82">  }</a>
+<a name="ln83"> </a>
+<a name="ln84">  void PrepareJoinWithPrev(const ReplicatedRetryableRequestRange&amp; prev) const {</a>
+<a name="ln85">    min_time = std::min(min_time, prev.min_time);</a>
+<a name="ln86">    max_time = std::max(max_time, prev.max_time);</a>
+<a name="ln87">    first_id = prev.first_id;</a>
+<a name="ln88">  }</a>
+<a name="ln89"> </a>
+<a name="ln90">  std::string ToString() const {</a>
+<a name="ln91">    return Format(&quot;{ first_id: $0 last_id: $1 min_op_id: $2 min_time: $3 max_time: $4 }&quot;,</a>
+<a name="ln92">                  first_id, last_id, min_op_id, min_time, max_time);</a>
+<a name="ln93">  }</a>
+<a name="ln94">};</a>
+<a name="ln95"> </a>
+<a name="ln96">struct LastIdIndex;</a>
+<a name="ln97">struct OpIdIndex;</a>
+<a name="ln98">struct RequestIdIndex;</a>
+<a name="ln99"> </a>
+<a name="ln100">typedef boost::multi_index_container &lt;</a>
+<a name="ln101">    RunningRetryableRequest,</a>
+<a name="ln102">    boost::multi_index::indexed_by &lt;</a>
+<a name="ln103">        boost::multi_index::hashed_unique &lt;</a>
+<a name="ln104">            boost::multi_index::tag&lt;RequestIdIndex&gt;,</a>
+<a name="ln105">            boost::multi_index::member &lt;</a>
+<a name="ln106">                RunningRetryableRequest, RetryableRequestId, &amp;RunningRetryableRequest::request_id</a>
+<a name="ln107">            &gt;</a>
+<a name="ln108">        &gt;,</a>
+<a name="ln109">        boost::multi_index::ordered_unique &lt;</a>
+<a name="ln110">            boost::multi_index::tag&lt;OpIdIndex&gt;,</a>
+<a name="ln111">            boost::multi_index::member &lt;</a>
+<a name="ln112">                RunningRetryableRequest, yb::OpId, &amp;RunningRetryableRequest::op_id</a>
+<a name="ln113">            &gt;</a>
+<a name="ln114">        &gt;</a>
+<a name="ln115">    &gt;</a>
+<a name="ln116">&gt; RunningRetryableRequests;</a>
+<a name="ln117"> </a>
+<a name="ln118">typedef boost::multi_index_container &lt;</a>
+<a name="ln119">    ReplicatedRetryableRequestRange,</a>
+<a name="ln120">    boost::multi_index::indexed_by &lt;</a>
+<a name="ln121">        boost::multi_index::ordered_unique &lt;</a>
+<a name="ln122">            boost::multi_index::tag&lt;LastIdIndex&gt;,</a>
+<a name="ln123">            boost::multi_index::member &lt;</a>
+<a name="ln124">                ReplicatedRetryableRequestRange, RetryableRequestId,</a>
+<a name="ln125">                &amp;ReplicatedRetryableRequestRange::last_id</a>
+<a name="ln126">            &gt;</a>
+<a name="ln127">        &gt;,</a>
+<a name="ln128">        boost::multi_index::ordered_unique &lt;</a>
+<a name="ln129">            boost::multi_index::tag&lt;OpIdIndex&gt;,</a>
+<a name="ln130">            boost::multi_index::member &lt;</a>
+<a name="ln131">                ReplicatedRetryableRequestRange, yb::OpId,</a>
+<a name="ln132">                &amp;ReplicatedRetryableRequestRange::min_op_id</a>
+<a name="ln133">            &gt;</a>
+<a name="ln134">        &gt;</a>
+<a name="ln135">    &gt;</a>
+<a name="ln136">&gt; ReplicatedRetryableRequestRanges;</a>
+<a name="ln137"> </a>
+<a name="ln138">typedef ReplicatedRetryableRequestRanges::index&lt;LastIdIndex&gt;::type</a>
+<a name="ln139">    ReplicatedRetryableRequestRangesByLastId;</a>
+<a name="ln140"> </a>
+<a name="ln141">struct ClientRetryableRequests {</a>
+<a name="ln142">  RunningRetryableRequests running;</a>
+<a name="ln143">  ReplicatedRetryableRequestRanges replicated;</a>
+<a name="ln144">  RetryableRequestId min_running_request_id = 0;</a>
+<a name="ln145">  RestartSafeCoarseTimePoint empty_since;</a>
+<a name="ln146">};</a>
+<a name="ln147"> </a>
+<a name="ln148">std::chrono::seconds RangeTimeLimit() {</a>
+<a name="ln149">  return std::chrono::seconds(FLAGS_retryable_request_range_time_limit_secs);</a>
+<a name="ln150">}</a>
+<a name="ln151"> </a>
+<a name="ln152">class ReplicateData {</a>
+<a name="ln153"> public:</a>
+<a name="ln154">  ReplicateData() : client_id_(ClientId::Nil()), write_request_(nullptr) {}</a>
+<a name="ln155"> </a>
+<a name="ln156">  explicit ReplicateData(const tserver::WriteRequestPB* write_request, const yb::OpIdPB&amp; op_id)</a>
+<a name="ln157">      : client_id_(write_request-&gt;client_id1(), write_request-&gt;client_id2()),</a>
+<a name="ln158">        write_request_(write_request), op_id_(yb::OpId::FromPB(op_id)) {</a>
+<a name="ln159"> </a>
+<a name="ln160">  }</a>
+<a name="ln161"> </a>
+<a name="ln162">  static ReplicateData FromMsg(const ReplicateMsg&amp; replicate_msg) {</a>
+<a name="ln163">    if (!replicate_msg.has_write_request()) {</a>
+<a name="ln164">      return ReplicateData();</a>
+<a name="ln165">    }</a>
+<a name="ln166"> </a>
+<a name="ln167">    return ReplicateData(&amp;replicate_msg.write_request(), replicate_msg.id());</a>
+<a name="ln168">  }</a>
+<a name="ln169"> </a>
+<a name="ln170">  bool operator!() const {</a>
+<a name="ln171">    return client_id_.IsNil();</a>
+<a name="ln172">  }</a>
+<a name="ln173"> </a>
+<a name="ln174">  explicit operator bool() const {</a>
+<a name="ln175">    return !!*this;</a>
+<a name="ln176">  }</a>
+<a name="ln177"> </a>
+<a name="ln178">  const ClientId&amp; client_id() const {</a>
+<a name="ln179">    return client_id_;</a>
+<a name="ln180">  }</a>
+<a name="ln181"> </a>
+<a name="ln182">  const tserver::WriteRequestPB&amp; write_request() const {</a>
+<a name="ln183">    return *write_request_;</a>
+<a name="ln184">  }</a>
+<a name="ln185"> </a>
+<a name="ln186">  RetryableRequestId request_id() const {</a>
+<a name="ln187">    return write_request_-&gt;request_id();</a>
+<a name="ln188">  }</a>
+<a name="ln189"> </a>
+<a name="ln190">  const yb::OpId&amp; op_id() const {</a>
+<a name="ln191">    return op_id_;</a>
+<a name="ln192">  }</a>
+<a name="ln193"> </a>
+<a name="ln194"> private:</a>
+<a name="ln195">  ClientId client_id_;</a>
+<a name="ln196">  const tserver::WriteRequestPB* write_request_;</a>
+<a name="ln197">  yb::OpId op_id_;</a>
+<a name="ln198">};</a>
+<a name="ln199"> </a>
+<a name="ln200">std::ostream&amp; operator&lt;&lt;(std::ostream&amp; out, const ReplicateData&amp; data) {</a>
+<a name="ln201">  return out &lt;&lt; data.client_id() &lt;&lt; '/' &lt;&lt; data.request_id() &lt;&lt; &quot;: &quot;</a>
+<a name="ln202">             &lt;&lt; data.write_request().ShortDebugString() &lt;&lt; &quot; op_id: &quot; &lt;&lt; data.op_id();</a>
+<a name="ln203">}</a>
+<a name="ln204"> </a>
+<a name="ln205">} // namespace</a>
+<a name="ln206"> </a>
+<a name="ln207">class RetryableRequests::Impl {</a>
+<a name="ln208"> public:</a>
+<a name="ln209">  explicit Impl(std::string log_prefix) : log_prefix_(std::move(log_prefix)) {</a>
+<a name="ln210">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Start&quot;;</a>
+<a name="ln211">  }</a>
+<a name="ln212"> </a>
+<a name="ln213">  bool Register(const ConsensusRoundPtr&amp; round, RestartSafeCoarseTimePoint entry_time) {</a>
+<a name="ln214">    auto data = ReplicateData::FromMsg(*round-&gt;replicate_msg());</a>
+<a name="ln215">    if (!data) {</a>
+<a name="ln216">      return true;</a>
+<a name="ln217">    }</a>
+<a name="ln218"> </a>
+<a name="ln219">    if (entry_time == RestartSafeCoarseTimePoint()) {</a>
+<a name="ln220">      entry_time = clock_.Now();</a>
+<a name="ln221">    }</a>
+<a name="ln222"> </a>
+<a name="ln223">    ClientRetryableRequests&amp; client_retryable_requests = clients_[data.client_id()];</a>
+<a name="ln224"> </a>
+<a name="ln225">    CleanupReplicatedRequests(</a>
+<a name="ln226">        data.write_request().min_running_request_id(), &amp;client_retryable_requests);</a>
+<a name="ln227"> </a>
+<a name="ln228">    if (data.request_id() &lt; client_retryable_requests.min_running_request_id) {</a>
+<a name="ln229">      round-&gt;NotifyReplicationFinished(</a>
+<a name="ln230">          STATUS_FORMAT(</a>
+<a name="ln231">              Expired, &quot;Request id $0 is less than min running $1&quot;, data.request_id(),</a>
+<a name="ln232">              client_retryable_requests.min_running_request_id),</a>
+<a name="ln233">          round-&gt;bound_term(), nullptr /* applied_op_ids */);</a>
+<a name="ln234">      return false;</a>
+<a name="ln235">    }</a>
+<a name="ln236"> </a>
+<a name="ln237">    auto&amp; replicated_indexed_by_last_id = client_retryable_requests.replicated.get&lt;LastIdIndex&gt;();</a>
+<a name="ln238">    auto it = replicated_indexed_by_last_id.lower_bound(data.request_id());</a>
+<a name="ln239">    if (it != replicated_indexed_by_last_id.end() &amp;&amp; it-&gt;first_id &lt;= data.request_id()) {</a>
+<a name="ln240">      round-&gt;NotifyReplicationFinished(</a>
+<a name="ln241">          STATUS(AlreadyPresent, &quot;Duplicate request&quot;), round-&gt;bound_term(),</a>
+<a name="ln242">          nullptr /* applied_op_ids */);</a>
+<a name="ln243">      return false;</a>
+<a name="ln244">    }</a>
+<a name="ln245"> </a>
+<a name="ln246">    auto&amp; running_indexed_by_request_id = client_retryable_requests.running.get&lt;RequestIdIndex&gt;();</a>
+<a name="ln247">    auto emplace_result = running_indexed_by_request_id.emplace(</a>
+<a name="ln248">        data.request_id(), round-&gt;replicate_msg()-&gt;id(), entry_time);</a>
+<a name="ln249">    if (!emplace_result.second) {</a>
+<a name="ln250">      emplace_result.first-&gt;duplicate_rounds.push_back(round);</a>
+<a name="ln251">      return false;</a>
+<a name="ln252">    }</a>
+<a name="ln253"> </a>
+<a name="ln254">    VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Running added &quot; &lt;&lt; data;</a>
+<a name="ln255">    if (running_requests_gauge_) {</a>
+<a name="ln256">      running_requests_gauge_-&gt;Increment();</a>
+<a name="ln257">    }</a>
+<a name="ln258"> </a>
+<a name="ln259">    return true;</a>
+<a name="ln260">  }</a>
+<a name="ln261"> </a>
+<a name="ln262">  yb::OpId CleanExpiredReplicatedAndGetMinOpId() {</a>
+<a name="ln263">    yb::OpId result(std::numeric_limits&lt;int64_t&gt;::max(), std::numeric_limits&lt;int64_t&gt;::max());</a>
+<a name="ln264">    auto now = clock_.Now();</a>
+<a name="ln265">    auto clean_start =</a>
+<a name="ln266">        now - std::chrono::seconds(GetAtomicFlag(&amp;FLAGS_retryable_request_timeout_secs));</a>
+<a name="ln267">    for (auto ci = clients_.begin(); ci != clients_.end();) {</a>
+<a name="ln268">      ClientRetryableRequests&amp; client_retryable_requests = ci-&gt;second;</a>
+<a name="ln269">      auto&amp; op_id_index = client_retryable_requests.replicated.get&lt;OpIdIndex&gt;();</a>
+<a name="ln270">      auto it = op_id_index.begin();</a>
+<a name="ln271">      int64_t count = 0;</a>
+<a name="ln272">      while (it != op_id_index.end() &amp;&amp; it-&gt;max_time &lt; clean_start) {</a>
+<a name="ln273">        ++it;</a>
+<a name="ln274">        ++count;</a>
+<a name="ln275">      }</a>
+<a name="ln276">      if (replicated_request_ranges_gauge_) {</a>
+<a name="ln277">        replicated_request_ranges_gauge_-&gt;DecrementBy(count);</a>
+<a name="ln278">      }</a>
+<a name="ln279">      if (it != op_id_index.end()) {</a>
+<a name="ln280">        result = std::min(result, it-&gt;min_op_id);</a>
+<a name="ln281">        op_id_index.erase(op_id_index.begin(), it);</a>
+<a name="ln282">      } else {</a>
+<a name="ln283">        op_id_index.clear();</a>
+<a name="ln284">      }</a>
+<a name="ln285">      if (op_id_index.empty() &amp;&amp; client_retryable_requests.running.empty()) {</a>
+<a name="ln286">        // We delay deleting client with empty requests, to be able to filter requests with too</a>
+<a name="ln287">        // small request id.</a>
+<a name="ln288">        if (client_retryable_requests.empty_since == RestartSafeCoarseTimePoint()) {</a>
+<a name="ln289">          client_retryable_requests.empty_since = now;</a>
+<a name="ln290">        } else if (client_retryable_requests.empty_since &lt; clean_start) {</a>
+<a name="ln291">          ci = clients_.erase(ci);</a>
+<a name="ln292">          continue;</a>
+<a name="ln293">        }</a>
+<a name="ln294">      }</a>
+<a name="ln295">      ++ci;</a>
+<a name="ln296">    }</a>
+<a name="ln297"> </a>
+<a name="ln298">    return result;</a>
+<a name="ln299">  }</a>
+<a name="ln300"> </a>
+<a name="ln301">  void ReplicationFinished(</a>
+<a name="ln302">      const ReplicateMsg&amp; replicate_msg, const Status&amp; status, int64_t leader_term) {</a>
+<a name="ln303">    auto data = ReplicateData::FromMsg(replicate_msg);</a>
+<a name="ln304">    if (!data) {</a>
+<a name="ln305">      return;</a>
+<a name="ln306">    }</a>
+<a name="ln307"> </a>
+<a name="ln308">    auto&amp; client_retryable_requests = clients_[data.client_id()];</a>
+<a name="ln309">    auto&amp; running_indexed_by_request_id = client_retryable_requests.running.get&lt;RequestIdIndex&gt;();</a>
+<a name="ln310">    auto running_it = running_indexed_by_request_id.find(data.request_id());</a>
+<a name="ln311">    if (running_it == running_indexed_by_request_id.end()) {</a>
+<a name="ln312">#ifndef NDEBUG</a>
+<a name="ln313">      LOG_WITH_PREFIX(ERROR) &lt;&lt; &quot;Running requests: &quot;</a>
+<a name="ln314">                             &lt;&lt; yb::ToString(running_indexed_by_request_id);</a>
+<a name="ln315">#endif</a>
+<a name="ln316">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Replication finished for request with unknown id &quot; &lt;&lt; data;</a>
+<a name="ln317">      return;</a>
+<a name="ln318">    }</a>
+<a name="ln319">    VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Running &quot; &lt;&lt; (status.ok() ? &quot;replicated &quot; : &quot;aborted &quot;) &lt;&lt; data</a>
+<a name="ln320">                        &lt;&lt; &quot;, &quot; &lt;&lt; status;</a>
+<a name="ln321"> </a>
+<a name="ln322">    static Status duplicate_write_status = STATUS(AlreadyPresent, &quot;Duplicate request&quot;);</a>
+<a name="ln323">    auto status_for_duplicate = status.ok() ? duplicate_write_status : status;</a>
+<a name="ln324">    for (const auto&amp; duplicate : running_it-&gt;duplicate_rounds) {</a>
+<a name="ln325">      duplicate-&gt;NotifyReplicationFinished(status_for_duplicate, leader_term,</a>
+<a name="ln326">                                           nullptr /* applied_op_ids */);</a>
+<a name="ln327">    }</a>
+<a name="ln328">    auto entry_time = running_it-&gt;time;</a>
+<a name="ln329">    running_indexed_by_request_id.erase(running_it);</a>
+<a name="ln330">    if (running_requests_gauge_) {</a>
+<a name="ln331">      running_requests_gauge_-&gt;Decrement();</a>
+<a name="ln332">    }</a>
+<a name="ln333"> </a>
+<a name="ln334">    if (status.ok()) {</a>
+<a name="ln335">      AddReplicated(</a>
+<a name="ln336">          yb::OpId::FromPB(replicate_msg.id()), data, entry_time, &amp;client_retryable_requests);</a>
+<a name="ln337">    }</a>
+<a name="ln338">  }</a>
+<a name="ln339"> </a>
+<a name="ln340">  void Bootstrap(</a>
+<a name="ln341">      const ReplicateMsg&amp; replicate_msg, RestartSafeCoarseTimePoint entry_time) {</a>
+<a name="ln342">    auto data = ReplicateData::FromMsg(replicate_msg);</a>
+<a name="ln343">    if (!data) {</a>
+<a name="ln344">      return;</a>
+<a name="ln345">    }</a>
+<a name="ln346"> </a>
+<a name="ln347">    auto&amp; client_retryable_requests = clients_[data.client_id()];</a>
+<a name="ln348">    auto&amp; running_indexed_by_request_id = client_retryable_requests.running.get&lt;RequestIdIndex&gt;();</a>
+<a name="ln349">    if (running_indexed_by_request_id.count(data.request_id()) != 0) {</a>
+<a name="ln350">#ifndef NDEBUG</a>
+<a name="ln351">      LOG_WITH_PREFIX(ERROR) &lt;&lt; &quot;Running requests: &quot;</a>
+<a name="ln352">                             &lt;&lt; yb::ToString(running_indexed_by_request_id);</a>
+<a name="ln353">#endif</a>
+<a name="ln354">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Bootstrapped running request &quot; &lt;&lt; data;</a>
+<a name="ln355">      return;</a>
+<a name="ln356">    }</a>
+<a name="ln357">    VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Bootstrapped &quot; &lt;&lt; data;</a>
+<a name="ln358"> </a>
+<a name="ln359">    CleanupReplicatedRequests(</a>
+<a name="ln360">       data.write_request().min_running_request_id(), &amp;client_retryable_requests);</a>
+<a name="ln361"> </a>
+<a name="ln362">    AddReplicated(</a>
+<a name="ln363">        yb::OpId::FromPB(replicate_msg.id()), data, entry_time, &amp;client_retryable_requests);</a>
+<a name="ln364">  }</a>
+<a name="ln365"> </a>
+<a name="ln366">  RestartSafeCoarseMonoClock&amp; Clock() {</a>
+<a name="ln367">    return clock_;</a>
+<a name="ln368">  }</a>
+<a name="ln369"> </a>
+<a name="ln370">  void SetMetricEntity(const scoped_refptr&lt;MetricEntity&gt;&amp; metric_entity) {</a>
+<a name="ln371">    running_requests_gauge_ = METRIC_running_retryable_requests.Instantiate(metric_entity, 0);</a>
+<a name="ln372">    replicated_request_ranges_gauge_ = METRIC_replicated_retryable_request_ranges.Instantiate(</a>
+<a name="ln373">        metric_entity, 0);</a>
+<a name="ln374">  }</a>
+<a name="ln375"> </a>
+<a name="ln376">  RetryableRequestsCounts TEST_Counts() {</a>
+<a name="ln377">    RetryableRequestsCounts result;</a>
+<a name="ln378">    for (const auto&amp; p : clients_) {</a>
+<a name="ln379">      result.running += p.second.running.size();</a>
+<a name="ln380">      result.replicated += p.second.replicated.size();</a>
+<a name="ln381">      LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Replicated: &quot; &lt;&lt; yb::ToString(p.second.replicated);</a>
+<a name="ln382">    }</a>
+<a name="ln383">    return result;</a>
+<a name="ln384">  }</a>
+<a name="ln385"> </a>
+<a name="ln386"> private:</a>
+<a name="ln387">  void CleanupReplicatedRequests(</a>
+<a name="ln388">      RetryableRequestId new_min_running_request_id,</a>
+<a name="ln389">      ClientRetryableRequests* client_retryable_requests) {</a>
+<a name="ln390">    auto&amp; replicated_indexed_by_last_id = client_retryable_requests-&gt;replicated.get&lt;LastIdIndex&gt;();</a>
+<a name="ln391">    if (new_min_running_request_id &gt; client_retryable_requests-&gt;min_running_request_id) {</a>
+<a name="ln392">      // We are not interested in ids below write_request.min_running_request_id() anymore.</a>
+<a name="ln393">      //</a>
+<a name="ln394">      // Request id intervals are ordered by last id of interval, and does not overlap.</a>
+<a name="ln395">      // So we are trying to find interval with last_id &gt;= min_running_request_id</a>
+<a name="ln396">      // and trim it if necessary.</a>
+<a name="ln397">      auto it = replicated_indexed_by_last_id.lower_bound(new_min_running_request_id);</a>
+<a name="ln398">      if (it != replicated_indexed_by_last_id.end() &amp;&amp;</a>
+<a name="ln399">          it-&gt;first_id &lt; new_min_running_request_id) {</a>
+<a name="ln400">        it-&gt;first_id = new_min_running_request_id;</a>
+<a name="ln401">      }</a>
+<a name="ln402">      if (replicated_request_ranges_gauge_) {</a>
+<a name="ln403">        replicated_request_ranges_gauge_-&gt;DecrementBy(</a>
+<a name="ln404">            std::distance(replicated_indexed_by_last_id.begin(), it));</a>
+<a name="ln405">      }</a>
+<a name="ln406">      // Remove all intervals that has ids below write_request.min_running_request_id().</a>
+<a name="ln407">      replicated_indexed_by_last_id.erase(replicated_indexed_by_last_id.begin(), it);</a>
+<a name="ln408">      client_retryable_requests-&gt;min_running_request_id = new_min_running_request_id;</a>
+<a name="ln409">    }</a>
+<a name="ln410">  }</a>
+<a name="ln411"> </a>
+<a name="ln412">  void AddReplicated(yb::OpId op_id, const ReplicateData&amp; data, RestartSafeCoarseTimePoint time,</a>
+<a name="ln413">                     ClientRetryableRequests* client) {</a>
+<a name="ln414">    auto request_id = data.request_id();</a>
+<a name="ln415">    auto&amp; replicated_indexed_by_last_id = client-&gt;replicated.get&lt;LastIdIndex&gt;();</a>
+<a name="ln416">    auto request_it = replicated_indexed_by_last_id.lower_bound(request_id);</a>
+<a name="ln417">    if (request_it != replicated_indexed_by_last_id.end() &amp;&amp; request_it-&gt;first_id &lt;= request_id) {</a>
+<a name="ln418">#ifndef NDEBUG</a>
+<a name="ln419">      LOG_WITH_PREFIX(ERROR)</a>
+<a name="ln420">          &lt;&lt; &quot;Replicated requests: &quot; &lt;&lt; yb::ToString(client-&gt;replicated);</a>
+<a name="ln421">#endif</a>
+<a name="ln422"> </a>
+<a name="ln423">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Request already replicated: &quot; &lt;&lt; data;</a>
+<a name="ln424">      return;</a>
+<a name="ln425">    }</a>
+<a name="ln426"> </a>
+<a name="ln427">    // Check that we have range right after this id, and we could extend it.</a>
+<a name="ln428">    // Requests rarely attaches to begin of interval, so we could don't check for</a>
+<a name="ln429">    // RangeTimeLimit() here.</a>
+<a name="ln430">    if (request_it != replicated_indexed_by_last_id.end() &amp;&amp;</a>
+<a name="ln431">        request_it-&gt;first_id == request_id + 1) {</a>
+<a name="ln432">      op_id = std::min(request_it-&gt;min_op_id, op_id);</a>
+<a name="ln433">      request_it-&gt;InsertTime(time);</a>
+<a name="ln434">      // If previous range is right before this id, then we could just join those ranges.</a>
+<a name="ln435">      if (!TryJoinRanges(request_it, op_id, &amp;replicated_indexed_by_last_id)) {</a>
+<a name="ln436">        --(request_it-&gt;first_id);</a>
+<a name="ln437">        UpdateMinOpId(request_it, op_id, &amp;replicated_indexed_by_last_id);</a>
+<a name="ln438">      }</a>
+<a name="ln439">      return;</a>
+<a name="ln440">    }</a>
+<a name="ln441"> </a>
+<a name="ln442">    if (TryJoinToEndOfRange(request_it, op_id, request_id, time, &amp;replicated_indexed_by_last_id)) {</a>
+<a name="ln443">      return;</a>
+<a name="ln444">    }</a>
+<a name="ln445"> </a>
+<a name="ln446">    client-&gt;replicated.emplace(request_id, op_id, time);</a>
+<a name="ln447">    if (replicated_request_ranges_gauge_) {</a>
+<a name="ln448">      replicated_request_ranges_gauge_-&gt;Increment();</a>
+<a name="ln449">    }</a>
+<a name="ln450">  }</a>
+<a name="ln451"> </a>
+<a name="ln452">  void UpdateMinOpId(</a>
+<a name="ln453">      ReplicatedRetryableRequestRangesByLastId::iterator request_it,</a>
+<a name="ln454">      yb::OpId min_op_id,</a>
+<a name="ln455">      ReplicatedRetryableRequestRangesByLastId* replicated_indexed_by_last_id) {</a>
+<a name="ln456">    if (min_op_id &lt; request_it-&gt;min_op_id) {</a>
+<a name="ln457">      replicated_indexed_by_last_id-&gt;modify(request_it, [min_op_id](auto&amp; entry) { // NOLINT</a>
+<a name="ln458">        entry.min_op_id = min_op_id;</a>
+<a name="ln459">      });</a>
+<a name="ln460">    }</a>
+<a name="ln461">  }</a>
+<a name="ln462"> </a>
+<a name="ln463">  bool TryJoinRanges(</a>
+<a name="ln464">      ReplicatedRetryableRequestRangesByLastId::iterator request_it,</a>
+<a name="ln465">      yb::OpId min_op_id,</a>
+<a name="ln466">      ReplicatedRetryableRequestRangesByLastId* replicated_indexed_by_last_id) {</a>
+<a name="ln467">    if (request_it == replicated_indexed_by_last_id-&gt;begin()) {</a>
+<a name="ln468">      return false;</a>
+<a name="ln469">    }</a>
+<a name="ln470"> </a>
+<a name="ln471">    auto request_prev_it = request_it;</a>
+<a name="ln472">    --request_prev_it;</a>
+<a name="ln473"> </a>
+<a name="ln474">    // We could join ranges if there is exactly one id between them, and request with that id was</a>
+<a name="ln475">    // just replicated...</a>
+<a name="ln476">    if (request_prev_it-&gt;last_id + 2 != request_it-&gt;first_id) {</a>
+<a name="ln477">      return false;</a>
+<a name="ln478">    }</a>
+<a name="ln479"> </a>
+<a name="ln480">    // ...and time range will fit into limit.</a>
+<a name="ln481">    if (request_it-&gt;max_time &gt; request_prev_it-&gt;min_time + RangeTimeLimit()) {</a>
+<a name="ln482">      return false;</a>
+<a name="ln483">    }</a>
+<a name="ln484"> </a>
+<a name="ln485">    min_op_id = std::min(min_op_id, request_prev_it-&gt;min_op_id);</a>
+<a name="ln486">    request_it-&gt;PrepareJoinWithPrev(*request_prev_it);</a>
+<a name="ln487">    replicated_indexed_by_last_id-&gt;erase(request_prev_it);</a>
+<a name="ln488">    if (replicated_request_ranges_gauge_) {</a>
+<a name="ln489">      replicated_request_ranges_gauge_-&gt;Decrement();</a>
+<a name="ln490">    }</a>
+<a name="ln491">    UpdateMinOpId(request_it, min_op_id, replicated_indexed_by_last_id);</a>
+<a name="ln492"> </a>
+<a name="ln493">    return true;</a>
+<a name="ln494">  }</a>
+<a name="ln495"> </a>
+<a name="ln496">  bool TryJoinToEndOfRange(</a>
+<a name="ln497">      ReplicatedRetryableRequestRangesByLastId::iterator request_it,</a>
+<a name="ln498">      yb::OpId op_id, RetryableRequestId request_id, RestartSafeCoarseTimePoint time,</a>
+<a name="ln499">      ReplicatedRetryableRequestRangesByLastId* replicated_indexed_by_last_id) {</a>
+<a name="ln500">    if (request_it == replicated_indexed_by_last_id-&gt;begin()) {</a>
+<a name="ln501">      return false;</a>
+<a name="ln502">    }</a>
+<a name="ln503"> </a>
+<a name="ln504">    --request_it;</a>
+<a name="ln505"> </a>
+<a name="ln506">    if (request_it-&gt;last_id + 1 != request_id) {</a>
+<a name="ln507">      return false;</a>
+<a name="ln508">    }</a>
+<a name="ln509"> </a>
+<a name="ln510">    // It is rare case when request is attaches to end of range, but his time is lower than</a>
+<a name="ln511">    // min_time. So we could avoid checking for the case when</a>
+<a name="ln512">    // time + RangeTimeLimit() &gt; request_prev_it-&gt;max_time</a>
+<a name="ln513">    if (time &gt; request_it-&gt;min_time + RangeTimeLimit()) {</a>
+<a name="ln514">      return false;</a>
+<a name="ln515">    }</a>
+<a name="ln516"> </a>
+<a name="ln517">    op_id = std::min(request_it-&gt;min_op_id, op_id);</a>
+<a name="ln518">    request_it-&gt;InsertTime(time);</a>
+<a name="ln519">    // Actually we should use the modify function on client.replicated, but since the order of</a>
+<a name="ln520">    // ranges should not be changed, we could update last_id directly.</a>
+<a name="ln521">    ++const_cast&lt;ReplicatedRetryableRequestRange&amp;&gt;(*request_it).last_id;</a>
+<a name="ln522"> </a>
+<a name="ln523">    UpdateMinOpId(request_it, op_id, replicated_indexed_by_last_id);</a>
+<a name="ln524"> </a>
+<a name="ln525">    return true;</a>
+<a name="ln526">  }</a>
+<a name="ln527"> </a>
+<a name="ln528">  const std::string&amp; LogPrefix() const {</a>
+<a name="ln529">    return log_prefix_;</a>
+<a name="ln530">  }</a>
+<a name="ln531"> </a>
+<a name="ln532">  const std::string log_prefix_;</a>
+<a name="ln533">  std::unordered_map&lt;ClientId, ClientRetryableRequests, ClientIdHash&gt; clients_;</a>
+<a name="ln534">  RestartSafeCoarseMonoClock clock_;</a>
+<a name="ln535">  scoped_refptr&lt;AtomicGauge&lt;int64_t&gt;&gt; running_requests_gauge_;</a>
+<a name="ln536">  scoped_refptr&lt;AtomicGauge&lt;int64_t&gt;&gt; replicated_request_ranges_gauge_;</a>
+<a name="ln537">};</a>
+<a name="ln538"> </a>
+<a name="ln539">RetryableRequests::RetryableRequests(std::string log_prefix)</a>
+<a name="ln540">    : impl_(new Impl(std::move(log_prefix))) {</a>
+<a name="ln541">}</a>
+<a name="ln542"> </a>
+<a name="ln543">RetryableRequests::~RetryableRequests() {</a>
+<a name="ln544">}</a>
+<a name="ln545"> </a>
+<a name="ln546">RetryableRequests::RetryableRequests(RetryableRequests&amp;&amp; rhs) : impl_(std::move(rhs.impl_)) {}</a>
+<a name="ln547"> </a>
+<a name="ln548">void RetryableRequests::operator=(RetryableRequests&amp;&amp; rhs) {</a>
+<a name="ln549">  impl_ = std::move(rhs.impl_);</a>
+<a name="ln550">}</a>
+<a name="ln551"> </a>
+<a name="ln552">bool RetryableRequests::Register(</a>
+<a name="ln553">    const ConsensusRoundPtr&amp; round, RestartSafeCoarseTimePoint entry_time) {</a>
+<a name="ln554">  return impl_-&gt;Register(round, entry_time);</a>
+<a name="ln555">}</a>
+<a name="ln556"> </a>
+<a name="ln557">yb::OpId RetryableRequests::CleanExpiredReplicatedAndGetMinOpId() {</a>
+<a name="ln558">  return impl_-&gt;CleanExpiredReplicatedAndGetMinOpId();</a>
+<a name="ln559">}</a>
+<a name="ln560"> </a>
+<a name="ln561">void RetryableRequests::ReplicationFinished(</a>
+<a name="ln562">    const ReplicateMsg&amp; replicate_msg, const Status&amp; status, int64_t leader_term) {</a>
+<a name="ln563">  impl_-&gt;ReplicationFinished(replicate_msg, status, leader_term);</a>
+<a name="ln564">}</a>
+<a name="ln565"> </a>
+<a name="ln566">void RetryableRequests::Bootstrap(</a>
+<a name="ln567">    const ReplicateMsg&amp; replicate_msg, RestartSafeCoarseTimePoint entry_time) {</a>
+<a name="ln568">  impl_-&gt;Bootstrap(replicate_msg, entry_time);</a>
+<a name="ln569">}</a>
+<a name="ln570"> </a>
+<a name="ln571">RestartSafeCoarseMonoClock&amp; RetryableRequests::Clock() {</a>
+<a name="ln572">  return impl_-&gt;Clock();</a>
+<a name="ln573">}</a>
+<a name="ln574"> </a>
+<a name="ln575">RetryableRequestsCounts RetryableRequests::TEST_Counts() {</a>
+<a name="ln576">  return impl_-&gt;TEST_Counts();</a>
+<a name="ln577">}</a>
+<a name="ln578"> </a>
+<a name="ln579">void RetryableRequests::SetMetricEntity(const scoped_refptr&lt;MetricEntity&gt;&amp; metric_entity) {</a>
+<a name="ln580">  impl_-&gt;SetMetricEntity(metric_entity);</a>
+<a name="ln581">}</a>
+<a name="ln582"> </a>
+<a name="ln583">} // namespace consensus</a>
+<a name="ln584">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="210"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="254"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="319"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="357"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

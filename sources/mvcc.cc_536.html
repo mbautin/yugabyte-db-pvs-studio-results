@@ -1,0 +1,722 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>mvcc.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/tablet/mvcc.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;sstream&gt;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &lt;boost/circular_buffer.hpp&gt;</a>
+<a name="ln38">#include &lt;boost/circular_buffer/space_optimized.hpp&gt;</a>
+<a name="ln39">#include &lt;boost/variant.hpp&gt;</a>
+<a name="ln40"> </a>
+<a name="ln41">#include &quot;yb/gutil/macros.h&quot;</a>
+<a name="ln42"> </a>
+<a name="ln43">#include &quot;yb/util/atomic.h&quot;</a>
+<a name="ln44">#include &quot;yb/util/enums.h&quot;</a>
+<a name="ln45">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln46">#include &quot;yb/util/flags.h&quot;</a>
+<a name="ln47">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln48">#include &quot;yb/util/scope_exit.h&quot;</a>
+<a name="ln49"> </a>
+<a name="ln50">DEFINE_test_flag(int64, mvcc_op_trace_num_items, 32,</a>
+<a name="ln51">                 &quot;Number of items to keep in an MvccManager operation trace. Set to 0 to disable &quot;</a>
+<a name="ln52">                 &quot;MVCC operation tracing.&quot;);</a>
+<a name="ln53"> </a>
+<a name="ln54">namespace yb {</a>
+<a name="ln55">namespace tablet {</a>
+<a name="ln56"> </a>
+<a name="ln57">namespace {</a>
+<a name="ln58"> </a>
+<a name="ln59">YB_DEFINE_ENUM(</a>
+<a name="ln60">    MvccOpType,</a>
+<a name="ln61">    (kInvalid)</a>
+<a name="ln62">    (kSetLeaderOnlyMode)</a>
+<a name="ln63">    (kSetLastReplicated)</a>
+<a name="ln64">    (kSetPropagatedSafeTimeOnFollower)</a>
+<a name="ln65">    (kSetPropagatedSafeTimeOnLeader)</a>
+<a name="ln66">    (kUpdatePropagatedSafeTimeOnLeader)</a>
+<a name="ln67">    (kAddPending)</a>
+<a name="ln68">    (kReplicated)</a>
+<a name="ln69">    (kAborted)</a>
+<a name="ln70">    (kSafeTime)</a>
+<a name="ln71">    (kSafeTimeForFollower)</a>
+<a name="ln72">    (kLastReplicatedHybridTime));</a>
+<a name="ln73"> </a>
+<a name="ln74">struct SetLeaderOnlyModeTraceItem {</a>
+<a name="ln75">  bool leader_only;</a>
+<a name="ln76"> </a>
+<a name="ln77">  std::string ToString() const {</a>
+<a name="ln78">    return Format(&quot;SetLeaderOnlyMode $0&quot;, YB_STRUCT_TO_STRING(leader_only));</a>
+<a name="ln79">  }</a>
+<a name="ln80">};</a>
+<a name="ln81"> </a>
+<a name="ln82">struct SetLastReplicatedTraceItem {</a>
+<a name="ln83">  HybridTime ht;</a>
+<a name="ln84"> </a>
+<a name="ln85">  std::string ToString() const {</a>
+<a name="ln86">    return Format(&quot;SetLastReplicated $0&quot;, YB_STRUCT_TO_STRING(ht));</a>
+<a name="ln87">  }</a>
+<a name="ln88">};</a>
+<a name="ln89"> </a>
+<a name="ln90">struct SetPropagatedSafeTimeOnFollowerTraceItem {</a>
+<a name="ln91">  HybridTime ht;</a>
+<a name="ln92"> </a>
+<a name="ln93">  std::string ToString() const {</a>
+<a name="ln94">    return Format(&quot;SetPropagatedSafeTimeOnFollower $0&quot;, YB_STRUCT_TO_STRING(ht));</a>
+<a name="ln95">  }</a>
+<a name="ln96">};</a>
+<a name="ln97"> </a>
+<a name="ln98">struct UpdatePropagatedSafeTimeOnLeaderTraceItem {</a>
+<a name="ln99">  FixedHybridTimeLease ht_lease;</a>
+<a name="ln100">  HybridTime safe_time;</a>
+<a name="ln101"> </a>
+<a name="ln102">  std::string ToString() const {</a>
+<a name="ln103">    return Format(&quot;UpdatePropagatedSafeTimeOnLeader $0&quot;,</a>
+<a name="ln104">                  YB_STRUCT_TO_STRING(ht_lease, safe_time));</a>
+<a name="ln105">  }</a>
+<a name="ln106">};</a>
+<a name="ln107"> </a>
+<a name="ln108">struct AddPendingTraceItem {</a>
+<a name="ln109">  HybridTime provided_ht;</a>
+<a name="ln110">  HybridTime final_ht;</a>
+<a name="ln111"> </a>
+<a name="ln112">  std::string ToString() const {</a>
+<a name="ln113">    return Format(&quot;AddPending $0&quot;, YB_STRUCT_TO_STRING(provided_ht, final_ht));</a>
+<a name="ln114">  }</a>
+<a name="ln115">};</a>
+<a name="ln116"> </a>
+<a name="ln117">struct ReplicatedTraceItem {</a>
+<a name="ln118">  HybridTime ht;</a>
+<a name="ln119"> </a>
+<a name="ln120">  std::string ToString() const {</a>
+<a name="ln121">    return Format(&quot;Replicated $0&quot;, YB_STRUCT_TO_STRING(ht));</a>
+<a name="ln122">  }</a>
+<a name="ln123">};</a>
+<a name="ln124"> </a>
+<a name="ln125">struct AbortedTraceItem {</a>
+<a name="ln126">  HybridTime ht;</a>
+<a name="ln127"> </a>
+<a name="ln128">  std::string ToString() const {</a>
+<a name="ln129">    return Format(&quot;Aborted $0&quot;, YB_STRUCT_TO_STRING(ht));</a>
+<a name="ln130">  }</a>
+<a name="ln131">};</a>
+<a name="ln132"> </a>
+<a name="ln133">struct SafeTimeTraceItem {</a>
+<a name="ln134">  HybridTime min_allowed;</a>
+<a name="ln135">  CoarseTimePoint deadline;</a>
+<a name="ln136">  FixedHybridTimeLease ht_lease;</a>
+<a name="ln137">  HybridTime safe_time;</a>
+<a name="ln138"> </a>
+<a name="ln139">  std::string ToString() const {</a>
+<a name="ln140">    return Format(&quot;SafeTime $0&quot;, YB_STRUCT_TO_STRING(min_allowed, deadline, ht_lease, safe_time));</a>
+<a name="ln141">  }</a>
+<a name="ln142">};</a>
+<a name="ln143"> </a>
+<a name="ln144">struct SafeTimeForFollowerTraceItem {</a>
+<a name="ln145">  HybridTime min_allowed;</a>
+<a name="ln146">  CoarseTimePoint deadline;</a>
+<a name="ln147">  SafeTimeWithSource safe_time_with_source;</a>
+<a name="ln148"> </a>
+<a name="ln149">  std::string ToString() const {</a>
+<a name="ln150">    return Format(&quot;SafeTimeForFollower $0&quot;,</a>
+<a name="ln151">                  YB_STRUCT_TO_STRING(min_allowed, deadline, safe_time_with_source));</a>
+<a name="ln152">  }</a>
+<a name="ln153">};</a>
+<a name="ln154"> </a>
+<a name="ln155">struct LastReplicatedHybridTimeTraceItem {</a>
+<a name="ln156">  HybridTime last_replicated;</a>
+<a name="ln157"> </a>
+<a name="ln158">  std::string ToString() const {</a>
+<a name="ln159">    return Format(&quot;LastReplicatedHybridTime $0&quot;, YB_STRUCT_TO_STRING(last_replicated));</a>
+<a name="ln160">  }</a>
+<a name="ln161">};</a>
+<a name="ln162"> </a>
+<a name="ln163">typedef boost::variant&lt;</a>
+<a name="ln164">    SetLeaderOnlyModeTraceItem,</a>
+<a name="ln165">    SetLastReplicatedTraceItem,</a>
+<a name="ln166">    SetPropagatedSafeTimeOnFollowerTraceItem,</a>
+<a name="ln167">    UpdatePropagatedSafeTimeOnLeaderTraceItem,</a>
+<a name="ln168">    AddPendingTraceItem,</a>
+<a name="ln169">    ReplicatedTraceItem,</a>
+<a name="ln170">    AbortedTraceItem,</a>
+<a name="ln171">    SafeTimeTraceItem,</a>
+<a name="ln172">    SafeTimeForFollowerTraceItem,</a>
+<a name="ln173">    LastReplicatedHybridTimeTraceItem</a>
+<a name="ln174">    &gt; TraceItemVariant;</a>
+<a name="ln175"> </a>
+<a name="ln176">class ItemPrintingVisitor : public boost::static_visitor&lt;&gt;{</a>
+<a name="ln177"> public:</a>
+<a name="ln178">  explicit ItemPrintingVisitor(std::ostream* out, size_t index)</a>
+<a name="ln179">      : out_(*out),</a>
+<a name="ln180">        index_(index) {</a>
+<a name="ln181">  }</a>
+<a name="ln182"> </a>
+<a name="ln183">  template&lt;typename T&gt; void operator()(const T&amp; t) const {</a>
+<a name="ln184">    out_ &lt;&lt; index_ &lt;&lt; &quot;. &quot; &lt;&lt; t.ToString() &lt;&lt; std::endl;</a>
+<a name="ln185">  }</a>
+<a name="ln186"> </a>
+<a name="ln187"> private:</a>
+<a name="ln188">  std::ostream&amp; out_;</a>
+<a name="ln189">  size_t index_;</a>
+<a name="ln190">};</a>
+<a name="ln191"> </a>
+<a name="ln192">}  // namespace</a>
+<a name="ln193"> </a>
+<a name="ln194">class MvccManager::MvccOpTrace {</a>
+<a name="ln195"> public:</a>
+<a name="ln196">  explicit MvccOpTrace(size_t capacity) : items_(capacity) {}</a>
+<a name="ln197">  ~MvccOpTrace() = default;</a>
+<a name="ln198"> </a>
+<a name="ln199">  void Add(TraceItemVariant v) {</a>
+<a name="ln200">    items_.push_back(std::move(v));</a>
+<a name="ln201">  }</a>
+<a name="ln202"> </a>
+<a name="ln203">  void DumpTrace(ostream* out) const {</a>
+<a name="ln204">    if (items_.empty()) {</a>
+<a name="ln205">      *out &lt;&lt; &quot;No MVCC operations&quot; &lt;&lt; std::endl;</a>
+<a name="ln206">      return;</a>
+<a name="ln207">    }</a>
+<a name="ln208">    *out &lt;&lt; &quot;Recent &quot; &lt;&lt; items_.size() &lt;&lt; &quot; MVCC operations:&quot; &lt;&lt; std::endl;</a>
+<a name="ln209">    size_t i = 1;</a>
+<a name="ln210">    for (const auto&amp; item : items_) {</a>
+<a name="ln211">      boost::apply_visitor(ItemPrintingVisitor(out, i), item);</a>
+<a name="ln212">      ++i;</a>
+<a name="ln213">    }</a>
+<a name="ln214">  }</a>
+<a name="ln215"> </a>
+<a name="ln216"> private:</a>
+<a name="ln217">  boost::circular_buffer_space_optimized&lt;TraceItemVariant, std::allocator&lt;TraceItemVariant&gt;&gt; items_;</a>
+<a name="ln218">};</a>
+<a name="ln219"> </a>
+<a name="ln220">struct MvccManager::InvariantViolationLoggingHelper {</a>
+<a name="ln221">  const std::string&amp; log_prefix;</a>
+<a name="ln222">  MvccOpTrace* mvcc_op_trace;</a>
+<a name="ln223">};</a>
+<a name="ln224"> </a>
+<a name="ln225">std::ostream&amp; operator&lt;&lt; (</a>
+<a name="ln226">    std::ostream&amp; out,</a>
+<a name="ln227">    const MvccManager::InvariantViolationLoggingHelper&amp; log_helper) {</a>
+<a name="ln228">  out &lt;&lt; log_helper.log_prefix;</a>
+<a name="ln229">  log_helper.mvcc_op_trace-&gt;DumpTrace(&amp;out);</a>
+<a name="ln230">  return out;</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln234">// SafeTimeWithSource</a>
+<a name="ln235">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln236"> </a>
+<a name="ln237">std::string SafeTimeWithSource::ToString() const {</a>
+<a name="ln238">  return Format(&quot;{ safe_time: $0 source: $1 }&quot;, safe_time, source);</a>
+<a name="ln239">}</a>
+<a name="ln240"> </a>
+<a name="ln241">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln242">// MvccManager</a>
+<a name="ln243">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln244"> </a>
+<a name="ln245">MvccManager::MvccManager(std::string prefix, server::ClockPtr clock)</a>
+<a name="ln246">    : prefix_(std::move(prefix)),</a>
+<a name="ln247">      clock_(std::move(clock)) {</a>
+<a name="ln248">  auto op_trace_num_items = GetAtomicFlag(&amp;FLAGS_TEST_mvcc_op_trace_num_items);</a>
+<a name="ln249">  if (op_trace_num_items &gt; 0) {</a>
+<a name="ln250">    op_trace_ = std::make_unique&lt;MvccManager::MvccOpTrace&gt;(op_trace_num_items);</a>
+<a name="ln251">  }</a>
+<a name="ln252">}</a>
+<a name="ln253"> </a>
+<a name="ln254">MvccManager::~MvccManager() {</a>
+<a name="ln255">}</a>
+<a name="ln256"> </a>
+<a name="ln257">void MvccManager::Replicated(HybridTime ht) {</a>
+<a name="ln258">  VLOG_WITH_PREFIX(1) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; ht &lt;&lt; &quot;)&quot;;</a>
+<a name="ln259"> </a>
+<a name="ln260">  {</a>
+<a name="ln261">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln262">    if (op_trace_) {</a>
+<a name="ln263">      op_trace_-&gt;Add(ReplicatedTraceItem { .ht = ht });</a>
+<a name="ln264">    }</a>
+<a name="ln265">    CHECK(!queue_.empty()) &lt;&lt; InvariantViolationLogPrefix();</a>
+<a name="ln266">    CHECK_EQ(queue_.front(), ht) &lt;&lt; InvariantViolationLogPrefix();</a>
+<a name="ln267">    PopFront(&amp;lock);</a>
+<a name="ln268">    last_replicated_ = ht;</a>
+<a name="ln269">  }</a>
+<a name="ln270">  cond_.notify_all();</a>
+<a name="ln271">}</a>
+<a name="ln272"> </a>
+<a name="ln273">void MvccManager::Aborted(HybridTime ht) {</a>
+<a name="ln274">  VLOG_WITH_PREFIX(1) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; ht &lt;&lt; &quot;)&quot;;</a>
+<a name="ln275"> </a>
+<a name="ln276">  {</a>
+<a name="ln277">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln278">    if (op_trace_) {</a>
+<a name="ln279">      op_trace_-&gt;Add(AbortedTraceItem { .ht = ht });</a>
+<a name="ln280">    }</a>
+<a name="ln281">    CHECK(!queue_.empty()) &lt;&lt; InvariantViolationLogPrefix();</a>
+<a name="ln282">    if (queue_.front() == ht) {</a>
+<a name="ln283">      PopFront(&amp;lock);</a>
+<a name="ln284">    } else {</a>
+<a name="ln285">      aborted_.push(ht);</a>
+<a name="ln286">      return;</a>
+<a name="ln287">    }</a>
+<a name="ln288">  }</a>
+<a name="ln289">  cond_.notify_all();</a>
+<a name="ln290">}</a>
+<a name="ln291"> </a>
+<a name="ln292">void MvccManager::PopFront(std::lock_guard&lt;std::mutex&gt;* lock) {</a>
+<a name="ln293">  queue_.pop_front();</a>
+<a name="ln294">  CHECK_GE(queue_.size(), aborted_.size()) &lt;&lt; InvariantViolationLogPrefix();</a>
+<a name="ln295">  while (!aborted_.empty()) {</a>
+<a name="ln296">    if (queue_.front() != aborted_.top()) {</a>
+<a name="ln297">      CHECK_LT(queue_.front(), aborted_.top()) &lt;&lt; InvariantViolationLogPrefix();</a>
+<a name="ln298">      break;</a>
+<a name="ln299">    }</a>
+<a name="ln300">    queue_.pop_front();</a>
+<a name="ln301">    aborted_.pop();</a>
+<a name="ln302">  }</a>
+<a name="ln303">}</a>
+<a name="ln304"> </a>
+<a name="ln305">void MvccManager::AddPending(HybridTime* ht) {</a>
+<a name="ln306">  const bool is_follower_side = ht-&gt;is_valid();</a>
+<a name="ln307">  HybridTime provided_ht = *ht;</a>
+<a name="ln308"> </a>
+<a name="ln309">  std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln310"> </a>
+<a name="ln311">  if (is_follower_side) {</a>
+<a name="ln312">    // This must be a follower-side transaction with already known hybrid time.</a>
+<a name="ln313">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;AddPending(&quot; &lt;&lt; *ht &lt;&lt; &quot;)&quot;;</a>
+<a name="ln314">  } else {</a>
+<a name="ln315">    // Otherwise this is a new transaction and we must assign a new hybrid_time. We assign one in</a>
+<a name="ln316">    // the present.</a>
+<a name="ln317">    *ht = clock_-&gt;Now();</a>
+<a name="ln318">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;AddPending(&lt;invalid&gt;), time from clock: &quot; &lt;&lt; *ht;</a>
+<a name="ln319">  }</a>
+<a name="ln320"> </a>
+<a name="ln321">  if (!queue_.empty() &amp;&amp; *ht &lt;= queue_.back() &amp;&amp; !aborted_.empty()) {</a>
+<a name="ln322">    // To avoid crashing with an invariant violation on leader changes, we detect the case when</a>
+<a name="ln323">    // an entire tail of the operation queue has been aborted. Theoretically it is still possible</a>
+<a name="ln324">    // that the subset of aborted operations is not contiguous and/or does not end with the last</a>
+<a name="ln325">    // element of the queue. In practice, though, Raft should only abort and overwrite all</a>
+<a name="ln326">    // operations starting with a particular index and until the end of the log.</a>
+<a name="ln327">    auto iter = std::lower_bound(queue_.begin(), queue_.end(), aborted_.top());</a>
+<a name="ln328"> </a>
+<a name="ln329">    // Every hybrid time in aborted_ must also exist in queue_.</a>
+<a name="ln330">    CHECK(iter != queue_.end()) &lt;&lt; InvariantViolationLogPrefix();</a>
+<a name="ln331"> </a>
+<a name="ln332">    auto start_iter = iter;</a>
+<a name="ln333">    while (iter != queue_.end() &amp;&amp; *iter == aborted_.top()) {</a>
+<a name="ln334">      aborted_.pop();</a>
+<a name="ln335">      iter++;</a>
+<a name="ln336">    }</a>
+<a name="ln337">    queue_.erase(start_iter, iter);</a>
+<a name="ln338">  }</a>
+<a name="ln339">  HybridTime last_ht_in_queue = queue_.empty() ? HybridTime::kMin : queue_.back();</a>
+<a name="ln340"> </a>
+<a name="ln341">  HybridTime sanity_check_lower_bound =</a>
+<a name="ln342">      std::max({</a>
+<a name="ln343">          max_safe_time_returned_with_lease_.safe_time,</a>
+<a name="ln344">          max_safe_time_returned_without_lease_.safe_time,</a>
+<a name="ln345">          max_safe_time_returned_for_follower_.safe_time,</a>
+<a name="ln346">          last_replicated_,</a>
+<a name="ln347">          last_ht_in_queue});</a>
+<a name="ln348"> </a>
+<a name="ln349">  if (*ht &lt;= sanity_check_lower_bound) {</a>
+<a name="ln350">    auto get_details_msg = [&amp;](bool drain_aborted) {</a>
+<a name="ln351">      std::ostringstream ss;</a>
+<a name="ln352">#define LOG_INFO_FOR_HT_LOWER_BOUND(t) \</a>
+<a name="ln353">             &quot;\n  &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(t) \</a>
+<a name="ln354">          &lt;&lt; &quot;\n  &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(*ht &lt; t.safe_time) \</a>
+<a name="ln355">          &lt;&lt; &quot;\n  &quot; &lt;&lt; EXPR_VALUE_FOR_LOG( \</a>
+<a name="ln356">                           static_cast&lt;int64_t&gt;(ht-&gt;ToUint64() - t.safe_time.ToUint64())) \</a>
+<a name="ln357">          &lt;&lt; &quot;\n  &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(ht-&gt;PhysicalDiff(t.safe_time)) \</a>
+<a name="ln358">          &lt;&lt; &quot;\n  &quot;</a>
+<a name="ln359"> </a>
+<a name="ln360">      ss &lt;&lt; &quot;New operation's hybrid time too low: &quot; &lt;&lt; *ht</a>
+<a name="ln361">         &lt;&lt; LOG_INFO_FOR_HT_LOWER_BOUND(max_safe_time_returned_with_lease_)</a>
+<a name="ln362">         &lt;&lt; LOG_INFO_FOR_HT_LOWER_BOUND(max_safe_time_returned_without_lease_)</a>
+<a name="ln363">         &lt;&lt; LOG_INFO_FOR_HT_LOWER_BOUND(max_safe_time_returned_for_follower_)</a>
+<a name="ln364">         &lt;&lt; LOG_INFO_FOR_HT_LOWER_BOUND(</a>
+<a name="ln365">                (SafeTimeWithSource{last_replicated_, SafeTimeSource::kUnknown}))</a>
+<a name="ln366">         &lt;&lt; LOG_INFO_FOR_HT_LOWER_BOUND(</a>
+<a name="ln367">                (SafeTimeWithSource{last_ht_in_queue, SafeTimeSource::kUnknown}))</a>
+<a name="ln368">         &lt;&lt; &quot;\n  &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(is_follower_side)</a>
+<a name="ln369">         &lt;&lt; &quot;\n  &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(queue_.size())</a>
+<a name="ln370">         &lt;&lt; &quot;\n  &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(queue_);</a>
+<a name="ln371">      if (drain_aborted) {</a>
+<a name="ln372">        std::vector&lt;HybridTime&gt; aborted;</a>
+<a name="ln373">        while (!aborted_.empty()) {</a>
+<a name="ln374">          aborted.push_back(aborted_.top());</a>
+<a name="ln375">          aborted_.pop();</a>
+<a name="ln376">        }</a>
+<a name="ln377">        ss &lt;&lt; &quot;\n  &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(aborted);</a>
+<a name="ln378">      }</a>
+<a name="ln379">      return ss.str();</a>
+<a name="ln380">#undef LOG_INFO_FOR_HT_LOWER_BOUND</a>
+<a name="ln381">    };</a>
+<a name="ln382"> </a>
+<a name="ln383">#ifdef NDEBUG</a>
+<a name="ln384">    // In release mode, let's try to avoid crashing if possible if we ever hit this situation.</a>
+<a name="ln385">    // On the leader side, we can assign a timestamp that is high enough.</a>
+<a name="ln386">    if (!is_follower_side &amp;&amp;</a>
+<a name="ln387">        sanity_check_lower_bound &amp;&amp;</a>
+<a name="ln388">        sanity_check_lower_bound != HybridTime::kMax) {</a>
+<a name="ln389">      HybridTime incremented_hybrid_time = sanity_check_lower_bound.Incremented();</a>
+<a name="ln390">      YB_LOG_EVERY_N_SECS(ERROR, 5) &lt;&lt; LogPrefix()</a>
+<a name="ln391">          &lt;&lt; &quot;Assigning an artificially incremented hybrid time: &quot; &lt;&lt; incremented_hybrid_time</a>
+<a name="ln392">          &lt;&lt; &quot;. This needs to be investigated. &quot; &lt;&lt; get_details_msg(/* drain_aborted */ false);</a>
+<a name="ln393">      *ht = incremented_hybrid_time;</a>
+<a name="ln394">    }</a>
+<a name="ln395">#endif</a>
+<a name="ln396"> </a>
+<a name="ln397">    if (*ht &lt;= sanity_check_lower_bound) {</a>
+<a name="ln398">      LOG_WITH_PREFIX(FATAL) &lt;&lt; InvariantViolationLogPrefix()</a>
+<a name="ln399">                             &lt;&lt; get_details_msg(/* drain_aborted */ true);</a>
+<a name="ln400">    }</a>
+<a name="ln401">  }</a>
+<a name="ln402">  if (op_trace_) {</a>
+<a name="ln403">    op_trace_-&gt;Add(AddPendingTraceItem {</a>
+<a name="ln404">      .provided_ht = provided_ht,</a>
+<a name="ln405">      .final_ht = *ht</a>
+<a name="ln406">    });</a>
+<a name="ln407">  }</a>
+<a name="ln408">  queue_.push_back(*ht);</a>
+<a name="ln409">}</a>
+<a name="ln410"> </a>
+<a name="ln411">void MvccManager::SetLastReplicated(HybridTime ht) {</a>
+<a name="ln412">  VLOG_WITH_PREFIX(1) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; ht &lt;&lt; &quot;)&quot;;</a>
+<a name="ln413"> </a>
+<a name="ln414">  {</a>
+<a name="ln415">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln416">    if (op_trace_) {</a>
+<a name="ln417">      op_trace_-&gt;Add(SetLastReplicatedTraceItem { .ht = ht });</a>
+<a name="ln418">    }</a>
+<a name="ln419">    last_replicated_ = ht;</a>
+<a name="ln420">  }</a>
+<a name="ln421">  cond_.notify_all();</a>
+<a name="ln422">}</a>
+<a name="ln423"> </a>
+<a name="ln424">void MvccManager::SetPropagatedSafeTimeOnFollower(HybridTime ht) {</a>
+<a name="ln425">  VLOG_WITH_PREFIX(1) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; ht &lt;&lt; &quot;)&quot;;</a>
+<a name="ln426"> </a>
+<a name="ln427">  {</a>
+<a name="ln428">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln429">    if (op_trace_) {</a>
+<a name="ln430">      op_trace_-&gt;Add(SetPropagatedSafeTimeOnFollowerTraceItem { .ht = ht });</a>
+<a name="ln431">    }</a>
+<a name="ln432">    if (ht &gt;= propagated_safe_time_) {</a>
+<a name="ln433">      propagated_safe_time_ = ht;</a>
+<a name="ln434">    } else {</a>
+<a name="ln435">      LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln436">          &lt;&lt; &quot;Received propagated safe time &quot; &lt;&lt; ht &lt;&lt; &quot; less than the old value: &quot;</a>
+<a name="ln437">          &lt;&lt; propagated_safe_time_ &lt;&lt; &quot;. This could happen on followers when a new leader &quot;</a>
+<a name="ln438">          &lt;&lt; &quot;is elected.&quot;;</a>
+<a name="ln439">    }</a>
+<a name="ln440">  }</a>
+<a name="ln441">  cond_.notify_all();</a>
+<a name="ln442">}</a>
+<a name="ln443"> </a>
+<a name="ln444">// NO_THREAD_SAFETY_ANALYSIS because this analysis does not work with unique_lock.</a>
+<a name="ln445">void MvccManager::UpdatePropagatedSafeTimeOnLeader(const FixedHybridTimeLease&amp; ht_lease)</a>
+<a name="ln446">    NO_THREAD_SAFETY_ANALYSIS {</a>
+<a name="ln447">  VLOG_WITH_PREFIX(1) &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; ht_lease &lt;&lt; &quot;)&quot;;</a>
+<a name="ln448"> </a>
+<a name="ln449">  {</a>
+<a name="ln450">    std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln451">    auto safe_time = DoGetSafeTime(HybridTime::kMin,       // min_allowed</a>
+<a name="ln452">                                   CoarseTimePoint::max(), // deadline</a>
+<a name="ln453">                                   ht_lease,</a>
+<a name="ln454">                                   &amp;lock);</a>
+<a name="ln455">#ifndef NDEBUG</a>
+<a name="ln456">    // This should only be called from RaftConsensus::UpdateMajorityReplicated, and ht_lease passed</a>
+<a name="ln457">    // in here should keep increasing, so we should not see propagated_safe_time_ going backwards.</a>
+<a name="ln458">    CHECK_GE(safe_time, propagated_safe_time_)</a>
+<a name="ln459">        &lt;&lt; InvariantViolationLogPrefix()</a>
+<a name="ln460">        &lt;&lt; &quot;ht_lease: &quot; &lt;&lt; ht_lease;</a>
+<a name="ln461">    propagated_safe_time_ = safe_time;</a>
+<a name="ln462">#else</a>
+<a name="ln463">    // Do not crash in production.</a>
+<a name="ln464">    if (safe_time &lt; propagated_safe_time_) {</a>
+<a name="ln465">      YB_LOG_EVERY_N_SECS(ERROR, 5) &lt;&lt; LogPrefix()</a>
+<a name="ln466">          &lt;&lt; &quot;Previously saw &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(propagated_safe_time_)</a>
+<a name="ln467">          &lt;&lt; &quot;, but now safe time is &quot; &lt;&lt; safe_time;</a>
+<a name="ln468">    } else {</a>
+<a name="ln469">      propagated_safe_time_ = safe_time;</a>
+<a name="ln470">    }</a>
+<a name="ln471">#endif</a>
+<a name="ln472"> </a>
+<a name="ln473">    if (op_trace_) {</a>
+<a name="ln474">      op_trace_-&gt;Add(UpdatePropagatedSafeTimeOnLeaderTraceItem {</a>
+<a name="ln475">        .ht_lease = ht_lease,</a>
+<a name="ln476">        .safe_time = safe_time</a>
+<a name="ln477">      });</a>
+<a name="ln478">    }</a>
+<a name="ln479">  }</a>
+<a name="ln480">  cond_.notify_all();</a>
+<a name="ln481">}</a>
+<a name="ln482"> </a>
+<a name="ln483">void MvccManager::SetLeaderOnlyMode(bool leader_only) {</a>
+<a name="ln484">  std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln485">  if (op_trace_) {</a>
+<a name="ln486">    op_trace_-&gt;Add(SetLeaderOnlyModeTraceItem {</a>
+<a name="ln487">      .leader_only = leader_only</a>
+<a name="ln488">    });</a>
+<a name="ln489">  }</a>
+<a name="ln490">  leader_only_mode_ = leader_only;</a>
+<a name="ln491">}</a>
+<a name="ln492"> </a>
+<a name="ln493">// NO_THREAD_SAFETY_ANALYSIS because this analysis does not work with unique_lock.</a>
+<a name="ln494">HybridTime MvccManager::SafeTimeForFollower(</a>
+<a name="ln495">    HybridTime min_allowed, CoarseTimePoint deadline) const NO_THREAD_SAFETY_ANALYSIS {</a>
+<a name="ln496">  std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln497"> </a>
+<a name="ln498">  if (leader_only_mode_) {</a>
+<a name="ln499">    // If there are no followers (RF == 1), use SafeTime() because propagated_safe_time_ might not</a>
+<a name="ln500">    // have a valid value.</a>
+<a name="ln501">    return DoGetSafeTime(min_allowed, deadline, FixedHybridTimeLease(), &amp;lock);</a>
+<a name="ln502">  }</a>
+<a name="ln503"> </a>
+<a name="ln504">  SafeTimeWithSource result;</a>
+<a name="ln505">  auto predicate = [this, &amp;result, min_allowed] {</a>
+<a name="ln506">    // last_replicated_ is updated earlier than propagated_safe_time_, so because of concurrency it</a>
+<a name="ln507">    // could be greater than propagated_safe_time_.</a>
+<a name="ln508">    if (propagated_safe_time_ &gt; last_replicated_) {</a>
+<a name="ln509">      if (queue_.empty() || propagated_safe_time_ &lt; queue_.front()) {</a>
+<a name="ln510">        result.safe_time = propagated_safe_time_;</a>
+<a name="ln511">        result.source = SafeTimeSource::kPropagated;</a>
+<a name="ln512">      } else {</a>
+<a name="ln513">        result.safe_time = queue_.front().Decremented();</a>
+<a name="ln514">        result.source = SafeTimeSource::kNextInQueue;</a>
+<a name="ln515">      }</a>
+<a name="ln516">    } else {</a>
+<a name="ln517">      result.safe_time = last_replicated_;</a>
+<a name="ln518">      result.source = SafeTimeSource::kLastReplicated;</a>
+<a name="ln519">    }</a>
+<a name="ln520">    return result.safe_time &gt;= min_allowed;</a>
+<a name="ln521">  };</a>
+<a name="ln522">  if (deadline == CoarseTimePoint::max()) {</a>
+<a name="ln523">    cond_.wait(lock, predicate);</a>
+<a name="ln524">  } else if (!cond_.wait_until(lock, deadline, predicate)) {</a>
+<a name="ln525">    return HybridTime::kInvalid;</a>
+<a name="ln526">  }</a>
+<a name="ln527">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;SafeTimeForFollower(&quot; &lt;&lt; min_allowed</a>
+<a name="ln528">                      &lt;&lt; &quot;), result = &quot; &lt;&lt; result.ToString();</a>
+<a name="ln529">  CHECK_GE(result.safe_time, max_safe_time_returned_for_follower_.safe_time)</a>
+<a name="ln530">      &lt;&lt; InvariantViolationLogPrefix()</a>
+<a name="ln531">      &lt;&lt; &quot;result: &quot; &lt;&lt; result.ToString()</a>
+<a name="ln532">      &lt;&lt; &quot;, max_safe_time_returned_for_follower_: &quot;</a>
+<a name="ln533">      &lt;&lt; max_safe_time_returned_for_follower_.ToString();</a>
+<a name="ln534">  max_safe_time_returned_for_follower_ = result;</a>
+<a name="ln535">  if (op_trace_) {</a>
+<a name="ln536">    op_trace_-&gt;Add(SafeTimeForFollowerTraceItem {</a>
+<a name="ln537">      .min_allowed = min_allowed,</a>
+<a name="ln538">      .deadline = deadline,</a>
+<a name="ln539">      .safe_time_with_source = result</a>
+<a name="ln540">    });</a>
+<a name="ln541">  }</a>
+<a name="ln542">  return result.safe_time;</a>
+<a name="ln543">}</a>
+<a name="ln544"> </a>
+<a name="ln545">// NO_THREAD_SAFETY_ANALYSIS because this analysis does not work with unique_lock.</a>
+<a name="ln546">HybridTime MvccManager::SafeTime(</a>
+<a name="ln547">    HybridTime min_allowed,</a>
+<a name="ln548">    CoarseTimePoint deadline,</a>
+<a name="ln549">    const FixedHybridTimeLease&amp; ht_lease) const NO_THREAD_SAFETY_ANALYSIS {</a>
+<a name="ln550">  std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln551">  auto safe_time = DoGetSafeTime(min_allowed, deadline, ht_lease, &amp;lock);</a>
+<a name="ln552">  if (op_trace_) {</a>
+<a name="ln553">    op_trace_-&gt;Add(SafeTimeTraceItem {</a>
+<a name="ln554">      .min_allowed = min_allowed,</a>
+<a name="ln555">      .deadline = deadline,</a>
+<a name="ln556">      .ht_lease = ht_lease,</a>
+<a name="ln557">      .safe_time = safe_time</a>
+<a name="ln558">    });</a>
+<a name="ln559">  }</a>
+<a name="ln560">  return safe_time;</a>
+<a name="ln561">}</a>
+<a name="ln562"> </a>
+<a name="ln563">HybridTime MvccManager::DoGetSafeTime(const HybridTime min_allowed,</a>
+<a name="ln564">                                      const CoarseTimePoint deadline,</a>
+<a name="ln565">                                      const FixedHybridTimeLease&amp; ht_lease,</a>
+<a name="ln566">                                      std::unique_lock&lt;std::mutex&gt;* lock) const {</a>
+<a name="ln567">  DCHECK_ONLY_NOTNULL(lock);</a>
+<a name="ln568">  CHECK(ht_lease.lease.is_valid()) &lt;&lt; InvariantViolationLogPrefix();</a>
+<a name="ln569">  CHECK_LE(min_allowed, ht_lease.lease) &lt;&lt; InvariantViolationLogPrefix();</a>
+<a name="ln570"> </a>
+<a name="ln571">  const bool has_lease = !ht_lease.empty();</a>
+<a name="ln572">  if (has_lease) {</a>
+<a name="ln573">    max_ht_lease_seen_ = std::max(ht_lease.lease, max_ht_lease_seen_);</a>
+<a name="ln574">    LOG_IF_WITH_PREFIX(DFATAL, !ht_lease.time.is_valid()) &lt;&lt; &quot;Bad ht lease: &quot; &lt;&lt; ht_lease;</a>
+<a name="ln575">  }</a>
+<a name="ln576"> </a>
+<a name="ln577">  HybridTime result;</a>
+<a name="ln578">  SafeTimeSource source = SafeTimeSource::kUnknown;</a>
+<a name="ln579">  auto predicate = [this, &amp;result, &amp;source, min_allowed, time = ht_lease.time, has_lease] {</a>
+<a name="ln580">    if (queue_.empty()) {</a>
+<a name="ln581">      result = time.is_valid() ? std::max(max_safe_time_returned_with_lease_.safe_time, time)</a>
+<a name="ln582">                               : clock_-&gt;Now();</a>
+<a name="ln583">      source = SafeTimeSource::kNow;</a>
+<a name="ln584">      VLOG_WITH_PREFIX(2) &lt;&lt; &quot;DoGetSafeTime, Now: &quot; &lt;&lt; result;</a>
+<a name="ln585">    } else {</a>
+<a name="ln586">      result = queue_.front().Decremented();</a>
+<a name="ln587">      source = SafeTimeSource::kNextInQueue;</a>
+<a name="ln588">      VLOG_WITH_PREFIX(2) &lt;&lt; &quot;DoGetSafeTime, Queue front (decremented): &quot; &lt;&lt; result;</a>
+<a name="ln589">    }</a>
+<a name="ln590"> </a>
+<a name="ln591">    if (has_lease &amp;&amp; result &gt; max_ht_lease_seen_) {</a>
+<a name="ln592">      result = max_ht_lease_seen_;</a>
+<a name="ln593">      source = SafeTimeSource::kHybridTimeLease;</a>
+<a name="ln594">    }</a>
+<a name="ln595"> </a>
+<a name="ln596">    // This function could be invoked at a follower, so it has a very old ht_lease. In this case it</a>
+<a name="ln597">    // is safe to read at least at last_replicated_.</a>
+<a name="ln598">    result = std::max(result, last_replicated_);</a>
+<a name="ln599"> </a>
+<a name="ln600">    return result &gt;= min_allowed;</a>
+<a name="ln601">  };</a>
+<a name="ln602"> </a>
+<a name="ln603">  // In the case of an empty queue, the safe hybrid time to read at is only limited by hybrid time</a>
+<a name="ln604">  // ht_lease, which is by definition higher than min_allowed, so we would not get blocked.</a>
+<a name="ln605">  if (deadline == CoarseTimePoint::max()) {</a>
+<a name="ln606">    cond_.wait(*lock, predicate);</a>
+<a name="ln607">  } else if (!cond_.wait_until(*lock, deadline, predicate)) {</a>
+<a name="ln608">    return HybridTime::kInvalid;</a>
+<a name="ln609">  }</a>
+<a name="ln610">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;DoGetSafeTime(&quot; &lt;&lt; min_allowed &lt;&lt; &quot;, &quot;</a>
+<a name="ln611">                      &lt;&lt; ht_lease &lt;&lt; &quot;), result = &quot; &lt;&lt; result;</a>
+<a name="ln612"> </a>
+<a name="ln613">  auto enforced_min_time = has_lease ? max_safe_time_returned_with_lease_.safe_time</a>
+<a name="ln614">                                     : max_safe_time_returned_without_lease_.safe_time;</a>
+<a name="ln615">  CHECK_GE(result, enforced_min_time)</a>
+<a name="ln616">      &lt;&lt; InvariantViolationLogPrefix()</a>
+<a name="ln617">      &lt;&lt; &quot;: &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(has_lease)</a>
+<a name="ln618">      &lt;&lt; &quot;, &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(enforced_min_time.ToUint64() - result.ToUint64())</a>
+<a name="ln619">      &lt;&lt; &quot;, &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(ht_lease)</a>
+<a name="ln620">      &lt;&lt; &quot;, &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(max_ht_lease_seen_)</a>
+<a name="ln621">      &lt;&lt; &quot;, &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(last_replicated_)</a>
+<a name="ln622">      &lt;&lt; &quot;, &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(clock_-&gt;Now())</a>
+<a name="ln623">      &lt;&lt; &quot;, &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(ToString(deadline))</a>
+<a name="ln624">      &lt;&lt; &quot;, &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(queue_.size())</a>
+<a name="ln625">      &lt;&lt; &quot;, &quot; &lt;&lt; EXPR_VALUE_FOR_LOG(queue_);</a>
+<a name="ln626"> </a>
+<a name="ln627">  if (has_lease) {</a>
+<a name="ln628">    max_safe_time_returned_with_lease_ = { result, source };</a>
+<a name="ln629">  } else {</a>
+<a name="ln630">    max_safe_time_returned_without_lease_ = { result, source };</a>
+<a name="ln631">  }</a>
+<a name="ln632">  return result;</a>
+<a name="ln633">}</a>
+<a name="ln634"> </a>
+<a name="ln635">HybridTime MvccManager::LastReplicatedHybridTime() const {</a>
+<a name="ln636">  std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln637">  VLOG_WITH_PREFIX(1) &lt;&lt; __func__ &lt;&lt; &quot;(), result = &quot; &lt;&lt; last_replicated_;</a>
+<a name="ln638">  if (op_trace_) {</a>
+<a name="ln639">    op_trace_-&gt;Add(LastReplicatedHybridTimeTraceItem {</a>
+<a name="ln640">      .last_replicated = last_replicated_</a>
+<a name="ln641">    });</a>
+<a name="ln642">  }</a>
+<a name="ln643">  return last_replicated_;</a>
+<a name="ln644">}</a>
+<a name="ln645"> </a>
+<a name="ln646">// Using NO_THREAD_SAFETY_ANALYSIS here because we're only reading op_trace_ here and it is set</a>
+<a name="ln647">// in the constructor.</a>
+<a name="ln648">MvccManager::InvariantViolationLoggingHelper MvccManager::InvariantViolationLogPrefix() const</a>
+<a name="ln649">    NO_THREAD_SAFETY_ANALYSIS {</a>
+<a name="ln650">  return { prefix_, op_trace_.get() };</a>
+<a name="ln651">}</a>
+<a name="ln652"> </a>
+<a name="ln653">// Ditto regarding NO_THREAD_SAFETY_ANALYSIS.</a>
+<a name="ln654">void MvccManager::TEST_DumpTrace(std::ostream* out) NO_THREAD_SAFETY_ANALYSIS {</a>
+<a name="ln655">  if (op_trace_)</a>
+<a name="ln656">    op_trace_-&gt;DumpTrace(out);</a>
+<a name="ln657">}</a>
+<a name="ln658"> </a>
+<a name="ln659">}  // namespace tablet</a>
+<a name="ln660">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="258"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="265"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="274"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="281"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="313"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="318"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="330"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="412"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="425"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="447"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="527"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="568"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="574"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="584"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="588"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="610"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="637"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

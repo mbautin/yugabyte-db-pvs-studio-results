@@ -1,0 +1,710 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>fs_manager.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/fs/fs_manager.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;deque&gt;</a>
+<a name="ln36">#include &lt;iostream&gt;</a>
+<a name="ln37">#include &lt;map&gt;</a>
+<a name="ln38">#include &lt;unordered_set&gt;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &lt;boost/algorithm/string/predicate.hpp&gt;</a>
+<a name="ln41"> </a>
+<a name="ln42">#include &lt;glog/logging.h&gt;</a>
+<a name="ln43">#include &lt;glog/stl_logging.h&gt;</a>
+<a name="ln44">#include &lt;google/protobuf/message.h&gt;</a>
+<a name="ln45"> </a>
+<a name="ln46">#include &quot;yb/fs/fs.pb.h&quot;</a>
+<a name="ln47">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln48">#include &quot;yb/gutil/strings/join.h&quot;</a>
+<a name="ln49">#include &quot;yb/gutil/strings/numbers.h&quot;</a>
+<a name="ln50">#include &quot;yb/gutil/strings/split.h&quot;</a>
+<a name="ln51">#include &quot;yb/gutil/strings/strip.h&quot;</a>
+<a name="ln52">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln53">#include &quot;yb/gutil/strings/util.h&quot;</a>
+<a name="ln54">#include &quot;yb/gutil/strtoint.h&quot;</a>
+<a name="ln55">#include &quot;yb/gutil/walltime.h&quot;</a>
+<a name="ln56">#include &quot;yb/util/env_util.h&quot;</a>
+<a name="ln57">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln58">#include &quot;yb/util/net/net_util.h&quot;</a>
+<a name="ln59">#include &quot;yb/util/oid_generator.h&quot;</a>
+<a name="ln60">#include &quot;yb/util/path_util.h&quot;</a>
+<a name="ln61">#include &quot;yb/util/pb_util.h&quot;</a>
+<a name="ln62"> </a>
+<a name="ln63">DEFINE_bool(enable_data_block_fsync, true,</a>
+<a name="ln64">            &quot;Whether to enable fsync() of data blocks, metadata, and their parent directories. &quot;</a>
+<a name="ln65">            &quot;Disabling this flag may cause data loss in the event of a system crash.&quot;);</a>
+<a name="ln66">TAG_FLAG(enable_data_block_fsync, unsafe);</a>
+<a name="ln67"> </a>
+<a name="ln68">DECLARE_string(fs_data_dirs);</a>
+<a name="ln69"> </a>
+<a name="ln70">DEFINE_string(fs_wal_dirs, &quot;&quot;,</a>
+<a name="ln71">              &quot;Comma-separated list of directories for write-ahead logs. This is an optional &quot;</a>
+<a name="ln72">                  &quot;argument. If this is not specified, fs_data_dirs is used for write-ahead logs &quot;</a>
+<a name="ln73">                  &quot;also and that's a reasonable default for most use cases.&quot;);</a>
+<a name="ln74">TAG_FLAG(fs_wal_dirs, stable);</a>
+<a name="ln75"> </a>
+<a name="ln76">DEFINE_string(instance_uuid_override, &quot;&quot;,</a>
+<a name="ln77">              &quot;When creating local instance metadata (for master or tserver) in an empty data &quot;</a>
+<a name="ln78">              &quot;directory, use this UUID instead of randomly-generated one. Can be used to replace &quot;</a>
+<a name="ln79">              &quot;a node that had its disk wiped in some scenarios.&quot;);</a>
+<a name="ln80"> </a>
+<a name="ln81">DEFINE_test_flag(bool, simulate_fs_create_failure, false,</a>
+<a name="ln82">                 &quot;Simulate failure during initial creation of fs during the first time &quot;</a>
+<a name="ln83">                 &quot;process creation.&quot;);</a>
+<a name="ln84"> </a>
+<a name="ln85">using google::protobuf::Message;</a>
+<a name="ln86">using yb::env_util::ScopedFileDeleter;</a>
+<a name="ln87">using std::map;</a>
+<a name="ln88">using std::unordered_set;</a>
+<a name="ln89">using strings::Substitute;</a>
+<a name="ln90"> </a>
+<a name="ln91">namespace yb {</a>
+<a name="ln92"> </a>
+<a name="ln93">// ==========================================================================</a>
+<a name="ln94">//  FS Paths</a>
+<a name="ln95">// ==========================================================================</a>
+<a name="ln96">const char *FsManager::kWalDirName = &quot;wals&quot;;</a>
+<a name="ln97">const char *FsManager::kWalFileNamePrefix = &quot;wal&quot;;</a>
+<a name="ln98">const char *FsManager::kWalsRecoveryDirSuffix = &quot;.recovery&quot;;</a>
+<a name="ln99">const char *FsManager::kRocksDBDirName = &quot;rocksdb&quot;;</a>
+<a name="ln100">const char *FsManager::kRaftGroupMetadataDirName = &quot;tablet-meta&quot;;</a>
+<a name="ln101">const char *FsManager::kDataDirName = &quot;data&quot;;</a>
+<a name="ln102">const char *FsManager::kCorruptedSuffix = &quot;.corrupted&quot;;</a>
+<a name="ln103">const char *FsManager::kInstanceMetadataFileName = &quot;instance&quot;;</a>
+<a name="ln104">const char *FsManager::kFsLockFileName = &quot;fs-lock&quot;;</a>
+<a name="ln105">const char *FsManager::kConsensusMetadataDirName = &quot;consensus-meta&quot;;</a>
+<a name="ln106">const char *FsManager::kLogsDirName = &quot;logs&quot;;</a>
+<a name="ln107"> </a>
+<a name="ln108">static const char* const kTmpInfix = &quot;.tmp&quot;;</a>
+<a name="ln109"> </a>
+<a name="ln110">FsManagerOpts::FsManagerOpts()</a>
+<a name="ln111">    : read_only(false) {</a>
+<a name="ln112">  if (FLAGS_fs_wal_dirs.empty() &amp;&amp; !FLAGS_fs_data_dirs.empty()) {</a>
+<a name="ln113">    // It is sufficient if user sets the data dirs. By default we use the same</a>
+<a name="ln114">    // directories for WALs as well.</a>
+<a name="ln115">    FLAGS_fs_wal_dirs = FLAGS_fs_data_dirs;</a>
+<a name="ln116">  }</a>
+<a name="ln117">  wal_paths = strings::Split(FLAGS_fs_wal_dirs, &quot;,&quot;, strings::SkipEmpty());</a>
+<a name="ln118">  data_paths = strings::Split(FLAGS_fs_data_dirs, &quot;,&quot;, strings::SkipEmpty());</a>
+<a name="ln119">}</a>
+<a name="ln120"> </a>
+<a name="ln121">FsManagerOpts::~FsManagerOpts() {</a>
+<a name="ln122">}</a>
+<a name="ln123"> </a>
+<a name="ln124">FsManager::FsManager(Env* env, const string&amp; root_path, const std::string&amp; server_type)</a>
+<a name="ln125">    : env_(DCHECK_NOTNULL(env)),</a>
+<a name="ln126">      read_only_(false),</a>
+<a name="ln127">      wal_fs_roots_({ root_path }),</a>
+<a name="ln128">      data_fs_roots_({ root_path }),</a>
+<a name="ln129">      server_type_(server_type),</a>
+<a name="ln130">      metric_entity_(nullptr),</a>
+<a name="ln131">      initted_(false) {</a>
+<a name="ln132">}</a>
+<a name="ln133"> </a>
+<a name="ln134">FsManager::FsManager(Env* env,</a>
+<a name="ln135">                     const FsManagerOpts&amp; opts)</a>
+<a name="ln136">    : env_(DCHECK_NOTNULL(env)),</a>
+<a name="ln137">      read_only_(opts.read_only),</a>
+<a name="ln138">      wal_fs_roots_(opts.wal_paths),</a>
+<a name="ln139">      data_fs_roots_(opts.data_paths),</a>
+<a name="ln140">      server_type_(opts.server_type),</a>
+<a name="ln141">      metric_entity_(opts.metric_entity),</a>
+<a name="ln142">      parent_mem_tracker_(opts.parent_mem_tracker),</a>
+<a name="ln143">      initted_(false) {</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146">FsManager::~FsManager() {</a>
+<a name="ln147">}</a>
+<a name="ln148"> </a>
+<a name="ln149">Status FsManager::Init() {</a>
+<a name="ln150">  if (initted_) {</a>
+<a name="ln151">    return Status::OK();</a>
+<a name="ln152">  }</a>
+<a name="ln153"> </a>
+<a name="ln154">  // The wal root must be set.</a>
+<a name="ln155">  if (data_fs_roots_.empty()) {</a>
+<a name="ln156">    return STATUS(IOError, &quot;List of data directories (fs_data_dirs) not provided&quot;);</a>
+<a name="ln157">  }</a>
+<a name="ln158"> </a>
+<a name="ln159">  // Deduplicate all of the roots.</a>
+<a name="ln160">  set&lt;string&gt; all_roots;</a>
+<a name="ln161">  for (const string&amp; wal_fs_root : wal_fs_roots_) {</a>
+<a name="ln162">    all_roots.insert(wal_fs_root);</a>
+<a name="ln163">  }</a>
+<a name="ln164">  for (const string&amp; data_fs_root : data_fs_roots_) {</a>
+<a name="ln165">    all_roots.insert(data_fs_root);</a>
+<a name="ln166">  }</a>
+<a name="ln167"> </a>
+<a name="ln168">  // Build a map of original root --&gt; canonicalized root, sanitizing each</a>
+<a name="ln169">  // root a bit as we go.</a>
+<a name="ln170">  typedef map&lt;string, string&gt; RootMap;</a>
+<a name="ln171">  RootMap canonicalized_roots;</a>
+<a name="ln172">  for (const string&amp; root : all_roots) {</a>
+<a name="ln173">    if (root.empty()) {</a>
+<a name="ln174">      return STATUS(IOError, &quot;Empty string provided for filesystem root&quot;);</a>
+<a name="ln175">    }</a>
+<a name="ln176">    if (root[0] != '/') {</a>
+<a name="ln177">      return STATUS(IOError,</a>
+<a name="ln178">          Substitute(&quot;Relative path $0 provided for filesystem root&quot;, root));</a>
+<a name="ln179">    }</a>
+<a name="ln180">    {</a>
+<a name="ln181">      string root_copy = root;</a>
+<a name="ln182">      StripWhiteSpace(&amp;root_copy);</a>
+<a name="ln183">      if (root != root_copy) {</a>
+<a name="ln184">        return STATUS(IOError,</a>
+<a name="ln185">                  Substitute(&quot;Filesystem root $0 contains illegal whitespace&quot;, root));</a>
+<a name="ln186">      }</a>
+<a name="ln187">    }</a>
+<a name="ln188"> </a>
+<a name="ln189">    // Strip the basename when canonicalizing, as it may not exist. The</a>
+<a name="ln190">    // dirname, however, must exist.</a>
+<a name="ln191">    string canonicalized;</a>
+<a name="ln192">    Status s = env_-&gt;Canonicalize(DirName(root), &amp;canonicalized);</a>
+<a name="ln193">    if (!s.ok()) {</a>
+<a name="ln194">      return STATUS(</a>
+<a name="ln195">          InvalidArgument, strings::Substitute(</a>
+<a name="ln196">          &quot;Cannot create directory for YB data, please check the --fs_data_dirs parameter &quot;</a>
+<a name="ln197">          &quot;(Passed: $0). Path does not exist: $1\nDetails: $2&quot;,</a>
+<a name="ln198">          FLAGS_fs_data_dirs, root, s.ToString()));</a>
+<a name="ln199">    }</a>
+<a name="ln200">    canonicalized = JoinPathSegments(canonicalized, BaseName(root));</a>
+<a name="ln201">    InsertOrDie(&amp;canonicalized_roots, root, canonicalized);</a>
+<a name="ln202">  }</a>
+<a name="ln203"> </a>
+<a name="ln204">  // All done, use the map to set the canonicalized state.</a>
+<a name="ln205">  for (const auto&amp; wal_fs_root : wal_fs_roots_) {</a>
+<a name="ln206">    canonicalized_wal_fs_roots_.insert(FindOrDie(canonicalized_roots, wal_fs_root));</a>
+<a name="ln207">  }</a>
+<a name="ln208">  if (!data_fs_roots_.empty()) {</a>
+<a name="ln209">    canonicalized_metadata_fs_root_ = FindOrDie(canonicalized_roots, data_fs_roots_[0]);</a>
+<a name="ln210">    for (const string&amp; data_fs_root : data_fs_roots_) {</a>
+<a name="ln211">      canonicalized_data_fs_roots_.insert(FindOrDie(canonicalized_roots, data_fs_root));</a>
+<a name="ln212">    }</a>
+<a name="ln213">  } else {</a>
+<a name="ln214">    LOG(FATAL) &lt;&lt; &quot;Data directories (fs_data_dirs) must be specified&quot;;</a>
+<a name="ln215">  }</a>
+<a name="ln216"> </a>
+<a name="ln217">  for (const RootMap::value_type&amp; e : canonicalized_roots) {</a>
+<a name="ln218">    canonicalized_all_fs_roots_.insert(e.second);</a>
+<a name="ln219">  }</a>
+<a name="ln220"> </a>
+<a name="ln221">  if (VLOG_IS_ON(1)) {</a>
+<a name="ln222">    VLOG(1) &lt;&lt; &quot;WAL roots: &quot; &lt;&lt; canonicalized_wal_fs_roots_;</a>
+<a name="ln223">    VLOG(1) &lt;&lt; &quot;Metadata root: &quot; &lt;&lt; canonicalized_metadata_fs_root_;</a>
+<a name="ln224">    VLOG(1) &lt;&lt; &quot;Data roots: &quot; &lt;&lt; canonicalized_data_fs_roots_;</a>
+<a name="ln225">    VLOG(1) &lt;&lt; &quot;All roots: &quot; &lt;&lt; canonicalized_all_fs_roots_;</a>
+<a name="ln226">  }</a>
+<a name="ln227"> </a>
+<a name="ln228">  initted_ = true;</a>
+<a name="ln229">  return Status::OK();</a>
+<a name="ln230">}</a>
+<a name="ln231"> </a>
+<a name="ln232">Status FsManager::Open() {</a>
+<a name="ln233">  RETURN_NOT_OK(Init());</a>
+<a name="ln234"> </a>
+<a name="ln235">  if (HasAnyLockFiles()) {</a>
+<a name="ln236">    return STATUS(Corruption, &quot;Lock file is present, filesystem may be in inconsistent state&quot;);</a>
+<a name="ln237">  }</a>
+<a name="ln238"> </a>
+<a name="ln239">  for (const string&amp; root : canonicalized_all_fs_roots_) {</a>
+<a name="ln240">    gscoped_ptr&lt;InstanceMetadataPB&gt; pb(new InstanceMetadataPB);</a>
+<a name="ln241">    RETURN_NOT_OK(pb_util::ReadPBContainerFromPath(env_, GetInstanceMetadataPath(root), pb.get()));</a>
+<a name="ln242">    if (!metadata_) {</a>
+<a name="ln243">      metadata_.reset(pb.release());</a>
+<a name="ln244">    } else if (pb-&gt;uuid() != metadata_-&gt;uuid()) {</a>
+<a name="ln245">      return STATUS(Corruption, Substitute(</a>
+<a name="ln246">          &quot;Mismatched UUIDs across filesystem roots: $0 vs. $1&quot;,</a>
+<a name="ln247">          metadata_-&gt;uuid(), pb-&gt;uuid()));</a>
+<a name="ln248">    }</a>
+<a name="ln249">  }</a>
+<a name="ln250"> </a>
+<a name="ln251">  LOG(INFO) &lt;&lt; &quot;Opened local filesystem: &quot; &lt;&lt; JoinStrings(canonicalized_all_fs_roots_, &quot;,&quot;)</a>
+<a name="ln252">            &lt;&lt; std::endl &lt;&lt; metadata_-&gt;DebugString();</a>
+<a name="ln253">  return Status::OK();</a>
+<a name="ln254">}</a>
+<a name="ln255"> </a>
+<a name="ln256">bool FsManager::HasAnyLockFiles() {</a>
+<a name="ln257">  for (const string&amp; root : canonicalized_all_fs_roots_) {</a>
+<a name="ln258">    if (Exists(GetFsLockFilePath(root))) {</a>
+<a name="ln259">      LOG(INFO) &lt;&lt; &quot;Found lock file in dir &quot; &lt;&lt; root;</a>
+<a name="ln260">      return true;</a>
+<a name="ln261">    }</a>
+<a name="ln262">  }</a>
+<a name="ln263"> </a>
+<a name="ln264">  return false;</a>
+<a name="ln265">}</a>
+<a name="ln266"> </a>
+<a name="ln267">Status FsManager::DeleteLockFiles() {</a>
+<a name="ln268">  CHECK(!read_only_);</a>
+<a name="ln269">  vector&lt;string&gt; removal_list;</a>
+<a name="ln270">  for (const string&amp; root : canonicalized_all_fs_roots_) {</a>
+<a name="ln271">    std::string lock_file_path = GetFsLockFilePath(root);</a>
+<a name="ln272">    if (Exists(lock_file_path)) {</a>
+<a name="ln273">      removal_list.push_back(lock_file_path);</a>
+<a name="ln274">    }</a>
+<a name="ln275">  }</a>
+<a name="ln276"> </a>
+<a name="ln277">  for (const string&amp; target : removal_list) {</a>
+<a name="ln278">    RETURN_NOT_OK_PREPEND(env_-&gt;DeleteFile(target), &quot;Lock file delete failed&quot;);</a>
+<a name="ln279">  }</a>
+<a name="ln280"> </a>
+<a name="ln281">  return Status::OK();</a>
+<a name="ln282">}</a>
+<a name="ln283"> </a>
+<a name="ln284">Status FsManager::DeleteFileSystemLayout(ShouldDeleteLogs also_delete_logs) {</a>
+<a name="ln285">  CHECK(!read_only_);</a>
+<a name="ln286">  set&lt;string&gt; removal_set;</a>
+<a name="ln287">  if (also_delete_logs) {</a>
+<a name="ln288">    removal_set = canonicalized_all_fs_roots_;</a>
+<a name="ln289">  } else {</a>
+<a name="ln290">    auto removal_list = GetWalRootDirs();</a>
+<a name="ln291">    removal_list.push_back(GetRaftGroupMetadataDir());</a>
+<a name="ln292">    removal_list.push_back(GetConsensusMetadataDir());</a>
+<a name="ln293">    for (const string&amp; root : canonicalized_all_fs_roots_) {</a>
+<a name="ln294">      removal_list.push_back(GetInstanceMetadataPath(root));</a>
+<a name="ln295">    }</a>
+<a name="ln296">    auto data_dirs = GetDataRootDirs();</a>
+<a name="ln297">    removal_list.insert(removal_list.begin(), data_dirs.begin(), data_dirs.end());</a>
+<a name="ln298">    removal_set.insert(removal_list.begin(), removal_list.end());</a>
+<a name="ln299">  }</a>
+<a name="ln300"> </a>
+<a name="ln301">  for (const string&amp; target : removal_set) {</a>
+<a name="ln302">    bool is_dir = false;</a>
+<a name="ln303">    Status s = env_-&gt;IsDirectory(target, &amp;is_dir);</a>
+<a name="ln304">    if (!s.ok()) {</a>
+<a name="ln305">      LOG(WARNING) &lt;&lt; &quot;Error: &quot; &lt;&lt; s.ToString() &lt;&lt; &quot; when checking if &quot; &lt;&lt; target</a>
+<a name="ln306">                   &lt;&lt; &quot; is a directory.&quot;;</a>
+<a name="ln307">      continue;</a>
+<a name="ln308">    }</a>
+<a name="ln309">    if (is_dir) {</a>
+<a name="ln310">      RETURN_NOT_OK(env_-&gt;DeleteRecursively(target));</a>
+<a name="ln311">    } else {</a>
+<a name="ln312">      RETURN_NOT_OK(env_-&gt;DeleteFile(target));</a>
+<a name="ln313">    }</a>
+<a name="ln314">  }</a>
+<a name="ln315"> </a>
+<a name="ln316">  RETURN_NOT_OK(DeleteLockFiles());</a>
+<a name="ln317"> </a>
+<a name="ln318">  return Status::OK();</a>
+<a name="ln319">}</a>
+<a name="ln320"> </a>
+<a name="ln321">Status FsManager::CreateInitialFileSystemLayout(bool delete_fs_if_lock_found) {</a>
+<a name="ln322">  CHECK(!read_only_);</a>
+<a name="ln323"> </a>
+<a name="ln324">  RETURN_NOT_OK(Init());</a>
+<a name="ln325"> </a>
+<a name="ln326">  bool fs_cleaned = false;</a>
+<a name="ln327"> </a>
+<a name="ln328">  // If lock file is present, delete existing filesystem layout before continuing.</a>
+<a name="ln329">  if (delete_fs_if_lock_found &amp;&amp; HasAnyLockFiles()) {</a>
+<a name="ln330">    RETURN_NOT_OK(DeleteFileSystemLayout());</a>
+<a name="ln331">    fs_cleaned = true;</a>
+<a name="ln332">  }</a>
+<a name="ln333"> </a>
+<a name="ln334">  // It's OK if a root already exists as long as there's nothing in it.</a>
+<a name="ln335">  for (const string&amp; root : canonicalized_all_fs_roots_) {</a>
+<a name="ln336">    if (!env_-&gt;FileExists(GetServerTypeDataPath(root, server_type_))) {</a>
+<a name="ln337">      // We'll create the directory below.</a>
+<a name="ln338">      continue;</a>
+<a name="ln339">    }</a>
+<a name="ln340">    bool is_empty;</a>
+<a name="ln341">    RETURN_NOT_OK_PREPEND(IsDirectoryEmpty(GetServerTypeDataPath(root, server_type_), &amp;is_empty),</a>
+<a name="ln342">                          &quot;Unable to check if FSManager root is empty&quot;);</a>
+<a name="ln343">    if (!is_empty) {</a>
+<a name="ln344">      return STATUS(AlreadyPresent, &quot;FSManager root is not empty&quot;, root);</a>
+<a name="ln345">    }</a>
+<a name="ln346">  }</a>
+<a name="ln347"> </a>
+<a name="ln348">  // All roots are either empty or non-existent. Create missing roots and all</a>
+<a name="ln349">  // subdirectories.</a>
+<a name="ln350">  //</a>
+<a name="ln351">  // In the event of failure, delete everything we created.</a>
+<a name="ln352">  std::deque&lt;std::unique_ptr&lt;ScopedFileDeleter&gt;&gt; delete_on_failure;</a>
+<a name="ln353">  unordered_set&lt;string&gt; to_sync;</a>
+<a name="ln354"> </a>
+<a name="ln355">  for (const string&amp; root : canonicalized_all_fs_roots_) {</a>
+<a name="ln356">    bool created;</a>
+<a name="ln357">    std::string out_dir;</a>
+<a name="ln358">    RETURN_NOT_OK(SetupRootDir(env_, root, server_type_, &amp;out_dir, &amp;created));</a>
+<a name="ln359">    if (created) {</a>
+<a name="ln360">      delete_on_failure.emplace_front(new ScopedFileDeleter(env_, out_dir));</a>
+<a name="ln361">      to_sync.insert(DirName(out_dir));</a>
+<a name="ln362">    }</a>
+<a name="ln363">    const string lock_file_path = GetFsLockFilePath(root);</a>
+<a name="ln364">    if (fs_cleaned || !Exists(lock_file_path)) {</a>
+<a name="ln365">      std::unique_ptr&lt;WritableFile&gt; file;</a>
+<a name="ln366">      RETURN_NOT_OK_PREPEND(env_-&gt;NewWritableFile(lock_file_path, &amp;file),</a>
+<a name="ln367">                            &quot;Unable to create lock file.&quot;);</a>
+<a name="ln368">      // Do not delete lock file on error. It is used to detect failed initial create.</a>
+<a name="ln369">    }</a>
+<a name="ln370">  }</a>
+<a name="ln371"> </a>
+<a name="ln372">  InstanceMetadataPB metadata;</a>
+<a name="ln373">  CreateInstanceMetadata(&amp;metadata);</a>
+<a name="ln374">  for (const string&amp; root : canonicalized_all_fs_roots_) {</a>
+<a name="ln375">    const string instance_metadata_path = GetInstanceMetadataPath(root);</a>
+<a name="ln376">    RETURN_NOT_OK_PREPEND(WriteInstanceMetadata(metadata, instance_metadata_path),</a>
+<a name="ln377">                          &quot;Unable to write instance metadata&quot;);</a>
+<a name="ln378">    delete_on_failure.emplace_front(new ScopedFileDeleter(env_, instance_metadata_path));</a>
+<a name="ln379">  }</a>
+<a name="ln380"> </a>
+<a name="ln381">  // Initialize ancillary directories.</a>
+<a name="ln382">  auto ancillary_dirs = GetWalRootDirs();</a>
+<a name="ln383">  ancillary_dirs.push_back(GetRaftGroupMetadataDir());</a>
+<a name="ln384">  ancillary_dirs.push_back(GetConsensusMetadataDir());</a>
+<a name="ln385"> </a>
+<a name="ln386">  for (const string&amp; dir : ancillary_dirs) {</a>
+<a name="ln387">    bool created;</a>
+<a name="ln388">    RETURN_NOT_OK_PREPEND(CreateDirIfMissing(dir, &amp;created),</a>
+<a name="ln389">                          Substitute(&quot;Unable to create directory $0&quot;, dir));</a>
+<a name="ln390">    if (created) {</a>
+<a name="ln391">      delete_on_failure.emplace_front(new ScopedFileDeleter(env_, dir));</a>
+<a name="ln392">      to_sync.insert(DirName(dir));</a>
+<a name="ln393">    }</a>
+<a name="ln394">  }</a>
+<a name="ln395"> </a>
+<a name="ln396">  // Ensure newly created directories are synchronized to disk.</a>
+<a name="ln397">  if (FLAGS_enable_data_block_fsync) {</a>
+<a name="ln398">    for (const string&amp; dir : to_sync) {</a>
+<a name="ln399">      RETURN_NOT_OK_PREPEND(env_-&gt;SyncDir(dir),</a>
+<a name="ln400">                            Substitute(&quot;Unable to synchronize directory $0&quot;, dir));</a>
+<a name="ln401">    }</a>
+<a name="ln402">  }</a>
+<a name="ln403"> </a>
+<a name="ln404">  // Create the RocksDB directory under each data directory.</a>
+<a name="ln405">  for (const string&amp; data_root : GetDataRootDirs()) {</a>
+<a name="ln406">    bool created = false;</a>
+<a name="ln407">    RETURN_NOT_OK_PREPEND(CreateDirIfMissing(data_root, &amp;created),</a>
+<a name="ln408">                          Substitute(&quot;Unable to create directory $0&quot;, data_root));</a>
+<a name="ln409">    if (created) {</a>
+<a name="ln410">      delete_on_failure.emplace_front(new ScopedFileDeleter(env_, data_root));</a>
+<a name="ln411">      to_sync.insert(DirName(data_root));</a>
+<a name="ln412">    }</a>
+<a name="ln413"> </a>
+<a name="ln414">    const string dir = JoinPathSegments(data_root, kRocksDBDirName);</a>
+<a name="ln415">    created = false;</a>
+<a name="ln416">    RETURN_NOT_OK_PREPEND(CreateDirIfMissing(dir, &amp;created),</a>
+<a name="ln417">                          Substitute(&quot;Unable to create directory $0&quot;, dir));</a>
+<a name="ln418">    if (created) {</a>
+<a name="ln419">      delete_on_failure.emplace_front(new ScopedFileDeleter(env_, dir));</a>
+<a name="ln420">      to_sync.insert(DirName(dir));</a>
+<a name="ln421">    }</a>
+<a name="ln422">  }</a>
+<a name="ln423"> </a>
+<a name="ln424">  if (FLAGS_TEST_simulate_fs_create_failure) {</a>
+<a name="ln425">    return STATUS(IOError, &quot;Simulated fs creation error&quot;);</a>
+<a name="ln426">  }</a>
+<a name="ln427"> </a>
+<a name="ln428">  // Success: don't delete any files.</a>
+<a name="ln429">  for (const auto&amp; deleter : delete_on_failure) {</a>
+<a name="ln430">    deleter-&gt;Cancel();</a>
+<a name="ln431">  }</a>
+<a name="ln432"> </a>
+<a name="ln433">  RETURN_NOT_OK(DeleteLockFiles());</a>
+<a name="ln434"> </a>
+<a name="ln435">  return Status::OK();</a>
+<a name="ln436">}</a>
+<a name="ln437"> </a>
+<a name="ln438">void FsManager::CreateInstanceMetadata(InstanceMetadataPB* metadata) {</a>
+<a name="ln439">  ObjectIdGenerator oid_generator;</a>
+<a name="ln440">  if (!FLAGS_instance_uuid_override.empty()) {</a>
+<a name="ln441">    metadata-&gt;set_uuid(FLAGS_instance_uuid_override);</a>
+<a name="ln442">  } else {</a>
+<a name="ln443">    metadata-&gt;set_uuid(oid_generator.Next());</a>
+<a name="ln444">  }</a>
+<a name="ln445"> </a>
+<a name="ln446">  string time_str;</a>
+<a name="ln447">  StringAppendStrftime(&amp;time_str, &quot;%Y-%m-%d %H:%M:%S&quot;, time(nullptr), false);</a>
+<a name="ln448">  string hostname;</a>
+<a name="ln449">  if (!GetHostname(&amp;hostname).ok()) {</a>
+<a name="ln450">    hostname = &quot;&lt;unknown host&gt;&quot;;</a>
+<a name="ln451">  }</a>
+<a name="ln452">  metadata-&gt;set_format_stamp(Substitute(&quot;Formatted at $0 on $1&quot;, time_str, hostname));</a>
+<a name="ln453">}</a>
+<a name="ln454"> </a>
+<a name="ln455">Status FsManager::WriteInstanceMetadata(const InstanceMetadataPB&amp; metadata,</a>
+<a name="ln456">                                        const string&amp; path) {</a>
+<a name="ln457">  // The instance metadata is written effectively once per TS, so the</a>
+<a name="ln458">  // durability cost is negligible.</a>
+<a name="ln459">  RETURN_NOT_OK(pb_util::WritePBContainerToPath(env_, path,</a>
+<a name="ln460">                                                metadata,</a>
+<a name="ln461">                                                pb_util::NO_OVERWRITE,</a>
+<a name="ln462">                                                pb_util::SYNC));</a>
+<a name="ln463">  LOG(INFO) &lt;&lt; &quot;Generated new instance metadata in path &quot; &lt;&lt; path &lt;&lt; &quot;:\n&quot;</a>
+<a name="ln464">            &lt;&lt; metadata.DebugString();</a>
+<a name="ln465">  return Status::OK();</a>
+<a name="ln466">}</a>
+<a name="ln467"> </a>
+<a name="ln468">Status FsManager::IsDirectoryEmpty(const string&amp; path, bool* is_empty) {</a>
+<a name="ln469">  vector&lt;string&gt; children;</a>
+<a name="ln470">  RETURN_NOT_OK(env_-&gt;GetChildren(path, &amp;children));</a>
+<a name="ln471">  for (const string&amp; child : children) {</a>
+<a name="ln472">    // Excluding logs directory from the list of things to check for.</a>
+<a name="ln473">    if (child == &quot;.&quot; || child == &quot;..&quot; || child == kLogsDirName) {</a>
+<a name="ln474">      continue;</a>
+<a name="ln475">    } else {</a>
+<a name="ln476">      LOG(INFO) &lt;&lt; &quot;Found data &quot; &lt;&lt; child;</a>
+<a name="ln477">      *is_empty = false;</a>
+<a name="ln478">      return Status::OK();</a>
+<a name="ln479">    }</a>
+<a name="ln480">  }</a>
+<a name="ln481">  *is_empty = true;</a>
+<a name="ln482">  return Status::OK();</a>
+<a name="ln483">}</a>
+<a name="ln484"> </a>
+<a name="ln485">Status FsManager::CreateDirIfMissing(const string&amp; path, bool* created) {</a>
+<a name="ln486">  return env_util::CreateDirIfMissing(env_, path, created);</a>
+<a name="ln487">}</a>
+<a name="ln488"> </a>
+<a name="ln489">Status FsManager::CreateDirIfMissingAndSync(const std::string&amp; path, bool* created) {</a>
+<a name="ln490">  RETURN_NOT_OK_PREPEND(CreateDirIfMissing(path, created),</a>
+<a name="ln491">                        Substitute(&quot;Failed to create directory $0&quot;, path));</a>
+<a name="ln492">  RETURN_NOT_OK_PREPEND(env_-&gt;SyncDir(DirName(path)),</a>
+<a name="ln493">                        Substitute(&quot;Failed to sync root directory $0&quot;, DirName(path)));</a>
+<a name="ln494">  return Status::OK();</a>
+<a name="ln495">}</a>
+<a name="ln496"> </a>
+<a name="ln497">const string&amp; FsManager::uuid() const {</a>
+<a name="ln498">  return CHECK_NOTNULL(metadata_.get())-&gt;uuid();</a>
+<a name="ln499">}</a>
+<a name="ln500"> </a>
+<a name="ln501">vector&lt;string&gt; FsManager::GetDataRootDirs() const {</a>
+<a name="ln502">  // Add the data subdirectory to each data root.</a>
+<a name="ln503">  vector&lt;string&gt; data_paths;</a>
+<a name="ln504">  for (const string&amp; data_fs_root : canonicalized_data_fs_roots_) {</a>
+<a name="ln505">    data_paths.push_back(</a>
+<a name="ln506">        JoinPathSegments(GetServerTypeDataPath(data_fs_root, server_type_), kDataDirName));</a>
+<a name="ln507">  }</a>
+<a name="ln508">  return data_paths;</a>
+<a name="ln509">}</a>
+<a name="ln510"> </a>
+<a name="ln511">vector&lt;string&gt; FsManager::GetWalRootDirs() const {</a>
+<a name="ln512">  DCHECK(initted_);</a>
+<a name="ln513">  vector&lt;string&gt; wal_dirs;</a>
+<a name="ln514">  for (const auto&amp; canonicalized_wal_fs_root : canonicalized_wal_fs_roots_) {</a>
+<a name="ln515">    wal_dirs.push_back(JoinPathSegments(</a>
+<a name="ln516">          GetServerTypeDataPath(canonicalized_wal_fs_root, server_type_), kWalDirName));</a>
+<a name="ln517">  }</a>
+<a name="ln518">  return wal_dirs;</a>
+<a name="ln519">}</a>
+<a name="ln520"> </a>
+<a name="ln521">std::string FsManager::GetRaftGroupMetadataDir(const std::string&amp; data_dir) {</a>
+<a name="ln522">  return JoinPathSegments(data_dir, kRaftGroupMetadataDirName);</a>
+<a name="ln523">}</a>
+<a name="ln524"> </a>
+<a name="ln525">string FsManager::GetRaftGroupMetadataDir() const {</a>
+<a name="ln526">  DCHECK(initted_);</a>
+<a name="ln527">  return GetRaftGroupMetadataDir(</a>
+<a name="ln528">      GetServerTypeDataPath(canonicalized_metadata_fs_root_, server_type_));</a>
+<a name="ln529">}</a>
+<a name="ln530"> </a>
+<a name="ln531">string FsManager::GetRaftGroupMetadataPath(const string&amp; tablet_id) const {</a>
+<a name="ln532">  return JoinPathSegments(GetRaftGroupMetadataDir(), tablet_id);</a>
+<a name="ln533">}</a>
+<a name="ln534"> </a>
+<a name="ln535">namespace {</a>
+<a name="ln536">// Return true if 'fname' is a valid tablet ID.</a>
+<a name="ln537">bool IsValidTabletId(const std::string&amp; fname) {</a>
+<a name="ln538">  if (fname.find(kTmpInfix) != string::npos) {</a>
+<a name="ln539">    LOG(WARNING) &lt;&lt; &quot;Ignoring tmp file in tablet metadata dir: &quot; &lt;&lt; fname;</a>
+<a name="ln540">    return false;</a>
+<a name="ln541">  }</a>
+<a name="ln542"> </a>
+<a name="ln543">  if (HasPrefixString(fname, &quot;.&quot;)) {</a>
+<a name="ln544">    // Hidden file or ./..</a>
+<a name="ln545">    VLOG(1) &lt;&lt; &quot;Ignoring hidden file in tablet metadata dir: &quot; &lt;&lt; fname;</a>
+<a name="ln546">    return false;</a>
+<a name="ln547">  }</a>
+<a name="ln548"> </a>
+<a name="ln549">  return true;</a>
+<a name="ln550">}</a>
+<a name="ln551">} // anonymous namespace</a>
+<a name="ln552"> </a>
+<a name="ln553">Status FsManager::ListTabletIds(vector&lt;string&gt;* tablet_ids) {</a>
+<a name="ln554">  string dir = GetRaftGroupMetadataDir();</a>
+<a name="ln555">  vector&lt;string&gt; children;</a>
+<a name="ln556">  RETURN_NOT_OK_PREPEND(ListDir(dir, &amp;children),</a>
+<a name="ln557">                        Substitute(&quot;Couldn't list tablets in metadata directory $0&quot;, dir));</a>
+<a name="ln558"> </a>
+<a name="ln559">  vector&lt;string&gt; tablets;</a>
+<a name="ln560">  for (const string&amp; child : children) {</a>
+<a name="ln561">    if (!IsValidTabletId(child)) {</a>
+<a name="ln562">      continue;</a>
+<a name="ln563">    }</a>
+<a name="ln564">    tablet_ids-&gt;push_back(child);</a>
+<a name="ln565">  }</a>
+<a name="ln566">  return Status::OK();</a>
+<a name="ln567">}</a>
+<a name="ln568"> </a>
+<a name="ln569">std::string FsManager::GetInstanceMetadataPath(const string&amp; root) const {</a>
+<a name="ln570">  return JoinPathSegments(GetServerTypeDataPath(root, server_type_), kInstanceMetadataFileName);</a>
+<a name="ln571">}</a>
+<a name="ln572"> </a>
+<a name="ln573">std::string FsManager::GetFsLockFilePath(const string&amp; root) const {</a>
+<a name="ln574">  return JoinPathSegments(GetServerTypeDataPath(root, server_type_), kFsLockFileName);</a>
+<a name="ln575">}</a>
+<a name="ln576"> </a>
+<a name="ln577">std::string FsManager::GetConsensusMetadataDir() const {</a>
+<a name="ln578">  DCHECK(initted_);</a>
+<a name="ln579">  return GetConsensusMetadataDir(</a>
+<a name="ln580">      GetServerTypeDataPath(canonicalized_metadata_fs_root_, server_type_));</a>
+<a name="ln581">}</a>
+<a name="ln582"> </a>
+<a name="ln583">std::string FsManager::GetConsensusMetadataDir(const std::string&amp; data_dir) {</a>
+<a name="ln584">  return JoinPathSegments(data_dir, kConsensusMetadataDirName);</a>
+<a name="ln585">}</a>
+<a name="ln586"> </a>
+<a name="ln587">std::string FsManager::GetFirstTabletWalDirOrDie(const std::string&amp; table_id,</a>
+<a name="ln588">                                                 const std::string&amp; tablet_id) const {</a>
+<a name="ln589">  auto wal_root_dirs = GetWalRootDirs();</a>
+<a name="ln590">  CHECK(!wal_root_dirs.empty()) &lt;&lt; &quot;No WAL directories specified&quot;;</a>
+<a name="ln591">  auto table_wal_dir = JoinPathSegments(wal_root_dirs[0], Substitute(&quot;table-$0&quot;, table_id));</a>
+<a name="ln592">  return JoinPathSegments(table_wal_dir, Substitute(&quot;tablet-$0&quot;, tablet_id));</a>
+<a name="ln593">}</a>
+<a name="ln594"> </a>
+<a name="ln595">std::string FsManager::GetTabletWalRecoveryDir(const string&amp; tablet_wal_path) {</a>
+<a name="ln596">  return tablet_wal_path + kWalsRecoveryDirSuffix;</a>
+<a name="ln597">}</a>
+<a name="ln598"> </a>
+<a name="ln599">namespace {</a>
+<a name="ln600"> </a>
+<a name="ln601">const auto kWalFileNameFullPrefix = std::string(FsManager::kWalFileNamePrefix) + &quot;-&quot;;</a>
+<a name="ln602"> </a>
+<a name="ln603">} // namespace</a>
+<a name="ln604"> </a>
+<a name="ln605">std::string FsManager::GetWalSegmentFileName(uint64_t sequence_number) {</a>
+<a name="ln606">  return Format(&quot;$0$1&quot;, kWalFileNameFullPrefix, StringPrintf(&quot;%09&quot; PRIu64, sequence_number));</a>
+<a name="ln607">}</a>
+<a name="ln608"> </a>
+<a name="ln609">bool FsManager::IsWalSegmentFileName(const std::string&amp; file_name) {</a>
+<a name="ln610">  return boost::starts_with(file_name, kWalFileNameFullPrefix);</a>
+<a name="ln611">}</a>
+<a name="ln612"> </a>
+<a name="ln613">// ==========================================================================</a>
+<a name="ln614">//  Dump/Debug utils</a>
+<a name="ln615">// ==========================================================================</a>
+<a name="ln616"> </a>
+<a name="ln617">void FsManager::DumpFileSystemTree(ostream&amp; out) {</a>
+<a name="ln618">  DCHECK(initted_);</a>
+<a name="ln619"> </a>
+<a name="ln620">  for (const string&amp; root : canonicalized_all_fs_roots_) {</a>
+<a name="ln621">    out &lt;&lt; &quot;File-System Root: &quot; &lt;&lt; root &lt;&lt; std::endl;</a>
+<a name="ln622"> </a>
+<a name="ln623">    std::vector&lt;string&gt; objects;</a>
+<a name="ln624">    Status s = env_-&gt;GetChildren(root, &amp;objects);</a>
+<a name="ln625">    if (!s.ok()) {</a>
+<a name="ln626">      LOG(ERROR) &lt;&lt; &quot;Unable to list the fs-tree: &quot; &lt;&lt; s.ToString();</a>
+<a name="ln627">      return;</a>
+<a name="ln628">    }</a>
+<a name="ln629"> </a>
+<a name="ln630">    DumpFileSystemTree(out, &quot;|-&quot;, root, objects);</a>
+<a name="ln631">  }</a>
+<a name="ln632">}</a>
+<a name="ln633"> </a>
+<a name="ln634">void FsManager::DumpFileSystemTree(ostream&amp; out, const string&amp; prefix,</a>
+<a name="ln635">                                   const string&amp; path, const vector&lt;string&gt;&amp; objects) {</a>
+<a name="ln636">  for (const string&amp; name : objects) {</a>
+<a name="ln637">    if (name == &quot;.&quot; || name == &quot;..&quot;) continue;</a>
+<a name="ln638"> </a>
+<a name="ln639">    std::vector&lt;string&gt; sub_objects;</a>
+<a name="ln640">    string sub_path = JoinPathSegments(path, name);</a>
+<a name="ln641">    Status s = env_-&gt;GetChildren(sub_path, &amp;sub_objects);</a>
+<a name="ln642">    if (s.ok()) {</a>
+<a name="ln643">      out &lt;&lt; prefix &lt;&lt; name &lt;&lt; &quot;/&quot; &lt;&lt; std::endl;</a>
+<a name="ln644">      DumpFileSystemTree(out, prefix + &quot;---&quot;, sub_path, sub_objects);</a>
+<a name="ln645">    } else {</a>
+<a name="ln646">      out &lt;&lt; prefix &lt;&lt; name &lt;&lt; std::endl;</a>
+<a name="ln647">    }</a>
+<a name="ln648">  }</a>
+<a name="ln649">}</a>
+<a name="ln650"> </a>
+<a name="ln651">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="208"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression '!data_fs_roots_.empty()' is always true.</p></div>
+<div class="balloon" rel="222"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="223"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="224"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="225"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="268"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="285"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="322"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="512"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="526"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="545"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="578"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="590"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="618"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

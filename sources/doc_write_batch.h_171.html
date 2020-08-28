@@ -1,0 +1,309 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>doc_write_batch.h</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#ifndef YB_DOCDB_DOC_WRITE_BATCH_H</a>
+<a name="ln15">#define YB_DOCDB_DOC_WRITE_BATCH_H</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &quot;yb/util/enums.h&quot;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &quot;yb/common/read_hybrid_time.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/rocksdb/cache.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/docdb/docdb_types.h&quot;</a>
+<a name="ln24">#include &quot;yb/docdb/doc_path.h&quot;</a>
+<a name="ln25">#include &quot;yb/docdb/doc_write_batch_cache.h&quot;</a>
+<a name="ln26">#include &quot;yb/docdb/intent_aware_iterator.h&quot;</a>
+<a name="ln27">#include &quot;yb/docdb/subdocument.h&quot;</a>
+<a name="ln28">#include &quot;yb/docdb/value.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">namespace rocksdb {</a>
+<a name="ln31">class DB;</a>
+<a name="ln32">}</a>
+<a name="ln33"> </a>
+<a name="ln34">namespace yb {</a>
+<a name="ln35">namespace docdb {</a>
+<a name="ln36"> </a>
+<a name="ln37">class KeyValueWriteBatchPB;</a>
+<a name="ln38">class IntentAwareIterator;</a>
+<a name="ln39"> </a>
+<a name="ln40">struct LazyIterator {</a>
+<a name="ln41">  std::function&lt;std::unique_ptr&lt;IntentAwareIterator&gt;()&gt;* creator;</a>
+<a name="ln42">  std::unique_ptr&lt;IntentAwareIterator&gt; iterator;</a>
+<a name="ln43"> </a>
+<a name="ln44">  explicit LazyIterator(std::function&lt;std::unique_ptr&lt;IntentAwareIterator&gt;()&gt;* c)</a>
+<a name="ln45">    : iterator(nullptr) {</a>
+<a name="ln46">    creator = c;</a>
+<a name="ln47">  }</a>
+<a name="ln48"> </a>
+<a name="ln49">  explicit LazyIterator(std::unique_ptr&lt;IntentAwareIterator&gt; i) {</a>
+<a name="ln50">    iterator = std::move(i);</a>
+<a name="ln51">  }</a>
+<a name="ln52"> </a>
+<a name="ln53">  ~LazyIterator() {}</a>
+<a name="ln54"> </a>
+<a name="ln55">  IntentAwareIterator* Iterator() {</a>
+<a name="ln56">    if (!iterator)</a>
+<a name="ln57">      iterator = (*creator)();</a>
+<a name="ln58">    return iterator.get();</a>
+<a name="ln59">  }</a>
+<a name="ln60">};</a>
+<a name="ln61"> </a>
+<a name="ln62">// This controls whether &quot;init markers&quot; are required at all intermediate levels.</a>
+<a name="ln63">YB_DEFINE_ENUM(InitMarkerBehavior,</a>
+<a name="ln64">               // This is used in Redis. We need to keep track of document types such as strings,</a>
+<a name="ln65">               // hashes, sets, because there is no schema and due to Redis's error checking.</a>
+<a name="ln66">               (kRequired)</a>
+<a name="ln67"> </a>
+<a name="ln68">               // This is used in CQL. Existence of &quot;a.b.c&quot; implies existence of &quot;a&quot; and &quot;a.b&quot;,</a>
+<a name="ln69">               // unless there are delete markers / TTL expiration involved.</a>
+<a name="ln70">               (kOptional));</a>
+<a name="ln71"> </a>
+<a name="ln72">// The DocWriteBatch class is used to build a RocksDB write batch for a DocDB batch of operations</a>
+<a name="ln73">// that may include a mix or write (set) or delete operations. It may read from RocksDB while</a>
+<a name="ln74">// writing, and builds up an internal rocksdb::WriteBatch while handling the operations.</a>
+<a name="ln75">// When all the operations are applied, the rocksdb::WriteBatch should be taken as output.</a>
+<a name="ln76">// Take ownership of it using std::move if it needs to live longer than this DocWriteBatch.</a>
+<a name="ln77">class DocWriteBatch {</a>
+<a name="ln78"> public:</a>
+<a name="ln79">  explicit DocWriteBatch(const DocDB&amp; doc_db,</a>
+<a name="ln80">                         InitMarkerBehavior init_marker_behavior,</a>
+<a name="ln81">                         std::atomic&lt;int64_t&gt;* monotonic_counter = nullptr);</a>
+<a name="ln82"> </a>
+<a name="ln83">  Status SeekToKeyPrefix(LazyIterator* doc_iter, bool has_ancestor = false);</a>
+<a name="ln84">  Status SeekToKeyPrefix(IntentAwareIterator* doc_iter, bool has_ancestor);</a>
+<a name="ln85"> </a>
+<a name="ln86">  // Set the primitive at the given path to the given value. Intermediate subdocuments are created</a>
+<a name="ln87">  // if necessary and possible.</a>
+<a name="ln88">  CHECKED_STATUS SetPrimitive(</a>
+<a name="ln89">      const DocPath&amp; doc_path,</a>
+<a name="ln90">      const Value&amp; value,</a>
+<a name="ln91">      LazyIterator* doc_iter);</a>
+<a name="ln92"> </a>
+<a name="ln93">  CHECKED_STATUS SetPrimitive(</a>
+<a name="ln94">      const DocPath&amp; doc_path,</a>
+<a name="ln95">      const Value&amp; value,</a>
+<a name="ln96">      const ReadHybridTime&amp; read_ht = ReadHybridTime::Max(),</a>
+<a name="ln97">      const CoarseTimePoint deadline = CoarseTimePoint::max(),</a>
+<a name="ln98">      rocksdb::QueryId query_id = rocksdb::kDefaultQueryId);</a>
+<a name="ln99"> </a>
+<a name="ln100">  CHECKED_STATUS SetPrimitive(</a>
+<a name="ln101">      const DocPath&amp; doc_path,</a>
+<a name="ln102">      const Value&amp; value,</a>
+<a name="ln103">      std::unique_ptr&lt;IntentAwareIterator&gt; intent_iter) {</a>
+<a name="ln104">    LazyIterator iter(std::move(intent_iter));</a>
+<a name="ln105">    return SetPrimitive(doc_path, value, &amp;iter);</a>
+<a name="ln106">  }</a>
+<a name="ln107"> </a>
+<a name="ln108"> </a>
+<a name="ln109">  CHECKED_STATUS SetPrimitive(</a>
+<a name="ln110">      const DocPath&amp; doc_path,</a>
+<a name="ln111">      const PrimitiveValue&amp; value,</a>
+<a name="ln112">      const ReadHybridTime&amp; read_ht = ReadHybridTime::Max(),</a>
+<a name="ln113">      const CoarseTimePoint deadline = CoarseTimePoint::max(),</a>
+<a name="ln114">      rocksdb::QueryId query_id = rocksdb::kDefaultQueryId,</a>
+<a name="ln115">      UserTimeMicros user_timestamp = Value::kInvalidUserTimestamp) {</a>
+<a name="ln116">    return SetPrimitive(doc_path, Value(value, Value::kMaxTtl, user_timestamp),</a>
+<a name="ln117">                        read_ht, deadline, query_id);</a>
+<a name="ln118">  }</a>
+<a name="ln119"> </a>
+<a name="ln120">  // Extend the SubDocument in the given key. We'll support List with Append and Prepend mode later.</a>
+<a name="ln121">  // TODO(akashnil): 03/20/17 ENG-1107</a>
+<a name="ln122">  // In each SetPrimitive call, some common work is repeated. It may be made more</a>
+<a name="ln123">  // efficient by not calling SetPrimitive internally.</a>
+<a name="ln124">  CHECKED_STATUS ExtendSubDocument(</a>
+<a name="ln125">      const DocPath&amp; doc_path,</a>
+<a name="ln126">      const SubDocument&amp; value,</a>
+<a name="ln127">      const ReadHybridTime&amp; read_ht = ReadHybridTime::Max(),</a>
+<a name="ln128">      const CoarseTimePoint deadline = CoarseTimePoint::max(),</a>
+<a name="ln129">      rocksdb::QueryId query_id = rocksdb::kDefaultQueryId,</a>
+<a name="ln130">      MonoDelta ttl = Value::kMaxTtl,</a>
+<a name="ln131">      UserTimeMicros user_timestamp = Value::kInvalidUserTimestamp);</a>
+<a name="ln132"> </a>
+<a name="ln133">  CHECKED_STATUS InsertSubDocument(</a>
+<a name="ln134">      const DocPath&amp; doc_path,</a>
+<a name="ln135">      const SubDocument&amp; value,</a>
+<a name="ln136">      const ReadHybridTime&amp; read_ht = ReadHybridTime::Max(),</a>
+<a name="ln137">      const CoarseTimePoint deadline = CoarseTimePoint::max(),</a>
+<a name="ln138">      rocksdb::QueryId query_id = rocksdb::kDefaultQueryId,</a>
+<a name="ln139">      MonoDelta ttl = Value::kMaxTtl,</a>
+<a name="ln140">      UserTimeMicros user_timestamp = Value::kInvalidUserTimestamp,</a>
+<a name="ln141">      bool init_marker_ttl = true);</a>
+<a name="ln142"> </a>
+<a name="ln143">  CHECKED_STATUS ExtendList(</a>
+<a name="ln144">      const DocPath&amp; doc_path,</a>
+<a name="ln145">      const SubDocument&amp; value,</a>
+<a name="ln146">      const ReadHybridTime&amp; read_ht = ReadHybridTime::Max(),</a>
+<a name="ln147">      const CoarseTimePoint deadline = CoarseTimePoint::max(),</a>
+<a name="ln148">      rocksdb::QueryId query_id = rocksdb::kDefaultQueryId,</a>
+<a name="ln149">      MonoDelta ttl = Value::kMaxTtl,</a>
+<a name="ln150">      UserTimeMicros user_timestamp = Value::kInvalidUserTimestamp);</a>
+<a name="ln151"> </a>
+<a name="ln152">  // 'indices' must be sorted. List indexes are not zero indexed, the first element is list[1].</a>
+<a name="ln153">  CHECKED_STATUS ReplaceInList(</a>
+<a name="ln154">      const DocPath &amp;doc_path,</a>
+<a name="ln155">      const std::vector&lt;int&gt;&amp; indices,</a>
+<a name="ln156">      const std::vector&lt;SubDocument&gt;&amp; values,</a>
+<a name="ln157">      const ReadHybridTime&amp; read_ht,</a>
+<a name="ln158">      const CoarseTimePoint deadline,</a>
+<a name="ln159">      const rocksdb::QueryId query_id,</a>
+<a name="ln160">      const Direction dir = Direction::kForward,</a>
+<a name="ln161">      const int64_t start_index = 0,</a>
+<a name="ln162">      std::vector&lt;string&gt;* results = nullptr,</a>
+<a name="ln163">      MonoDelta default_ttl = Value::kMaxTtl,</a>
+<a name="ln164">      MonoDelta write_ttl = Value::kMaxTtl,</a>
+<a name="ln165">      bool is_cql = false);</a>
+<a name="ln166"> </a>
+<a name="ln167">  CHECKED_STATUS ReplaceCqlInList(</a>
+<a name="ln168">      const DocPath &amp;doc_path,</a>
+<a name="ln169">      const std::vector&lt;int&gt;&amp; indices,</a>
+<a name="ln170">      const std::vector&lt;SubDocument&gt;&amp; values,</a>
+<a name="ln171">      const ReadHybridTime&amp; read_ht,</a>
+<a name="ln172">      const CoarseTimePoint deadline,</a>
+<a name="ln173">      const rocksdb::QueryId query_id,</a>
+<a name="ln174">      MonoDelta default_ttl = Value::kMaxTtl,</a>
+<a name="ln175">      MonoDelta write_ttl = Value::kMaxTtl) {</a>
+<a name="ln176">    return ReplaceInList(doc_path, indices, values, read_ht, deadline, query_id,</a>
+<a name="ln177">                         Direction::kForward, /* start index */ 0, /* results */ nullptr,</a>
+<a name="ln178">                         default_ttl, write_ttl, /* is_cql */ true);</a>
+<a name="ln179">  }</a>
+<a name="ln180"> </a>
+<a name="ln181">  CHECKED_STATUS DeleteSubDoc(</a>
+<a name="ln182">      const DocPath&amp; doc_path,</a>
+<a name="ln183">      const ReadHybridTime&amp; read_ht = ReadHybridTime::Max(),</a>
+<a name="ln184">      const CoarseTimePoint deadline = CoarseTimePoint::max(),</a>
+<a name="ln185">      rocksdb::QueryId query_id = rocksdb::kDefaultQueryId,</a>
+<a name="ln186">      UserTimeMicros user_timestamp = Value::kInvalidUserTimestamp) {</a>
+<a name="ln187">    return SetPrimitive(doc_path, PrimitiveValue::kTombstone,</a>
+<a name="ln188">                        read_ht, deadline, query_id, user_timestamp);</a>
+<a name="ln189">  }</a>
+<a name="ln190"> </a>
+<a name="ln191">  void Clear();</a>
+<a name="ln192">  bool IsEmpty() const { return put_batch_.empty(); }</a>
+<a name="ln193"> </a>
+<a name="ln194">  size_t size() const { return put_batch_.size(); }</a>
+<a name="ln195"> </a>
+<a name="ln196">  const std::vector&lt;std::pair&lt;std::string, std::string&gt;&gt;&amp; key_value_pairs() const {</a>
+<a name="ln197">    return put_batch_;</a>
+<a name="ln198">  }</a>
+<a name="ln199"> </a>
+<a name="ln200">  void MoveToWriteBatchPB(KeyValueWriteBatchPB *kv_pb);</a>
+<a name="ln201"> </a>
+<a name="ln202">  // This method has worse performance comparing to MoveToWriteBatchPB and intented to be used in</a>
+<a name="ln203">  // testing. Consider using MoveToWriteBatchPB in production code.</a>
+<a name="ln204">  void TEST_CopyToWriteBatchPB(KeyValueWriteBatchPB *kv_pb) const;</a>
+<a name="ln205"> </a>
+<a name="ln206">  // This is used in tests when measuring the number of seeks that a given update to this batch</a>
+<a name="ln207">  // performs. The internal seek count is reset.</a>
+<a name="ln208">  int GetAndResetNumRocksDBSeeks();</a>
+<a name="ln209"> </a>
+<a name="ln210">  const DocDB&amp; doc_db() { return doc_db_; }</a>
+<a name="ln211"> </a>
+<a name="ln212">  boost::optional&lt;DocWriteBatchCache::Entry&gt; LookupCache(const KeyBytes&amp; encoded_key_prefix) {</a>
+<a name="ln213">    return cache_.Get(encoded_key_prefix);</a>
+<a name="ln214">  }</a>
+<a name="ln215"> </a>
+<a name="ln216"> private:</a>
+<a name="ln217">  // This member function performs the necessary operations to set a primitive value for a given</a>
+<a name="ln218">  // docpath assuming the appropriate operations have been taken care of for subkeys with index &lt;</a>
+<a name="ln219">  // subkey_index. This method assumes responsibility of ensuring the proper DocDB structure</a>
+<a name="ln220">  // (e.g: init markers) is maintained for subdocuments starting at the given subkey_index.</a>
+<a name="ln221">  CHECKED_STATUS SetPrimitiveInternal(</a>
+<a name="ln222">      const DocPath&amp; doc_path,</a>
+<a name="ln223">      const Value&amp; value,</a>
+<a name="ln224">      LazyIterator* doc_iter,</a>
+<a name="ln225">      bool is_deletion,</a>
+<a name="ln226">      int num_subkeys);</a>
+<a name="ln227"> </a>
+<a name="ln228">  // Handle the user provided timestamp during writes.</a>
+<a name="ln229">  Result&lt;bool&gt; SetPrimitiveInternalHandleUserTimestamp(const Value &amp;value,</a>
+<a name="ln230">                                                       LazyIterator* doc_iter);</a>
+<a name="ln231"> </a>
+<a name="ln232">  bool required_init_markers() {</a>
+<a name="ln233">    return init_marker_behavior_ == InitMarkerBehavior::kRequired;</a>
+<a name="ln234">  }</a>
+<a name="ln235"> </a>
+<a name="ln236">  bool optional_init_markers() {</a>
+<a name="ln237">    return init_marker_behavior_ == InitMarkerBehavior::kOptional;</a>
+<a name="ln238">  }</a>
+<a name="ln239"> </a>
+<a name="ln240">  DocWriteBatchCache cache_;</a>
+<a name="ln241"> </a>
+<a name="ln242">  DocDB doc_db_;</a>
+<a name="ln243"> </a>
+<a name="ln244">  InitMarkerBehavior init_marker_behavior_;</a>
+<a name="ln245">  std::atomic&lt;int64_t&gt;* monotonic_counter_;</a>
+<a name="ln246">  std::vector&lt;std::pair&lt;std::string, std::string&gt;&gt; put_batch_;</a>
+<a name="ln247"> </a>
+<a name="ln248">  // Taken from internal_doc_iterator</a>
+<a name="ln249">  KeyBytes key_prefix_;</a>
+<a name="ln250">  bool subdoc_exists_ = true;</a>
+<a name="ln251">  DocWriteBatchCache::Entry current_entry_;</a>
+<a name="ln252">};</a>
+<a name="ln253"> </a>
+<a name="ln254">// Converts a RocksDB WriteBatch to a string.</a>
+<a name="ln255">Result&lt;std::string&gt; WriteBatchToString(</a>
+<a name="ln256">    const rocksdb::WriteBatch&amp; write_batch,</a>
+<a name="ln257">    StorageDbType storage_db_type,</a>
+<a name="ln258">    BinaryOutputFormat binary_output_format);</a>
+<a name="ln259"> </a>
+<a name="ln260">}  // namespace docdb</a>
+<a name="ln261">}  // namespace yb</a>
+<a name="ln262"> </a>
+<a name="ln263">#endif // YB_DOCDB_DOC_WRITE_BATCH_H</a>
+
+</code></pre>
+<div class="balloon" rel="49"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: creator.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

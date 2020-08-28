@@ -1,0 +1,1031 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>log_util.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/consensus/log_util.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;algorithm&gt;</a>
+<a name="ln36">#include &lt;iostream&gt;</a>
+<a name="ln37">#include &lt;limits&gt;</a>
+<a name="ln38">#include &lt;utility&gt;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln41">#include &lt;glog/logging.h&gt;</a>
+<a name="ln42"> </a>
+<a name="ln43">#include &quot;yb/consensus/opid_util.h&quot;</a>
+<a name="ln44">#include &quot;yb/fs/fs_manager.h&quot;</a>
+<a name="ln45">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln46">#include &quot;yb/gutil/stl_util.h&quot;</a>
+<a name="ln47">#include &quot;yb/gutil/strings/split.h&quot;</a>
+<a name="ln48">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln49">#include &quot;yb/gutil/strings/util.h&quot;</a>
+<a name="ln50"> </a>
+<a name="ln51">#include &quot;yb/util/coding-inl.h&quot;</a>
+<a name="ln52">#include &quot;yb/util/coding.h&quot;</a>
+<a name="ln53">#include &quot;yb/util/crc.h&quot;</a>
+<a name="ln54">#include &quot;yb/util/debug/trace_event.h&quot;</a>
+<a name="ln55">#include &quot;yb/util/env_util.h&quot;</a>
+<a name="ln56">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln57">#include &quot;yb/util/pb_util.h&quot;</a>
+<a name="ln58">#include &quot;yb/util/size_literals.h&quot;</a>
+<a name="ln59"> </a>
+<a name="ln60">DEFINE_int32(log_segment_size_mb, 64,</a>
+<a name="ln61">             &quot;The default segment size for log roll-overs, in MB&quot;);</a>
+<a name="ln62">TAG_FLAG(log_segment_size_mb, advanced);</a>
+<a name="ln63"> </a>
+<a name="ln64">DEFINE_uint64(log_segment_size_bytes, 0,</a>
+<a name="ln65">             &quot;The default segment size for log roll-overs, in bytes. &quot;</a>
+<a name="ln66">             &quot;If 0 then log_segment_size_mb is used.&quot;);</a>
+<a name="ln67"> </a>
+<a name="ln68">DEFINE_uint64(initial_log_segment_size_bytes, 1024 * 1024,</a>
+<a name="ln69">              &quot;The maximum segment size we want for a new WAL segment, in bytes. &quot;</a>
+<a name="ln70">              &quot;This value keeps doubling (for each subsequent WAL segment) till it gets to the &quot;</a>
+<a name="ln71">              &quot;maximum configured segment size (log_segment_size_bytes or log_segment_size_mb).&quot;);</a>
+<a name="ln72"> </a>
+<a name="ln73">DEFINE_bool(durable_wal_write, false,</a>
+<a name="ln74">            &quot;Whether the Log/WAL should explicitly call fsync() after each write.&quot;);</a>
+<a name="ln75">TAG_FLAG(durable_wal_write, stable);</a>
+<a name="ln76"> </a>
+<a name="ln77">DEFINE_int32(interval_durable_wal_write_ms, 1000,</a>
+<a name="ln78">            &quot;Interval in ms after which the Log/WAL should explicitly call fsync(). &quot;</a>
+<a name="ln79">            &quot;If 0 fsysnc() is not called.&quot;);</a>
+<a name="ln80">TAG_FLAG(interval_durable_wal_write_ms, stable);</a>
+<a name="ln81"> </a>
+<a name="ln82">DEFINE_int32(bytes_durable_wal_write_mb, 1,</a>
+<a name="ln83">             &quot;Amount of data in MB after which the Log/WAL should explicitly call fsync(). &quot;</a>
+<a name="ln84">             &quot;If 0 fsysnc() is not called.&quot;);</a>
+<a name="ln85">TAG_FLAG(bytes_durable_wal_write_mb, stable);</a>
+<a name="ln86"> </a>
+<a name="ln87">DEFINE_bool(log_preallocate_segments, true,</a>
+<a name="ln88">            &quot;Whether the WAL should preallocate the entire segment before writing to it&quot;);</a>
+<a name="ln89">TAG_FLAG(log_preallocate_segments, advanced);</a>
+<a name="ln90"> </a>
+<a name="ln91">DEFINE_bool(log_async_preallocate_segments, true,</a>
+<a name="ln92">            &quot;Whether the WAL segments preallocation should happen asynchronously&quot;);</a>
+<a name="ln93">TAG_FLAG(log_async_preallocate_segments, advanced);</a>
+<a name="ln94"> </a>
+<a name="ln95">DECLARE_string(fs_data_dirs);</a>
+<a name="ln96"> </a>
+<a name="ln97">DEFINE_bool(require_durable_wal_write, false, &quot;Whether durable WAL write is required.&quot;</a>
+<a name="ln98">    &quot;In case you cannot write using O_DIRECT in WAL and data directories and this flag is set true&quot;</a>
+<a name="ln99">    &quot;the system will deliberately crash with the appropriate error. If this flag is set false, &quot;</a>
+<a name="ln100">    &quot;the system will soft downgrade the durable_wal_write flag.&quot;);</a>
+<a name="ln101">TAG_FLAG(require_durable_wal_write, stable);</a>
+<a name="ln102"> </a>
+<a name="ln103">namespace yb {</a>
+<a name="ln104">namespace log {</a>
+<a name="ln105"> </a>
+<a name="ln106">using env_util::ReadFully;</a>
+<a name="ln107">using std::vector;</a>
+<a name="ln108">using std::shared_ptr;</a>
+<a name="ln109">using strings::Substitute;</a>
+<a name="ln110">using strings::SubstituteAndAppend;</a>
+<a name="ln111"> </a>
+<a name="ln112">const char kTmpSuffix[] = &quot;.tmp&quot;;</a>
+<a name="ln113"> </a>
+<a name="ln114">const char kLogSegmentHeaderMagicString[] = &quot;yugalogf&quot;;</a>
+<a name="ln115"> </a>
+<a name="ln116">// A magic that is written as the very last thing when a segment is closed.</a>
+<a name="ln117">// Segments that were not closed (usually the last one being written) will not</a>
+<a name="ln118">// have this magic.</a>
+<a name="ln119">const char kLogSegmentFooterMagicString[] = &quot;closedls&quot;;</a>
+<a name="ln120"> </a>
+<a name="ln121">// Header is prefixed with the header magic (8 bytes) and the header length (4 bytes).</a>
+<a name="ln122">const size_t kLogSegmentHeaderMagicAndHeaderLength = 12;</a>
+<a name="ln123"> </a>
+<a name="ln124">// Footer is suffixed with the footer magic (8 bytes) and the footer length (4 bytes).</a>
+<a name="ln125">const size_t kLogSegmentFooterMagicAndFooterLength  = 12;</a>
+<a name="ln126"> </a>
+<a name="ln127">const size_t kEntryHeaderSize = 12;</a>
+<a name="ln128"> </a>
+<a name="ln129">const int kLogMajorVersion = 1;</a>
+<a name="ln130">const int kLogMinorVersion = 0;</a>
+<a name="ln131"> </a>
+<a name="ln132">// Maximum log segment header/footer size, in bytes (8 MB).</a>
+<a name="ln133">const uint32_t kLogSegmentMaxHeaderOrFooterSize = 8 * 1024 * 1024;</a>
+<a name="ln134"> </a>
+<a name="ln135">LogOptions::LogOptions()</a>
+<a name="ln136">    : segment_size_bytes(FLAGS_log_segment_size_bytes == 0 ? FLAGS_log_segment_size_mb * 1_MB</a>
+<a name="ln137">                                                           : FLAGS_log_segment_size_bytes),</a>
+<a name="ln138">      initial_segment_size_bytes(FLAGS_initial_log_segment_size_bytes),</a>
+<a name="ln139">      durable_wal_write(FLAGS_durable_wal_write),</a>
+<a name="ln140">      interval_durable_wal_write(FLAGS_interval_durable_wal_write_ms &gt; 0 ?</a>
+<a name="ln141">                                     MonoDelta::FromMilliseconds(</a>
+<a name="ln142">                                         FLAGS_interval_durable_wal_write_ms) : MonoDelta()),</a>
+<a name="ln143">      bytes_durable_wal_write_mb(FLAGS_bytes_durable_wal_write_mb),</a>
+<a name="ln144">      preallocate_segments(FLAGS_log_preallocate_segments),</a>
+<a name="ln145">      async_preallocate_segments(FLAGS_log_async_preallocate_segments),</a>
+<a name="ln146">      env(Env::Default()) {</a>
+<a name="ln147">}</a>
+<a name="ln148"> </a>
+<a name="ln149">Status ReadableLogSegment::Open(Env* env,</a>
+<a name="ln150">                                const string&amp; path,</a>
+<a name="ln151">                                scoped_refptr&lt;ReadableLogSegment&gt;* segment) {</a>
+<a name="ln152">  VLOG(1) &lt;&lt; &quot;Parsing wal segment: &quot; &lt;&lt; path;</a>
+<a name="ln153">  shared_ptr&lt;RandomAccessFile&gt; readable_file;</a>
+<a name="ln154">  RETURN_NOT_OK_PREPEND(env_util::OpenFileForRandom(env, path, &amp;readable_file),</a>
+<a name="ln155">                        &quot;Unable to open file for reading&quot;);</a>
+<a name="ln156"> </a>
+<a name="ln157">  segment-&gt;reset(new ReadableLogSegment(path, readable_file));</a>
+<a name="ln158">  RETURN_NOT_OK_PREPEND((*segment)-&gt;Init(), &quot;Unable to initialize segment&quot;);</a>
+<a name="ln159">  return Status::OK();</a>
+<a name="ln160">}</a>
+<a name="ln161"> </a>
+<a name="ln162">ReadableLogSegment::ReadableLogSegment(</a>
+<a name="ln163">    std::string path, shared_ptr&lt;RandomAccessFile&gt; readable_file)</a>
+<a name="ln164">    : path_(std::move(path)),</a>
+<a name="ln165">      file_size_(0),</a>
+<a name="ln166">      readable_to_offset_(0),</a>
+<a name="ln167">      readable_file_(std::move(readable_file)),</a>
+<a name="ln168">      is_initialized_(false),</a>
+<a name="ln169">      footer_was_rebuilt_(false) {</a>
+<a name="ln170">  CHECK_OK(env_util::OpenFileForRandom(Env::Default(), path_, &amp;readable_file_checkpoint_));</a>
+<a name="ln171">}</a>
+<a name="ln172"> </a>
+<a name="ln173">Status ReadableLogSegment::Init(const LogSegmentHeaderPB&amp; header,</a>
+<a name="ln174">                                const LogSegmentFooterPB&amp; footer,</a>
+<a name="ln175">                                int64_t first_entry_offset) {</a>
+<a name="ln176">  DCHECK(!IsInitialized()) &lt;&lt; &quot;Can only call Init() once&quot;;</a>
+<a name="ln177">  DCHECK(header.IsInitialized()) &lt;&lt; &quot;Log segment header must be initialized&quot;;</a>
+<a name="ln178">  DCHECK(footer.IsInitialized()) &lt;&lt; &quot;Log segment footer must be initialized&quot;;</a>
+<a name="ln179"> </a>
+<a name="ln180">  RETURN_NOT_OK(ReadFileSize());</a>
+<a name="ln181"> </a>
+<a name="ln182">  header_.CopyFrom(header);</a>
+<a name="ln183">  footer_.CopyFrom(footer);</a>
+<a name="ln184">  first_entry_offset_ = first_entry_offset;</a>
+<a name="ln185">  is_initialized_ = true;</a>
+<a name="ln186">  readable_to_offset_.Store(file_size());</a>
+<a name="ln187"> </a>
+<a name="ln188">  return Status::OK();</a>
+<a name="ln189">}</a>
+<a name="ln190"> </a>
+<a name="ln191">Status ReadableLogSegment::Init(const LogSegmentHeaderPB&amp; header,</a>
+<a name="ln192">                                int64_t first_entry_offset) {</a>
+<a name="ln193">  DCHECK(!IsInitialized()) &lt;&lt; &quot;Can only call Init() once&quot;;</a>
+<a name="ln194">  DCHECK(header.IsInitialized()) &lt;&lt; &quot;Log segment header must be initialized&quot;;</a>
+<a name="ln195"> </a>
+<a name="ln196">  RETURN_NOT_OK(ReadFileSize());</a>
+<a name="ln197"> </a>
+<a name="ln198">  header_.CopyFrom(header);</a>
+<a name="ln199">  first_entry_offset_ = first_entry_offset;</a>
+<a name="ln200">  is_initialized_ = true;</a>
+<a name="ln201"> </a>
+<a name="ln202">  // On a new segment, we don't expect any readable entries yet.</a>
+<a name="ln203">  readable_to_offset_.Store(first_entry_offset);</a>
+<a name="ln204"> </a>
+<a name="ln205">  return Status::OK();</a>
+<a name="ln206">}</a>
+<a name="ln207"> </a>
+<a name="ln208">Status ReadableLogSegment::Init() {</a>
+<a name="ln209">  DCHECK(!IsInitialized()) &lt;&lt; &quot;Can only call Init() once&quot;;</a>
+<a name="ln210"> </a>
+<a name="ln211">  RETURN_NOT_OK(ReadFileSize());</a>
+<a name="ln212"> </a>
+<a name="ln213">  RETURN_NOT_OK(ReadHeader());</a>
+<a name="ln214"> </a>
+<a name="ln215">  Status s = ReadFooter();</a>
+<a name="ln216">  if (!s.ok()) {</a>
+<a name="ln217">    LOG(WARNING) &lt;&lt; &quot;Could not read footer for segment: &quot; &lt;&lt; path_</a>
+<a name="ln218">        &lt;&lt; &quot;: &quot; &lt;&lt; s.ToString();</a>
+<a name="ln219">  }</a>
+<a name="ln220"> </a>
+<a name="ln221">  is_initialized_ = true;</a>
+<a name="ln222"> </a>
+<a name="ln223">  readable_to_offset_.Store(file_size());</a>
+<a name="ln224"> </a>
+<a name="ln225">  return Status::OK();</a>
+<a name="ln226">}</a>
+<a name="ln227"> </a>
+<a name="ln228">const int64_t ReadableLogSegment::readable_up_to() const {</a>
+<a name="ln229">  return readable_to_offset_.Load();</a>
+<a name="ln230">}</a>
+<a name="ln231"> </a>
+<a name="ln232">void ReadableLogSegment::UpdateReadableToOffset(int64_t readable_to_offset) {</a>
+<a name="ln233">  readable_to_offset_.Store(readable_to_offset);</a>
+<a name="ln234">  file_size_.StoreMax(readable_to_offset);</a>
+<a name="ln235">}</a>
+<a name="ln236"> </a>
+<a name="ln237">Status ReadableLogSegment::RebuildFooterByScanning() {</a>
+<a name="ln238">  TRACE_EVENT1(&quot;log&quot;, &quot;ReadableLogSegment::RebuildFooterByScanning&quot;,</a>
+<a name="ln239">               &quot;path&quot;, path_);</a>
+<a name="ln240"> </a>
+<a name="ln241">  DCHECK(!footer_.IsInitialized());</a>
+<a name="ln242">  auto read_entries = ReadEntries();</a>
+<a name="ln243">  RETURN_NOT_OK(read_entries.status);</a>
+<a name="ln244"> </a>
+<a name="ln245">  footer_.set_num_entries(read_entries.entries.size());</a>
+<a name="ln246"> </a>
+<a name="ln247">  // Rebuild the min/max replicate index (by scanning)</a>
+<a name="ln248">  for (const auto&amp; entry : read_entries.entries) {</a>
+<a name="ln249">    if (entry-&gt;has_replicate()) {</a>
+<a name="ln250">      int64_t index = entry-&gt;replicate().id().index();</a>
+<a name="ln251">      // TODO: common code with Log::UpdateFooterForBatch</a>
+<a name="ln252">      if (!footer_.has_min_replicate_index() ||</a>
+<a name="ln253">          index &lt; footer_.min_replicate_index()) {</a>
+<a name="ln254">        footer_.set_min_replicate_index(index);</a>
+<a name="ln255">      }</a>
+<a name="ln256">      if (!footer_.has_max_replicate_index() ||</a>
+<a name="ln257">          index &gt; footer_.max_replicate_index()) {</a>
+<a name="ln258">        footer_.set_max_replicate_index(index);</a>
+<a name="ln259">      }</a>
+<a name="ln260">    }</a>
+<a name="ln261">  }</a>
+<a name="ln262"> </a>
+<a name="ln263">  DCHECK(footer_.IsInitialized());</a>
+<a name="ln264">  DCHECK_EQ(read_entries.entries.size(), footer_.num_entries());</a>
+<a name="ln265">  footer_was_rebuilt_ = true;</a>
+<a name="ln266"> </a>
+<a name="ln267">  readable_to_offset_.Store(read_entries.end_offset);</a>
+<a name="ln268"> </a>
+<a name="ln269">  LOG(INFO) &lt;&lt; &quot;Successfully rebuilt footer for segment: &quot; &lt;&lt; path_</a>
+<a name="ln270">            &lt;&lt; &quot; (valid entries through byte offset &quot; &lt;&lt; read_entries.end_offset &lt;&lt; &quot;)&quot;;</a>
+<a name="ln271">  return Status::OK();</a>
+<a name="ln272">}</a>
+<a name="ln273"> </a>
+<a name="ln274">Status ReadableLogSegment::ReadFileSize() {</a>
+<a name="ln275">  // Check the size of the file.</a>
+<a name="ln276">  // Env uses uint here, even though we generally prefer signed ints to avoid</a>
+<a name="ln277">  // underflow bugs. Use a local to convert.</a>
+<a name="ln278">  uint64_t size = VERIFY_RESULT_PREPEND(readable_file_-&gt;Size(), &quot;Unable to read file size&quot;);</a>
+<a name="ln279">  file_size_.Store(size);</a>
+<a name="ln280">  if (size == 0) {</a>
+<a name="ln281">    VLOG(1) &lt;&lt; &quot;Log segment file $0 is zero-length: &quot; &lt;&lt; path();</a>
+<a name="ln282">    return Status::OK();</a>
+<a name="ln283">  }</a>
+<a name="ln284">  return Status::OK();</a>
+<a name="ln285">}</a>
+<a name="ln286"> </a>
+<a name="ln287">Status ReadableLogSegment::ReadHeader() {</a>
+<a name="ln288">  uint32_t header_size;</a>
+<a name="ln289">  RETURN_NOT_OK(ReadHeaderMagicAndHeaderLength(&amp;header_size));</a>
+<a name="ln290">  if (header_size == 0) {</a>
+<a name="ln291">    // If a log file has been pre-allocated but not initialized, then</a>
+<a name="ln292">    // 'header_size' will be 0 even the file size is &gt; 0; in this</a>
+<a name="ln293">    // case, 'is_initialized_' remains set to false and return</a>
+<a name="ln294">    // Status::OK() early. LogReader ignores segments where</a>
+<a name="ln295">    // IsInitialized() returns false.</a>
+<a name="ln296">    return Status::OK();</a>
+<a name="ln297">  }</a>
+<a name="ln298"> </a>
+<a name="ln299">  if (header_size &gt; kLogSegmentMaxHeaderOrFooterSize) {</a>
+<a name="ln300">    return STATUS(Corruption,</a>
+<a name="ln301">        Substitute(&quot;File is corrupted. &quot;</a>
+<a name="ln302">                   &quot;Parsed header size: $0 is zero or bigger than max header size: $1&quot;,</a>
+<a name="ln303">                   header_size, kLogSegmentMaxHeaderOrFooterSize));</a>
+<a name="ln304">  }</a>
+<a name="ln305"> </a>
+<a name="ln306">  std::vector&lt;uint8_t&gt; header_space(header_size);</a>
+<a name="ln307">  Slice header_slice;</a>
+<a name="ln308">  LogSegmentHeaderPB header;</a>
+<a name="ln309"> </a>
+<a name="ln310">  // Read and parse the log segment header.</a>
+<a name="ln311">  RETURN_NOT_OK_PREPEND(ReadFully(readable_file_.get(), kLogSegmentHeaderMagicAndHeaderLength,</a>
+<a name="ln312">                                  header_size, &amp;header_slice, header_space.data()),</a>
+<a name="ln313">                                      &quot;Unable to read fully&quot;);</a>
+<a name="ln314"> </a>
+<a name="ln315">  RETURN_NOT_OK_PREPEND(pb_util::ParseFromArray(&amp;header,</a>
+<a name="ln316">                                                header_slice.data(),</a>
+<a name="ln317">                                                header_size),</a>
+<a name="ln318">                        &quot;Unable to parse protobuf&quot;);</a>
+<a name="ln319"> </a>
+<a name="ln320">  header_.CopyFrom(header);</a>
+<a name="ln321">  first_entry_offset_ = header_size + kLogSegmentHeaderMagicAndHeaderLength;</a>
+<a name="ln322"> </a>
+<a name="ln323">  return Status::OK();</a>
+<a name="ln324">}</a>
+<a name="ln325"> </a>
+<a name="ln326"> </a>
+<a name="ln327">Status ReadableLogSegment::ReadHeaderMagicAndHeaderLength(uint32_t *len) {</a>
+<a name="ln328">  uint8_t scratch[kLogSegmentHeaderMagicAndHeaderLength];</a>
+<a name="ln329">  Slice slice;</a>
+<a name="ln330">  RETURN_NOT_OK(ReadFully(readable_file_.get(), 0, kLogSegmentHeaderMagicAndHeaderLength,</a>
+<a name="ln331">                          &amp;slice, scratch));</a>
+<a name="ln332">  RETURN_NOT_OK(ParseHeaderMagicAndHeaderLength(slice, len));</a>
+<a name="ln333">  return Status::OK();</a>
+<a name="ln334">}</a>
+<a name="ln335"> </a>
+<a name="ln336">namespace {</a>
+<a name="ln337"> </a>
+<a name="ln338">// We don't run TSAN on this function because it makes it really slow and causes some</a>
+<a name="ln339">// test timeouts. This is only used on local buffers anyway, so we don't lose much</a>
+<a name="ln340">// by not checking it.</a>
+<a name="ln341">ATTRIBUTE_NO_SANITIZE_THREAD</a>
+<a name="ln342">bool IsAllZeros(const Slice&amp; s) {</a>
+<a name="ln343">  // Walk a pointer through the slice instead of using s[i]</a>
+<a name="ln344">  // since this is way faster in debug mode builds. We also do some</a>
+<a name="ln345">  // manual unrolling for the same purpose.</a>
+<a name="ln346">  const uint8_t* p = s.data();</a>
+<a name="ln347">  size_t rem = s.size();</a>
+<a name="ln348"> </a>
+<a name="ln349">  while (rem &gt;= 8) {</a>
+<a name="ln350">    if (UNALIGNED_LOAD64(p) != 0) return false;</a>
+<a name="ln351">    rem -= 8;</a>
+<a name="ln352">    p += 8;</a>
+<a name="ln353">  }</a>
+<a name="ln354"> </a>
+<a name="ln355">  while (rem &gt; 0) {</a>
+<a name="ln356">    if (*p++ != '\0') return false;</a>
+<a name="ln357">    rem--;</a>
+<a name="ln358">  }</a>
+<a name="ln359">  return true;</a>
+<a name="ln360">}</a>
+<a name="ln361">} // anonymous namespace</a>
+<a name="ln362"> </a>
+<a name="ln363">Status ReadableLogSegment::ParseHeaderMagicAndHeaderLength(const Slice &amp;data,</a>
+<a name="ln364">                                                           uint32_t *parsed_len) {</a>
+<a name="ln365">  RETURN_NOT_OK_PREPEND(data.check_size(kLogSegmentHeaderMagicAndHeaderLength),</a>
+<a name="ln366">                        &quot;Log segment file is too small to contain initial magic number&quot;);</a>
+<a name="ln367"> </a>
+<a name="ln368">  if (memcmp(kLogSegmentHeaderMagicString, data.data(),</a>
+<a name="ln369">             strlen(kLogSegmentHeaderMagicString)) != 0) {</a>
+<a name="ln370">    // As a special case, we check whether the file was allocated but no header</a>
+<a name="ln371">    // was written. We treat that case as an uninitialized file, much in the</a>
+<a name="ln372">    // same way we treat zero-length files.</a>
+<a name="ln373">    // Note: While the above comparison checks 8 bytes, this one checks the full 12</a>
+<a name="ln374">    // to ensure we have a full 12 bytes of NULL data.</a>
+<a name="ln375">    if (IsAllZeros(data)) {</a>
+<a name="ln376">      // 12 bytes of NULLs, good enough for us to consider this a file that</a>
+<a name="ln377">      // was never written to (but apparently preallocated).</a>
+<a name="ln378">      LOG(WARNING) &lt;&lt; &quot;Log segment file &quot; &lt;&lt; path() &lt;&lt; &quot; has 12 initial NULL bytes instead of &quot;</a>
+<a name="ln379">                   &lt;&lt; &quot;magic and header length: &quot; &lt;&lt; data.ToDebugString()</a>
+<a name="ln380">                   &lt;&lt; &quot; and will be treated as a blank segment.&quot;;</a>
+<a name="ln381">      *parsed_len = 0;</a>
+<a name="ln382">      return Status::OK();</a>
+<a name="ln383">    }</a>
+<a name="ln384">    // If no magic and not uninitialized, the file is considered corrupt.</a>
+<a name="ln385">    return STATUS(Corruption, Substitute(&quot;Invalid log segment file $0: Bad magic. $1&quot;,</a>
+<a name="ln386">                                         path(), data.ToDebugString()));</a>
+<a name="ln387">  }</a>
+<a name="ln388"> </a>
+<a name="ln389">  *parsed_len = DecodeFixed32(data.data() + strlen(kLogSegmentHeaderMagicString));</a>
+<a name="ln390">  return Status::OK();</a>
+<a name="ln391">}</a>
+<a name="ln392"> </a>
+<a name="ln393">Status ReadableLogSegment::ReadFooter() {</a>
+<a name="ln394">  uint32_t footer_size;</a>
+<a name="ln395">  RETURN_NOT_OK(ReadFooterMagicAndFooterLength(&amp;footer_size));</a>
+<a name="ln396"> </a>
+<a name="ln397">  if (footer_size == 0 || footer_size &gt; kLogSegmentMaxHeaderOrFooterSize) {</a>
+<a name="ln398">    return STATUS(NotFound,</a>
+<a name="ln399">        Substitute(&quot;File is corrupted. &quot;</a>
+<a name="ln400">                   &quot;Parsed header size: $0 is zero or bigger than max header size: $1&quot;,</a>
+<a name="ln401">                   footer_size, kLogSegmentMaxHeaderOrFooterSize));</a>
+<a name="ln402">  }</a>
+<a name="ln403"> </a>
+<a name="ln404">  if (footer_size &gt; (file_size() - first_entry_offset_)) {</a>
+<a name="ln405">    return STATUS(NotFound, &quot;Footer not found. File corrupted. &quot;</a>
+<a name="ln406">        &quot;Decoded footer length pointed at a footer before the first entry.&quot;);</a>
+<a name="ln407">  }</a>
+<a name="ln408"> </a>
+<a name="ln409">  std::vector&lt;uint8_t&gt; footer_space(footer_size);</a>
+<a name="ln410">  Slice footer_slice;</a>
+<a name="ln411"> </a>
+<a name="ln412">  int64_t footer_offset = file_size() - kLogSegmentFooterMagicAndFooterLength - footer_size;</a>
+<a name="ln413"> </a>
+<a name="ln414">  LogSegmentFooterPB footer;</a>
+<a name="ln415"> </a>
+<a name="ln416">  // Read and parse the log segment footer.</a>
+<a name="ln417">  RETURN_NOT_OK_PREPEND(ReadFully(readable_file_.get(), footer_offset,</a>
+<a name="ln418">                                  footer_size, &amp;footer_slice, footer_space.data()),</a>
+<a name="ln419">                        &quot;Footer not found. Could not read fully.&quot;);</a>
+<a name="ln420"> </a>
+<a name="ln421">  RETURN_NOT_OK_PREPEND(pb_util::ParseFromArray(&amp;footer,</a>
+<a name="ln422">                                                footer_slice.data(),</a>
+<a name="ln423">                                                footer_size),</a>
+<a name="ln424">                        &quot;Unable to parse protobuf&quot;);</a>
+<a name="ln425"> </a>
+<a name="ln426">  footer_.Swap(&amp;footer);</a>
+<a name="ln427">  return Status::OK();</a>
+<a name="ln428">}</a>
+<a name="ln429"> </a>
+<a name="ln430">Status ReadableLogSegment::ReadFooterMagicAndFooterLength(uint32_t *len) {</a>
+<a name="ln431">  uint8_t scratch[kLogSegmentFooterMagicAndFooterLength];</a>
+<a name="ln432">  Slice slice;</a>
+<a name="ln433"> </a>
+<a name="ln434">  CHECK_GT(file_size(), kLogSegmentFooterMagicAndFooterLength);</a>
+<a name="ln435">  RETURN_NOT_OK(ReadFully(readable_file_.get(),</a>
+<a name="ln436">                          file_size() - kLogSegmentFooterMagicAndFooterLength,</a>
+<a name="ln437">                          kLogSegmentFooterMagicAndFooterLength,</a>
+<a name="ln438">                          &amp;slice,</a>
+<a name="ln439">                          scratch));</a>
+<a name="ln440"> </a>
+<a name="ln441">  RETURN_NOT_OK(ParseFooterMagicAndFooterLength(slice, len));</a>
+<a name="ln442">  return Status::OK();</a>
+<a name="ln443">}</a>
+<a name="ln444"> </a>
+<a name="ln445">Status ReadableLogSegment::ParseFooterMagicAndFooterLength(const Slice &amp;data,</a>
+<a name="ln446">                                                           uint32_t *parsed_len) {</a>
+<a name="ln447">  RETURN_NOT_OK_PREPEND(data.check_size(kLogSegmentFooterMagicAndFooterLength),</a>
+<a name="ln448">                        &quot;Slice is too small to contain final magic number&quot;);</a>
+<a name="ln449"> </a>
+<a name="ln450">  if (memcmp(kLogSegmentFooterMagicString, data.data(),</a>
+<a name="ln451">             strlen(kLogSegmentFooterMagicString)) != 0) {</a>
+<a name="ln452">    return STATUS(NotFound, &quot;Footer not found. Footer magic doesn't match&quot;);</a>
+<a name="ln453">  }</a>
+<a name="ln454"> </a>
+<a name="ln455">  *parsed_len = DecodeFixed32(data.data() + strlen(kLogSegmentFooterMagicString));</a>
+<a name="ln456">  return Status::OK();</a>
+<a name="ln457">}</a>
+<a name="ln458"> </a>
+<a name="ln459">ReadEntriesResult ReadableLogSegment::ReadEntries(int64_t max_entries_to_read) {</a>
+<a name="ln460">  TRACE_EVENT1(&quot;log&quot;, &quot;ReadableLogSegment::ReadEntries&quot;,</a>
+<a name="ln461">               &quot;path&quot;, path_);</a>
+<a name="ln462"> </a>
+<a name="ln463">  ReadEntriesResult result;</a>
+<a name="ln464"> </a>
+<a name="ln465">  std::vector&lt;int64_t&gt; recent_offsets(4, -1);</a>
+<a name="ln466">  int64_t batches_read = 0;</a>
+<a name="ln467"> </a>
+<a name="ln468">  int64_t offset = first_entry_offset();</a>
+<a name="ln469">  int64_t readable_to_offset = readable_to_offset_.Load();</a>
+<a name="ln470">  VLOG(1) &lt;&lt; &quot;Reading segment entries from &quot;</a>
+<a name="ln471">          &lt;&lt; path_ &lt;&lt; &quot;: offset=&quot; &lt;&lt; offset &lt;&lt; &quot; file_size=&quot;</a>
+<a name="ln472">          &lt;&lt; file_size() &lt;&lt; &quot; readable_to_offset=&quot; &lt;&lt; readable_to_offset;</a>
+<a name="ln473">  faststring tmp_buf;</a>
+<a name="ln474"> </a>
+<a name="ln475">  // If we have a footer we only read up to it. If we don't we likely crashed</a>
+<a name="ln476">  // and always read to the end.</a>
+<a name="ln477">  int64_t read_up_to = (footer_.IsInitialized() &amp;&amp; !footer_was_rebuilt_) ?</a>
+<a name="ln478">      file_size() - footer_.ByteSize() - kLogSegmentFooterMagicAndFooterLength :</a>
+<a name="ln479">      readable_to_offset;</a>
+<a name="ln480"> </a>
+<a name="ln481">  result.end_offset = offset;</a>
+<a name="ln482"> </a>
+<a name="ln483">  int64_t num_entries_read = 0;</a>
+<a name="ln484">  while (offset &lt; read_up_to) {</a>
+<a name="ln485">    const int64_t this_batch_offset = offset;</a>
+<a name="ln486">    recent_offsets[batches_read++ % recent_offsets.size()] = offset;</a>
+<a name="ln487"> </a>
+<a name="ln488">    LogEntryBatchPB current_batch;</a>
+<a name="ln489"> </a>
+<a name="ln490">    // Read and validate the entry header first.</a>
+<a name="ln491">    Status s;</a>
+<a name="ln492">    if (offset + kEntryHeaderSize &lt; read_up_to) {</a>
+<a name="ln493">      s = ReadEntryHeaderAndBatch(&amp;offset, &amp;tmp_buf, &amp;current_batch);</a>
+<a name="ln494">    } else {</a>
+<a name="ln495">      s = STATUS(Corruption, Substitute(&quot;Truncated log entry at offset $0&quot;, offset));</a>
+<a name="ln496">    }</a>
+<a name="ln497"> </a>
+<a name="ln498">    if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln499">      if (!s.IsCorruption()) {</a>
+<a name="ln500">        // IO errors should always propagate back</a>
+<a name="ln501">        result.status = s.CloneAndPrepend(Substitute(&quot;Error reading from log $0&quot;, path_));</a>
+<a name="ln502">        return result;</a>
+<a name="ln503">      }</a>
+<a name="ln504"> </a>
+<a name="ln505">      result.status = MakeCorruptionStatus(</a>
+<a name="ln506">          batches_read, this_batch_offset, &amp;recent_offsets, result.entries, s);</a>
+<a name="ln507"> </a>
+<a name="ln508">      // If we have a valid footer in the segment, then the segment was correctly</a>
+<a name="ln509">      // closed, and we shouldn't see any corruption anywhere (including the last</a>
+<a name="ln510">      // batch).</a>
+<a name="ln511">      if (HasFooter() &amp;&amp; !footer_was_rebuilt_) {</a>
+<a name="ln512">        LOG(WARNING) &lt;&lt; &quot;Found a corruption in a closed log segment: &quot; &lt;&lt; result.status;</a>
+<a name="ln513">        return result;</a>
+<a name="ln514">      }</a>
+<a name="ln515"> </a>
+<a name="ln516">      // If we read a corrupt entry, but we don't have a footer, then it's</a>
+<a name="ln517">      // possible that we crashed in the middle of writing an entry.</a>
+<a name="ln518">      // In this case, we scan forward to see if there are any more valid looking</a>
+<a name="ln519">      // entries after this one in the file. If there are, it's really a corruption.</a>
+<a name="ln520">      // if not, we just WARN it, since it's OK for the last entry to be partially</a>
+<a name="ln521">      // written.</a>
+<a name="ln522">      bool has_valid_entries;</a>
+<a name="ln523">      auto status = ScanForValidEntryHeaders(offset, &amp;has_valid_entries);</a>
+<a name="ln524">      if (!status.ok()) {</a>
+<a name="ln525">        result.status = s.CloneAndPrepend(&quot;Scanning forward for valid entries&quot;);</a>
+<a name="ln526">      }</a>
+<a name="ln527"> </a>
+<a name="ln528">      if (has_valid_entries) {</a>
+<a name="ln529">        return result;</a>
+<a name="ln530">      }</a>
+<a name="ln531"> </a>
+<a name="ln532">      LOG(INFO) &lt;&lt; &quot;Ignoring log segment corruption in &quot; &lt;&lt; path_ &lt;&lt; &quot; because &quot;</a>
+<a name="ln533">                &lt;&lt; &quot;there are no log entries following the corrupted one. &quot;</a>
+<a name="ln534">                &lt;&lt; &quot;The server probably crashed in the middle of writing an entry &quot;</a>
+<a name="ln535">                &lt;&lt; &quot;to the write-ahead log or downloaded an active log via remote bootstrap. &quot;</a>
+<a name="ln536">                &lt;&lt; &quot;Error detail: &quot; &lt;&lt; result.status.ToString();</a>
+<a name="ln537">      break;</a>
+<a name="ln538">    }</a>
+<a name="ln539"> </a>
+<a name="ln540">    if (VLOG_IS_ON(3)) {</a>
+<a name="ln541">      VLOG(3) &lt;&lt; &quot;Read Log entry batch: &quot; &lt;&lt; current_batch.DebugString();</a>
+<a name="ln542">    }</a>
+<a name="ln543">    if (current_batch.has_committed_op_id()) {</a>
+<a name="ln544">      result.committed_op_id = yb::OpId::FromPB(current_batch.committed_op_id());</a>
+<a name="ln545">    }</a>
+<a name="ln546"> </a>
+<a name="ln547">    // Number of entries to extract from the protobuf repeated field because the ownership of those</a>
+<a name="ln548">    // entries will be transferred to the caller.</a>
+<a name="ln549">    size_t num_entries_to_extract = 0;</a>
+<a name="ln550"> </a>
+<a name="ln551">    for (size_t i = 0; i &lt; current_batch.entry_size(); ++i) {</a>
+<a name="ln552">      result.entries.emplace_back(current_batch.mutable_entry(i));</a>
+<a name="ln553">      DCHECK_NE(current_batch.mono_time(), 0);</a>
+<a name="ln554">      LogEntryMetadata entry_metadata;</a>
+<a name="ln555">      entry_metadata.offset = this_batch_offset;</a>
+<a name="ln556">      entry_metadata.active_segment_sequence_number = header().sequence_number();</a>
+<a name="ln557">      entry_metadata.entry_time = RestartSafeCoarseTimePoint::FromUInt64(current_batch.mono_time());</a>
+<a name="ln558">      result.entry_metadata.emplace_back(std::move(entry_metadata));</a>
+<a name="ln559">      num_entries_read++;</a>
+<a name="ln560">      num_entries_to_extract++;</a>
+<a name="ln561">      if (num_entries_read &gt;= max_entries_to_read) {</a>
+<a name="ln562">        break;</a>
+<a name="ln563">      }</a>
+<a name="ln564">    }</a>
+<a name="ln565">    current_batch.mutable_entry()-&gt;ExtractSubrange(</a>
+<a name="ln566">        0, num_entries_to_extract, /* elements */ nullptr);</a>
+<a name="ln567">    result.end_offset = offset;</a>
+<a name="ln568">    if (num_entries_read &gt;= max_entries_to_read) {</a>
+<a name="ln569">      result.status = Status::OK();</a>
+<a name="ln570">      return result;</a>
+<a name="ln571">    }</a>
+<a name="ln572">  }</a>
+<a name="ln573"> </a>
+<a name="ln574">  if (footer_.IsInitialized() &amp;&amp; footer_.num_entries() != num_entries_read) {</a>
+<a name="ln575">    result.status = STATUS_FORMAT(</a>
+<a name="ln576">        Corruption,</a>
+<a name="ln577">        &quot;Read $0 log entries from $1, but expected $2 based on the footer&quot;,</a>
+<a name="ln578">        num_entries_read, path_, footer_.num_entries());</a>
+<a name="ln579">  }</a>
+<a name="ln580"> </a>
+<a name="ln581">  result.status = Status::OK();</a>
+<a name="ln582">  return result;</a>
+<a name="ln583">}</a>
+<a name="ln584"> </a>
+<a name="ln585">Result&lt;FirstEntryMetadata&gt; ReadableLogSegment::ReadFirstEntryMetadata() {</a>
+<a name="ln586">  auto read_result = ReadEntries(/* max_entries_to_read */ 1);</a>
+<a name="ln587">  const auto&amp; entries = read_result.entries;</a>
+<a name="ln588">  const auto&amp; entry_metadata_records = read_result.entry_metadata;</a>
+<a name="ln589">  if (entries.empty()) {</a>
+<a name="ln590">    return STATUS(NotFound, &quot;No entries found&quot;);</a>
+<a name="ln591">  }</a>
+<a name="ln592">  if (entry_metadata_records.empty()) {</a>
+<a name="ln593">    return STATUS(NotFound, &quot;No entry metadata found&quot;);</a>
+<a name="ln594">  }</a>
+<a name="ln595">  auto&amp; first_entry = *entries.front();</a>
+<a name="ln596">  if (!first_entry.has_replicate()) {</a>
+<a name="ln597">    return STATUS(NotFound, &quot;No REPLICATE message found in the first entry&quot;);</a>
+<a name="ln598">  }</a>
+<a name="ln599"> </a>
+<a name="ln600">  return FirstEntryMetadata {</a>
+<a name="ln601">    .op_id = OpId::FromPB(first_entry.replicate().id()),</a>
+<a name="ln602">    .entry_time = entry_metadata_records.front().entry_time</a>
+<a name="ln603">  };</a>
+<a name="ln604">}</a>
+<a name="ln605"> </a>
+<a name="ln606">Status ReadableLogSegment::ScanForValidEntryHeaders(int64_t offset, bool* has_valid_entries) {</a>
+<a name="ln607">  TRACE_EVENT1(&quot;log&quot;, &quot;ReadableLogSegment::ScanForValidEntryHeaders&quot;,</a>
+<a name="ln608">               &quot;path&quot;, path_);</a>
+<a name="ln609">  LOG(INFO) &lt;&lt; &quot;Scanning &quot; &lt;&lt; path_ &lt;&lt; &quot; for valid entry headers &quot;</a>
+<a name="ln610">            &lt;&lt; &quot;following offset &quot; &lt;&lt; offset &lt;&lt; &quot;...&quot;;</a>
+<a name="ln611">  *has_valid_entries = false;</a>
+<a name="ln612"> </a>
+<a name="ln613">  const int kChunkSize = 1024 * 1024;</a>
+<a name="ln614">  gscoped_ptr&lt;uint8_t[]&gt; buf(new uint8_t[kChunkSize]);</a>
+<a name="ln615"> </a>
+<a name="ln616">  // We overlap the reads by the size of the header, so that if a header</a>
+<a name="ln617">  // spans chunks, we don't miss it.</a>
+<a name="ln618">  for (;</a>
+<a name="ln619">       offset &lt; file_size() - kEntryHeaderSize;</a>
+<a name="ln620">       offset += kChunkSize - kEntryHeaderSize) {</a>
+<a name="ln621">    int rem = std::min&lt;int64_t&gt;(file_size() - offset, kChunkSize);</a>
+<a name="ln622">    Slice chunk;</a>
+<a name="ln623">    // If encryption is enabled, need to use checkpoint file to read pre-allocated file since</a>
+<a name="ln624">    // we want to preserve all 0s.</a>
+<a name="ln625">    RETURN_NOT_OK(ReadFully(</a>
+<a name="ln626">        readable_file_checkpoint().get(), offset + readable_file()-&gt;GetEncryptionHeaderSize(), rem,</a>
+<a name="ln627">        &amp;chunk, &amp;buf[0]));</a>
+<a name="ln628"> </a>
+<a name="ln629">    // Optimization for the case where a chunk is all zeros -- this is common in the</a>
+<a name="ln630">    // case of pre-allocated files. This avoids a lot of redundant CRC calculation.</a>
+<a name="ln631">    if (IsAllZeros(chunk)) {</a>
+<a name="ln632">      continue;</a>
+<a name="ln633">    }</a>
+<a name="ln634"> </a>
+<a name="ln635">    if (readable_file()-&gt;IsEncrypted()) {</a>
+<a name="ln636">      // If encryption enabled, decrypt the contents of the file.</a>
+<a name="ln637">      RETURN_NOT_OK(ReadFully(readable_file().get(), offset, rem, &amp;chunk, &amp;buf[0]));</a>
+<a name="ln638">    }</a>
+<a name="ln639"> </a>
+<a name="ln640">    // Check if this chunk has a valid entry header.</a>
+<a name="ln641">    for (int off_in_chunk = 0;</a>
+<a name="ln642">         off_in_chunk &lt; chunk.size() - kEntryHeaderSize;</a>
+<a name="ln643">         off_in_chunk++) {</a>
+<a name="ln644">      const Slice potential_header = Slice(chunk.data() + off_in_chunk, kEntryHeaderSize);</a>
+<a name="ln645"> </a>
+<a name="ln646">      EntryHeader header;</a>
+<a name="ln647">      if (DecodeEntryHeader(potential_header, &amp;header).ok()) {</a>
+<a name="ln648">        LOG(INFO) &lt;&lt; &quot;Found a valid entry header at offset &quot; &lt;&lt; (offset + off_in_chunk);</a>
+<a name="ln649">        *has_valid_entries = true;</a>
+<a name="ln650">        return Status::OK();</a>
+<a name="ln651">      }</a>
+<a name="ln652">    }</a>
+<a name="ln653">  }</a>
+<a name="ln654"> </a>
+<a name="ln655">  LOG(INFO) &lt;&lt; &quot;Found no log entry headers&quot;;</a>
+<a name="ln656">  return Status::OK();</a>
+<a name="ln657">}</a>
+<a name="ln658"> </a>
+<a name="ln659">Status ReadableLogSegment::MakeCorruptionStatus(</a>
+<a name="ln660">    int batch_number,</a>
+<a name="ln661">    int64_t batch_offset,</a>
+<a name="ln662">    std::vector&lt;int64_t&gt;* recent_offsets,</a>
+<a name="ln663">    const std::vector&lt;std::unique_ptr&lt;LogEntryPB&gt;&gt;&amp; entries,</a>
+<a name="ln664">    const Status&amp; status) const {</a>
+<a name="ln665"> </a>
+<a name="ln666">  string err = &quot;Log file corruption detected. &quot;;</a>
+<a name="ln667">  SubstituteAndAppend(&amp;err, &quot;Failed trying to read batch #$0 at offset $1 for log segment $2: &quot;,</a>
+<a name="ln668">                      batch_number, batch_offset, path_);</a>
+<a name="ln669">  err.append(&quot;Prior batch offsets:&quot;);</a>
+<a name="ln670">  std::sort(recent_offsets-&gt;begin(), recent_offsets-&gt;end());</a>
+<a name="ln671">  for (int64_t offset : *recent_offsets) {</a>
+<a name="ln672">    if (offset &gt;= 0) {</a>
+<a name="ln673">      SubstituteAndAppend(&amp;err, &quot; $0&quot;, offset);</a>
+<a name="ln674">    }</a>
+<a name="ln675">  }</a>
+<a name="ln676">  if (!entries.empty()) {</a>
+<a name="ln677">    err.append(&quot;; Last log entries read:&quot;);</a>
+<a name="ln678">    const int kNumEntries = 4; // Include up to the last 4 entries in the segment.</a>
+<a name="ln679">    for (int i = std::max(0, static_cast&lt;int&gt;(entries.size()) - kNumEntries);</a>
+<a name="ln680">        i &lt; entries.size(); i++) {</a>
+<a name="ln681">      LogEntryPB* entry = entries[i].get();</a>
+<a name="ln682">      LogEntryTypePB type = entry-&gt;type();</a>
+<a name="ln683">      string opid_str;</a>
+<a name="ln684">      if (type == log::REPLICATE &amp;&amp; entry-&gt;has_replicate()) {</a>
+<a name="ln685">        opid_str = consensus::OpIdToString(entry-&gt;replicate().id());</a>
+<a name="ln686">      } else {</a>
+<a name="ln687">        opid_str = &quot;&lt;unknown&gt;&quot;;</a>
+<a name="ln688">      }</a>
+<a name="ln689">      SubstituteAndAppend(&amp;err, &quot; [$0 ($1)]&quot;, LogEntryTypePB_Name(type), opid_str);</a>
+<a name="ln690">    }</a>
+<a name="ln691">  }</a>
+<a name="ln692"> </a>
+<a name="ln693">  return status.CloneAndAppend(err);</a>
+<a name="ln694">}</a>
+<a name="ln695"> </a>
+<a name="ln696">Status ReadableLogSegment::ReadEntryHeaderAndBatch(int64_t* offset, faststring* tmp_buf,</a>
+<a name="ln697">                                                   LogEntryBatchPB* batch) {</a>
+<a name="ln698">  EntryHeader header;</a>
+<a name="ln699">  RETURN_NOT_OK(ReadEntryHeader(offset, &amp;header));</a>
+<a name="ln700">  RETURN_NOT_OK(ReadEntryBatch(offset, header, tmp_buf, batch));</a>
+<a name="ln701">  return Status::OK();</a>
+<a name="ln702">}</a>
+<a name="ln703"> </a>
+<a name="ln704"> </a>
+<a name="ln705">Status ReadableLogSegment::ReadEntryHeader(int64_t *offset, EntryHeader* header) {</a>
+<a name="ln706">  uint8_t scratch[kEntryHeaderSize];</a>
+<a name="ln707">  Slice slice;</a>
+<a name="ln708">  RETURN_NOT_OK_PREPEND(ReadFully(readable_file().get(), *offset, kEntryHeaderSize,</a>
+<a name="ln709">                                  &amp;slice, scratch),</a>
+<a name="ln710">                        &quot;Could not read log entry header&quot;);</a>
+<a name="ln711"> </a>
+<a name="ln712">  RETURN_NOT_OK(DecodeEntryHeader(slice, header));</a>
+<a name="ln713">  *offset += slice.size();</a>
+<a name="ln714">  return Status::OK();</a>
+<a name="ln715">}</a>
+<a name="ln716"> </a>
+<a name="ln717">Status ReadableLogSegment::DecodeEntryHeader(const Slice&amp; data, EntryHeader* header) {</a>
+<a name="ln718">  DCHECK_EQ(kEntryHeaderSize, data.size());</a>
+<a name="ln719">  header-&gt;msg_length = DecodeFixed32(data.data());</a>
+<a name="ln720">  header-&gt;msg_crc = DecodeFixed32(data.data() + 4);</a>
+<a name="ln721">  header-&gt;header_crc = DecodeFixed32(data.data() + 8);</a>
+<a name="ln722"> </a>
+<a name="ln723">  // Verify the header.</a>
+<a name="ln724">  uint32_t computed_crc = crc::Crc32c(data.data(), 8);</a>
+<a name="ln725">  if (computed_crc != header-&gt;header_crc) {</a>
+<a name="ln726">    return STATUS_FORMAT(</a>
+<a name="ln727">        Corruption, &quot;Invalid checksum in log entry head header: found=$0, computed=$1&quot;,</a>
+<a name="ln728">        header-&gt;header_crc, computed_crc);</a>
+<a name="ln729">  }</a>
+<a name="ln730">  return Status::OK();</a>
+<a name="ln731">}</a>
+<a name="ln732"> </a>
+<a name="ln733"> </a>
+<a name="ln734">Status ReadableLogSegment::ReadEntryBatch(int64_t *offset,</a>
+<a name="ln735">                                          const EntryHeader&amp; header,</a>
+<a name="ln736">                                          faststring *tmp_buf,</a>
+<a name="ln737">                                          LogEntryBatchPB* entry_batch) {</a>
+<a name="ln738">  TRACE_EVENT2(&quot;log&quot;, &quot;ReadableLogSegment::ReadEntryBatch&quot;,</a>
+<a name="ln739">               &quot;path&quot;, path_,</a>
+<a name="ln740">               &quot;range&quot;, Substitute(&quot;offset=$0 entry_len=$1&quot;,</a>
+<a name="ln741">                                   *offset, header.msg_length));</a>
+<a name="ln742"> </a>
+<a name="ln743">  if (header.msg_length == 0) {</a>
+<a name="ln744">    return STATUS(Corruption, &quot;Invalid 0 entry length&quot;);</a>
+<a name="ln745">  }</a>
+<a name="ln746">  int64_t limit = readable_up_to();</a>
+<a name="ln747">  if (PREDICT_FALSE(header.msg_length + *offset &gt; limit)) {</a>
+<a name="ln748">    // The log was likely truncated during writing.</a>
+<a name="ln749">    return STATUS(Corruption,</a>
+<a name="ln750">        Substitute(&quot;Could not read $0-byte log entry from offset $1 in $2: &quot;</a>
+<a name="ln751">                   &quot;log only readable up to offset $3&quot;,</a>
+<a name="ln752">                   header.msg_length, *offset, path_, limit));</a>
+<a name="ln753">  }</a>
+<a name="ln754"> </a>
+<a name="ln755">  tmp_buf-&gt;clear();</a>
+<a name="ln756">  tmp_buf-&gt;resize(header.msg_length);</a>
+<a name="ln757">  Slice entry_batch_slice;</a>
+<a name="ln758"> </a>
+<a name="ln759">  Status s =  readable_file()-&gt;Read(*offset,</a>
+<a name="ln760">                                    header.msg_length,</a>
+<a name="ln761">                                    &amp;entry_batch_slice,</a>
+<a name="ln762">                                    tmp_buf-&gt;data());</a>
+<a name="ln763"> </a>
+<a name="ln764">  if (!s.ok()) return STATUS(IOError, Substitute(&quot;Could not read entry. Cause: $0&quot;,</a>
+<a name="ln765">                                                 s.ToString()));</a>
+<a name="ln766"> </a>
+<a name="ln767">  // Verify the CRC.</a>
+<a name="ln768">  uint32_t read_crc = crc::Crc32c(entry_batch_slice.data(), entry_batch_slice.size());</a>
+<a name="ln769">  if (PREDICT_FALSE(read_crc != header.msg_crc)) {</a>
+<a name="ln770">    return STATUS(Corruption, Substitute(&quot;Entry CRC mismatch in byte range $0-$1: &quot;</a>
+<a name="ln771">                                         &quot;expected CRC=$2, computed=$3&quot;,</a>
+<a name="ln772">                                         *offset, *offset + header.msg_length,</a>
+<a name="ln773">                                         header.msg_crc, read_crc));</a>
+<a name="ln774">  }</a>
+<a name="ln775"> </a>
+<a name="ln776"> </a>
+<a name="ln777">  LogEntryBatchPB read_entry_batch;</a>
+<a name="ln778">  s = pb_util::ParseFromArray(&amp;read_entry_batch,</a>
+<a name="ln779">                              entry_batch_slice.data(),</a>
+<a name="ln780">                              header.msg_length);</a>
+<a name="ln781"> </a>
+<a name="ln782">  if (!s.ok()) return STATUS(Corruption, Substitute(&quot;Could parse PB. Cause: $0&quot;,</a>
+<a name="ln783">                                                    s.ToString()));</a>
+<a name="ln784"> </a>
+<a name="ln785">  *offset += entry_batch_slice.size();</a>
+<a name="ln786">  entry_batch-&gt;Swap(&amp;read_entry_batch);</a>
+<a name="ln787">  return Status::OK();</a>
+<a name="ln788">}</a>
+<a name="ln789"> </a>
+<a name="ln790">WritableLogSegment::WritableLogSegment(string path,</a>
+<a name="ln791">                                       shared_ptr&lt;WritableFile&gt; writable_file)</a>
+<a name="ln792">    : path_(std::move(path)),</a>
+<a name="ln793">      writable_file_(std::move(writable_file)),</a>
+<a name="ln794">      is_header_written_(false),</a>
+<a name="ln795">      is_footer_written_(false),</a>
+<a name="ln796">      written_offset_(0) {}</a>
+<a name="ln797"> </a>
+<a name="ln798">Status WritableLogSegment::WriteHeaderAndOpen(const LogSegmentHeaderPB&amp; new_header) {</a>
+<a name="ln799">  DCHECK(!IsHeaderWritten()) &lt;&lt; &quot;Can only call WriteHeader() once&quot;;</a>
+<a name="ln800">  DCHECK(new_header.IsInitialized())</a>
+<a name="ln801">      &lt;&lt; &quot;Log segment header must be initialized&quot; &lt;&lt; new_header.InitializationErrorString();</a>
+<a name="ln802">  faststring buf;</a>
+<a name="ln803"> </a>
+<a name="ln804">  // First the magic.</a>
+<a name="ln805">  buf.append(kLogSegmentHeaderMagicString);</a>
+<a name="ln806">  // Then Length-prefixed header.</a>
+<a name="ln807">  PutFixed32(&amp;buf, new_header.ByteSize());</a>
+<a name="ln808">  // Then Serialize the PB.</a>
+<a name="ln809">  if (!pb_util::AppendToString(new_header, &amp;buf)) {</a>
+<a name="ln810">    return STATUS(Corruption, &quot;unable to encode header&quot;);</a>
+<a name="ln811">  }</a>
+<a name="ln812">  RETURN_NOT_OK(writable_file()-&gt;Append(Slice(buf)));</a>
+<a name="ln813"> </a>
+<a name="ln814">  header_.CopyFrom(new_header);</a>
+<a name="ln815">  first_entry_offset_ = buf.size();</a>
+<a name="ln816">  written_offset_ = first_entry_offset_;</a>
+<a name="ln817">  is_header_written_ = true;</a>
+<a name="ln818"> </a>
+<a name="ln819">  return Status::OK();</a>
+<a name="ln820">}</a>
+<a name="ln821"> </a>
+<a name="ln822">Status WritableLogSegment::WriteFooterAndClose(const LogSegmentFooterPB&amp; footer) {</a>
+<a name="ln823">  TRACE_EVENT1(&quot;log&quot;, &quot;WritableLogSegment::WriteFooterAndClose&quot;,</a>
+<a name="ln824">               &quot;path&quot;, path_);</a>
+<a name="ln825">  DCHECK(IsHeaderWritten());</a>
+<a name="ln826">  DCHECK(!IsFooterWritten());</a>
+<a name="ln827">  DCHECK(footer.IsInitialized()) &lt;&lt; footer.InitializationErrorString();</a>
+<a name="ln828"> </a>
+<a name="ln829">  faststring buf;</a>
+<a name="ln830"> </a>
+<a name="ln831">  if (!pb_util::AppendToString(footer, &amp;buf)) {</a>
+<a name="ln832">    return STATUS(Corruption, &quot;unable to encode header&quot;);</a>
+<a name="ln833">  }</a>
+<a name="ln834"> </a>
+<a name="ln835">  buf.append(kLogSegmentFooterMagicString);</a>
+<a name="ln836">  PutFixed32(&amp;buf, footer.ByteSize());</a>
+<a name="ln837"> </a>
+<a name="ln838">  RETURN_NOT_OK_PREPEND(writable_file()-&gt;Append(Slice(buf)), &quot;Could not write the footer&quot;);</a>
+<a name="ln839"> </a>
+<a name="ln840">  footer_.CopyFrom(footer);</a>
+<a name="ln841">  is_footer_written_ = true;</a>
+<a name="ln842"> </a>
+<a name="ln843">  RETURN_NOT_OK(writable_file_-&gt;Close());</a>
+<a name="ln844"> </a>
+<a name="ln845">  written_offset_ += buf.size();</a>
+<a name="ln846"> </a>
+<a name="ln847">  return Status::OK();</a>
+<a name="ln848">}</a>
+<a name="ln849"> </a>
+<a name="ln850"> </a>
+<a name="ln851">Status WritableLogSegment::WriteEntryBatch(const Slice&amp; data) {</a>
+<a name="ln852">  DCHECK(is_header_written_);</a>
+<a name="ln853">  DCHECK(!is_footer_written_);</a>
+<a name="ln854">  uint8_t header_buf[kEntryHeaderSize];</a>
+<a name="ln855"> </a>
+<a name="ln856">  // First encode the length of the message.</a>
+<a name="ln857">  uint32_t len = data.size();</a>
+<a name="ln858">  InlineEncodeFixed32(&amp;header_buf[0], len);</a>
+<a name="ln859"> </a>
+<a name="ln860">  // Then the CRC of the message.</a>
+<a name="ln861">  uint32_t msg_crc = crc::Crc32c(data.data(), data.size());</a>
+<a name="ln862">  InlineEncodeFixed32(&amp;header_buf[4], msg_crc);</a>
+<a name="ln863"> </a>
+<a name="ln864">  // Then the CRC of the header</a>
+<a name="ln865">  uint32_t header_crc = crc::Crc32c(&amp;header_buf, 8);</a>
+<a name="ln866">  InlineEncodeFixed32(&amp;header_buf[8], header_crc);</a>
+<a name="ln867"> </a>
+<a name="ln868">  // Write the header to the file, followed by the batch data itself.</a>
+<a name="ln869">  RETURN_NOT_OK(writable_file_-&gt;Append(Slice(header_buf, sizeof(header_buf))));</a>
+<a name="ln870">  written_offset_ += sizeof(header_buf);</a>
+<a name="ln871"> </a>
+<a name="ln872">  RETURN_NOT_OK(writable_file_-&gt;Append(data));</a>
+<a name="ln873">  written_offset_ += data.size();</a>
+<a name="ln874"> </a>
+<a name="ln875">  return Status::OK();</a>
+<a name="ln876">}</a>
+<a name="ln877"> </a>
+<a name="ln878">// Creates a LogEntryBatchPB from pre-allocated ReplicateMsgs managed using shared pointers. The</a>
+<a name="ln879">// caller has to ensure these messages are not deleted twice, both by LogEntryBatchPB and by</a>
+<a name="ln880">// the shared pointers.</a>
+<a name="ln881">LogEntryBatchPB CreateBatchFromAllocatedOperations(const ReplicateMsgs&amp; msgs) {</a>
+<a name="ln882">  LogEntryBatchPB result;</a>
+<a name="ln883">  result.set_mono_time(RestartSafeCoarseMonoClock().Now().ToUInt64());</a>
+<a name="ln884">  result.mutable_entry()-&gt;Reserve(msgs.size());</a>
+<a name="ln885">  for (const auto&amp; msg_ptr : msgs) {</a>
+<a name="ln886">    LogEntryPB* entry_pb = result.add_entry();</a>
+<a name="ln887">    entry_pb-&gt;set_type(log::REPLICATE);</a>
+<a name="ln888">    // entry_pb does not actually own the ReplicateMsg object, even though it thinks it does,</a>
+<a name="ln889">    // because we release it in ~LogEntryBatch. LogEntryBatchPB has a separate vector of shared</a>
+<a name="ln890">    // pointers to messages.</a>
+<a name="ln891">    entry_pb-&gt;set_allocated_replicate(msg_ptr.get());</a>
+<a name="ln892">  }</a>
+<a name="ln893">  return result;</a>
+<a name="ln894">}</a>
+<a name="ln895"> </a>
+<a name="ln896">bool IsLogFileName(const string&amp; fname) {</a>
+<a name="ln897">  if (HasPrefixString(fname, &quot;.&quot;)) {</a>
+<a name="ln898">    // Hidden file or ./..</a>
+<a name="ln899">    VLOG(1) &lt;&lt; &quot;Ignoring hidden file: &quot; &lt;&lt; fname;</a>
+<a name="ln900">    return false;</a>
+<a name="ln901">  }</a>
+<a name="ln902"> </a>
+<a name="ln903">  if (HasSuffixString(fname, kTmpSuffix)) {</a>
+<a name="ln904">    LOG(WARNING) &lt;&lt; &quot;Ignoring tmp file: &quot; &lt;&lt; fname;</a>
+<a name="ln905">    return false;</a>
+<a name="ln906">  }</a>
+<a name="ln907"> </a>
+<a name="ln908">  vector&lt;string&gt; v = strings::Split(fname, &quot;-&quot;);</a>
+<a name="ln909">  if (v.size() != 2 || v[0] != FsManager::kWalFileNamePrefix) {</a>
+<a name="ln910">    VLOG(1) &lt;&lt; &quot;Not a log file: &quot; &lt;&lt; fname;</a>
+<a name="ln911">    return false;</a>
+<a name="ln912">  }</a>
+<a name="ln913"> </a>
+<a name="ln914">  return true;</a>
+<a name="ln915">}</a>
+<a name="ln916"> </a>
+<a name="ln917">std::vector&lt;std::string&gt; ParseDirFlags(string flag_dirs, string flag_name) {</a>
+<a name="ln918">  std::vector&lt;std::string&gt; paths = strings::Split(flag_dirs, &quot;,&quot;, strings::SkipEmpty());</a>
+<a name="ln919">  return paths;</a>
+<a name="ln920">}</a>
+<a name="ln921"> </a>
+<a name="ln922">Status CheckPathsAreODirectWritable(const std::vector&lt;std::string&gt; &amp;paths) {</a>
+<a name="ln923">  Env *def_env = Env::Default();</a>
+<a name="ln924">  for (const auto &amp;path : paths) {</a>
+<a name="ln925">    RETURN_NOT_OK(CheckODirectTempFileCreationInDir(def_env, path));</a>
+<a name="ln926">  }</a>
+<a name="ln927">  return Status::OK();</a>
+<a name="ln928">}</a>
+<a name="ln929"> </a>
+<a name="ln930">Status CheckRelevantPathsAreODirectWritable() {</a>
+<a name="ln931">  if (!FLAGS_log_dir.empty()) {</a>
+<a name="ln932">    RETURN_NOT_OK_PREPEND(CheckPathsAreODirectWritable(ParseDirFlags(</a>
+<a name="ln933">        FLAGS_log_dir, &quot;--log_dir&quot;)), &quot;Not all log_dirs are O_DIRECT Writable.&quot;);</a>
+<a name="ln934">  }</a>
+<a name="ln935">  RETURN_NOT_OK_PREPEND(CheckPathsAreODirectWritable(ParseDirFlags(</a>
+<a name="ln936">      FLAGS_fs_data_dirs, &quot;--data_dirs&quot;)), &quot;Not all fs_data_dirs are O_DIRECT Writable.&quot;);</a>
+<a name="ln937"> </a>
+<a name="ln938">  RETURN_NOT_OK_PREPEND(CheckPathsAreODirectWritable(ParseDirFlags(</a>
+<a name="ln939">      FLAGS_fs_wal_dirs, &quot;--wal_dirs&quot;)), &quot;Not all fs_wal_dirs are O_DIRECT Writable.&quot;);</a>
+<a name="ln940">  return Status::OK();</a>
+<a name="ln941">}</a>
+<a name="ln942"> </a>
+<a name="ln943">Status ModifyDurableWriteFlagIfNotODirect() {</a>
+<a name="ln944">  if (FLAGS_durable_wal_write) {</a>
+<a name="ln945">    Status s = CheckRelevantPathsAreODirectWritable();</a>
+<a name="ln946">    if (!s.ok()) {</a>
+<a name="ln947">      if (FLAGS_require_durable_wal_write) {</a>
+<a name="ln948">        // Crash with appropriate error.</a>
+<a name="ln949">        RETURN_NOT_OK_PREPEND(s, &quot;require_durable_wal_write is set true, but O_DIRECT is &quot;</a>
+<a name="ln950">            &quot;not allowed.&quot;)</a>
+<a name="ln951">      } else {</a>
+<a name="ln952">        // Report error but do not crash.</a>
+<a name="ln953">        LOG(ERROR) &lt;&lt; &quot;O_DIRECT is not allowed in some of the directories. &quot;</a>
+<a name="ln954">            &quot;Setting durable wal write flag to false.&quot;;</a>
+<a name="ln955">        FLAGS_durable_wal_write = false;</a>
+<a name="ln956">      }</a>
+<a name="ln957">    }</a>
+<a name="ln958">  }</a>
+<a name="ln959">  return Status::OK();</a>
+<a name="ln960">}</a>
+<a name="ln961">}  // namespace log</a>
+<a name="ln962">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="152"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="170"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="176"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="177"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="178"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="193"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="194"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="209"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="241"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="263"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="281"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="470"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="541"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="581"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v519/" target="_blank">V519</a> The 'result.status' variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 575, 581.</p></div>
+<div class="balloon" rel="799"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="800"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="825"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="826"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="827"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="852"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="853"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="899"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="910"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="790"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: first_entry_offset_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

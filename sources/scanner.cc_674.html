@@ -1,0 +1,612 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>scanner.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln5">//</a>
+<a name="ln6">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln7">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln12">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln13">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln14">// under the License.</a>
+<a name="ln15">//</a>
+<a name="ln16">// Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group</a>
+<a name="ln17">// Portions Copyright (c) 1994, Regents of the University of California</a>
+<a name="ln18">//</a>
+<a name="ln19">// API for the core scanner (flex machine). Some of the functions are not following Yugabyte naming</a>
+<a name="ln20">// convention because they are PostgreQL code.</a>
+<a name="ln21">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln22"> </a>
+<a name="ln23">// #include &lt;algorithm&gt;</a>
+<a name="ln24">#include &lt;unordered_map&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/yql/cql/ql/parser/parser.h&quot;</a>
+<a name="ln27">#include &quot;yb/yql/cql/ql/parser/scanner.h&quot;</a>
+<a name="ln28">#include &quot;yb/yql/cql/ql/parser/scanner_util.h&quot;</a>
+<a name="ln29">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31">namespace yb {</a>
+<a name="ln32">namespace ql {</a>
+<a name="ln33"> </a>
+<a name="ln34">using std::unordered_map;</a>
+<a name="ln35"> </a>
+<a name="ln36">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln37">// Class LexProcessor.</a>
+<a name="ln38">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln39"> </a>
+<a name="ln40">LexProcessor::LexProcessor()</a>
+<a name="ln41">    : literalbuf_(nullptr),</a>
+<a name="ln42">      literallen_(0),</a>
+<a name="ln43">      literalalloc_(0),</a>
+<a name="ln44">      backslash_quote_(BackslashQuoteType::SAFE_ENCODING),</a>
+<a name="ln45">      escape_string_warning_(true),</a>
+<a name="ln46">      standard_conforming_strings_(true) {</a>
+<a name="ln47">}</a>
+<a name="ln48"> </a>
+<a name="ln49">LexProcessor::~LexProcessor() {</a>
+<a name="ln50">  if (literalbuf_ != nullptr) {</a>
+<a name="ln51">    free(literalbuf_);</a>
+<a name="ln52">  }</a>
+<a name="ln53">}</a>
+<a name="ln54"> </a>
+<a name="ln55">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln56"> </a>
+<a name="ln57">void LexProcessor::ScanInit(ParseContext *parse_context) {</a>
+<a name="ln58">  yyrestart(parse_context-&gt;ql_file());</a>
+<a name="ln59"> </a>
+<a name="ln60">  token_loc_.initialize();</a>
+<a name="ln61">  cursor_.initialize();</a>
+<a name="ln62">  lookahead_.type = 0;</a>
+<a name="ln63"> </a>
+<a name="ln64">  literallen_ = 0;</a>
+<a name="ln65">  xcdepth_ = 0;</a>
+<a name="ln66">  dolqstart_ = nullptr;</a>
+<a name="ln67">  utf16_first_part_ = 0;</a>
+<a name="ln68">  warn_on_first_escape_ = false;</a>
+<a name="ln69">  saw_non_ascii_ = false;</a>
+<a name="ln70"> </a>
+<a name="ln71">  backslash_quote_ = BackslashQuoteType::SAFE_ENCODING;</a>
+<a name="ln72">  escape_string_warning_ = true;</a>
+<a name="ln73">  standard_conforming_strings_ = true;</a>
+<a name="ln74"> </a>
+<a name="ln75">  parse_context_ = parse_context;</a>
+<a name="ln76">  if (parse_context_ != nullptr) {</a>
+<a name="ln77">    yy_flex_debug = parse_context-&gt;trace_scanning();</a>
+<a name="ln78">  }</a>
+<a name="ln79">}</a>
+<a name="ln80"> </a>
+<a name="ln81">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln82"> </a>
+<a name="ln83">GramProcessor::symbol_type LexProcessor::Scan() {</a>
+<a name="ln84">  // Use the lookahead from the context if it's available. Otherwise, read the token.</a>
+<a name="ln85">  GramProcessor::symbol_type cur_token;</a>
+<a name="ln86">  ScanState scan_state;</a>
+<a name="ln87"> </a>
+<a name="ln88">  if (lookahead_.token() != 0) {</a>
+<a name="ln89">    // Remove lookahead from the context and reset it to type 0.</a>
+<a name="ln90">    cur_token.move(lookahead_);</a>
+<a name="ln91">    lookahead_.type = 0;</a>
+<a name="ln92">  } else {</a>
+<a name="ln93">    // Read the next token and save it to 'cur_token'.</a>
+<a name="ln94">    ScanNextToken(scan_state, &amp;cur_token);</a>
+<a name="ln95">  }</a>
+<a name="ln96"> </a>
+<a name="ln97">  // Return the token if it doesn't require lookahead. Otherwise, set the token length.</a>
+<a name="ln98">  switch (cur_token.token()) {</a>
+<a name="ln99">    case GramProcessor::token::TOK_GROUP_P:</a>
+<a name="ln100">    case GramProcessor::token::TOK_OFFSET:</a>
+<a name="ln101">    case GramProcessor::token::TOK_NOT:</a>
+<a name="ln102">    case GramProcessor::token::TOK_NULLS_P:</a>
+<a name="ln103">    case GramProcessor::token::TOK_WITH: {</a>
+<a name="ln104">      break;</a>
+<a name="ln105">    }</a>
+<a name="ln106"> </a>
+<a name="ln107">    default: {</a>
+<a name="ln108">      // Return 'cur_token' as it does not require lookahead.</a>
+<a name="ln109">      return cur_token;</a>
+<a name="ln110">    }</a>
+<a name="ln111">  }</a>
+<a name="ln112"> </a>
+<a name="ln113">  // Cache the lookahead token.</a>
+<a name="ln114">  ScanNextToken(scan_state, &amp;lookahead_);</a>
+<a name="ln115"> </a>
+<a name="ln116">  // Replace cur_token if needed, based on lookahead.</a>
+<a name="ln117">  GramProcessor::token_type next_token_type = lookahead_.token();</a>
+<a name="ln118">  switch (cur_token.token()) {</a>
+<a name="ln119">    case GramProcessor::token::TOK_GROUP_P: {</a>
+<a name="ln120">      // Replace GROUP_P with GROUP_LA to support SELECT ... GROUP BY ...</a>
+<a name="ln121">      // - Token GROUP_P is accepted when being used as column name (practically all names).</a>
+<a name="ln122">      // - Token GROUP_LA is accepted when being used in GROUP BY clause.</a>
+<a name="ln123">      //   group_clause: GROUP_LA BY &lt;group_by_list&gt;</a>
+<a name="ln124">      int next_tok = static_cast&lt;int&gt;(next_token_type);</a>
+<a name="ln125">      if (next_tok == GramProcessor::token::TOK_BY) {</a>
+<a name="ln126">        return GramProcessor::make_GROUP_LA(cursor_);</a>
+<a name="ln127">      }</a>
+<a name="ln128">      break;</a>
+<a name="ln129">    }</a>
+<a name="ln130"> </a>
+<a name="ln131">    case GramProcessor::token::TOK_OFFSET: {</a>
+<a name="ln132">      // Replace OFFSET with OFFSET_LA to support SELECT ... OFFSET ...</a>
+<a name="ln133">      // - Token OFFSET is accepted when being used as column name (practically all names).</a>
+<a name="ln134">      // - Token OFFSET_LA is accepted when being used in OFFSET clause.</a>
+<a name="ln135">      //   offset_clause:  OFFSET_LA &lt;int constant&gt;</a>
+<a name="ln136">      //                   OFFSET_LA '?'  --&gt; Bind variable</a>
+<a name="ln137">      //                   OFFSET_LA ':'  --&gt; Bind variable</a>
+<a name="ln138">      int next_tok = static_cast&lt;int&gt;(next_token_type);</a>
+<a name="ln139">      if (next_tok == GramProcessor::token::TOK_ICONST || next_tok == '?' || next_tok == ':') {</a>
+<a name="ln140">        return GramProcessor::make_OFFSET_LA(cursor_);</a>
+<a name="ln141">      }</a>
+<a name="ln142">      break;</a>
+<a name="ln143">    }</a>
+<a name="ln144"> </a>
+<a name="ln145">    case GramProcessor::token::TOK_NOT: {</a>
+<a name="ln146">      // Replace NOT by NOT_LA if it's followed by BETWEEN, IN, etc.</a>
+<a name="ln147">      switch (next_token_type) {</a>
+<a name="ln148">        case GramProcessor::token::TOK_BETWEEN:</a>
+<a name="ln149">        case GramProcessor::token::TOK_EXISTS:</a>
+<a name="ln150">        case GramProcessor::token::TOK_IN_P:</a>
+<a name="ln151">        case GramProcessor::token::TOK_LIKE:</a>
+<a name="ln152">        case GramProcessor::token::TOK_ILIKE:</a>
+<a name="ln153">        case GramProcessor::token::TOK_SIMILAR: {</a>
+<a name="ln154">          return GramProcessor::make_NOT_LA(cursor_);</a>
+<a name="ln155">        }</a>
+<a name="ln156"> </a>
+<a name="ln157">        default: {</a>
+<a name="ln158">          break;</a>
+<a name="ln159">        }</a>
+<a name="ln160">      }</a>
+<a name="ln161">      break;</a>
+<a name="ln162">    }</a>
+<a name="ln163"> </a>
+<a name="ln164">    case GramProcessor::token::TOK_NULLS_P: {</a>
+<a name="ln165">      // Replace NULLS_P by NULLS_LA if it's followed by FIRST or LAST.</a>
+<a name="ln166">      switch (next_token_type) {</a>
+<a name="ln167">        case GramProcessor::token::TOK_FIRST_P:</a>
+<a name="ln168">        case GramProcessor::token::TOK_LAST_P: {</a>
+<a name="ln169">          return GramProcessor::make_NULLS_LA(cursor_);</a>
+<a name="ln170">        }</a>
+<a name="ln171"> </a>
+<a name="ln172">        default: {</a>
+<a name="ln173">          break;</a>
+<a name="ln174">        }</a>
+<a name="ln175">      }</a>
+<a name="ln176">      break;</a>
+<a name="ln177">    }</a>
+<a name="ln178"> </a>
+<a name="ln179">    case GramProcessor::token::TOK_WITH: {</a>
+<a name="ln180">      // Replace WITH by WITH_LA if it's followed by TIME or ORDINALITY.</a>
+<a name="ln181">      switch (next_token_type) {</a>
+<a name="ln182">        case GramProcessor::token::TOK_TIME:</a>
+<a name="ln183">        case GramProcessor::token::TOK_ORDINALITY: {</a>
+<a name="ln184">          return GramProcessor::make_WITH_LA(cursor_);</a>
+<a name="ln185">        }</a>
+<a name="ln186"> </a>
+<a name="ln187">        default: {</a>
+<a name="ln188">          break;</a>
+<a name="ln189">        }</a>
+<a name="ln190">      }</a>
+<a name="ln191">      break;</a>
+<a name="ln192">    }</a>
+<a name="ln193"> </a>
+<a name="ln194">    default: {</a>
+<a name="ln195">      break;</a>
+<a name="ln196">    }</a>
+<a name="ln197">  }</a>
+<a name="ln198"> </a>
+<a name="ln199">  return cur_token;</a>
+<a name="ln200">}</a>
+<a name="ln201"> </a>
+<a name="ln202">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln203"> </a>
+<a name="ln204">int LexProcessor::LexerInput(char* buf, int max_size) {</a>
+<a name="ln205">  return parse_context_-&gt;Read(buf, max_size);</a>
+<a name="ln206">}</a>
+<a name="ln207"> </a>
+<a name="ln208">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln209"> </a>
+<a name="ln210">void LexProcessor::CountNewlineInToken(const string&amp; token) {</a>
+<a name="ln211">  const int lines =</a>
+<a name="ln212">    count(token.begin(), token.end(), '\n') + count(token.begin(), token.end(), '\r');</a>
+<a name="ln213">  cursor_.lines(lines);</a>
+<a name="ln214">}</a>
+<a name="ln215"> </a>
+<a name="ln216">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln217"> </a>
+<a name="ln218">GramProcessor::symbol_type LexProcessor::ScanError(const char *token) {</a>
+<a name="ln219">  // Flex scanner will raise exception by itself, so we don't return Status::Error here.</a>
+<a name="ln220">  Status s = parse_context_-&gt;Error(token_loc_,</a>
+<a name="ln221">                                   &quot;Lexical error at or near &quot;,</a>
+<a name="ln222">                                   ErrorCode::LEXICAL_ERROR,</a>
+<a name="ln223">                                   token);</a>
+<a name="ln224">  VLOG(3) &lt;&lt; s.ToString();</a>
+<a name="ln225">  return GramProcessor::make_SCAN_ERROR(cursor_);</a>
+<a name="ln226">}</a>
+<a name="ln227"> </a>
+<a name="ln228">GramProcessor::symbol_type LexProcessor::ScanError(const char *message, ErrorCode errcode) {</a>
+<a name="ln229">  // Flex scanner will raise exception by itself, so we don't return Status::Error here.</a>
+<a name="ln230">  Status s = parse_context_-&gt;Error(token_loc_, message, errcode);</a>
+<a name="ln231">  VLOG(3) &lt;&lt; s.ToString();</a>
+<a name="ln232">  return GramProcessor::make_SCAN_ERROR(cursor_);</a>
+<a name="ln233">}</a>
+<a name="ln234"> </a>
+<a name="ln235">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln236"> </a>
+<a name="ln237">void LexProcessor::ScanNextToken(const ScanState&amp; scan_state,</a>
+<a name="ln238">                                 GramProcessor::symbol_type *next_token) {</a>
+<a name="ln239">  GramProcessor::symbol_type new_token(yylex(scan_state));</a>
+<a name="ln240">  next_token-&gt;move(new_token);</a>
+<a name="ln241">}</a>
+<a name="ln242"> </a>
+<a name="ln243">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln244"> </a>
+<a name="ln245">MCSharedPtr&lt;MCString&gt; LexProcessor::ScanLiteral() {</a>
+<a name="ln246">  // Convert the literal to string and count the newline character.</a>
+<a name="ln247">  MCSharedPtr&lt;MCString&gt; value = MCMakeShared&lt;MCString&gt;(PTreeMem(), literalbuf_, literallen_);</a>
+<a name="ln248">  // Count newlines in this literal.</a>
+<a name="ln249">  CountNewlineInToken(value-&gt;c_str());</a>
+<a name="ln250"> </a>
+<a name="ln251">  return value;</a>
+<a name="ln252">}</a>
+<a name="ln253"> </a>
+<a name="ln254">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln255"> </a>
+<a name="ln256">MCSharedPtr&lt;MCString&gt; LexProcessor::MakeIdentifier(const char *text, int len, bool warn) {</a>
+<a name="ln257">  // SQL99 specifies Unicode-aware case normalization, which we don't yet</a>
+<a name="ln258">  // have the infrastructure for.  Instead we use tolower() to provide a</a>
+<a name="ln259">  // locale-aware translation.  However, there are some locales where this</a>
+<a name="ln260">  // is not right either (eg, Turkish may do strange things with 'i' and</a>
+<a name="ln261">  // 'I').  Our current compromise is to use tolower() for characters with</a>
+<a name="ln262">  // the high bit set, as long as they aren't part of a multi-byte</a>
+<a name="ln263">  // character, and use an ASCII-only downcasing for 7-bit characters.</a>
+<a name="ln264">  MCSharedPtr&lt;MCString&gt; ident = MCMakeShared&lt;MCString&gt;(PTreeMem(), len, '\0');</a>
+<a name="ln265">  int i;</a>
+<a name="ln266">  for (i = 0; i &lt; len; i++) {</a>
+<a name="ln267">    unsigned char ch = static_cast&lt;unsigned char&gt;(text[i]);</a>
+<a name="ln268">    if (ch &gt;= 'A' &amp;&amp; ch &lt;= 'Z') {</a>
+<a name="ln269">      ch += 'a' - 'A';</a>
+<a name="ln270">    }</a>
+<a name="ln271">    (*ident)[i] = static_cast&lt;char&gt;(ch);</a>
+<a name="ln272">  }</a>
+<a name="ln273"> </a>
+<a name="ln274">  if (i &gt;= NAMEDATALEN) {</a>
+<a name="ln275">    TruncateIdentifier(ident, warn);</a>
+<a name="ln276">  }</a>
+<a name="ln277">  return ident;</a>
+<a name="ln278">}</a>
+<a name="ln279"> </a>
+<a name="ln280">void LexProcessor::TruncateIdentifier(const MCSharedPtr&lt;MCString&gt;&amp; ident, bool warn) {</a>
+<a name="ln281">  int len = ident-&gt;length();</a>
+<a name="ln282">  if (len &gt;= NAMEDATALEN) {</a>
+<a name="ln283">    len = pg_encoding_mbcliplen(ident-&gt;c_str(), len, NAMEDATALEN - 1);</a>
+<a name="ln284">    if (warn) {</a>
+<a name="ln285">      // We avoid using %.*s here because it can misbehave if the data</a>
+<a name="ln286">      // is not valid in what libc thinks is the prevailing encoding.</a>
+<a name="ln287">      char buf[NAMEDATALEN];</a>
+<a name="ln288">      memcpy(buf, ident-&gt;c_str(), len);</a>
+<a name="ln289">      buf[len] = '\0';</a>
+<a name="ln290">      char warn_msg[1024];</a>
+<a name="ln291">      snprintf(warn_msg, sizeof(warn_msg),</a>
+<a name="ln292">               &quot;Identifier %s will be truncated to %s&quot;, ident-&gt;c_str(), buf);</a>
+<a name="ln293">      parse_context_-&gt;Warn(token_loc_, warn_msg, ErrorCode::NAME_TOO_LONG);</a>
+<a name="ln294">    }</a>
+<a name="ln295">    ident-&gt;resize(len);</a>
+<a name="ln296">  }</a>
+<a name="ln297">}</a>
+<a name="ln298"> </a>
+<a name="ln299">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln300">// NOTE: All entities below this line in this modules are copies of PostgreQL's code. We made some</a>
+<a name="ln301">// minor changes to avoid lint errors such as using '{' for if blocks and change the comment style</a>
+<a name="ln302">// from '/**/' to '//'.</a>
+<a name="ln303">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln304"> </a>
+<a name="ln305">inline void LexProcessor::EnlargeLiteralBuf(int bytes) {</a>
+<a name="ln306">  // Increase literalbuf by the given number of &quot;bytes&quot;.</a>
+<a name="ln307">  int prev_literalalloc_;</a>
+<a name="ln308">  if ((prev_literalalloc_ = literalalloc_) &lt;= 0) {</a>
+<a name="ln309">    literalalloc_ = 4096;</a>
+<a name="ln310">  }</a>
+<a name="ln311">  while (literalalloc_ &lt; literallen_ + bytes) {</a>
+<a name="ln312">    literalalloc_ &lt;&lt;= 1;</a>
+<a name="ln313">  }</a>
+<a name="ln314">  if (prev_literalalloc_ != literalalloc_) {</a>
+<a name="ln315">    literalbuf_ = reinterpret_cast&lt;char *&gt;(realloc(literalbuf_, literalalloc_));</a>
+<a name="ln316">  }</a>
+<a name="ln317">}</a>
+<a name="ln318"> </a>
+<a name="ln319">void LexProcessor::startlit() {</a>
+<a name="ln320">  literallen_ = 0;</a>
+<a name="ln321">}</a>
+<a name="ln322"> </a>
+<a name="ln323">void LexProcessor::addlit(char *ytext, int yleng) {</a>
+<a name="ln324">  // Enlarge buffer if needed.</a>
+<a name="ln325">  EnlargeLiteralBuf(yleng);</a>
+<a name="ln326"> </a>
+<a name="ln327">  // Append new data.</a>
+<a name="ln328">  memcpy(literalbuf_ + literallen_, ytext, yleng);</a>
+<a name="ln329">  literallen_ += yleng;</a>
+<a name="ln330">}</a>
+<a name="ln331"> </a>
+<a name="ln332">void LexProcessor::addlitchar(unsigned char ychar) {</a>
+<a name="ln333">  // Enlarge buffer if needed.</a>
+<a name="ln334">  EnlargeLiteralBuf(1);</a>
+<a name="ln335"> </a>
+<a name="ln336">  // Append new data.</a>
+<a name="ln337">  literalbuf_[literallen_++] = ychar;</a>
+<a name="ln338">}</a>
+<a name="ln339"> </a>
+<a name="ln340">char *LexProcessor::litbuf_udeescape(unsigned char escape) {</a>
+<a name="ln341">  char     *new_litbuf;</a>
+<a name="ln342">  char     *litbuf, *in, *out;</a>
+<a name="ln343">  pg_wchar  pair_first = 0;</a>
+<a name="ln344"> </a>
+<a name="ln345">  // Make literalbuf null-terminated to simplify the scanning loop.</a>
+<a name="ln346">  litbuf = literalbuf_;</a>
+<a name="ln347">  litbuf[literallen_] = '\0';</a>
+<a name="ln348"> </a>
+<a name="ln349">  // This relies on the subtle assumption that a UTF-8 expansion</a>
+<a name="ln350">  // cannot be longer than its escaped representation.</a>
+<a name="ln351">  new_litbuf = static_cast&lt;char *&gt;(PTempMem()-&gt;AllocateBytes(literallen_ + 1));</a>
+<a name="ln352"> </a>
+<a name="ln353">  in = litbuf;</a>
+<a name="ln354">  out = new_litbuf;</a>
+<a name="ln355">  while (*in) {</a>
+<a name="ln356">    if (in[0] == escape) {</a>
+<a name="ln357">      if (in[1] == escape) {</a>
+<a name="ln358">        if (pair_first) {</a>
+<a name="ln359">          AdvanceCursor(in - litbuf + 3);                                             // 3 for U&amp;&quot;.</a>
+<a name="ln360">          ScanError(&quot;invalid Unicode surrogate pair&quot;);</a>
+<a name="ln361">        }</a>
+<a name="ln362">        *out++ = escape;</a>
+<a name="ln363">        in += 2;</a>
+<a name="ln364"> </a>
+<a name="ln365">      } else if (isxdigit((unsigned char) in[1]) &amp;&amp;</a>
+<a name="ln366">                 isxdigit((unsigned char) in[2]) &amp;&amp;</a>
+<a name="ln367">                 isxdigit((unsigned char) in[3]) &amp;&amp;</a>
+<a name="ln368">                 isxdigit((unsigned char) in[4])) {</a>
+<a name="ln369">        pg_wchar unicode;</a>
+<a name="ln370">        unicode = ((hexval(in[1]) &lt;&lt; 12) +</a>
+<a name="ln371">                   (hexval(in[2]) &lt;&lt; 8) +</a>
+<a name="ln372">                   (hexval(in[3]) &lt;&lt; 4) +</a>
+<a name="ln373">                   hexval(in[4]));</a>
+<a name="ln374">        check_unicode_value(unicode, in);</a>
+<a name="ln375"> </a>
+<a name="ln376">        if (pair_first) {</a>
+<a name="ln377">          if (is_utf16_surrogate_second(unicode)) {</a>
+<a name="ln378">            unicode = surrogate_pair_to_codepoint(pair_first, unicode);</a>
+<a name="ln379">            pair_first = 0;</a>
+<a name="ln380">          } else {</a>
+<a name="ln381">            AdvanceCursor(in - litbuf + 3);   /* 3 for U&amp;&quot; */</a>
+<a name="ln382">            ScanError(&quot;invalid Unicode surrogate pair&quot;);</a>
+<a name="ln383">          }</a>
+<a name="ln384">        } else if (is_utf16_surrogate_second(unicode)) {</a>
+<a name="ln385">          ScanError(&quot;invalid Unicode surrogate pair&quot;);</a>
+<a name="ln386">        }</a>
+<a name="ln387"> </a>
+<a name="ln388">        if (is_utf16_surrogate_first(unicode)) {</a>
+<a name="ln389">          pair_first = unicode;</a>
+<a name="ln390">        } else {</a>
+<a name="ln391">          unicode_to_utf8(unicode, (unsigned char *) out);</a>
+<a name="ln392">          out += pg_utf_mblen((unsigned char *)out);</a>
+<a name="ln393">        }</a>
+<a name="ln394">        in += 5;</a>
+<a name="ln395"> </a>
+<a name="ln396">      } else if (in[1] == '+' &amp;&amp;</a>
+<a name="ln397">                 isxdigit((unsigned char) in[2]) &amp;&amp;</a>
+<a name="ln398">                 isxdigit((unsigned char) in[3]) &amp;&amp;</a>
+<a name="ln399">                 isxdigit((unsigned char) in[4]) &amp;&amp;</a>
+<a name="ln400">                 isxdigit((unsigned char) in[5]) &amp;&amp;</a>
+<a name="ln401">                 isxdigit((unsigned char) in[6]) &amp;&amp;</a>
+<a name="ln402">                 isxdigit((unsigned char) in[7])) {</a>
+<a name="ln403">        pg_wchar unicode;</a>
+<a name="ln404">        unicode = ((hexval(in[2]) &lt;&lt; 20) +</a>
+<a name="ln405">                   (hexval(in[3]) &lt;&lt; 16) +</a>
+<a name="ln406">                   (hexval(in[4]) &lt;&lt; 12) +</a>
+<a name="ln407">                   (hexval(in[5]) &lt;&lt; 8) +</a>
+<a name="ln408">                   (hexval(in[6]) &lt;&lt; 4) +</a>
+<a name="ln409">                   hexval(in[7]));</a>
+<a name="ln410">        check_unicode_value(unicode, in);</a>
+<a name="ln411"> </a>
+<a name="ln412">        if (pair_first) {</a>
+<a name="ln413">          if (is_utf16_surrogate_second(unicode)) {</a>
+<a name="ln414">            unicode = surrogate_pair_to_codepoint(pair_first, unicode);</a>
+<a name="ln415">            pair_first = 0;</a>
+<a name="ln416">          } else {</a>
+<a name="ln417">            AdvanceCursor(in - litbuf + 3);   /* 3 for U&amp;&quot; */</a>
+<a name="ln418">            ScanError(&quot;invalid Unicode surrogate pair&quot;);</a>
+<a name="ln419">          }</a>
+<a name="ln420">        } else if (is_utf16_surrogate_second(unicode)) {</a>
+<a name="ln421">          ScanError(&quot;invalid Unicode surrogate pair&quot;);</a>
+<a name="ln422">        }</a>
+<a name="ln423"> </a>
+<a name="ln424">        if (is_utf16_surrogate_first(unicode)) {</a>
+<a name="ln425">          pair_first = unicode;</a>
+<a name="ln426">        } else {</a>
+<a name="ln427">          unicode_to_utf8(unicode, (unsigned char *) out);</a>
+<a name="ln428">          out += pg_utf_mblen((unsigned char *)out);</a>
+<a name="ln429">        }</a>
+<a name="ln430">        in += 8;</a>
+<a name="ln431">      } else {</a>
+<a name="ln432">        AdvanceCursor(in - litbuf + 3);   /* 3 for U&amp;&quot; */</a>
+<a name="ln433">        ScanError(&quot;invalid Unicode escape value&quot;);</a>
+<a name="ln434">      }</a>
+<a name="ln435">    } else {</a>
+<a name="ln436">      if (pair_first) {</a>
+<a name="ln437">        AdvanceCursor(in - litbuf + 3);   /* 3 for U&amp;&quot; */</a>
+<a name="ln438">        ScanError(&quot;invalid Unicode surrogate pair&quot;);</a>
+<a name="ln439">      }</a>
+<a name="ln440">      *out++ = *in++;</a>
+<a name="ln441">    }</a>
+<a name="ln442">  }</a>
+<a name="ln443">  *out = '\0';</a>
+<a name="ln444"> </a>
+<a name="ln445">  // We could skip pg_verifymbstr if we didn't process any non-7-bit-ASCII</a>
+<a name="ln446">  // codes; but it's probably not worth the trouble, since this isn't</a>
+<a name="ln447">  // likely to be a performance-critical path.</a>
+<a name="ln448">  pg_verify_mbstr_len(new_litbuf, out - new_litbuf, false);</a>
+<a name="ln449">  return new_litbuf;</a>
+<a name="ln450">}</a>
+<a name="ln451"> </a>
+<a name="ln452">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln453"> </a>
+<a name="ln454">void LexProcessor::check_string_escape_warning(unsigned char ychar) {</a>
+<a name="ln455">  if (ychar == '\'') {</a>
+<a name="ln456">    if (warn_on_first_escape_ &amp;&amp; escape_string_warning_)</a>
+<a name="ln457">      parse_context_-&gt;Warn(token_loc_,</a>
+<a name="ln458">                           &quot;Nonstandard use of \\' in a string literal. Use '' to write quotes in &quot;</a>
+<a name="ln459">                           &quot;strings, or use the escape string syntax (E'...').&quot;,</a>
+<a name="ln460">                           ErrorCode::NONSTANDARD_USE_OF_ESCAPE_CHARACTER);</a>
+<a name="ln461">    warn_on_first_escape_ = false;  // Warn only once per string.</a>
+<a name="ln462">  } else if (ychar == '\\') {</a>
+<a name="ln463">    if (warn_on_first_escape_ &amp;&amp; escape_string_warning_)</a>
+<a name="ln464">      parse_context_-&gt;Warn(token_loc_,</a>
+<a name="ln465">                           &quot;(Nonstandard use of \\\\ in a string literal. Use the escape string &quot;</a>
+<a name="ln466">                           &quot;syntax for backslashes, e.g., E'\\\\'.&quot;,</a>
+<a name="ln467">                           ErrorCode::NONSTANDARD_USE_OF_ESCAPE_CHARACTER);</a>
+<a name="ln468">    warn_on_first_escape_ = false;  // Warn only once per string.</a>
+<a name="ln469">  } else {</a>
+<a name="ln470">    check_escape_warning();</a>
+<a name="ln471">  }</a>
+<a name="ln472">}</a>
+<a name="ln473"> </a>
+<a name="ln474">void LexProcessor::check_escape_warning() {</a>
+<a name="ln475">  if (warn_on_first_escape_ &amp;&amp; escape_string_warning_)</a>
+<a name="ln476">    parse_context_-&gt;Warn(token_loc_,</a>
+<a name="ln477">                         &quot;Nonstandard use of escape in a string literal. Use the escape string &quot;</a>
+<a name="ln478">                         &quot;syntax for escapes, e.g., E'\\r\\n'.&quot;,</a>
+<a name="ln479">                         ErrorCode::NONSTANDARD_USE_OF_ESCAPE_CHARACTER);</a>
+<a name="ln480">  warn_on_first_escape_ = false;  // Warn only once per string.</a>
+<a name="ln481">}</a>
+<a name="ln482"> </a>
+<a name="ln483">unsigned char LexProcessor::unescape_single_char(unsigned char c) {</a>
+<a name="ln484">  switch (c) {</a>
+<a name="ln485">    case 'b':</a>
+<a name="ln486">      return '\b';</a>
+<a name="ln487">    case 'f':</a>
+<a name="ln488">      return '\f';</a>
+<a name="ln489">    case 'n':</a>
+<a name="ln490">      return '\n';</a>
+<a name="ln491">    case 'r':</a>
+<a name="ln492">      return '\r';</a>
+<a name="ln493">    case 't':</a>
+<a name="ln494">      return '\t';</a>
+<a name="ln495">    default:</a>
+<a name="ln496">      /* check for backslash followed by non-7-bit-ASCII */</a>
+<a name="ln497">      if (c == '\0' || is_utf_highbit_set(c)) {</a>
+<a name="ln498">        saw_non_ascii_ = true;</a>
+<a name="ln499">      }</a>
+<a name="ln500">      return c;</a>
+<a name="ln501">  }</a>
+<a name="ln502">}</a>
+<a name="ln503"> </a>
+<a name="ln504">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln505"> </a>
+<a name="ln506">void LexProcessor::addunicode(pg_wchar c) {</a>
+<a name="ln507">  char buf[8];</a>
+<a name="ln508"> </a>
+<a name="ln509">  if (c == 0 || c &gt; 0x10FFFF)</a>
+<a name="ln510">    ScanError(&quot;invalid Unicode escape value&quot;);</a>
+<a name="ln511">  if (c &gt; 0x7F) {</a>
+<a name="ln512">    saw_non_ascii_ = true;</a>
+<a name="ln513">  }</a>
+<a name="ln514">  unicode_to_utf8(c, (unsigned char *)buf);</a>
+<a name="ln515">  addlit(buf, pg_utf_mblen((unsigned char *)buf));</a>
+<a name="ln516">}</a>
+<a name="ln517"> </a>
+<a name="ln518">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln519"> </a>
+<a name="ln520">static const ScanKeyword&amp; kInvalidKeyword {</a>
+<a name="ln521">  &quot;&quot;, GramProcessor::token::TOK_NULL_P, ScanKeyword::KeywordCategory::INVALID_KEYWORD</a>
+<a name="ln522">};</a>
+<a name="ln523"> </a>
+<a name="ln524">#define PG_KEYWORD(a, b, c) \</a>
+<a name="ln525">  {a, {a, GramProcessor::token::TOK_##b, ScanKeyword::KeywordCategory::c}},</a>
+<a name="ln526">const unordered_map&lt;string, const ScanKeyword&gt; kScanKeywords {</a>
+<a name="ln527">#include &quot;yb/yql/cql/ql/kwlist.h&quot;</a>
+<a name="ln528">};</a>
+<a name="ln529"> </a>
+<a name="ln530">const ScanKeyword&amp; LexProcessor::ScanKeywordLookup(const char *text) {</a>
+<a name="ln531">  static const int kMaxKeywordBytes = 4096;</a>
+<a name="ln532">  char word[kMaxKeywordBytes];</a>
+<a name="ln533">  size_t word_bytes = strlen(text);</a>
+<a name="ln534"> </a>
+<a name="ln535">  // PostgreQL Note: Apply an ASCII-only downcasing.  We must not use tolower() since it may</a>
+<a name="ln536">  // produce the wrong translation in some locales (eg, Turkish).</a>
+<a name="ln537">  for (int i = 0; i &lt; word_bytes; i++) {</a>
+<a name="ln538">    char ch = text[i];</a>
+<a name="ln539">    if (ch &gt;= 'A' &amp;&amp; ch &lt;= 'Z') {</a>
+<a name="ln540">      ch += 'a' - 'A';</a>
+<a name="ln541">    }</a>
+<a name="ln542">    word[i] = ch;</a>
+<a name="ln543">  }</a>
+<a name="ln544">  word[word_bytes] = '\0';</a>
+<a name="ln545"> </a>
+<a name="ln546">  unordered_map&lt;string, const ScanKeyword&gt;::const_iterator iter = kScanKeywords.find(word);</a>
+<a name="ln547">  if (iter != kScanKeywords.end()) {</a>
+<a name="ln548">    return iter-&gt;second;</a>
+<a name="ln549">  }</a>
+<a name="ln550">  return kInvalidKeyword;</a>
+<a name="ln551">}</a>
+<a name="ln552"> </a>
+<a name="ln553">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln554">// Class ScanStatus - Not yet implemented.</a>
+<a name="ln555">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln556">ScanState::ScanState() {</a>
+<a name="ln557">}</a>
+<a name="ln558"> </a>
+<a name="ln559">ScanState::~ScanState() {</a>
+<a name="ln560">}</a>
+<a name="ln561"> </a>
+<a name="ln562">}  // namespace ql</a>
+<a name="ln563">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="224"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="231"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="315"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v701/" target="_blank">V701</a> realloc() possible leak: when realloc() fails in allocating memory, original pointer 'literalbuf_' is lost. Consider assigning realloc() to a temporary pointer.</p></div>
+<div class="balloon" rel="40"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: parse_context_, xcdepth_, dolqstart_, utf16_first_part_, warn_on_first_escape_, saw_non_ascii_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

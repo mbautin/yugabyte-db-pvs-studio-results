@@ -1,0 +1,334 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>ts_manager.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/master/ts_manager.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;mutex&gt;</a>
+<a name="ln36">#include &lt;vector&gt;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln39">#include &quot;yb/master/master.pb.h&quot;</a>
+<a name="ln40">#include &quot;yb/master/ts_descriptor.h&quot;</a>
+<a name="ln41">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln42">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln43">#include &quot;yb/util/shared_lock.h&quot;</a>
+<a name="ln44"> </a>
+<a name="ln45">DEFINE_int32(tserver_unresponsive_timeout_ms, 60 * 1000,</a>
+<a name="ln46">             &quot;The period of time that a Master can go without receiving a heartbeat from a &quot;</a>
+<a name="ln47">             &quot;tablet server before considering it unresponsive. Unresponsive servers are not &quot;</a>
+<a name="ln48">             &quot;selected when assigning replicas during table creation or re-replication.&quot;);</a>
+<a name="ln49">TAG_FLAG(tserver_unresponsive_timeout_ms, advanced);</a>
+<a name="ln50"> </a>
+<a name="ln51">using std::shared_ptr;</a>
+<a name="ln52">using std::string;</a>
+<a name="ln53">using std::vector;</a>
+<a name="ln54"> </a>
+<a name="ln55">namespace yb {</a>
+<a name="ln56">namespace master {</a>
+<a name="ln57"> </a>
+<a name="ln58">TSManager::TSManager() {</a>
+<a name="ln59">}</a>
+<a name="ln60"> </a>
+<a name="ln61">TSManager::~TSManager() {</a>
+<a name="ln62">}</a>
+<a name="ln63"> </a>
+<a name="ln64">Status TSManager::LookupTS(const NodeInstancePB&amp; instance,</a>
+<a name="ln65">                           TSDescriptorPtr* ts_desc) {</a>
+<a name="ln66">  SharedLock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln67"> </a>
+<a name="ln68">  const TSDescriptorPtr* found_ptr =</a>
+<a name="ln69">    FindOrNull(servers_by_id_, instance.permanent_uuid());</a>
+<a name="ln70">  if (!found_ptr || (*found_ptr)-&gt;IsRemoved()) {</a>
+<a name="ln71">    return STATUS(NotFound, &quot;unknown tablet server ID&quot;, instance.ShortDebugString());</a>
+<a name="ln72">  }</a>
+<a name="ln73">  const TSDescriptorPtr&amp; found = *found_ptr;</a>
+<a name="ln74"> </a>
+<a name="ln75">  if (instance.instance_seqno() != found-&gt;latest_seqno()) {</a>
+<a name="ln76">    return STATUS(NotFound, &quot;mismatched instance sequence number&quot;, instance.ShortDebugString());</a>
+<a name="ln77">  }</a>
+<a name="ln78"> </a>
+<a name="ln79">  *ts_desc = found;</a>
+<a name="ln80">  return Status::OK();</a>
+<a name="ln81">}</a>
+<a name="ln82"> </a>
+<a name="ln83">bool TSManager::LookupTSByUUID(const string&amp; uuid,</a>
+<a name="ln84">                               TSDescriptorPtr* ts_desc) {</a>
+<a name="ln85">  SharedLock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln86">  const TSDescriptorPtr* found_ptr = FindOrNull(servers_by_id_, uuid);</a>
+<a name="ln87">  if (!found_ptr || (*found_ptr)-&gt;IsRemoved()) {</a>
+<a name="ln88">    return false;</a>
+<a name="ln89">  }</a>
+<a name="ln90">  *ts_desc = *found_ptr;</a>
+<a name="ln91">  return true;</a>
+<a name="ln92">}</a>
+<a name="ln93"> </a>
+<a name="ln94">bool HasSameHostPort(const google::protobuf::RepeatedPtrField&lt;HostPortPB&gt;&amp; old_addresses,</a>
+<a name="ln95">                     const google::protobuf::RepeatedPtrField&lt;HostPortPB&gt;&amp; new_addresses) {</a>
+<a name="ln96">  for (const auto&amp; old_address : old_addresses) {</a>
+<a name="ln97">    for (const auto&amp; new_address : new_addresses) {</a>
+<a name="ln98">      if (old_address.host() == new_address.host() &amp;&amp; old_address.port() == new_address.port())</a>
+<a name="ln99">        return true;</a>
+<a name="ln100">    }</a>
+<a name="ln101">  }</a>
+<a name="ln102"> </a>
+<a name="ln103">  return false;</a>
+<a name="ln104">}</a>
+<a name="ln105"> </a>
+<a name="ln106">Status TSManager::RegisterTS(const NodeInstancePB&amp; instance,</a>
+<a name="ln107">                             const TSRegistrationPB&amp; registration,</a>
+<a name="ln108">                             CloudInfoPB local_cloud_info,</a>
+<a name="ln109">                             rpc::ProxyCache* proxy_cache,</a>
+<a name="ln110">                             RegisteredThroughHeartbeat registered_through_heartbeat) {</a>
+<a name="ln111">  TSCountCallback callback_to_call;</a>
+<a name="ln112"> </a>
+<a name="ln113">  {</a>
+<a name="ln114">    std::lock_guard&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln115">    const string&amp; uuid = instance.permanent_uuid();</a>
+<a name="ln116"> </a>
+<a name="ln117">    auto it = servers_by_id_.find(uuid);</a>
+<a name="ln118">    if (it == servers_by_id_.end()) {</a>
+<a name="ln119">      // Check if a server with the same host and port already exists.</a>
+<a name="ln120">      for (const auto&amp; map_entry : servers_by_id_) {</a>
+<a name="ln121">        const auto ts_info = map_entry.second-&gt;GetTSInformationPB();</a>
+<a name="ln122"> </a>
+<a name="ln123">        if (HasSameHostPort(ts_info-&gt;registration().common().private_rpc_addresses(),</a>
+<a name="ln124">                            registration.common().private_rpc_addresses()) ||</a>
+<a name="ln125">            HasSameHostPort(ts_info-&gt;registration().common().broadcast_addresses(),</a>
+<a name="ln126">                            registration.common().broadcast_addresses())) {</a>
+<a name="ln127">          if (ts_info-&gt;tserver_instance().instance_seqno() &gt;= instance.instance_seqno()) {</a>
+<a name="ln128">            // Skip adding the node since we already have a node with the same rpc address and</a>
+<a name="ln129">            // a higher sequence number.</a>
+<a name="ln130">            LOG(WARNING) &lt;&lt; &quot;Skipping registration for TS &quot; &lt;&lt; instance.ShortDebugString()</a>
+<a name="ln131">                &lt;&lt; &quot; since an entry with same host/port but a higher sequence number exists &quot;</a>
+<a name="ln132">                &lt;&lt; ts_info-&gt;ShortDebugString();</a>
+<a name="ln133">            return Status::OK();</a>
+<a name="ln134">          } else {</a>
+<a name="ln135">            LOG(WARNING) &lt;&lt; &quot;Removing entry: &quot; &lt;&lt; ts_info-&gt;ShortDebugString()</a>
+<a name="ln136">                &lt;&lt; &quot; since we received registration for a tserver with a higher sequence number: &quot;</a>
+<a name="ln137">                &lt;&lt; instance.ShortDebugString();</a>
+<a name="ln138">            // Mark the old node to be removed, since we have a newer sequence number.</a>
+<a name="ln139">            map_entry.second-&gt;SetRemoved();</a>
+<a name="ln140">          }</a>
+<a name="ln141">        }</a>
+<a name="ln142">      }</a>
+<a name="ln143"> </a>
+<a name="ln144">      auto new_desc = VERIFY_RESULT(TSDescriptor::RegisterNew(</a>
+<a name="ln145">          instance, registration, std::move(local_cloud_info), proxy_cache,</a>
+<a name="ln146">          registered_through_heartbeat));</a>
+<a name="ln147">      InsertOrDie(&amp;servers_by_id_, uuid, std::move(new_desc));</a>
+<a name="ln148">      LOG(INFO) &lt;&lt; &quot;Registered new tablet server { &quot; &lt;&lt; instance.ShortDebugString()</a>
+<a name="ln149">                &lt;&lt; &quot; } with Master, full list: &quot; &lt;&lt; yb::ToString(servers_by_id_);</a>
+<a name="ln150"> </a>
+<a name="ln151">    } else {</a>
+<a name="ln152">      RETURN_NOT_OK(it-&gt;second-&gt;Register(</a>
+<a name="ln153">          instance, registration, std::move(local_cloud_info), proxy_cache));</a>
+<a name="ln154">      LOG(INFO) &lt;&lt; &quot;Re-registered known tablet server { &quot; &lt;&lt; instance.ShortDebugString()</a>
+<a name="ln155">                &lt;&lt; &quot; }: &quot; &lt;&lt; registration.ShortDebugString();</a>
+<a name="ln156">    }</a>
+<a name="ln157"> </a>
+<a name="ln158">    if (!ts_count_callback_.empty()) {</a>
+<a name="ln159">      int new_count = GetCountUnlocked();</a>
+<a name="ln160">      if (new_count &gt;= ts_count_callback_min_count_) {</a>
+<a name="ln161">        callback_to_call = std::move(ts_count_callback_);</a>
+<a name="ln162">        ts_count_callback_min_count_ = 0;</a>
+<a name="ln163">      }</a>
+<a name="ln164">    }</a>
+<a name="ln165">  }</a>
+<a name="ln166"> </a>
+<a name="ln167">  if (!callback_to_call.empty()) {</a>
+<a name="ln168">    callback_to_call();</a>
+<a name="ln169">  }</a>
+<a name="ln170"> </a>
+<a name="ln171">  return Status::OK();</a>
+<a name="ln172">}</a>
+<a name="ln173"> </a>
+<a name="ln174">void TSManager::GetDescriptors(std::function&lt;bool(const TSDescriptorPtr&amp;)&gt; condition,</a>
+<a name="ln175">                               TSDescriptorVector* descs) const {</a>
+<a name="ln176">  descs-&gt;clear();</a>
+<a name="ln177">  SharedLock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln178"> </a>
+<a name="ln179">  descs-&gt;reserve(servers_by_id_.size());</a>
+<a name="ln180">  for (const TSDescriptorMap::value_type&amp; entry : servers_by_id_) {</a>
+<a name="ln181">    const TSDescriptorPtr&amp; ts = entry.second;</a>
+<a name="ln182">    if (condition(ts)) {</a>
+<a name="ln183">      VLOG(1) &lt;&lt; &quot; Adding &quot; &lt;&lt; yb::ToString(*ts);</a>
+<a name="ln184">      descs-&gt;push_back(ts);</a>
+<a name="ln185">    } else {</a>
+<a name="ln186">      VLOG(1) &lt;&lt; &quot; NOT Adding &quot; &lt;&lt; yb::ToString(*ts);</a>
+<a name="ln187">    }</a>
+<a name="ln188">  }</a>
+<a name="ln189">}</a>
+<a name="ln190"> </a>
+<a name="ln191">void TSManager::GetAllDescriptors(TSDescriptorVector* descs) const {</a>
+<a name="ln192">  GetDescriptors([](const TSDescriptorPtr&amp; ts) -&gt; bool { return !ts-&gt;IsRemoved(); }, descs);</a>
+<a name="ln193">}</a>
+<a name="ln194"> </a>
+<a name="ln195">bool TSManager::IsTSLive(const TSDescriptorPtr&amp; ts) {</a>
+<a name="ln196">  return ts-&gt;TimeSinceHeartbeat().ToMilliseconds() &lt;</a>
+<a name="ln197">         GetAtomicFlag(&amp;FLAGS_tserver_unresponsive_timeout_ms) &amp;&amp; !ts-&gt;IsRemoved();</a>
+<a name="ln198">}</a>
+<a name="ln199"> </a>
+<a name="ln200">void TSManager::GetAllLiveDescriptors(TSDescriptorVector* descs,</a>
+<a name="ln201">    const BlacklistSet blacklist) const {</a>
+<a name="ln202">  GetDescriptors([blacklist](const TSDescriptorPtr&amp; ts) -&gt; bool {</a>
+<a name="ln203">    return IsTSLive(ts) &amp;&amp; !IsTsBlacklisted(ts, blacklist); }, descs);</a>
+<a name="ln204">}</a>
+<a name="ln205"> </a>
+<a name="ln206">void TSManager::GetAllReportedDescriptors(TSDescriptorVector* descs) const {</a>
+<a name="ln207">  GetDescriptors([](const TSDescriptorPtr&amp; ts)</a>
+<a name="ln208">                   -&gt; bool { return IsTSLive(ts) &amp;&amp; ts-&gt;has_tablet_report(); }, descs);</a>
+<a name="ln209">}</a>
+<a name="ln210"> </a>
+<a name="ln211">bool TSManager::IsTsInCluster(const TSDescriptorPtr&amp; ts, string cluster_uuid) {</a>
+<a name="ln212">  return ts-&gt;placement_uuid() == cluster_uuid;</a>
+<a name="ln213">}</a>
+<a name="ln214"> </a>
+<a name="ln215">bool TSManager::IsTsBlacklisted(const TSDescriptorPtr&amp; ts,</a>
+<a name="ln216">    const BlacklistSet blacklist) {</a>
+<a name="ln217">  if (blacklist.empty()) {</a>
+<a name="ln218">    return false;</a>
+<a name="ln219">  }</a>
+<a name="ln220">  for (const auto&amp; tserver : blacklist) {</a>
+<a name="ln221">    HostPortPB hp;</a>
+<a name="ln222">    HostPortToPB(tserver, &amp;hp);</a>
+<a name="ln223">    if (ts-&gt;IsRunningOn(hp)) {</a>
+<a name="ln224">      return true;</a>
+<a name="ln225">    }</a>
+<a name="ln226">  }</a>
+<a name="ln227">  return false;</a>
+<a name="ln228">}</a>
+<a name="ln229"> </a>
+<a name="ln230">void TSManager::GetAllLiveDescriptorsInCluster(TSDescriptorVector* descs,</a>
+<a name="ln231">    string placement_uuid,</a>
+<a name="ln232">    const BlacklistSet blacklist,</a>
+<a name="ln233">    bool primary_cluster) const {</a>
+<a name="ln234">  descs-&gt;clear();</a>
+<a name="ln235">  SharedLock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln236"> </a>
+<a name="ln237">  descs-&gt;reserve(servers_by_id_.size());</a>
+<a name="ln238">  for (const TSDescriptorMap::value_type&amp; entry : servers_by_id_) {</a>
+<a name="ln239">    const TSDescriptorPtr&amp; ts = entry.second;</a>
+<a name="ln240">    // ts_in_cluster true if there's a matching config and tserver placement uuid or</a>
+<a name="ln241">    // if we're getting primary nodes and the tserver placement uuid is empty.</a>
+<a name="ln242">    bool ts_in_cluster = (IsTsInCluster(ts, placement_uuid) ||</a>
+<a name="ln243">                         (primary_cluster &amp;&amp; ts-&gt;placement_uuid().empty()));</a>
+<a name="ln244">    if (IsTSLive(ts) &amp;&amp; !IsTsBlacklisted(ts, blacklist) &amp;&amp; ts_in_cluster) {</a>
+<a name="ln245">      descs-&gt;push_back(ts);</a>
+<a name="ln246">    }</a>
+<a name="ln247">  }</a>
+<a name="ln248">}</a>
+<a name="ln249"> </a>
+<a name="ln250">const TSDescriptorPtr TSManager::GetTSDescriptor(const HostPortPB&amp; host_port) const {</a>
+<a name="ln251">  SharedLock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln252"> </a>
+<a name="ln253">  for (const TSDescriptorMap::value_type&amp; entry : servers_by_id_) {</a>
+<a name="ln254">    const TSDescriptorPtr&amp; ts = entry.second;</a>
+<a name="ln255">    if (IsTSLive(ts) &amp;&amp; ts-&gt;IsRunningOn(host_port)) {</a>
+<a name="ln256">      return ts;</a>
+<a name="ln257">    }</a>
+<a name="ln258">  }</a>
+<a name="ln259"> </a>
+<a name="ln260">  return nullptr;</a>
+<a name="ln261">}</a>
+<a name="ln262"> </a>
+<a name="ln263">int TSManager::GetCount() const {</a>
+<a name="ln264">  SharedLock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln265"> </a>
+<a name="ln266">  return GetCountUnlocked();</a>
+<a name="ln267">}</a>
+<a name="ln268"> </a>
+<a name="ln269">int TSManager::GetCountUnlocked() const {</a>
+<a name="ln270">  size_t count = 0;</a>
+<a name="ln271">  for (const auto&amp; map_entry : servers_by_id_) {</a>
+<a name="ln272">    if (!map_entry.second-&gt;IsRemoved()) {</a>
+<a name="ln273">      count++;</a>
+<a name="ln274">    }</a>
+<a name="ln275">  }</a>
+<a name="ln276">  return count;</a>
+<a name="ln277">}</a>
+<a name="ln278"> </a>
+<a name="ln279">// Register a callback to be called when the number of tablet servers reaches a certain number.</a>
+<a name="ln280">void TSManager::SetTSCountCallback(int min_count, TSCountCallback callback) {</a>
+<a name="ln281">  std::lock_guard&lt;rw_spinlock&gt; l(lock_);</a>
+<a name="ln282">  ts_count_callback_ = std::move(callback);</a>
+<a name="ln283">  ts_count_callback_min_count_ = min_count;</a>
+<a name="ln284">}</a>
+<a name="ln285"> </a>
+<a name="ln286">} // namespace master</a>
+<a name="ln287">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="183"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="186"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

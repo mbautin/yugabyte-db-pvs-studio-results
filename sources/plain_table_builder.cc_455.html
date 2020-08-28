@@ -1,0 +1,363 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>plain_table_builder.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20"> </a>
+<a name="ln21">#ifndef ROCKSDB_LITE</a>
+<a name="ln22">#include &quot;yb/rocksdb/table/plain_table_builder.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;assert.h&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;string&gt;</a>
+<a name="ln27">#include &lt;limits&gt;</a>
+<a name="ln28">#include &lt;map&gt;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;yb/rocksdb/comparator.h&quot;</a>
+<a name="ln31">#include &quot;yb/rocksdb/env.h&quot;</a>
+<a name="ln32">#include &quot;yb/rocksdb/filter_policy.h&quot;</a>
+<a name="ln33">#include &quot;yb/rocksdb/options.h&quot;</a>
+<a name="ln34">#include &quot;yb/rocksdb/table.h&quot;</a>
+<a name="ln35">#include &quot;yb/rocksdb/table/plain_table_factory.h&quot;</a>
+<a name="ln36">#include &quot;yb/rocksdb/db/dbformat.h&quot;</a>
+<a name="ln37">#include &quot;yb/rocksdb/table/block_builder.h&quot;</a>
+<a name="ln38">#include &quot;yb/rocksdb/table/bloom_block.h&quot;</a>
+<a name="ln39">#include &quot;yb/rocksdb/table/plain_table_index.h&quot;</a>
+<a name="ln40">#include &quot;yb/rocksdb/table/format.h&quot;</a>
+<a name="ln41">#include &quot;yb/rocksdb/table/meta_blocks.h&quot;</a>
+<a name="ln42">#include &quot;yb/rocksdb/util/coding.h&quot;</a>
+<a name="ln43">#include &quot;yb/rocksdb/util/crc32c.h&quot;</a>
+<a name="ln44">#include &quot;yb/rocksdb/util/file_reader_writer.h&quot;</a>
+<a name="ln45">#include &quot;yb/rocksdb/util/stop_watch.h&quot;</a>
+<a name="ln46"> </a>
+<a name="ln47">namespace rocksdb {</a>
+<a name="ln48"> </a>
+<a name="ln49">namespace {</a>
+<a name="ln50"> </a>
+<a name="ln51">// a utility that helps writing block content to the file</a>
+<a name="ln52">//   @offset will advance if @block_contents was successfully written.</a>
+<a name="ln53">//   @block_handle the block handle this particular block.</a>
+<a name="ln54">Status WriteBlock(const Slice&amp; block_contents, WritableFileWriter* file,</a>
+<a name="ln55">                  uint64_t* offset, BlockHandle* block_handle) {</a>
+<a name="ln56">  block_handle-&gt;set_offset(*offset);</a>
+<a name="ln57">  block_handle-&gt;set_size(block_contents.size());</a>
+<a name="ln58">  Status s = file-&gt;Append(block_contents);</a>
+<a name="ln59"> </a>
+<a name="ln60">  if (s.ok()) {</a>
+<a name="ln61">    *offset += block_contents.size();</a>
+<a name="ln62">  }</a>
+<a name="ln63">  return s;</a>
+<a name="ln64">}</a>
+<a name="ln65"> </a>
+<a name="ln66">}  // namespace</a>
+<a name="ln67"> </a>
+<a name="ln68">// kPlainTableMagicNumber was picked by running</a>
+<a name="ln69">//    echo rocksdb.table.plain | sha1sum</a>
+<a name="ln70">// and taking the leading 64 bits.</a>
+<a name="ln71">extern const uint64_t kPlainTableMagicNumber = 0x8242229663bf9564ull;</a>
+<a name="ln72">extern const uint64_t kLegacyPlainTableMagicNumber = 0x4f3418eb7a8f13b8ull;</a>
+<a name="ln73"> </a>
+<a name="ln74">PlainTableBuilder::PlainTableBuilder(</a>
+<a name="ln75">    const ImmutableCFOptions&amp; ioptions,</a>
+<a name="ln76">    const IntTblPropCollectorFactories&amp; int_tbl_prop_collector_factories,</a>
+<a name="ln77">    uint32_t column_family_id,</a>
+<a name="ln78">    WritableFileWriter* file,</a>
+<a name="ln79">    uint32_t user_key_len,</a>
+<a name="ln80">    EncodingType encoding_type,</a>
+<a name="ln81">    size_t index_sparseness,</a>
+<a name="ln82">    uint32_t bloom_bits_per_key,</a>
+<a name="ln83">    uint32_t num_probes, size_t</a>
+<a name="ln84">    huge_page_tlb_size,</a>
+<a name="ln85">    double hash_table_ratio,</a>
+<a name="ln86">    bool store_index_in_file)</a>
+<a name="ln87">    : ioptions_(ioptions),</a>
+<a name="ln88">      bloom_block_(num_probes),</a>
+<a name="ln89">      file_(file),</a>
+<a name="ln90">      bloom_bits_per_key_(bloom_bits_per_key),</a>
+<a name="ln91">      huge_page_tlb_size_(huge_page_tlb_size),</a>
+<a name="ln92">      encoder_(encoding_type, user_key_len, ioptions.prefix_extractor,</a>
+<a name="ln93">               index_sparseness),</a>
+<a name="ln94">      store_index_in_file_(store_index_in_file),</a>
+<a name="ln95">      prefix_extractor_(ioptions.prefix_extractor) {</a>
+<a name="ln96">  // Build index block and save it in the file if hash_table_ratio &gt; 0</a>
+<a name="ln97">  if (store_index_in_file_) {</a>
+<a name="ln98">    assert(hash_table_ratio &gt; 0 || IsTotalOrderMode());</a>
+<a name="ln99">    index_builder_.reset(</a>
+<a name="ln100">        new PlainTableIndexBuilder(&amp;arena_, ioptions, index_sparseness,</a>
+<a name="ln101">                                   hash_table_ratio, huge_page_tlb_size_));</a>
+<a name="ln102">    assert(bloom_bits_per_key_ &gt; 0);</a>
+<a name="ln103">    properties_.user_collected_properties</a>
+<a name="ln104">        [PlainTablePropertyNames::kBloomVersion] = &quot;1&quot;;  // For future use</a>
+<a name="ln105">  }</a>
+<a name="ln106"> </a>
+<a name="ln107">  properties_.fixed_key_len = user_key_len;</a>
+<a name="ln108"> </a>
+<a name="ln109">  // for plain table, we put all the data in a big chuck.</a>
+<a name="ln110">  properties_.num_data_blocks = 1;</a>
+<a name="ln111">  // Fill it later if store_index_in_file_ == true</a>
+<a name="ln112">  properties_.data_index_size = 0;</a>
+<a name="ln113">  properties_.num_data_index_blocks = 0;</a>
+<a name="ln114">  properties_.filter_index_size = 0;</a>
+<a name="ln115">  properties_.num_filter_blocks = 0;</a>
+<a name="ln116">  properties_.filter_size = 0;</a>
+<a name="ln117">  // To support roll-back to previous version, now still use version 0 for</a>
+<a name="ln118">  // plain encoding.</a>
+<a name="ln119">  properties_.format_version = (encoding_type == kPlain) ? 0 : 1;</a>
+<a name="ln120"> </a>
+<a name="ln121">  if (ioptions_.prefix_extractor) {</a>
+<a name="ln122">    properties_.user_collected_properties</a>
+<a name="ln123">        [PlainTablePropertyNames::kPrefixExtractorName] =</a>
+<a name="ln124">        ioptions_.prefix_extractor-&gt;Name();</a>
+<a name="ln125">  }</a>
+<a name="ln126"> </a>
+<a name="ln127">  std::string val;</a>
+<a name="ln128">  PutFixed32(&amp;val, static_cast&lt;uint32_t&gt;(encoder_.GetEncodingType()));</a>
+<a name="ln129">  properties_.user_collected_properties</a>
+<a name="ln130">      [PlainTablePropertyNames::kEncodingType] = val;</a>
+<a name="ln131"> </a>
+<a name="ln132">  for (auto&amp; collector_factories : int_tbl_prop_collector_factories) {</a>
+<a name="ln133">    table_properties_collectors_.emplace_back(</a>
+<a name="ln134">        collector_factories-&gt;CreateIntTblPropCollector(column_family_id));</a>
+<a name="ln135">  }</a>
+<a name="ln136">}</a>
+<a name="ln137"> </a>
+<a name="ln138">PlainTableBuilder::~PlainTableBuilder() {</a>
+<a name="ln139">}</a>
+<a name="ln140"> </a>
+<a name="ln141">void PlainTableBuilder::Add(const Slice&amp; key, const Slice&amp; value) {</a>
+<a name="ln142">  // temp buffer for metadata bytes between key and value.</a>
+<a name="ln143">  char meta_bytes_buf[6];</a>
+<a name="ln144">  size_t meta_bytes_buf_size = 0;</a>
+<a name="ln145"> </a>
+<a name="ln146">  ParsedInternalKey internal_key;</a>
+<a name="ln147">  ParseInternalKey(key, &amp;internal_key);</a>
+<a name="ln148"> </a>
+<a name="ln149">  // Store key hash</a>
+<a name="ln150">  if (store_index_in_file_) {</a>
+<a name="ln151">    if (ioptions_.prefix_extractor == nullptr) {</a>
+<a name="ln152">      keys_or_prefixes_hashes_.push_back(GetSliceHash(internal_key.user_key));</a>
+<a name="ln153">    } else {</a>
+<a name="ln154">      Slice prefix =</a>
+<a name="ln155">          ioptions_.prefix_extractor-&gt;Transform(internal_key.user_key);</a>
+<a name="ln156">      keys_or_prefixes_hashes_.push_back(GetSliceHash(prefix));</a>
+<a name="ln157">    }</a>
+<a name="ln158">  }</a>
+<a name="ln159"> </a>
+<a name="ln160">  // Write value</a>
+<a name="ln161">  assert(offset_ &lt;= std::numeric_limits&lt;uint32_t&gt;::max());</a>
+<a name="ln162">  auto prev_offset = static_cast&lt;uint32_t&gt;(offset_);</a>
+<a name="ln163">  // Write out the key</a>
+<a name="ln164">  CHECK_OK(encoder_.AppendKey(key, file_, &amp;offset_, meta_bytes_buf, &amp;meta_bytes_buf_size));</a>
+<a name="ln165">  if (SaveIndexInFile()) {</a>
+<a name="ln166">    index_builder_-&gt;AddKeyPrefix(GetPrefix(internal_key), prev_offset);</a>
+<a name="ln167">  }</a>
+<a name="ln168"> </a>
+<a name="ln169">  // Write value length</a>
+<a name="ln170">  uint32_t value_size = static_cast&lt;uint32_t&gt;(value.size());</a>
+<a name="ln171">  char* end_ptr =</a>
+<a name="ln172">      EncodeVarint32(meta_bytes_buf + meta_bytes_buf_size, value_size);</a>
+<a name="ln173">  assert(end_ptr &lt;= meta_bytes_buf + sizeof(meta_bytes_buf));</a>
+<a name="ln174">  meta_bytes_buf_size = end_ptr - meta_bytes_buf;</a>
+<a name="ln175">  CHECK_OK(file_-&gt;Append(Slice(meta_bytes_buf, meta_bytes_buf_size)));</a>
+<a name="ln176"> </a>
+<a name="ln177">  // Write value</a>
+<a name="ln178">  CHECK_OK(file_-&gt;Append(value));</a>
+<a name="ln179">  offset_ += value_size + meta_bytes_buf_size;</a>
+<a name="ln180"> </a>
+<a name="ln181">  properties_.num_entries++;</a>
+<a name="ln182">  properties_.raw_key_size += key.size();</a>
+<a name="ln183">  properties_.raw_value_size += value.size();</a>
+<a name="ln184"> </a>
+<a name="ln185">  // notify property collectors</a>
+<a name="ln186">  NotifyCollectTableCollectorsOnAdd(</a>
+<a name="ln187">      key, value, offset_, table_properties_collectors_, ioptions_.info_log);</a>
+<a name="ln188">}</a>
+<a name="ln189"> </a>
+<a name="ln190">Status PlainTableBuilder::status() const { return status_; }</a>
+<a name="ln191"> </a>
+<a name="ln192">Status PlainTableBuilder::Finish() {</a>
+<a name="ln193">  assert(!closed_);</a>
+<a name="ln194">  closed_ = true;</a>
+<a name="ln195"> </a>
+<a name="ln196">  properties_.data_size = offset_;</a>
+<a name="ln197"> </a>
+<a name="ln198">  //  Write the following blocks</a>
+<a name="ln199">  //  1. [meta block: bloom] - optional</a>
+<a name="ln200">  //  2. [meta block: index] - optional</a>
+<a name="ln201">  //  3. [meta block: properties]</a>
+<a name="ln202">  //  4. [metaindex block]</a>
+<a name="ln203">  //  5. [footer]</a>
+<a name="ln204"> </a>
+<a name="ln205">  MetaIndexBuilder meta_index_builer;</a>
+<a name="ln206"> </a>
+<a name="ln207">  if (store_index_in_file_ &amp;&amp; (properties_.num_entries &gt; 0)) {</a>
+<a name="ln208">    assert(properties_.num_entries &lt;= std::numeric_limits&lt;uint32_t&gt;::max());</a>
+<a name="ln209">    bloom_block_.SetTotalBits(</a>
+<a name="ln210">        &amp;arena_,</a>
+<a name="ln211">        static_cast&lt;uint32_t&gt;(properties_.num_entries) * bloom_bits_per_key_,</a>
+<a name="ln212">        ioptions_.bloom_locality, huge_page_tlb_size_, ioptions_.info_log);</a>
+<a name="ln213"> </a>
+<a name="ln214">    PutVarint32(&amp;properties_.user_collected_properties</a>
+<a name="ln215">                     [PlainTablePropertyNames::kNumBloomBlocks],</a>
+<a name="ln216">                bloom_block_.GetNumBlocks());</a>
+<a name="ln217"> </a>
+<a name="ln218">    bloom_block_.AddKeysHashes(keys_or_prefixes_hashes_);</a>
+<a name="ln219">    BlockHandle bloom_block_handle;</a>
+<a name="ln220">    auto finish_result = bloom_block_.Finish();</a>
+<a name="ln221"> </a>
+<a name="ln222">    properties_.filter_size = finish_result.size();</a>
+<a name="ln223">    properties_.num_filter_blocks = 1;</a>
+<a name="ln224">    auto s = WriteBlock(finish_result, file_, &amp;offset_, &amp;bloom_block_handle);</a>
+<a name="ln225"> </a>
+<a name="ln226">    if (!s.ok()) {</a>
+<a name="ln227">      return s;</a>
+<a name="ln228">    }</a>
+<a name="ln229"> </a>
+<a name="ln230">    BlockHandle index_block_handle;</a>
+<a name="ln231">    finish_result = index_builder_-&gt;Finish();</a>
+<a name="ln232"> </a>
+<a name="ln233">    properties_.data_index_size = finish_result.size();</a>
+<a name="ln234">    properties_.num_data_index_blocks = 1;</a>
+<a name="ln235">    s = WriteBlock(finish_result, file_, &amp;offset_, &amp;index_block_handle);</a>
+<a name="ln236"> </a>
+<a name="ln237">    if (!s.ok()) {</a>
+<a name="ln238">      return s;</a>
+<a name="ln239">    }</a>
+<a name="ln240"> </a>
+<a name="ln241">    meta_index_builer.Add(BloomBlockBuilder::kBloomBlock, bloom_block_handle);</a>
+<a name="ln242">    meta_index_builer.Add(PlainTableIndexBuilder::kPlainTableIndexBlock,</a>
+<a name="ln243">                          index_block_handle);</a>
+<a name="ln244">  }</a>
+<a name="ln245"> </a>
+<a name="ln246">  // Calculate bloom block size and index block size</a>
+<a name="ln247">  PropertyBlockBuilder property_block_builder;</a>
+<a name="ln248">  // -- Add basic properties</a>
+<a name="ln249">  property_block_builder.AddTableProperty(properties_);</a>
+<a name="ln250"> </a>
+<a name="ln251">  property_block_builder.Add(properties_.user_collected_properties);</a>
+<a name="ln252"> </a>
+<a name="ln253">  // -- Add user collected properties</a>
+<a name="ln254">  NotifyCollectTableCollectorsOnFinish(table_properties_collectors_,</a>
+<a name="ln255">                                       ioptions_.info_log,</a>
+<a name="ln256">                                       &amp;property_block_builder);</a>
+<a name="ln257"> </a>
+<a name="ln258">  // -- Write property block</a>
+<a name="ln259">  BlockHandle property_block_handle;</a>
+<a name="ln260">  auto s = WriteBlock(</a>
+<a name="ln261">      property_block_builder.Finish(),</a>
+<a name="ln262">      file_,</a>
+<a name="ln263">      &amp;offset_,</a>
+<a name="ln264">      &amp;property_block_handle</a>
+<a name="ln265">  );</a>
+<a name="ln266">  if (!s.ok()) {</a>
+<a name="ln267">    return s;</a>
+<a name="ln268">  }</a>
+<a name="ln269">  meta_index_builer.Add(kPropertiesBlock, property_block_handle);</a>
+<a name="ln270"> </a>
+<a name="ln271">  // -- write metaindex block</a>
+<a name="ln272">  BlockHandle metaindex_block_handle;</a>
+<a name="ln273">  s = WriteBlock(</a>
+<a name="ln274">      meta_index_builer.Finish(),</a>
+<a name="ln275">      file_,</a>
+<a name="ln276">      &amp;offset_,</a>
+<a name="ln277">      &amp;metaindex_block_handle</a>
+<a name="ln278">  );</a>
+<a name="ln279">  if (!s.ok()) {</a>
+<a name="ln280">    return s;</a>
+<a name="ln281">  }</a>
+<a name="ln282"> </a>
+<a name="ln283">  // Write Footer</a>
+<a name="ln284">  // no need to write out new footer if we're using default checksum</a>
+<a name="ln285">  Footer footer(kLegacyPlainTableMagicNumber, 0);</a>
+<a name="ln286">  footer.set_metaindex_handle(metaindex_block_handle);</a>
+<a name="ln287">  footer.set_index_handle(BlockHandle::NullBlockHandle());</a>
+<a name="ln288">  std::string footer_encoding;</a>
+<a name="ln289">  footer.AppendEncodedTo(&amp;footer_encoding);</a>
+<a name="ln290">  s = file_-&gt;Append(footer_encoding);</a>
+<a name="ln291">  if (s.ok()) {</a>
+<a name="ln292">    offset_ += footer_encoding.size();</a>
+<a name="ln293">  }</a>
+<a name="ln294"> </a>
+<a name="ln295">  return s;</a>
+<a name="ln296">}</a>
+<a name="ln297"> </a>
+<a name="ln298">void PlainTableBuilder::Abandon() {</a>
+<a name="ln299">  closed_ = true;</a>
+<a name="ln300">}</a>
+<a name="ln301"> </a>
+<a name="ln302">uint64_t PlainTableBuilder::NumEntries() const {</a>
+<a name="ln303">  return properties_.num_entries;</a>
+<a name="ln304">}</a>
+<a name="ln305"> </a>
+<a name="ln306">uint64_t PlainTableBuilder::TotalFileSize() const {</a>
+<a name="ln307">  return offset_;</a>
+<a name="ln308">}</a>
+<a name="ln309"> </a>
+<a name="ln310">uint64_t PlainTableBuilder::BaseFileSize() const {</a>
+<a name="ln311">  return TotalFileSize();</a>
+<a name="ln312">}</a>
+<a name="ln313"> </a>
+<a name="ln314">}  // namespace rocksdb</a>
+<a name="ln315">#endif  // ROCKSDB_LITE</a>
+
+</code></pre>
+<div class="balloon" rel="164"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="175"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="178"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

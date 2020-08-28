@@ -1,0 +1,488 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>libpq_utils.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;boost/preprocessor/seq/for_each.hpp&gt;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/yql/pgwrapper/libpq_utils.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/common/pgsql_error.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/gutil/endian.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/util/enums.h&quot;</a>
+<a name="ln23">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln24">#include &quot;yb/util/monotime.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">using namespace std::literals;</a>
+<a name="ln27"> </a>
+<a name="ln28">namespace yb {</a>
+<a name="ln29">namespace pgwrapper {</a>
+<a name="ln30"> </a>
+<a name="ln31">namespace {</a>
+<a name="ln32"> </a>
+<a name="ln33">// Converts the given element of the ExecStatusType enum to a string.</a>
+<a name="ln34">std::string ExecStatusTypeToStr(ExecStatusType exec_status_type) {</a>
+<a name="ln35">#define EXEC_STATUS_SWITCH_CASE(r, data, item) case item: return #item;</a>
+<a name="ln36">#define EXEC_STATUS_TYPE_ENUM_ELEMENTS \</a>
+<a name="ln37">    (PGRES_EMPTY_QUERY) \</a>
+<a name="ln38">    (PGRES_COMMAND_OK) \</a>
+<a name="ln39">    (PGRES_TUPLES_OK) \</a>
+<a name="ln40">    (PGRES_COPY_OUT) \</a>
+<a name="ln41">    (PGRES_COPY_IN) \</a>
+<a name="ln42">    (PGRES_BAD_RESPONSE) \</a>
+<a name="ln43">    (PGRES_NONFATAL_ERROR) \</a>
+<a name="ln44">    (PGRES_FATAL_ERROR) \</a>
+<a name="ln45">    (PGRES_COPY_BOTH) \</a>
+<a name="ln46">    (PGRES_SINGLE_TUPLE)</a>
+<a name="ln47">  switch (exec_status_type) {</a>
+<a name="ln48">    BOOST_PP_SEQ_FOR_EACH(EXEC_STATUS_SWITCH_CASE, ~, EXEC_STATUS_TYPE_ENUM_ELEMENTS)</a>
+<a name="ln49">  }</a>
+<a name="ln50">#undef EXEC_STATUS_SWITCH_CASE</a>
+<a name="ln51">#undef EXEC_STATUS_TYPE_ENUM_ELEMENTS</a>
+<a name="ln52">  return Format(&quot;Unknown ExecStatusType ($0)&quot;, exec_status_type);</a>
+<a name="ln53">}</a>
+<a name="ln54"> </a>
+<a name="ln55">YBPgErrorCode GetSqlState(PGresult* result) {</a>
+<a name="ln56">  auto exec_status_type = PQresultStatus(result);</a>
+<a name="ln57">  if (exec_status_type == ExecStatusType::PGRES_COMMAND_OK ||</a>
+<a name="ln58">      exec_status_type == ExecStatusType::PGRES_TUPLES_OK) {</a>
+<a name="ln59">    return YBPgErrorCode::YB_PG_SUCCESSFUL_COMPLETION;</a>
+<a name="ln60">  }</a>
+<a name="ln61"> </a>
+<a name="ln62">  const char* sqlstate_str = PQresultErrorField(result, PG_DIAG_SQLSTATE);</a>
+<a name="ln63">  if (sqlstate_str == nullptr) {</a>
+<a name="ln64">    auto err_msg = PQresultErrorMessage(result);</a>
+<a name="ln65">    YB_LOG_EVERY_N_SECS(WARNING, 5)</a>
+<a name="ln66">        &lt;&lt; &quot;SQLSTATE is not defined for result with &quot;</a>
+<a name="ln67">        &lt;&lt; &quot;error message: &quot; &lt;&lt; (err_msg ? err_msg : &quot;N/A&quot;) &lt;&lt; &quot;, &quot;</a>
+<a name="ln68">        &lt;&lt; &quot;PQresultStatus: &quot; &lt;&lt; ExecStatusTypeToStr(exec_status_type);</a>
+<a name="ln69">    return YBPgErrorCode::YB_PG_INTERNAL_ERROR;</a>
+<a name="ln70">  }</a>
+<a name="ln71"> </a>
+<a name="ln72">  CHECK_EQ(5, strlen(sqlstate_str))</a>
+<a name="ln73">      &lt;&lt; &quot;sqlstate_str: &quot; &lt;&lt; sqlstate_str</a>
+<a name="ln74">      &lt;&lt; &quot;, PQresultStatus: &quot; &lt;&lt; ExecStatusTypeToStr(exec_status_type);</a>
+<a name="ln75"> </a>
+<a name="ln76">  uint32_t sqlstate = 0;</a>
+<a name="ln77"> </a>
+<a name="ln78">  for (int i = 0; i &lt; 5; ++i) {</a>
+<a name="ln79">    sqlstate |= (sqlstate_str[i] - '0') &lt;&lt; (6 * i);</a>
+<a name="ln80">  }</a>
+<a name="ln81">  return static_cast&lt;YBPgErrorCode&gt;(sqlstate);</a>
+<a name="ln82">}</a>
+<a name="ln83"> </a>
+<a name="ln84">}  // anonymous namespace</a>
+<a name="ln85"> </a>
+<a name="ln86"> </a>
+<a name="ln87">void PGConnClose::operator()(PGconn* conn) const {</a>
+<a name="ln88">  PQfinish(conn);</a>
+<a name="ln89">}</a>
+<a name="ln90"> </a>
+<a name="ln91">struct PGConn::CopyData {</a>
+<a name="ln92">  static constexpr size_t kBufferSize = 2048;</a>
+<a name="ln93"> </a>
+<a name="ln94">  Status error;</a>
+<a name="ln95">  char * pos;</a>
+<a name="ln96">  char buffer[kBufferSize];</a>
+<a name="ln97"> </a>
+<a name="ln98">  void Start() {</a>
+<a name="ln99">    pos = buffer;</a>
+<a name="ln100">    error = Status::OK();</a>
+<a name="ln101">  }</a>
+<a name="ln102"> </a>
+<a name="ln103">  void WriteUInt16(uint16_t value) {</a>
+<a name="ln104">    BigEndian::Store16(pos, value);</a>
+<a name="ln105">    pos += 2;</a>
+<a name="ln106">  }</a>
+<a name="ln107"> </a>
+<a name="ln108">  void WriteUInt32(uint32_t value) {</a>
+<a name="ln109">    BigEndian::Store32(pos, value);</a>
+<a name="ln110">    pos += 4;</a>
+<a name="ln111">  }</a>
+<a name="ln112"> </a>
+<a name="ln113">  void WriteUInt64(uint64_t value) {</a>
+<a name="ln114">    BigEndian::Store64(pos, value);</a>
+<a name="ln115">    pos += 8;</a>
+<a name="ln116">  }</a>
+<a name="ln117"> </a>
+<a name="ln118">  void Write(const char* value, size_t len) {</a>
+<a name="ln119">    memcpy(pos, value, len);</a>
+<a name="ln120">    pos += len;</a>
+<a name="ln121">  }</a>
+<a name="ln122"> </a>
+<a name="ln123">  size_t left() const {</a>
+<a name="ln124">    return buffer + kBufferSize - pos;</a>
+<a name="ln125">  }</a>
+<a name="ln126">};</a>
+<a name="ln127"> </a>
+<a name="ln128">Result&lt;PGConn&gt; PGConn::Connect(const HostPort&amp; host_port, const std::string&amp; db_name) {</a>
+<a name="ln129">  auto start = CoarseMonoClock::now();</a>
+<a name="ln130">  auto deadline = start + 60s;</a>
+<a name="ln131">  for (;;) {</a>
+<a name="ln132">    auto conn_info = Format(&quot;host=$0 port=$1 user=postgres&quot;, host_port.host(), host_port.port());</a>
+<a name="ln133">    if (!db_name.empty()) {</a>
+<a name="ln134">      conn_info = Format(&quot;$0 dbname=$1&quot;, conn_info, db_name);</a>
+<a name="ln135">    }</a>
+<a name="ln136">    PGConnPtr result(PQconnectdb(conn_info.c_str()));</a>
+<a name="ln137">    auto status = PQstatus(result.get());</a>
+<a name="ln138">    if (status == ConnStatusType::CONNECTION_OK) {</a>
+<a name="ln139">      LOG(INFO) &lt;&lt; &quot;Connected to PG: &quot; &lt;&lt; host_port &lt;&lt; &quot;, time taken: &quot;</a>
+<a name="ln140">                &lt;&lt; MonoDelta(CoarseMonoClock::Now() - start);</a>
+<a name="ln141">      return PGConn(std::move(result));</a>
+<a name="ln142">    }</a>
+<a name="ln143">    auto now = CoarseMonoClock::now();</a>
+<a name="ln144">    if (now &gt;= deadline) {</a>
+<a name="ln145">      return STATUS_FORMAT(NetworkError, &quot;Connect failed: $0, passed: $1&quot;,</a>
+<a name="ln146">                           status, MonoDelta(now - start));</a>
+<a name="ln147">    }</a>
+<a name="ln148">  }</a>
+<a name="ln149">}</a>
+<a name="ln150"> </a>
+<a name="ln151">PGConn::PGConn(PGConnPtr ptr) : impl_(std::move(ptr)) {</a>
+<a name="ln152">}</a>
+<a name="ln153"> </a>
+<a name="ln154">PGConn::~PGConn() {</a>
+<a name="ln155">}</a>
+<a name="ln156"> </a>
+<a name="ln157">PGConn::PGConn(PGConn&amp;&amp; rhs) : impl_(std::move(rhs.impl_)) {</a>
+<a name="ln158">}</a>
+<a name="ln159"> </a>
+<a name="ln160">PGConn&amp; PGConn::operator=(PGConn&amp;&amp; rhs) {</a>
+<a name="ln161">  impl_ = std::move(rhs.impl_);</a>
+<a name="ln162">  return *this;</a>
+<a name="ln163">}</a>
+<a name="ln164"> </a>
+<a name="ln165">void PGResultClear::operator()(PGresult* result) const {</a>
+<a name="ln166">  PQclear(result);</a>
+<a name="ln167">}</a>
+<a name="ln168"> </a>
+<a name="ln169">Status PGConn::Execute(const std::string&amp; command) {</a>
+<a name="ln170">  PGResultPtr res(PQexec(impl_.get(), command.c_str()));</a>
+<a name="ln171">  auto status = PQresultStatus(res.get());</a>
+<a name="ln172">  if (ExecStatusType::PGRES_COMMAND_OK != status) {</a>
+<a name="ln173">    return STATUS(NetworkError,</a>
+<a name="ln174">                  Format(&quot;Execute '$0' failed: $1, message: $2&quot;,</a>
+<a name="ln175">                         command, status, PQresultErrorMessage(res.get())), Slice(),</a>
+<a name="ln176">                  PgsqlError(GetSqlState(res.get())));</a>
+<a name="ln177">  }</a>
+<a name="ln178">  return Status::OK();</a>
+<a name="ln179">}</a>
+<a name="ln180"> </a>
+<a name="ln181">Result&lt;PGResultPtr&gt; CheckResult(PGResultPtr result, const std::string&amp; command) {</a>
+<a name="ln182">  auto status = PQresultStatus(result.get());</a>
+<a name="ln183">  if (ExecStatusType::PGRES_TUPLES_OK != status &amp;&amp; ExecStatusType::PGRES_COPY_IN != status) {</a>
+<a name="ln184">    return STATUS(NetworkError,</a>
+<a name="ln185">                  Format(&quot;Fetch '$0' failed: $1, message: $2&quot;,</a>
+<a name="ln186">                         command, status, PQresultErrorMessage(result.get())), Slice(),</a>
+<a name="ln187">                  PgsqlError(GetSqlState(result.get())));</a>
+<a name="ln188">  }</a>
+<a name="ln189">  return std::move(result);</a>
+<a name="ln190">}</a>
+<a name="ln191"> </a>
+<a name="ln192">Result&lt;PGResultPtr&gt; PGConn::Fetch(const std::string&amp; command) {</a>
+<a name="ln193">  return CheckResult(</a>
+<a name="ln194">      PGResultPtr(</a>
+<a name="ln195">          PQexecParams(impl_.get(), command.c_str(), 0, nullptr, nullptr, nullptr, nullptr, 1)),</a>
+<a name="ln196">      command);</a>
+<a name="ln197">}</a>
+<a name="ln198"> </a>
+<a name="ln199">Result&lt;PGResultPtr&gt; PGConn::FetchMatrix(const std::string&amp; command, int rows, int columns) {</a>
+<a name="ln200">  auto res = VERIFY_RESULT(Fetch(command));</a>
+<a name="ln201"> </a>
+<a name="ln202">  auto fetched_columns = PQnfields(res.get());</a>
+<a name="ln203">  if (fetched_columns != columns) {</a>
+<a name="ln204">    return STATUS_FORMAT(</a>
+<a name="ln205">        RuntimeError, &quot;Fetched $0 columns, while $1 expected&quot;, fetched_columns, columns);</a>
+<a name="ln206">  }</a>
+<a name="ln207"> </a>
+<a name="ln208">  auto fetched_rows = PQntuples(res.get());</a>
+<a name="ln209">  if (fetched_rows != rows) {</a>
+<a name="ln210">    return STATUS_FORMAT(</a>
+<a name="ln211">        RuntimeError, &quot;Fetched $0 rows, while $1 expected&quot;, fetched_rows, rows);</a>
+<a name="ln212">  }</a>
+<a name="ln213"> </a>
+<a name="ln214">  return res;</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217">CHECKED_STATUS PGConn::StartTransaction(IsolationLevel isolation_level) {</a>
+<a name="ln218">  switch (isolation_level) {</a>
+<a name="ln219">    case IsolationLevel::NON_TRANSACTIONAL:</a>
+<a name="ln220">      return Status::OK();</a>
+<a name="ln221">    case IsolationLevel::SNAPSHOT_ISOLATION:</a>
+<a name="ln222">      return Execute(&quot;START TRANSACTION ISOLATION LEVEL REPEATABLE READ&quot;);</a>
+<a name="ln223">    case IsolationLevel::SERIALIZABLE_ISOLATION:</a>
+<a name="ln224">      return Execute(&quot;START TRANSACTION ISOLATION LEVEL SERIALIZABLE&quot;);</a>
+<a name="ln225">  }</a>
+<a name="ln226"> </a>
+<a name="ln227">  FATAL_INVALID_ENUM_VALUE(IsolationLevel, isolation_level);</a>
+<a name="ln228">}</a>
+<a name="ln229"> </a>
+<a name="ln230">CHECKED_STATUS PGConn::CommitTransaction() {</a>
+<a name="ln231">  return Execute(&quot;COMMIT&quot;);</a>
+<a name="ln232">}</a>
+<a name="ln233"> </a>
+<a name="ln234">CHECKED_STATUS PGConn::RollbackTransaction() {</a>
+<a name="ln235">  return Execute(&quot;ROLLBACK&quot;);</a>
+<a name="ln236">}</a>
+<a name="ln237"> </a>
+<a name="ln238">Result&lt;bool&gt; PGConn::HasIndexScan(const std::string&amp; query) {</a>
+<a name="ln239">  constexpr int kExpectedColumns = 1;</a>
+<a name="ln240">  auto res = VERIFY_RESULT(FetchFormat(&quot;EXPLAIN $0&quot;, query));</a>
+<a name="ln241"> </a>
+<a name="ln242">  {</a>
+<a name="ln243">    int fetched_columns = PQnfields(res.get());</a>
+<a name="ln244">    if (fetched_columns != kExpectedColumns) {</a>
+<a name="ln245">      return STATUS_FORMAT(</a>
+<a name="ln246">          InternalError, &quot;Fetched $0 columns, expected $1&quot;, fetched_columns, kExpectedColumns);</a>
+<a name="ln247">    }</a>
+<a name="ln248">  }</a>
+<a name="ln249"> </a>
+<a name="ln250">  for (int line = 0; line &lt; PQntuples(res.get()); ++line) {</a>
+<a name="ln251">    std::string value = VERIFY_RESULT(GetString(res.get(), line, 0));</a>
+<a name="ln252">    if (value.find(&quot;Index Scan&quot;) != std::string::npos) {</a>
+<a name="ln253">      return true;</a>
+<a name="ln254">    } else if (value.find(&quot;Index Only Scan&quot;) != std::string::npos) {</a>
+<a name="ln255">      return true;</a>
+<a name="ln256">    }</a>
+<a name="ln257">  }</a>
+<a name="ln258">  return false;</a>
+<a name="ln259">}</a>
+<a name="ln260"> </a>
+<a name="ln261"> </a>
+<a name="ln262">Status PGConn::CopyBegin(const std::string&amp; command) {</a>
+<a name="ln263">  auto result = VERIFY_RESULT(CheckResult(</a>
+<a name="ln264">      PGResultPtr(</a>
+<a name="ln265">          PQexecParams(impl_.get(), command.c_str(), 0, nullptr, nullptr, nullptr, nullptr, 0)),</a>
+<a name="ln266">      command));</a>
+<a name="ln267"> </a>
+<a name="ln268">  if (!copy_data_) {</a>
+<a name="ln269">    copy_data_.reset(new CopyData);</a>
+<a name="ln270">  }</a>
+<a name="ln271">  copy_data_-&gt;Start();</a>
+<a name="ln272"> </a>
+<a name="ln273">  static const char prefix[] = &quot;PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0&quot;;</a>
+<a name="ln274">  copy_data_-&gt;Write(prefix, sizeof(prefix) - 1);</a>
+<a name="ln275"> </a>
+<a name="ln276">  return Status::OK();</a>
+<a name="ln277">}</a>
+<a name="ln278"> </a>
+<a name="ln279">bool PGConn::CopyEnsureBuffer(size_t len) {</a>
+<a name="ln280">  if (!copy_data_-&gt;error.ok()) {</a>
+<a name="ln281">    return false;</a>
+<a name="ln282">  }</a>
+<a name="ln283">  if (copy_data_-&gt;left() &lt; len) {</a>
+<a name="ln284">    return CopyFlushBuffer();</a>
+<a name="ln285">  }</a>
+<a name="ln286">  return true;</a>
+<a name="ln287">}</a>
+<a name="ln288"> </a>
+<a name="ln289">void PGConn::CopyStartRow(int16_t columns) {</a>
+<a name="ln290">  if (!CopyEnsureBuffer(2)) {</a>
+<a name="ln291">    return;</a>
+<a name="ln292">  }</a>
+<a name="ln293">  copy_data_-&gt;WriteUInt16(columns);</a>
+<a name="ln294">}</a>
+<a name="ln295"> </a>
+<a name="ln296">bool PGConn::CopyFlushBuffer() {</a>
+<a name="ln297">  if (!copy_data_-&gt;error.ok()) {</a>
+<a name="ln298">    return false;</a>
+<a name="ln299">  }</a>
+<a name="ln300">  ptrdiff_t len = copy_data_-&gt;pos - copy_data_-&gt;buffer;</a>
+<a name="ln301">  if (len) {</a>
+<a name="ln302">    int res = PQputCopyData(impl_.get(), copy_data_-&gt;buffer, len);</a>
+<a name="ln303">    if (res &lt; 0) {</a>
+<a name="ln304">      copy_data_-&gt;error = STATUS_FORMAT(NetworkError, &quot;Put copy data failed: $0&quot;, res);</a>
+<a name="ln305">      return false;</a>
+<a name="ln306">    }</a>
+<a name="ln307">  }</a>
+<a name="ln308">  copy_data_-&gt;Start();</a>
+<a name="ln309">  return true;</a>
+<a name="ln310">}</a>
+<a name="ln311"> </a>
+<a name="ln312">void PGConn::CopyPutInt16(int16_t value) {</a>
+<a name="ln313">  if (!CopyEnsureBuffer(6)) {</a>
+<a name="ln314">    return;</a>
+<a name="ln315">  }</a>
+<a name="ln316">  copy_data_-&gt;WriteUInt32(2);</a>
+<a name="ln317">  copy_data_-&gt;WriteUInt16(value);</a>
+<a name="ln318">}</a>
+<a name="ln319"> </a>
+<a name="ln320">void PGConn::CopyPutInt32(int32_t value) {</a>
+<a name="ln321">  if (!CopyEnsureBuffer(8)) {</a>
+<a name="ln322">    return;</a>
+<a name="ln323">  }</a>
+<a name="ln324">  copy_data_-&gt;WriteUInt32(4);</a>
+<a name="ln325">  copy_data_-&gt;WriteUInt32(value);</a>
+<a name="ln326">}</a>
+<a name="ln327"> </a>
+<a name="ln328">void PGConn::CopyPutInt64(int64_t value) {</a>
+<a name="ln329">  if (!CopyEnsureBuffer(12)) {</a>
+<a name="ln330">    return;</a>
+<a name="ln331">  }</a>
+<a name="ln332">  copy_data_-&gt;WriteUInt32(8);</a>
+<a name="ln333">  copy_data_-&gt;WriteUInt64(value);</a>
+<a name="ln334">}</a>
+<a name="ln335"> </a>
+<a name="ln336">void PGConn::CopyPut(const char* value, size_t len) {</a>
+<a name="ln337">  if (!CopyEnsureBuffer(4)) {</a>
+<a name="ln338">    return;</a>
+<a name="ln339">  }</a>
+<a name="ln340">  copy_data_-&gt;WriteUInt32(static_cast&lt;uint32_t&gt;(len));</a>
+<a name="ln341">  for (;;) {</a>
+<a name="ln342">    size_t left = copy_data_-&gt;left();</a>
+<a name="ln343">    if (copy_data_-&gt;left() &lt; len) {</a>
+<a name="ln344">      copy_data_-&gt;Write(value, left);</a>
+<a name="ln345">      value += left;</a>
+<a name="ln346">      len -= left;</a>
+<a name="ln347">      if (!CopyFlushBuffer()) {</a>
+<a name="ln348">        return;</a>
+<a name="ln349">      }</a>
+<a name="ln350">    } else {</a>
+<a name="ln351">      copy_data_-&gt;Write(value, len);</a>
+<a name="ln352">      break;</a>
+<a name="ln353">    }</a>
+<a name="ln354">  }</a>
+<a name="ln355">}</a>
+<a name="ln356"> </a>
+<a name="ln357">Result&lt;PGResultPtr&gt; PGConn::CopyEnd() {</a>
+<a name="ln358">  if (CopyEnsureBuffer(2)) {</a>
+<a name="ln359">    copy_data_-&gt;WriteUInt16(static_cast&lt;uint16_t&gt;(-1));</a>
+<a name="ln360">  }</a>
+<a name="ln361">  if (!CopyFlushBuffer()) {</a>
+<a name="ln362">    return copy_data_-&gt;error;</a>
+<a name="ln363">  }</a>
+<a name="ln364">  int res = PQputCopyEnd(impl_.get(), 0);</a>
+<a name="ln365">  if (res &lt;= 0) {</a>
+<a name="ln366">    return STATUS_FORMAT(NetworkError, &quot;Put copy end failed: $0&quot;, res);</a>
+<a name="ln367">  }</a>
+<a name="ln368"> </a>
+<a name="ln369">  return PGResultPtr(PQgetResult(impl_.get()));</a>
+<a name="ln370">}</a>
+<a name="ln371"> </a>
+<a name="ln372">Result&lt;char*&gt; GetValueWithLength(PGresult* result, int row, int column, size_t size) {</a>
+<a name="ln373">  auto len = PQgetlength(result, row, column);</a>
+<a name="ln374">  if (len != size) {</a>
+<a name="ln375">    return STATUS_FORMAT(Corruption, &quot;Bad column length: $0, expected: $1, row: $2, column: $3&quot;,</a>
+<a name="ln376">                         len, size, row, column);</a>
+<a name="ln377">  }</a>
+<a name="ln378">  return PQgetvalue(result, row, column);</a>
+<a name="ln379">}</a>
+<a name="ln380"> </a>
+<a name="ln381">Result&lt;int32_t&gt; GetInt32(PGresult* result, int row, int column) {</a>
+<a name="ln382">  return BigEndian::Load32(VERIFY_RESULT(GetValueWithLength(result, row, column, sizeof(int32_t))));</a>
+<a name="ln383">}</a>
+<a name="ln384"> </a>
+<a name="ln385">Result&lt;int64_t&gt; GetInt64(PGresult* result, int row, int column) {</a>
+<a name="ln386">  return BigEndian::Load64(VERIFY_RESULT(GetValueWithLength(result, row, column, sizeof(int64_t))));</a>
+<a name="ln387">}</a>
+<a name="ln388"> </a>
+<a name="ln389">Result&lt;double&gt; GetDouble(PGresult* result, int row, int column) {</a>
+<a name="ln390">  auto temp =</a>
+<a name="ln391">      BigEndian::Load64(VERIFY_RESULT(GetValueWithLength(result, row, column, sizeof(int64_t))));</a>
+<a name="ln392">  return *reinterpret_cast&lt;double*&gt;(&amp;temp);</a>
+<a name="ln393">}</a>
+<a name="ln394"> </a>
+<a name="ln395">Result&lt;std::string&gt; GetString(PGresult* result, int row, int column) {</a>
+<a name="ln396">  auto len = PQgetlength(result, row, column);</a>
+<a name="ln397">  auto value = PQgetvalue(result, row, column);</a>
+<a name="ln398">  return std::string(value, len);</a>
+<a name="ln399">}</a>
+<a name="ln400"> </a>
+<a name="ln401">Result&lt;std::string&gt; AsString(PGresult* result, int row, int column) {</a>
+<a name="ln402">  constexpr Oid INT8OID = 20;</a>
+<a name="ln403">  constexpr Oid INT4OID = 23;</a>
+<a name="ln404">  constexpr Oid TEXTOID = 25;</a>
+<a name="ln405">  constexpr Oid FLOAT8OID = 701;</a>
+<a name="ln406">  constexpr Oid BPCHAROID = 1042;</a>
+<a name="ln407">  constexpr Oid VARCHAROID = 1043;</a>
+<a name="ln408"> </a>
+<a name="ln409">  auto type = PQftype(result, column);</a>
+<a name="ln410">  switch (type) {</a>
+<a name="ln411">    case INT8OID:</a>
+<a name="ln412">      return std::to_string(VERIFY_RESULT(GetInt64(result, row, column)));</a>
+<a name="ln413">    case INT4OID:</a>
+<a name="ln414">      return std::to_string(VERIFY_RESULT(GetInt32(result, row, column)));</a>
+<a name="ln415">    case FLOAT8OID:</a>
+<a name="ln416">      return std::to_string(VERIFY_RESULT(GetDouble(result, row, column)));</a>
+<a name="ln417">    case TEXTOID: FALLTHROUGH_INTENDED;</a>
+<a name="ln418">    case BPCHAROID: FALLTHROUGH_INTENDED;</a>
+<a name="ln419">    case VARCHAROID:</a>
+<a name="ln420">      return VERIFY_RESULT(GetString(result, row, column));</a>
+<a name="ln421">    default:</a>
+<a name="ln422">      return Format(&quot;Type not supported: $0&quot;, type);</a>
+<a name="ln423">  }</a>
+<a name="ln424">}</a>
+<a name="ln425"> </a>
+<a name="ln426">void LogResult(PGresult* result) {</a>
+<a name="ln427">  int cols = PQnfields(result);</a>
+<a name="ln428">  int rows = PQntuples(result);</a>
+<a name="ln429">  for (int row = 0; row != rows; ++row) {</a>
+<a name="ln430">    std::string line;</a>
+<a name="ln431">    for (int col = 0; col != cols; ++col) {</a>
+<a name="ln432">      if (col) {</a>
+<a name="ln433">        line += &quot;, &quot;;</a>
+<a name="ln434">      }</a>
+<a name="ln435">      line += CHECK_RESULT(AsString(result, row, col));</a>
+<a name="ln436">    }</a>
+<a name="ln437">    LOG(INFO) &lt;&lt; line;</a>
+<a name="ln438">  }</a>
+<a name="ln439">}</a>
+<a name="ln440"> </a>
+<a name="ln441">} // namespace pgwrapper</a>
+<a name="ln442">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="435"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

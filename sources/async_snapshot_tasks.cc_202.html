@@ -1,0 +1,225 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>async_snapshot_tasks.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &quot;yb/master/async_snapshot_tasks.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &quot;yb/common/transaction_error.h&quot;</a>
+<a name="ln16">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/master/master.h&quot;</a>
+<a name="ln19">#include &quot;yb/master/ts_descriptor.h&quot;</a>
+<a name="ln20">#include &quot;yb/master/catalog_manager.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;yb/tserver/backup.proxy.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln27">#include &quot;yb/util/format.h&quot;</a>
+<a name="ln28">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">namespace yb {</a>
+<a name="ln31">namespace master {</a>
+<a name="ln32"> </a>
+<a name="ln33">using std::string;</a>
+<a name="ln34">using tserver::TabletServerErrorPB;</a>
+<a name="ln35"> </a>
+<a name="ln36">////////////////////////////////////////////////////////////</a>
+<a name="ln37">// AsyncTabletSnapshotOp</a>
+<a name="ln38">////////////////////////////////////////////////////////////</a>
+<a name="ln39"> </a>
+<a name="ln40">AsyncTabletSnapshotOp::AsyncTabletSnapshotOp(Master *master,</a>
+<a name="ln41">                                             ThreadPool* callback_pool,</a>
+<a name="ln42">                                             const scoped_refptr&lt;TabletInfo&gt;&amp; tablet,</a>
+<a name="ln43">                                             const string&amp; snapshot_id,</a>
+<a name="ln44">                                             tserver::TabletSnapshotOpRequestPB::Operation op)</a>
+<a name="ln45">  : enterprise::RetryingTSRpcTask(master,</a>
+<a name="ln46">                                  callback_pool,</a>
+<a name="ln47">                                  new PickLeaderReplica(tablet),</a>
+<a name="ln48">                                  tablet-&gt;table().get()),</a>
+<a name="ln49">    tablet_(tablet),</a>
+<a name="ln50">    snapshot_id_(snapshot_id),</a>
+<a name="ln51">    operation_(op) {</a>
+<a name="ln52">}</a>
+<a name="ln53"> </a>
+<a name="ln54">string AsyncTabletSnapshotOp::description() const {</a>
+<a name="ln55">  return Format(&quot;$0 Tablet Snapshot Operation $1 RPC&quot;,</a>
+<a name="ln56">                *tablet_, tserver::TabletSnapshotOpRequestPB::Operation_Name(operation_));</a>
+<a name="ln57">}</a>
+<a name="ln58"> </a>
+<a name="ln59">TabletId AsyncTabletSnapshotOp::tablet_id() const {</a>
+<a name="ln60">  return tablet_-&gt;tablet_id();</a>
+<a name="ln61">}</a>
+<a name="ln62"> </a>
+<a name="ln63">TabletServerId AsyncTabletSnapshotOp::permanent_uuid() const {</a>
+<a name="ln64">  return target_ts_desc_ != nullptr ? target_ts_desc_-&gt;permanent_uuid() : &quot;&quot;;</a>
+<a name="ln65">}</a>
+<a name="ln66"> </a>
+<a name="ln67">void AsyncTabletSnapshotOp::HandleResponse(int attempt) {</a>
+<a name="ln68">  server::UpdateClock(resp_, master_-&gt;clock());</a>
+<a name="ln69"> </a>
+<a name="ln70">  if (resp_.has_error()) {</a>
+<a name="ln71">    Status status = StatusFromPB(resp_.error().status());</a>
+<a name="ln72"> </a>
+<a name="ln73">    // Do not retry on a fatal error.</a>
+<a name="ln74">    switch (resp_.error().code()) {</a>
+<a name="ln75">      case TabletServerErrorPB::TABLET_NOT_FOUND:</a>
+<a name="ln76">        LOG(WARNING) &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot;: snapshot failed for tablet &quot;</a>
+<a name="ln77">                     &lt;&lt; tablet_-&gt;ToString() &lt;&lt; &quot; no further retry: &quot; &lt;&lt; status;</a>
+<a name="ln78">        TransitionToCompleteState();</a>
+<a name="ln79">        break;</a>
+<a name="ln80">      case TabletServerErrorPB::INVALID_SNAPSHOT:</a>
+<a name="ln81">        LOG(WARNING) &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot;: snapshot failed for tablet &quot;</a>
+<a name="ln82">                     &lt;&lt; tablet_-&gt;ToString() &lt;&lt; &quot;: &quot; &lt;&lt; status;</a>
+<a name="ln83">        if (operation_ == tserver::TabletSnapshotOpRequestPB::RESTORE) {</a>
+<a name="ln84">          LOG(WARNING) &lt;&lt; &quot;No further retry for RESTORE snapshot operation: &quot; &lt;&lt; status;</a>
+<a name="ln85">          TransitionToCompleteState();</a>
+<a name="ln86">        }</a>
+<a name="ln87">        break;</a>
+<a name="ln88">      default:</a>
+<a name="ln89">        LOG(WARNING) &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot;: snapshot failed for tablet &quot;</a>
+<a name="ln90">                     &lt;&lt; tablet_-&gt;ToString() &lt;&lt; &quot;: &quot; &lt;&lt; status;</a>
+<a name="ln91">        if (TransactionError(status) == TransactionErrorCode::kSnapshotTooOld) {</a>
+<a name="ln92">          TransitionToCompleteState();</a>
+<a name="ln93">        }</a>
+<a name="ln94">        break;</a>
+<a name="ln95">    }</a>
+<a name="ln96">  } else {</a>
+<a name="ln97">    TransitionToCompleteState();</a>
+<a name="ln98">    VLOG(1) &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot;: snapshot complete on tablet &quot;</a>
+<a name="ln99">            &lt;&lt; tablet_-&gt;ToString();</a>
+<a name="ln100">  }</a>
+<a name="ln101"> </a>
+<a name="ln102">  if (state() != MonitoredTaskState::kComplete) {</a>
+<a name="ln103">    VLOG(1) &lt;&lt; &quot;TabletSnapshotOp task is not completed&quot;;</a>
+<a name="ln104">    return;</a>
+<a name="ln105">  }</a>
+<a name="ln106"> </a>
+<a name="ln107">  switch (operation_) {</a>
+<a name="ln108">    case tserver::TabletSnapshotOpRequestPB::CREATE_ON_TABLET: {</a>
+<a name="ln109">      // TODO: this class should not know CatalogManager API,</a>
+<a name="ln110">      //       remove circular dependency between classes.</a>
+<a name="ln111">      master_-&gt;catalog_manager()-&gt;HandleCreateTabletSnapshotResponse(</a>
+<a name="ln112">          tablet_.get(), resp_.has_error());</a>
+<a name="ln113">      return;</a>
+<a name="ln114">    }</a>
+<a name="ln115">    case tserver::TabletSnapshotOpRequestPB::RESTORE: {</a>
+<a name="ln116">      // TODO: this class should not know CatalogManager API,</a>
+<a name="ln117">      //       remove circular dependency between classes.</a>
+<a name="ln118">      master_-&gt;catalog_manager()-&gt;HandleRestoreTabletSnapshotResponse(</a>
+<a name="ln119">          tablet_.get(), resp_.has_error());</a>
+<a name="ln120">      return;</a>
+<a name="ln121">    }</a>
+<a name="ln122">    case tserver::TabletSnapshotOpRequestPB::DELETE_ON_TABLET: {</a>
+<a name="ln123">      // TODO: this class should not know CatalogManager API,</a>
+<a name="ln124">      //       remove circular dependency between classes.</a>
+<a name="ln125">      master_-&gt;catalog_manager()-&gt;HandleDeleteTabletSnapshotResponse(</a>
+<a name="ln126">          snapshot_id_, tablet_.get(), resp_.has_error());</a>
+<a name="ln127">      return;</a>
+<a name="ln128">    }</a>
+<a name="ln129">    case tserver::TabletSnapshotOpRequestPB::CREATE_ON_MASTER: FALLTHROUGH_INTENDED;</a>
+<a name="ln130">    case tserver::TabletSnapshotOpRequestPB::DELETE_ON_MASTER: FALLTHROUGH_INTENDED;</a>
+<a name="ln131">    case google::protobuf::kint32min: FALLTHROUGH_INTENDED;</a>
+<a name="ln132">    case google::protobuf::kint32max: FALLTHROUGH_INTENDED;</a>
+<a name="ln133">    case tserver::TabletSnapshotOpRequestPB::UNKNOWN: break; // Not handled.</a>
+<a name="ln134">  }</a>
+<a name="ln135"> </a>
+<a name="ln136">  FATAL_INVALID_ENUM_VALUE(tserver::TabletSnapshotOpRequestPB::Operation, operation_);</a>
+<a name="ln137">}</a>
+<a name="ln138"> </a>
+<a name="ln139">bool AsyncTabletSnapshotOp::SendRequest(int attempt) {</a>
+<a name="ln140">  tserver::TabletSnapshotOpRequestPB req;</a>
+<a name="ln141">  req.set_dest_uuid(permanent_uuid());</a>
+<a name="ln142">  req.add_tablet_id(tablet_-&gt;tablet_id());</a>
+<a name="ln143">  req.set_snapshot_id(snapshot_id_);</a>
+<a name="ln144">  req.set_operation(operation_);</a>
+<a name="ln145">  if (snapshot_hybrid_time_) {</a>
+<a name="ln146">    req.set_snapshot_hybrid_time(snapshot_hybrid_time_.ToUint64());</a>
+<a name="ln147">  }</a>
+<a name="ln148">  req.set_propagated_hybrid_time(master_-&gt;clock()-&gt;Now().ToUint64());</a>
+<a name="ln149"> </a>
+<a name="ln150">  ts_backup_proxy_-&gt;TabletSnapshotOpAsync(req, &amp;resp_, &amp;rpc_, BindRpcCallback());</a>
+<a name="ln151">  VLOG(1) &lt;&lt; &quot;Send tablet snapshot request &quot; &lt;&lt; operation_ &lt;&lt; &quot; to &quot; &lt;&lt; permanent_uuid()</a>
+<a name="ln152">          &lt;&lt; &quot; (attempt &quot; &lt;&lt; attempt &lt;&lt; &quot;):\n&quot;</a>
+<a name="ln153">          &lt;&lt; req.DebugString();</a>
+<a name="ln154">  return true;</a>
+<a name="ln155">}</a>
+<a name="ln156"> </a>
+<a name="ln157">void AsyncTabletSnapshotOp::Finished(const Status&amp; status) {</a>
+<a name="ln158">  if (!callback_) {</a>
+<a name="ln159">    return;</a>
+<a name="ln160">  }</a>
+<a name="ln161">  if (!status.ok()) {</a>
+<a name="ln162">    callback_(status);</a>
+<a name="ln163">    return;</a>
+<a name="ln164">  }</a>
+<a name="ln165">  if (resp_.has_error()) {</a>
+<a name="ln166">    auto status = tablet_-&gt;CheckRunning();</a>
+<a name="ln167">    if (status.ok()) {</a>
+<a name="ln168">      status = StatusFromPB(resp_.error().status());</a>
+<a name="ln169">    }</a>
+<a name="ln170">    callback_(status);</a>
+<a name="ln171">  } else {</a>
+<a name="ln172">    callback_(&amp;resp_);</a>
+<a name="ln173">  }</a>
+<a name="ln174">}</a>
+<a name="ln175"> </a>
+<a name="ln176">} // namespace master</a>
+<a name="ln177">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="98"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="103"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="151"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

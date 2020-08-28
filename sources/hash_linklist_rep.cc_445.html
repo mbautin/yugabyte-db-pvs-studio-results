@@ -1,0 +1,882 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>hash_linklist_rep.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20"> </a>
+<a name="ln21">#ifndef ROCKSDB_LITE</a>
+<a name="ln22">#include &quot;yb/rocksdb/memtable/hash_linklist_rep.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;algorithm&gt;</a>
+<a name="ln25">#include &lt;atomic&gt;</a>
+<a name="ln26">#include &quot;yb/rocksdb/memtablerep.h&quot;</a>
+<a name="ln27">#include &quot;yb/rocksdb/util/arena.h&quot;</a>
+<a name="ln28">#include &quot;yb/util/slice.h&quot;</a>
+<a name="ln29">#include &quot;yb/rocksdb/slice_transform.h&quot;</a>
+<a name="ln30">#include &quot;yb/rocksdb/port/port.h&quot;</a>
+<a name="ln31">#include &quot;yb/rocksdb/util/histogram.h&quot;</a>
+<a name="ln32">#include &quot;yb/rocksdb/util/murmurhash.h&quot;</a>
+<a name="ln33">#include &quot;yb/rocksdb/db/memtable.h&quot;</a>
+<a name="ln34">#include &quot;yb/rocksdb/db/skiplist.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">namespace rocksdb {</a>
+<a name="ln37">namespace {</a>
+<a name="ln38"> </a>
+<a name="ln39">typedef const char* Key;</a>
+<a name="ln40">typedef SkipList&lt;Key, const MemTableRep::KeyComparator&amp;&gt; MemtableSkipList;</a>
+<a name="ln41">typedef std::atomic&lt;void*&gt; Pointer;</a>
+<a name="ln42"> </a>
+<a name="ln43">// A data structure used as the header of a link list of a hash bucket.</a>
+<a name="ln44">struct BucketHeader {</a>
+<a name="ln45">  Pointer next;</a>
+<a name="ln46">  std::atomic&lt;uint32_t&gt; num_entries;</a>
+<a name="ln47"> </a>
+<a name="ln48">  explicit BucketHeader(void* n, uint32_t count)</a>
+<a name="ln49">      : next(n), num_entries(count) {}</a>
+<a name="ln50"> </a>
+<a name="ln51">  bool IsSkipListBucket() {</a>
+<a name="ln52">    return next.load(std::memory_order_relaxed) == this;</a>
+<a name="ln53">  }</a>
+<a name="ln54"> </a>
+<a name="ln55">  uint32_t GetNumEntries() const {</a>
+<a name="ln56">    return num_entries.load(std::memory_order_relaxed);</a>
+<a name="ln57">  }</a>
+<a name="ln58"> </a>
+<a name="ln59">  // REQUIRES: called from single-threaded Insert()</a>
+<a name="ln60">  void IncNumEntries() {</a>
+<a name="ln61">    // Only one thread can do write at one time. No need to do atomic</a>
+<a name="ln62">    // incremental. Update it with relaxed load and store.</a>
+<a name="ln63">    num_entries.store(GetNumEntries() + 1, std::memory_order_relaxed);</a>
+<a name="ln64">  }</a>
+<a name="ln65">};</a>
+<a name="ln66"> </a>
+<a name="ln67">// A data structure used as the header of a skip list of a hash bucket.</a>
+<a name="ln68">struct SkipListBucketHeader {</a>
+<a name="ln69">  BucketHeader Counting_header;</a>
+<a name="ln70">  MemtableSkipList skip_list;</a>
+<a name="ln71"> </a>
+<a name="ln72">  explicit SkipListBucketHeader(const MemTableRep::KeyComparator&amp; cmp,</a>
+<a name="ln73">                                MemTableAllocator* allocator, uint32_t count)</a>
+<a name="ln74">      : Counting_header(this,  // Pointing to itself to indicate header type.</a>
+<a name="ln75">                        count),</a>
+<a name="ln76">        skip_list(cmp, allocator) {}</a>
+<a name="ln77">};</a>
+<a name="ln78"> </a>
+<a name="ln79">struct Node {</a>
+<a name="ln80">  // Accessors/mutators for links.  Wrapped in methods so we can</a>
+<a name="ln81">  // add the appropriate barriers as necessary.</a>
+<a name="ln82">  Node* Next() {</a>
+<a name="ln83">    // Use an 'acquire load' so that we observe a fully initialized</a>
+<a name="ln84">    // version of the returned Node.</a>
+<a name="ln85">    return next_.load(std::memory_order_acquire);</a>
+<a name="ln86">  }</a>
+<a name="ln87">  void SetNext(Node* x) {</a>
+<a name="ln88">    // Use a 'release store' so that anybody who reads through this</a>
+<a name="ln89">    // pointer observes a fully initialized version of the inserted node.</a>
+<a name="ln90">    next_.store(x, std::memory_order_release);</a>
+<a name="ln91">  }</a>
+<a name="ln92">  // No-barrier variants that can be safely used in a few locations.</a>
+<a name="ln93">  Node* NoBarrier_Next() {</a>
+<a name="ln94">    return next_.load(std::memory_order_relaxed);</a>
+<a name="ln95">  }</a>
+<a name="ln96"> </a>
+<a name="ln97">  void NoBarrier_SetNext(Node* x) { next_.store(x, std::memory_order_relaxed); }</a>
+<a name="ln98"> </a>
+<a name="ln99">  // Needed for placement new below which is fine</a>
+<a name="ln100">  Node() {}</a>
+<a name="ln101"> </a>
+<a name="ln102"> private:</a>
+<a name="ln103">  std::atomic&lt;Node*&gt; next_;</a>
+<a name="ln104"> </a>
+<a name="ln105">  // Prohibit copying due to the below</a>
+<a name="ln106">  Node(const Node&amp;) = delete;</a>
+<a name="ln107">  Node&amp; operator=(const Node&amp;) = delete;</a>
+<a name="ln108"> </a>
+<a name="ln109"> public:</a>
+<a name="ln110">  char key[1];</a>
+<a name="ln111">};</a>
+<a name="ln112"> </a>
+<a name="ln113">// Memory structure of the mem table:</a>
+<a name="ln114">// It is a hash table, each bucket points to one entry, a linked list or a</a>
+<a name="ln115">// skip list. In order to track total number of records in a bucket to determine</a>
+<a name="ln116">// whether should switch to skip list, a header is added just to indicate</a>
+<a name="ln117">// number of entries in the bucket.</a>
+<a name="ln118">//</a>
+<a name="ln119">//</a>
+<a name="ln120">//          +-----&gt; NULL    Case 1. Empty bucket</a>
+<a name="ln121">//          |</a>
+<a name="ln122">//          |</a>
+<a name="ln123">//          | +---&gt; +-------+</a>
+<a name="ln124">//          | |     | Next  +--&gt; NULL</a>
+<a name="ln125">//          | |     +-------+</a>
+<a name="ln126">//  +-----+ | |     |       |  Case 2. One Entry in bucket.</a>
+<a name="ln127">//  |     +-+ |     | Data  |          next pointer points to</a>
+<a name="ln128">//  +-----+   |     |       |          NULL. All other cases</a>
+<a name="ln129">//  |     |   |     |       |          next pointer is not NULL.</a>
+<a name="ln130">//  +-----+   |     +-------+</a>
+<a name="ln131">//  |     +---+</a>
+<a name="ln132">//  +-----+     +-&gt; +-------+  +&gt; +-------+  +-&gt; +-------+</a>
+<a name="ln133">//  |     |     |   | Next  +--+  | Next  +--+   | Next  +--&gt;NULL</a>
+<a name="ln134">//  +-----+     |   +-------+     +-------+      +-------+</a>
+<a name="ln135">//  |     +-----+   | Count |     |       |      |       |</a>
+<a name="ln136">//  +-----+         +-------+     | Data  |      | Data  |</a>
+<a name="ln137">//  |     |                       |       |      |       |</a>
+<a name="ln138">//  +-----+          Case 3.      |       |      |       |</a>
+<a name="ln139">//  |     |          A header     +-------+      +-------+</a>
+<a name="ln140">//  +-----+          points to</a>
+<a name="ln141">//  |     |          a linked list. Count indicates total number</a>
+<a name="ln142">//  +-----+          of rows in this bucket.</a>
+<a name="ln143">//  |     |</a>
+<a name="ln144">//  +-----+    +-&gt; +-------+ &lt;--+</a>
+<a name="ln145">//  |     |    |   | Next  +----+</a>
+<a name="ln146">//  +-----+    |   +-------+   Case 4. A header points to a skip</a>
+<a name="ln147">//  |     +----+   | Count |           list and next pointer points to</a>
+<a name="ln148">//  +-----+        +-------+           itself, to distinguish case 3 or 4.</a>
+<a name="ln149">//  |     |        |       |           Count still is kept to indicates total</a>
+<a name="ln150">//  +-----+        | Skip +--&gt;         of entries in the bucket for debugging</a>
+<a name="ln151">//  |     |        | List  |   Data    purpose.</a>
+<a name="ln152">//  |     |        |      +--&gt;</a>
+<a name="ln153">//  +-----+        |       |</a>
+<a name="ln154">//  |     |        +-------+</a>
+<a name="ln155">//  +-----+</a>
+<a name="ln156">//</a>
+<a name="ln157">// We don't have data race when changing cases because:</a>
+<a name="ln158">// (1) When changing from case 2-&gt;3, we create a new bucket header, put the</a>
+<a name="ln159">//     single node there first without changing the original node, and do a</a>
+<a name="ln160">//     release store when changing the bucket pointer. In that case, a reader</a>
+<a name="ln161">//     who sees a stale value of the bucket pointer will read this node, while</a>
+<a name="ln162">//     a reader sees the correct value because of the release store.</a>
+<a name="ln163">// (2) When changing case 3-&gt;4, a new header is created with skip list points</a>
+<a name="ln164">//     to the data, before doing an acquire store to change the bucket pointer.</a>
+<a name="ln165">//     The old header and nodes are never changed, so any reader sees any</a>
+<a name="ln166">//     of those existing pointers will guarantee to be able to iterate to the</a>
+<a name="ln167">//     end of the linked list.</a>
+<a name="ln168">// (3) Header's next pointer in case 3 might change, but they are never equal</a>
+<a name="ln169">//     to itself, so no matter a reader sees any stale or newer value, it will</a>
+<a name="ln170">//     be able to correctly distinguish case 3 and 4.</a>
+<a name="ln171">//</a>
+<a name="ln172">// The reason that we use case 2 is we want to make the format to be efficient</a>
+<a name="ln173">// when the utilization of buckets is relatively low. If we use case 3 for</a>
+<a name="ln174">// single entry bucket, we will need to waste 12 bytes for every entry,</a>
+<a name="ln175">// which can be significant decrease of memory utilization.</a>
+<a name="ln176">class HashLinkListRep : public MemTableRep {</a>
+<a name="ln177"> public:</a>
+<a name="ln178">  HashLinkListRep(const MemTableRep::KeyComparator&amp; compare,</a>
+<a name="ln179">                  MemTableAllocator* allocator, const SliceTransform* transform,</a>
+<a name="ln180">                  size_t bucket_size, uint32_t threshold_use_skiplist,</a>
+<a name="ln181">                  size_t huge_page_tlb_size, Logger* logger,</a>
+<a name="ln182">                  int bucket_entries_logging_threshold,</a>
+<a name="ln183">                  bool if_log_bucket_dist_when_flash);</a>
+<a name="ln184"> </a>
+<a name="ln185">  KeyHandle Allocate(const size_t len, char** buf) override;</a>
+<a name="ln186"> </a>
+<a name="ln187">  void Insert(KeyHandle handle) override;</a>
+<a name="ln188"> </a>
+<a name="ln189">  bool Contains(const char* key) const override;</a>
+<a name="ln190"> </a>
+<a name="ln191">  size_t ApproximateMemoryUsage() override;</a>
+<a name="ln192"> </a>
+<a name="ln193">  virtual void Get(const LookupKey&amp; k, void* callback_args,</a>
+<a name="ln194">                   bool (*callback_func)(void* arg,</a>
+<a name="ln195">                                         const char* entry)) override;</a>
+<a name="ln196"> </a>
+<a name="ln197">  virtual ~HashLinkListRep();</a>
+<a name="ln198"> </a>
+<a name="ln199">  MemTableRep::Iterator* GetIterator(Arena* arena = nullptr) override;</a>
+<a name="ln200"> </a>
+<a name="ln201">  virtual MemTableRep::Iterator* GetDynamicPrefixIterator(</a>
+<a name="ln202">       Arena* arena = nullptr) override;</a>
+<a name="ln203"> </a>
+<a name="ln204"> private:</a>
+<a name="ln205">  friend class DynamicIterator;</a>
+<a name="ln206"> </a>
+<a name="ln207">  size_t bucket_size_;</a>
+<a name="ln208"> </a>
+<a name="ln209">  // Maps slices (which are transformed user keys) to buckets of keys sharing</a>
+<a name="ln210">  // the same transform.</a>
+<a name="ln211">  Pointer* buckets_;</a>
+<a name="ln212"> </a>
+<a name="ln213">  const uint32_t threshold_use_skiplist_;</a>
+<a name="ln214"> </a>
+<a name="ln215">  // The user-supplied transform whose domain is the user keys.</a>
+<a name="ln216">  const SliceTransform* transform_;</a>
+<a name="ln217"> </a>
+<a name="ln218">  const MemTableRep::KeyComparator&amp; compare_;</a>
+<a name="ln219"> </a>
+<a name="ln220">  Logger* logger_;</a>
+<a name="ln221">  int bucket_entries_logging_threshold_;</a>
+<a name="ln222">  bool if_log_bucket_dist_when_flash_;</a>
+<a name="ln223"> </a>
+<a name="ln224">  bool LinkListContains(Node* head, const Slice&amp; key) const;</a>
+<a name="ln225"> </a>
+<a name="ln226">  SkipListBucketHeader* GetSkipListBucketHeader(Pointer* first_next_pointer)</a>
+<a name="ln227">      const;</a>
+<a name="ln228"> </a>
+<a name="ln229">  Node* GetLinkListFirstNode(Pointer* first_next_pointer) const;</a>
+<a name="ln230"> </a>
+<a name="ln231">  Slice GetPrefix(const Slice&amp; internal_key) const {</a>
+<a name="ln232">    return transform_-&gt;Transform(ExtractUserKey(internal_key));</a>
+<a name="ln233">  }</a>
+<a name="ln234"> </a>
+<a name="ln235">  size_t GetHash(const Slice&amp; slice) const {</a>
+<a name="ln236">    return MurmurHash(slice.data(), static_cast&lt;int&gt;(slice.size()), 0) %</a>
+<a name="ln237">           bucket_size_;</a>
+<a name="ln238">  }</a>
+<a name="ln239"> </a>
+<a name="ln240">  Pointer* GetBucket(size_t i) const {</a>
+<a name="ln241">    return static_cast&lt;Pointer*&gt;(buckets_[i].load(std::memory_order_acquire));</a>
+<a name="ln242">  }</a>
+<a name="ln243"> </a>
+<a name="ln244">  Pointer* GetBucket(const Slice&amp; slice) const {</a>
+<a name="ln245">    return GetBucket(GetHash(slice));</a>
+<a name="ln246">  }</a>
+<a name="ln247"> </a>
+<a name="ln248">  bool Equal(const Slice&amp; a, const Key&amp; b) const {</a>
+<a name="ln249">    return (compare_(b, a) == 0);</a>
+<a name="ln250">  }</a>
+<a name="ln251"> </a>
+<a name="ln252">  bool Equal(const Key&amp; a, const Key&amp; b) const { return (compare_(a, b) == 0); }</a>
+<a name="ln253"> </a>
+<a name="ln254">  bool KeyIsAfterNode(const Slice&amp; internal_key, const Node* n) const {</a>
+<a name="ln255">    // nullptr n is considered infinite</a>
+<a name="ln256">    return (n != nullptr) &amp;&amp; (compare_(n-&gt;key, internal_key) &lt; 0);</a>
+<a name="ln257">  }</a>
+<a name="ln258"> </a>
+<a name="ln259">  bool KeyIsAfterNode(const Key&amp; key, const Node* n) const {</a>
+<a name="ln260">    // nullptr n is considered infinite</a>
+<a name="ln261">    return (n != nullptr) &amp;&amp; (compare_(n-&gt;key, key) &lt; 0);</a>
+<a name="ln262">  }</a>
+<a name="ln263"> </a>
+<a name="ln264"> </a>
+<a name="ln265">  Node* FindGreaterOrEqualInBucket(Node* head, const Slice&amp; key) const;</a>
+<a name="ln266"> </a>
+<a name="ln267">  class FullListIterator : public MemTableRep::Iterator {</a>
+<a name="ln268">   public:</a>
+<a name="ln269">    explicit FullListIterator(MemtableSkipList* list, Allocator* allocator)</a>
+<a name="ln270">        : iter_(list), full_list_(list), allocator_(allocator) {}</a>
+<a name="ln271"> </a>
+<a name="ln272">    virtual ~FullListIterator() {</a>
+<a name="ln273">    }</a>
+<a name="ln274"> </a>
+<a name="ln275">    // Returns true iff the iterator is positioned at a valid node.</a>
+<a name="ln276">    bool Valid() const override { return iter_.Valid(); }</a>
+<a name="ln277"> </a>
+<a name="ln278">    // Returns the key at the current position.</a>
+<a name="ln279">    // REQUIRES: Valid()</a>
+<a name="ln280">    const char* key() const override {</a>
+<a name="ln281">      assert(Valid());</a>
+<a name="ln282">      return iter_.key();</a>
+<a name="ln283">    }</a>
+<a name="ln284"> </a>
+<a name="ln285">    // Advances to the next position.</a>
+<a name="ln286">    // REQUIRES: Valid()</a>
+<a name="ln287">    void Next() override {</a>
+<a name="ln288">      assert(Valid());</a>
+<a name="ln289">      iter_.Next();</a>
+<a name="ln290">    }</a>
+<a name="ln291"> </a>
+<a name="ln292">    // Advances to the previous position.</a>
+<a name="ln293">    // REQUIRES: Valid()</a>
+<a name="ln294">    void Prev() override {</a>
+<a name="ln295">      assert(Valid());</a>
+<a name="ln296">      iter_.Prev();</a>
+<a name="ln297">    }</a>
+<a name="ln298"> </a>
+<a name="ln299">    // Advance to the first entry with a key &gt;= target</a>
+<a name="ln300">    virtual void Seek(const Slice&amp; internal_key,</a>
+<a name="ln301">                      const char* memtable_key) override {</a>
+<a name="ln302">      const char* encoded_key =</a>
+<a name="ln303">          (memtable_key != nullptr) ?</a>
+<a name="ln304">              memtable_key : EncodeKey(&amp;tmp_, internal_key);</a>
+<a name="ln305">      iter_.Seek(encoded_key);</a>
+<a name="ln306">    }</a>
+<a name="ln307"> </a>
+<a name="ln308">    // Position at the first entry in collection.</a>
+<a name="ln309">    // Final state of iterator is Valid() iff collection is not empty.</a>
+<a name="ln310">    void SeekToFirst() override { iter_.SeekToFirst(); }</a>
+<a name="ln311"> </a>
+<a name="ln312">    // Position at the last entry in collection.</a>
+<a name="ln313">    // Final state of iterator is Valid() iff collection is not empty.</a>
+<a name="ln314">    void SeekToLast() override { iter_.SeekToLast(); }</a>
+<a name="ln315">   private:</a>
+<a name="ln316">    MemtableSkipList::Iterator iter_;</a>
+<a name="ln317">    // To destruct with the iterator.</a>
+<a name="ln318">    std::unique_ptr&lt;MemtableSkipList&gt; full_list_;</a>
+<a name="ln319">    std::unique_ptr&lt;Allocator&gt; allocator_;</a>
+<a name="ln320">    std::string tmp_;       // For passing to EncodeKey</a>
+<a name="ln321">  };</a>
+<a name="ln322"> </a>
+<a name="ln323">  class LinkListIterator : public MemTableRep::Iterator {</a>
+<a name="ln324">   public:</a>
+<a name="ln325">    explicit LinkListIterator(const HashLinkListRep* const hash_link_list_rep,</a>
+<a name="ln326">                              Node* head)</a>
+<a name="ln327">        : hash_link_list_rep_(hash_link_list_rep),</a>
+<a name="ln328">          head_(head),</a>
+<a name="ln329">          node_(nullptr) {}</a>
+<a name="ln330"> </a>
+<a name="ln331">    virtual ~LinkListIterator() {}</a>
+<a name="ln332"> </a>
+<a name="ln333">    // Returns true iff the iterator is positioned at a valid node.</a>
+<a name="ln334">    bool Valid() const override { return node_ != nullptr; }</a>
+<a name="ln335"> </a>
+<a name="ln336">    // Returns the key at the current position.</a>
+<a name="ln337">    // REQUIRES: Valid()</a>
+<a name="ln338">    const char* key() const override {</a>
+<a name="ln339">      assert(Valid());</a>
+<a name="ln340">      return node_-&gt;key;</a>
+<a name="ln341">    }</a>
+<a name="ln342"> </a>
+<a name="ln343">    // Advances to the next position.</a>
+<a name="ln344">    // REQUIRES: Valid()</a>
+<a name="ln345">    void Next() override {</a>
+<a name="ln346">      assert(Valid());</a>
+<a name="ln347">      node_ = node_-&gt;Next();</a>
+<a name="ln348">    }</a>
+<a name="ln349"> </a>
+<a name="ln350">    // Advances to the previous position.</a>
+<a name="ln351">    // REQUIRES: Valid()</a>
+<a name="ln352">    void Prev() override {</a>
+<a name="ln353">      // Prefix iterator does not support total order.</a>
+<a name="ln354">      // We simply set the iterator to invalid state</a>
+<a name="ln355">      Reset(nullptr);</a>
+<a name="ln356">    }</a>
+<a name="ln357"> </a>
+<a name="ln358">    // Advance to the first entry with a key &gt;= target</a>
+<a name="ln359">    virtual void Seek(const Slice&amp; internal_key,</a>
+<a name="ln360">                      const char* memtable_key) override {</a>
+<a name="ln361">      node_ = hash_link_list_rep_-&gt;FindGreaterOrEqualInBucket(head_,</a>
+<a name="ln362">                                                              internal_key);</a>
+<a name="ln363">    }</a>
+<a name="ln364"> </a>
+<a name="ln365">    // Position at the first entry in collection.</a>
+<a name="ln366">    // Final state of iterator is Valid() iff collection is not empty.</a>
+<a name="ln367">    void SeekToFirst() override {</a>
+<a name="ln368">      // Prefix iterator does not support total order.</a>
+<a name="ln369">      // We simply set the iterator to invalid state</a>
+<a name="ln370">      Reset(nullptr);</a>
+<a name="ln371">    }</a>
+<a name="ln372"> </a>
+<a name="ln373">    // Position at the last entry in collection.</a>
+<a name="ln374">    // Final state of iterator is Valid() iff collection is not empty.</a>
+<a name="ln375">    void SeekToLast() override {</a>
+<a name="ln376">      // Prefix iterator does not support total order.</a>
+<a name="ln377">      // We simply set the iterator to invalid state</a>
+<a name="ln378">      Reset(nullptr);</a>
+<a name="ln379">    }</a>
+<a name="ln380"> </a>
+<a name="ln381">   protected:</a>
+<a name="ln382">    void Reset(Node* head) {</a>
+<a name="ln383">      head_ = head;</a>
+<a name="ln384">      node_ = nullptr;</a>
+<a name="ln385">    }</a>
+<a name="ln386">   private:</a>
+<a name="ln387">    friend class HashLinkListRep;</a>
+<a name="ln388">    const HashLinkListRep* const hash_link_list_rep_;</a>
+<a name="ln389">    Node* head_;</a>
+<a name="ln390">    Node* node_;</a>
+<a name="ln391"> </a>
+<a name="ln392">    virtual void SeekToHead() {</a>
+<a name="ln393">      node_ = head_;</a>
+<a name="ln394">    }</a>
+<a name="ln395">  };</a>
+<a name="ln396"> </a>
+<a name="ln397">  class DynamicIterator : public HashLinkListRep::LinkListIterator {</a>
+<a name="ln398">   public:</a>
+<a name="ln399">    explicit DynamicIterator(const HashLinkListRep&amp; memtable_rep)</a>
+<a name="ln400">        : HashLinkListRep::LinkListIterator(&amp;memtable_rep, nullptr),</a>
+<a name="ln401">          memtable_rep_(memtable_rep) {}</a>
+<a name="ln402"> </a>
+<a name="ln403">    // Advance to the first entry with a key &gt;= target</a>
+<a name="ln404">    void Seek(const Slice&amp; k, const char* memtable_key) override {</a>
+<a name="ln405">      auto transformed = memtable_rep_.GetPrefix(k);</a>
+<a name="ln406">      auto* bucket = memtable_rep_.GetBucket(transformed);</a>
+<a name="ln407"> </a>
+<a name="ln408">      SkipListBucketHeader* skip_list_header =</a>
+<a name="ln409">          memtable_rep_.GetSkipListBucketHeader(bucket);</a>
+<a name="ln410">      if (skip_list_header != nullptr) {</a>
+<a name="ln411">        // The bucket is organized as a skip list</a>
+<a name="ln412">        if (!skip_list_iter_) {</a>
+<a name="ln413">          skip_list_iter_.reset(</a>
+<a name="ln414">              new MemtableSkipList::Iterator(&amp;skip_list_header-&gt;skip_list));</a>
+<a name="ln415">        } else {</a>
+<a name="ln416">          skip_list_iter_-&gt;SetList(&amp;skip_list_header-&gt;skip_list);</a>
+<a name="ln417">        }</a>
+<a name="ln418">        if (memtable_key != nullptr) {</a>
+<a name="ln419">          skip_list_iter_-&gt;Seek(memtable_key);</a>
+<a name="ln420">        } else {</a>
+<a name="ln421">          IterKey encoded_key;</a>
+<a name="ln422">          encoded_key.EncodeLengthPrefixedKey(k);</a>
+<a name="ln423">          skip_list_iter_-&gt;Seek(encoded_key.GetKey().cdata());</a>
+<a name="ln424">        }</a>
+<a name="ln425">      } else {</a>
+<a name="ln426">        // The bucket is organized as a linked list</a>
+<a name="ln427">        skip_list_iter_.reset();</a>
+<a name="ln428">        Reset(memtable_rep_.GetLinkListFirstNode(bucket));</a>
+<a name="ln429">        HashLinkListRep::LinkListIterator::Seek(k, memtable_key);</a>
+<a name="ln430">      }</a>
+<a name="ln431">    }</a>
+<a name="ln432"> </a>
+<a name="ln433">    bool Valid() const override {</a>
+<a name="ln434">      if (skip_list_iter_) {</a>
+<a name="ln435">        return skip_list_iter_-&gt;Valid();</a>
+<a name="ln436">      }</a>
+<a name="ln437">      return HashLinkListRep::LinkListIterator::Valid();</a>
+<a name="ln438">    }</a>
+<a name="ln439"> </a>
+<a name="ln440">    const char* key() const override {</a>
+<a name="ln441">      if (skip_list_iter_) {</a>
+<a name="ln442">        return skip_list_iter_-&gt;key();</a>
+<a name="ln443">      }</a>
+<a name="ln444">      return HashLinkListRep::LinkListIterator::key();</a>
+<a name="ln445">    }</a>
+<a name="ln446"> </a>
+<a name="ln447">    void Next() override {</a>
+<a name="ln448">      if (skip_list_iter_) {</a>
+<a name="ln449">        skip_list_iter_-&gt;Next();</a>
+<a name="ln450">      } else {</a>
+<a name="ln451">        HashLinkListRep::LinkListIterator::Next();</a>
+<a name="ln452">      }</a>
+<a name="ln453">    }</a>
+<a name="ln454"> </a>
+<a name="ln455">   private:</a>
+<a name="ln456">    // the underlying memtable</a>
+<a name="ln457">    const HashLinkListRep&amp; memtable_rep_;</a>
+<a name="ln458">    std::unique_ptr&lt;MemtableSkipList::Iterator&gt; skip_list_iter_;</a>
+<a name="ln459">  };</a>
+<a name="ln460"> </a>
+<a name="ln461">  class EmptyIterator : public MemTableRep::Iterator {</a>
+<a name="ln462">    // This is used when there wasn't a bucket. It is cheaper than</a>
+<a name="ln463">    // instantiating an empty bucket over which to iterate.</a>
+<a name="ln464">   public:</a>
+<a name="ln465">    EmptyIterator() { }</a>
+<a name="ln466">    bool Valid() const override { return false; }</a>
+<a name="ln467">    const char* key() const override {</a>
+<a name="ln468">      assert(false);</a>
+<a name="ln469">      return nullptr;</a>
+<a name="ln470">    }</a>
+<a name="ln471">    void Next() override {}</a>
+<a name="ln472">    void Prev() override {}</a>
+<a name="ln473">    virtual void Seek(const Slice&amp; user_key,</a>
+<a name="ln474">                      const char* memtable_key) override {}</a>
+<a name="ln475">    void SeekToFirst() override {}</a>
+<a name="ln476">    void SeekToLast() override {}</a>
+<a name="ln477"> </a>
+<a name="ln478">   private:</a>
+<a name="ln479">  };</a>
+<a name="ln480">};</a>
+<a name="ln481"> </a>
+<a name="ln482">HashLinkListRep::HashLinkListRep(const MemTableRep::KeyComparator&amp; compare,</a>
+<a name="ln483">                                 MemTableAllocator* allocator,</a>
+<a name="ln484">                                 const SliceTransform* transform,</a>
+<a name="ln485">                                 size_t bucket_size,</a>
+<a name="ln486">                                 uint32_t threshold_use_skiplist,</a>
+<a name="ln487">                                 size_t huge_page_tlb_size, Logger* logger,</a>
+<a name="ln488">                                 int bucket_entries_logging_threshold,</a>
+<a name="ln489">                                 bool if_log_bucket_dist_when_flash)</a>
+<a name="ln490">    : MemTableRep(allocator),</a>
+<a name="ln491">      bucket_size_(bucket_size),</a>
+<a name="ln492">      // Threshold to use skip list doesn't make sense if less than 3, so we</a>
+<a name="ln493">      // force it to be minimum of 3 to simplify implementation.</a>
+<a name="ln494">      threshold_use_skiplist_(std::max(threshold_use_skiplist, 3U)),</a>
+<a name="ln495">      transform_(transform),</a>
+<a name="ln496">      compare_(compare),</a>
+<a name="ln497">      logger_(logger),</a>
+<a name="ln498">      bucket_entries_logging_threshold_(bucket_entries_logging_threshold),</a>
+<a name="ln499">      if_log_bucket_dist_when_flash_(if_log_bucket_dist_when_flash) {</a>
+<a name="ln500">  char* mem = allocator_-&gt;AllocateAligned(sizeof(Pointer) * bucket_size,</a>
+<a name="ln501">                                      huge_page_tlb_size, logger);</a>
+<a name="ln502"> </a>
+<a name="ln503">  buckets_ = new (mem) Pointer[bucket_size];</a>
+<a name="ln504"> </a>
+<a name="ln505">  for (size_t i = 0; i &lt; bucket_size_; ++i) {</a>
+<a name="ln506">    buckets_[i].store(nullptr, std::memory_order_relaxed);</a>
+<a name="ln507">  }</a>
+<a name="ln508">}</a>
+<a name="ln509"> </a>
+<a name="ln510">HashLinkListRep::~HashLinkListRep() {</a>
+<a name="ln511">}</a>
+<a name="ln512"> </a>
+<a name="ln513">KeyHandle HashLinkListRep::Allocate(const size_t len, char** buf) {</a>
+<a name="ln514">  char* mem = allocator_-&gt;AllocateAligned(sizeof(Node) + len);</a>
+<a name="ln515">  Node* x = new (mem) Node();</a>
+<a name="ln516">  *buf = x-&gt;key;</a>
+<a name="ln517">  return static_cast&lt;void*&gt;(x);</a>
+<a name="ln518">}</a>
+<a name="ln519"> </a>
+<a name="ln520">SkipListBucketHeader* HashLinkListRep::GetSkipListBucketHeader(</a>
+<a name="ln521">    Pointer* first_next_pointer) const {</a>
+<a name="ln522">  if (first_next_pointer == nullptr) {</a>
+<a name="ln523">    return nullptr;</a>
+<a name="ln524">  }</a>
+<a name="ln525">  if (first_next_pointer-&gt;load(std::memory_order_relaxed) == nullptr) {</a>
+<a name="ln526">    // Single entry bucket</a>
+<a name="ln527">    return nullptr;</a>
+<a name="ln528">  }</a>
+<a name="ln529">  // Counting header</a>
+<a name="ln530">  BucketHeader* header = reinterpret_cast&lt;BucketHeader*&gt;(first_next_pointer);</a>
+<a name="ln531">  if (header-&gt;IsSkipListBucket()) {</a>
+<a name="ln532">    assert(header-&gt;GetNumEntries() &gt; threshold_use_skiplist_);</a>
+<a name="ln533">    auto* skip_list_bucket_header =</a>
+<a name="ln534">        reinterpret_cast&lt;SkipListBucketHeader*&gt;(header);</a>
+<a name="ln535">    assert(skip_list_bucket_header-&gt;Counting_header.next.load(</a>
+<a name="ln536">               std::memory_order_relaxed) == header);</a>
+<a name="ln537">    return skip_list_bucket_header;</a>
+<a name="ln538">  }</a>
+<a name="ln539">  assert(header-&gt;GetNumEntries() &lt;= threshold_use_skiplist_);</a>
+<a name="ln540">  return nullptr;</a>
+<a name="ln541">}</a>
+<a name="ln542"> </a>
+<a name="ln543">Node* HashLinkListRep::GetLinkListFirstNode(Pointer* first_next_pointer) const {</a>
+<a name="ln544">  if (first_next_pointer == nullptr) {</a>
+<a name="ln545">    return nullptr;</a>
+<a name="ln546">  }</a>
+<a name="ln547">  if (first_next_pointer-&gt;load(std::memory_order_relaxed) == nullptr) {</a>
+<a name="ln548">    // Single entry bucket</a>
+<a name="ln549">    return reinterpret_cast&lt;Node*&gt;(first_next_pointer);</a>
+<a name="ln550">  }</a>
+<a name="ln551">  // Counting header</a>
+<a name="ln552">  BucketHeader* header = reinterpret_cast&lt;BucketHeader*&gt;(first_next_pointer);</a>
+<a name="ln553">  if (!header-&gt;IsSkipListBucket()) {</a>
+<a name="ln554">    assert(header-&gt;GetNumEntries() &lt;= threshold_use_skiplist_);</a>
+<a name="ln555">    return reinterpret_cast&lt;Node*&gt;(</a>
+<a name="ln556">        header-&gt;next.load(std::memory_order_acquire));</a>
+<a name="ln557">  }</a>
+<a name="ln558">  assert(header-&gt;GetNumEntries() &gt; threshold_use_skiplist_);</a>
+<a name="ln559">  return nullptr;</a>
+<a name="ln560">}</a>
+<a name="ln561"> </a>
+<a name="ln562">void HashLinkListRep::Insert(KeyHandle handle) {</a>
+<a name="ln563">  Node* x = static_cast&lt;Node*&gt;(handle);</a>
+<a name="ln564">  assert(!Contains(x-&gt;key));</a>
+<a name="ln565">  Slice internal_key = GetLengthPrefixedSlice(x-&gt;key);</a>
+<a name="ln566">  auto transformed = GetPrefix(internal_key);</a>
+<a name="ln567">  auto&amp; bucket = buckets_[GetHash(transformed)];</a>
+<a name="ln568">  Pointer* first_next_pointer =</a>
+<a name="ln569">      static_cast&lt;Pointer*&gt;(bucket.load(std::memory_order_relaxed));</a>
+<a name="ln570"> </a>
+<a name="ln571">  if (first_next_pointer == nullptr) {</a>
+<a name="ln572">    // Case 1. empty bucket</a>
+<a name="ln573">    // NoBarrier_SetNext() suffices since we will add a barrier when</a>
+<a name="ln574">    // we publish a pointer to &quot;x&quot; in prev[i].</a>
+<a name="ln575">    x-&gt;NoBarrier_SetNext(nullptr);</a>
+<a name="ln576">    bucket.store(x, std::memory_order_release);</a>
+<a name="ln577">    return;</a>
+<a name="ln578">  }</a>
+<a name="ln579"> </a>
+<a name="ln580">  BucketHeader* header = nullptr;</a>
+<a name="ln581">  if (first_next_pointer-&gt;load(std::memory_order_relaxed) == nullptr) {</a>
+<a name="ln582">    // Case 2. only one entry in the bucket</a>
+<a name="ln583">    // Need to convert to a Counting bucket and turn to case 4.</a>
+<a name="ln584">    Node* first = reinterpret_cast&lt;Node*&gt;(first_next_pointer);</a>
+<a name="ln585">    // Need to add a bucket header.</a>
+<a name="ln586">    // We have to first convert it to a bucket with header before inserting</a>
+<a name="ln587">    // the new node. Otherwise, we might need to change next pointer of first.</a>
+<a name="ln588">    // In that case, a reader might sees the next pointer is NULL and wrongly</a>
+<a name="ln589">    // think the node is a bucket header.</a>
+<a name="ln590">    auto* mem = allocator_-&gt;AllocateAligned(sizeof(BucketHeader));</a>
+<a name="ln591">    header = new (mem) BucketHeader(first, 1);</a>
+<a name="ln592">    bucket.store(header, std::memory_order_release);</a>
+<a name="ln593">  } else {</a>
+<a name="ln594">    header = reinterpret_cast&lt;BucketHeader*&gt;(first_next_pointer);</a>
+<a name="ln595">    if (header-&gt;IsSkipListBucket()) {</a>
+<a name="ln596">      // Case 4. Bucket is already a skip list</a>
+<a name="ln597">      assert(header-&gt;GetNumEntries() &gt; threshold_use_skiplist_);</a>
+<a name="ln598">      auto* skip_list_bucket_header =</a>
+<a name="ln599">          reinterpret_cast&lt;SkipListBucketHeader*&gt;(header);</a>
+<a name="ln600">      // Only one thread can execute Insert() at one time. No need to do atomic</a>
+<a name="ln601">      // incremental.</a>
+<a name="ln602">      skip_list_bucket_header-&gt;Counting_header.IncNumEntries();</a>
+<a name="ln603">      skip_list_bucket_header-&gt;skip_list.Insert(x-&gt;key);</a>
+<a name="ln604">      return;</a>
+<a name="ln605">    }</a>
+<a name="ln606">  }</a>
+<a name="ln607"> </a>
+<a name="ln608">  if (bucket_entries_logging_threshold_ &gt; 0 &amp;&amp;</a>
+<a name="ln609">      header-&gt;GetNumEntries() ==</a>
+<a name="ln610">          static_cast&lt;uint32_t&gt;(bucket_entries_logging_threshold_)) {</a>
+<a name="ln611">    RINFO(logger_, &quot;HashLinkedList bucket %&quot; ROCKSDB_PRIszt</a>
+<a name="ln612">                  &quot; has more than %d &quot;</a>
+<a name="ln613">                  &quot;entries. Key to insert: %s&quot;,</a>
+<a name="ln614">         GetHash(transformed), header-&gt;GetNumEntries(),</a>
+<a name="ln615">         GetLengthPrefixedSlice(x-&gt;key).ToString(true).c_str());</a>
+<a name="ln616">  }</a>
+<a name="ln617"> </a>
+<a name="ln618">  if (header-&gt;GetNumEntries() == threshold_use_skiplist_) {</a>
+<a name="ln619">    // Case 3. number of entries reaches the threshold so need to convert to</a>
+<a name="ln620">    // skip list.</a>
+<a name="ln621">    LinkListIterator bucket_iter(</a>
+<a name="ln622">        this, reinterpret_cast&lt;Node*&gt;(</a>
+<a name="ln623">                  first_next_pointer-&gt;load(std::memory_order_relaxed)));</a>
+<a name="ln624">    auto mem = allocator_-&gt;AllocateAligned(sizeof(SkipListBucketHeader));</a>
+<a name="ln625">    SkipListBucketHeader* new_skip_list_header = new (mem)</a>
+<a name="ln626">        SkipListBucketHeader(compare_, allocator_, header-&gt;GetNumEntries() + 1);</a>
+<a name="ln627">    auto&amp; skip_list = new_skip_list_header-&gt;skip_list;</a>
+<a name="ln628"> </a>
+<a name="ln629">    // Add all current entries to the skip list</a>
+<a name="ln630">    for (bucket_iter.SeekToHead(); bucket_iter.Valid(); bucket_iter.Next()) {</a>
+<a name="ln631">      skip_list.Insert(bucket_iter.key());</a>
+<a name="ln632">    }</a>
+<a name="ln633"> </a>
+<a name="ln634">    // insert the new entry</a>
+<a name="ln635">    skip_list.Insert(x-&gt;key);</a>
+<a name="ln636">    // Set the bucket</a>
+<a name="ln637">    bucket.store(new_skip_list_header, std::memory_order_release);</a>
+<a name="ln638">  } else {</a>
+<a name="ln639">    // Case 5. Need to insert to the sorted linked list without changing the</a>
+<a name="ln640">    // header.</a>
+<a name="ln641">    Node* first =</a>
+<a name="ln642">        reinterpret_cast&lt;Node*&gt;(header-&gt;next.load(std::memory_order_relaxed));</a>
+<a name="ln643">    assert(first != nullptr);</a>
+<a name="ln644">    // Advance counter unless the bucket needs to be advanced to skip list.</a>
+<a name="ln645">    // In that case, we need to make sure the previous count never exceeds</a>
+<a name="ln646">    // threshold_use_skiplist_ to avoid readers to cast to wrong format.</a>
+<a name="ln647">    header-&gt;IncNumEntries();</a>
+<a name="ln648"> </a>
+<a name="ln649">    Node* cur = first;</a>
+<a name="ln650">    Node* prev = nullptr;</a>
+<a name="ln651">    while (true) {</a>
+<a name="ln652">      if (cur == nullptr) {</a>
+<a name="ln653">        break;</a>
+<a name="ln654">      }</a>
+<a name="ln655">      Node* next = cur-&gt;Next();</a>
+<a name="ln656">      // Make sure the lists are sorted.</a>
+<a name="ln657">      // If x points to head_ or next points nullptr, it is trivially satisfied.</a>
+<a name="ln658">      assert((cur == first) || (next == nullptr) ||</a>
+<a name="ln659">             KeyIsAfterNode(next-&gt;key, cur));</a>
+<a name="ln660">      if (KeyIsAfterNode(internal_key, cur)) {</a>
+<a name="ln661">        // Keep searching in this list</a>
+<a name="ln662">        prev = cur;</a>
+<a name="ln663">        cur = next;</a>
+<a name="ln664">      } else {</a>
+<a name="ln665">        break;</a>
+<a name="ln666">      }</a>
+<a name="ln667">    }</a>
+<a name="ln668"> </a>
+<a name="ln669">    // Our data structure does not allow duplicate insertion</a>
+<a name="ln670">    assert(cur == nullptr || !Equal(x-&gt;key, cur-&gt;key));</a>
+<a name="ln671"> </a>
+<a name="ln672">    // NoBarrier_SetNext() suffices since we will add a barrier when</a>
+<a name="ln673">    // we publish a pointer to &quot;x&quot; in prev[i].</a>
+<a name="ln674">    x-&gt;NoBarrier_SetNext(cur);</a>
+<a name="ln675"> </a>
+<a name="ln676">    if (prev) {</a>
+<a name="ln677">      prev-&gt;SetNext(x);</a>
+<a name="ln678">    } else {</a>
+<a name="ln679">      header-&gt;next.store(static_cast&lt;void*&gt;(x), std::memory_order_release);</a>
+<a name="ln680">    }</a>
+<a name="ln681">  }</a>
+<a name="ln682">}</a>
+<a name="ln683"> </a>
+<a name="ln684">bool HashLinkListRep::Contains(const char* key) const {</a>
+<a name="ln685">  Slice internal_key = GetLengthPrefixedSlice(key);</a>
+<a name="ln686"> </a>
+<a name="ln687">  auto transformed = GetPrefix(internal_key);</a>
+<a name="ln688">  auto bucket = GetBucket(transformed);</a>
+<a name="ln689">  if (bucket == nullptr) {</a>
+<a name="ln690">    return false;</a>
+<a name="ln691">  }</a>
+<a name="ln692"> </a>
+<a name="ln693">  SkipListBucketHeader* skip_list_header = GetSkipListBucketHeader(bucket);</a>
+<a name="ln694">  if (skip_list_header != nullptr) {</a>
+<a name="ln695">    return skip_list_header-&gt;skip_list.Contains(key);</a>
+<a name="ln696">  } else {</a>
+<a name="ln697">    return LinkListContains(GetLinkListFirstNode(bucket), internal_key);</a>
+<a name="ln698">  }</a>
+<a name="ln699">}</a>
+<a name="ln700"> </a>
+<a name="ln701">size_t HashLinkListRep::ApproximateMemoryUsage() {</a>
+<a name="ln702">  // Memory is always allocated from the allocator.</a>
+<a name="ln703">  return 0;</a>
+<a name="ln704">}</a>
+<a name="ln705"> </a>
+<a name="ln706">void HashLinkListRep::Get(const LookupKey&amp; k, void* callback_args,</a>
+<a name="ln707">                          bool (*callback_func)(void* arg, const char* entry)) {</a>
+<a name="ln708">  auto transformed = transform_-&gt;Transform(k.user_key());</a>
+<a name="ln709">  auto bucket = GetBucket(transformed);</a>
+<a name="ln710"> </a>
+<a name="ln711">  auto* skip_list_header = GetSkipListBucketHeader(bucket);</a>
+<a name="ln712">  if (skip_list_header != nullptr) {</a>
+<a name="ln713">    // Is a skip list</a>
+<a name="ln714">    MemtableSkipList::Iterator iter(&amp;skip_list_header-&gt;skip_list);</a>
+<a name="ln715">    for (iter.Seek(k.memtable_key().cdata());</a>
+<a name="ln716">         iter.Valid() &amp;&amp; callback_func(callback_args, iter.key());</a>
+<a name="ln717">         iter.Next()) {</a>
+<a name="ln718">    }</a>
+<a name="ln719">  } else {</a>
+<a name="ln720">    auto* link_list_head = GetLinkListFirstNode(bucket);</a>
+<a name="ln721">    if (link_list_head != nullptr) {</a>
+<a name="ln722">      LinkListIterator iter(this, link_list_head);</a>
+<a name="ln723">      for (iter.Seek(k.internal_key(), nullptr);</a>
+<a name="ln724">           iter.Valid() &amp;&amp; callback_func(callback_args, iter.key());</a>
+<a name="ln725">           iter.Next()) {</a>
+<a name="ln726">      }</a>
+<a name="ln727">    }</a>
+<a name="ln728">  }</a>
+<a name="ln729">}</a>
+<a name="ln730"> </a>
+<a name="ln731">MemTableRep::Iterator* HashLinkListRep::GetIterator(Arena* alloc_arena) {</a>
+<a name="ln732">  // allocate a new arena of similar size to the one currently in use</a>
+<a name="ln733">  Arena* new_arena = new Arena(allocator_-&gt;BlockSize());</a>
+<a name="ln734">  auto list = new MemtableSkipList(compare_, new_arena);</a>
+<a name="ln735">  HistogramImpl keys_per_bucket_hist;</a>
+<a name="ln736"> </a>
+<a name="ln737">  for (size_t i = 0; i &lt; bucket_size_; ++i) {</a>
+<a name="ln738">    int count = 0;</a>
+<a name="ln739">    auto* bucket = GetBucket(i);</a>
+<a name="ln740">    if (bucket != nullptr) {</a>
+<a name="ln741">      auto* skip_list_header = GetSkipListBucketHeader(bucket);</a>
+<a name="ln742">      if (skip_list_header != nullptr) {</a>
+<a name="ln743">        // Is a skip list</a>
+<a name="ln744">        MemtableSkipList::Iterator itr(&amp;skip_list_header-&gt;skip_list);</a>
+<a name="ln745">        for (itr.SeekToFirst(); itr.Valid(); itr.Next()) {</a>
+<a name="ln746">          list-&gt;Insert(itr.key());</a>
+<a name="ln747">          count++;</a>
+<a name="ln748">        }</a>
+<a name="ln749">      } else {</a>
+<a name="ln750">        auto* link_list_head = GetLinkListFirstNode(bucket);</a>
+<a name="ln751">        if (link_list_head != nullptr) {</a>
+<a name="ln752">          LinkListIterator itr(this, link_list_head);</a>
+<a name="ln753">          for (itr.SeekToHead(); itr.Valid(); itr.Next()) {</a>
+<a name="ln754">            list-&gt;Insert(itr.key());</a>
+<a name="ln755">            count++;</a>
+<a name="ln756">          }</a>
+<a name="ln757">        }</a>
+<a name="ln758">      }</a>
+<a name="ln759">    }</a>
+<a name="ln760">    if (if_log_bucket_dist_when_flash_) {</a>
+<a name="ln761">      keys_per_bucket_hist.Add(count);</a>
+<a name="ln762">    }</a>
+<a name="ln763">  }</a>
+<a name="ln764">  if (if_log_bucket_dist_when_flash_ &amp;&amp; logger_ != nullptr) {</a>
+<a name="ln765">    RINFO(logger_, &quot;hashLinkedList Entry distribution among buckets: %s&quot;,</a>
+<a name="ln766">        keys_per_bucket_hist.ToString().c_str());</a>
+<a name="ln767">  }</a>
+<a name="ln768"> </a>
+<a name="ln769">  if (alloc_arena == nullptr) {</a>
+<a name="ln770">    return new FullListIterator(list, new_arena);</a>
+<a name="ln771">  } else {</a>
+<a name="ln772">    auto mem = alloc_arena-&gt;AllocateAligned(sizeof(FullListIterator));</a>
+<a name="ln773">    return new (mem) FullListIterator(list, new_arena);</a>
+<a name="ln774">  }</a>
+<a name="ln775">}</a>
+<a name="ln776"> </a>
+<a name="ln777">MemTableRep::Iterator* HashLinkListRep::GetDynamicPrefixIterator(</a>
+<a name="ln778">    Arena* alloc_arena) {</a>
+<a name="ln779">  if (alloc_arena == nullptr) {</a>
+<a name="ln780">    return new DynamicIterator(*this);</a>
+<a name="ln781">  } else {</a>
+<a name="ln782">    auto mem = alloc_arena-&gt;AllocateAligned(sizeof(DynamicIterator));</a>
+<a name="ln783">    return new (mem) DynamicIterator(*this);</a>
+<a name="ln784">  }</a>
+<a name="ln785">}</a>
+<a name="ln786"> </a>
+<a name="ln787">bool HashLinkListRep::LinkListContains(Node* head,</a>
+<a name="ln788">                                       const Slice&amp; user_key) const {</a>
+<a name="ln789">  Node* x = FindGreaterOrEqualInBucket(head, user_key);</a>
+<a name="ln790">  return (x != nullptr &amp;&amp; Equal(user_key, x-&gt;key));</a>
+<a name="ln791">}</a>
+<a name="ln792"> </a>
+<a name="ln793">Node* HashLinkListRep::FindGreaterOrEqualInBucket(Node* head,</a>
+<a name="ln794">                                                  const Slice&amp; key) const {</a>
+<a name="ln795">  Node* x = head;</a>
+<a name="ln796">  while (true) {</a>
+<a name="ln797">    if (x == nullptr) {</a>
+<a name="ln798">      return x;</a>
+<a name="ln799">    }</a>
+<a name="ln800">    Node* next = x-&gt;Next();</a>
+<a name="ln801">    // Make sure the lists are sorted.</a>
+<a name="ln802">    // If x points to head_ or next points nullptr, it is trivially satisfied.</a>
+<a name="ln803">    assert((x == head) || (next == nullptr) || KeyIsAfterNode(next-&gt;key, x));</a>
+<a name="ln804">    if (KeyIsAfterNode(key, x)) {</a>
+<a name="ln805">      // Keep searching in this list</a>
+<a name="ln806">      x = next;</a>
+<a name="ln807">    } else {</a>
+<a name="ln808">      break;</a>
+<a name="ln809">    }</a>
+<a name="ln810">  }</a>
+<a name="ln811">  return x;</a>
+<a name="ln812">}</a>
+<a name="ln813"> </a>
+<a name="ln814">} // anon namespace</a>
+<a name="ln815"> </a>
+<a name="ln816">MemTableRep* HashLinkListRepFactory::CreateMemTableRep(</a>
+<a name="ln817">    const MemTableRep::KeyComparator&amp; compare, MemTableAllocator* allocator,</a>
+<a name="ln818">    const SliceTransform* transform, Logger* logger) {</a>
+<a name="ln819">  return new HashLinkListRep(compare, allocator, transform, bucket_count_,</a>
+<a name="ln820">                             threshold_use_skiplist_, huge_page_tlb_size_,</a>
+<a name="ln821">                             logger, bucket_entries_logging_threshold_,</a>
+<a name="ln822">                             if_log_bucket_dist_when_flash_);</a>
+<a name="ln823">}</a>
+<a name="ln824"> </a>
+<a name="ln825">MemTableRepFactory* NewHashLinkListRepFactory(</a>
+<a name="ln826">    size_t bucket_count, size_t huge_page_tlb_size,</a>
+<a name="ln827">    int bucket_entries_logging_threshold, bool if_log_bucket_dist_when_flash,</a>
+<a name="ln828">    uint32_t threshold_use_skiplist) {</a>
+<a name="ln829">  return new HashLinkListRepFactory(</a>
+<a name="ln830">      bucket_count, threshold_use_skiplist, huge_page_tlb_size,</a>
+<a name="ln831">      bucket_entries_logging_threshold, if_log_bucket_dist_when_flash);</a>
+<a name="ln832">}</a>
+<a name="ln833"> </a>
+<a name="ln834">} // namespace rocksdb</a>
+<a name="ln835">#endif  // ROCKSDB_LITE</a>
+
+</code></pre>
+<div class="balloon" rel="375"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v524/" target="_blank">V524</a> It is odd that the body of 'SeekToLast' function is fully equivalent to the body of 'SeekToFirst' function.</p></div>
+<div class="balloon" rel="100"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: next_, key.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

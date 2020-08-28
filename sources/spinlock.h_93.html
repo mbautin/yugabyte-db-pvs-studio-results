@@ -1,0 +1,210 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>spinlock.h</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">/* Copyright (c) 2006, Google Inc.</a>
+<a name="ln2"> * All rights reserved.</a>
+<a name="ln3"> *</a>
+<a name="ln4"> * Redistribution and use in source and binary forms, with or without</a>
+<a name="ln5"> * modification, are permitted provided that the following conditions are</a>
+<a name="ln6"> * met:</a>
+<a name="ln7"> *</a>
+<a name="ln8"> *     * Redistributions of source code must retain the above copyright</a>
+<a name="ln9"> * notice, this list of conditions and the following disclaimer.</a>
+<a name="ln10"> *     * Redistributions in binary form must reproduce the above</a>
+<a name="ln11"> * copyright notice, this list of conditions and the following disclaimer</a>
+<a name="ln12"> * in the documentation and/or other materials provided with the</a>
+<a name="ln13"> * distribution.</a>
+<a name="ln14"> *     * Neither the name of Google Inc. nor the names of its</a>
+<a name="ln15"> * contributors may be used to endorse or promote products derived from</a>
+<a name="ln16"> * this software without specific prior written permission.</a>
+<a name="ln17"> *</a>
+<a name="ln18"> * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS</a>
+<a name="ln19"> * &quot;AS IS&quot; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT</a>
+<a name="ln20"> * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR</a>
+<a name="ln21"> * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT</a>
+<a name="ln22"> * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,</a>
+<a name="ln23"> * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT</a>
+<a name="ln24"> * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,</a>
+<a name="ln25"> * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY</a>
+<a name="ln26"> * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT</a>
+<a name="ln27"> * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE</a>
+<a name="ln28"> * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.</a>
+<a name="ln29"> *</a>
+<a name="ln30"> * The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln31"> *</a>
+<a name="ln32"> * Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln33"> *</a>
+<a name="ln34"> * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln35"> * in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln36"> *</a>
+<a name="ln37"> * http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln38"> *</a>
+<a name="ln39"> * Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln40"> * is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln41"> * or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln42"> * under the License.</a>
+<a name="ln43"> *</a>
+<a name="ln44"> *</a>
+<a name="ln45"> * ---</a>
+<a name="ln46"> * Author: Sanjay Ghemawat</a>
+<a name="ln47"> */</a>
+<a name="ln48"> </a>
+<a name="ln49">// SpinLock is async signal safe.</a>
+<a name="ln50">// If used within a signal handler, all lock holders</a>
+<a name="ln51">// should block the signal even outside the signal handler.</a>
+<a name="ln52"> </a>
+<a name="ln53">#ifndef YB_GUTIL_SPINLOCK_H</a>
+<a name="ln54">#define YB_GUTIL_SPINLOCK_H</a>
+<a name="ln55"> </a>
+<a name="ln56">#include &quot;yb/gutil/atomicops.h&quot;</a>
+<a name="ln57">#include &quot;yb/gutil/basictypes.h&quot;</a>
+<a name="ln58">#include &quot;yb/gutil/dynamic_annotations.h&quot;</a>
+<a name="ln59">#include &quot;yb/gutil/thread_annotations.h&quot;</a>
+<a name="ln60"> </a>
+<a name="ln61">// This isn't originally in the base:: namespace in tcmalloc,</a>
+<a name="ln62">// but tcmalloc inadvertently exports these symbols. So, if we</a>
+<a name="ln63">// don't namespace it differently, we conflict.</a>
+<a name="ln64">namespace base {</a>
+<a name="ln65"> </a>
+<a name="ln66">class CAPABILITY(&quot;mutex&quot;) SpinLock {</a>
+<a name="ln67"> public:</a>
+<a name="ln68">  SpinLock() : lockword_(kSpinLockFree) { }</a>
+<a name="ln69"> </a>
+<a name="ln70">  // Special constructor for use with static SpinLock objects.  E.g.,</a>
+<a name="ln71">  //</a>
+<a name="ln72">  //    static SpinLock lock(base::LINKER_INITIALIZED);</a>
+<a name="ln73">  //</a>
+<a name="ln74">  // When intialized using this constructor, we depend on the fact</a>
+<a name="ln75">  // that the linker has already initialized the memory appropriately.</a>
+<a name="ln76">  // A SpinLock constructed like this can be freely used from global</a>
+<a name="ln77">  // initializers without worrying about the order in which global</a>
+<a name="ln78">  // initializers run.</a>
+<a name="ln79">  explicit SpinLock(base::LinkerInitialized /*x*/) {</a>
+<a name="ln80">    // Does nothing; lockword_ is already initialized</a>
+<a name="ln81">  }</a>
+<a name="ln82"> </a>
+<a name="ln83">  // Acquire this SpinLock.</a>
+<a name="ln84">  // TODO(csilvers): uncomment the annotation when we figure out how to</a>
+<a name="ln85">  //                 support this macro with 0 args (see thread_annotations.h)</a>
+<a name="ln86">  inline void Lock() ACQUIRE() {</a>
+<a name="ln87">    if (base::subtle::Acquire_CompareAndSwap(&amp;lockword_, kSpinLockFree,</a>
+<a name="ln88">                                             kSpinLockHeld) != kSpinLockFree) {</a>
+<a name="ln89">      SlowLock();</a>
+<a name="ln90">    }</a>
+<a name="ln91">    ANNOTATE_RWLOCK_ACQUIRED(this, 1);</a>
+<a name="ln92">  }</a>
+<a name="ln93"> </a>
+<a name="ln94">  // Try to acquire this SpinLock without blocking and return true if the</a>
+<a name="ln95">  // acquisition was successful.  If the lock was not acquired, false is</a>
+<a name="ln96">  // returned.  If this SpinLock is free at the time of the call, TryLock</a>
+<a name="ln97">  // will return true with high probability.</a>
+<a name="ln98">  inline bool TryLock() TRY_ACQUIRE(true) {</a>
+<a name="ln99">    bool res =</a>
+<a name="ln100">        (base::subtle::Acquire_CompareAndSwap(&amp;lockword_, kSpinLockFree,</a>
+<a name="ln101">                                              kSpinLockHeld) == kSpinLockFree);</a>
+<a name="ln102">    if (res) {</a>
+<a name="ln103">      ANNOTATE_RWLOCK_ACQUIRED(this, 1);</a>
+<a name="ln104">    }</a>
+<a name="ln105">    return res;</a>
+<a name="ln106">  }</a>
+<a name="ln107"> </a>
+<a name="ln108">  // Release this SpinLock, which must be held by the calling thread.</a>
+<a name="ln109">  // TODO(csilvers): uncomment the annotation when we figure out how to</a>
+<a name="ln110">  //                 support this macro with 0 args (see thread_annotations.h)</a>
+<a name="ln111">  inline void Unlock() RELEASE() {</a>
+<a name="ln112">    ANNOTATE_RWLOCK_RELEASED(this, 1);</a>
+<a name="ln113">    uint64 wait_cycles = static_cast&lt;uint64&gt;(</a>
+<a name="ln114">        base::subtle::Release_AtomicExchange(&amp;lockword_, kSpinLockFree));</a>
+<a name="ln115">    if (wait_cycles != kSpinLockHeld) {</a>
+<a name="ln116">      // Collect contentionz profile info, and speed the wakeup of any waiter.</a>
+<a name="ln117">      // The wait_cycles value indicates how long this thread spent waiting</a>
+<a name="ln118">      // for the lock.</a>
+<a name="ln119">      SlowUnlock(wait_cycles);</a>
+<a name="ln120">    }</a>
+<a name="ln121">  }</a>
+<a name="ln122"> </a>
+<a name="ln123">  // Determine if the lock is held.  When the lock is held by the invoking</a>
+<a name="ln124">  // thread, true will always be returned. Intended to be used as</a>
+<a name="ln125">  // CHECK(lock.IsHeld()).</a>
+<a name="ln126">  inline bool IsHeld() const {</a>
+<a name="ln127">    return base::subtle::NoBarrier_Load(&amp;lockword_) != kSpinLockFree;</a>
+<a name="ln128">  }</a>
+<a name="ln129"> </a>
+<a name="ln130">  static const base::LinkerInitialized LINKER_INITIALIZED;  // backwards compat</a>
+<a name="ln131"> private:</a>
+<a name="ln132">  enum { kSpinLockFree = 0 };</a>
+<a name="ln133">  enum { kSpinLockHeld = 1 };</a>
+<a name="ln134">  enum { kSpinLockSleeper = 2 };</a>
+<a name="ln135"> </a>
+<a name="ln136">  volatile Atomic32 lockword_;</a>
+<a name="ln137"> </a>
+<a name="ln138">  void SlowLock();</a>
+<a name="ln139">  void SlowUnlock(uint64 wait_cycles);</a>
+<a name="ln140">  Atomic32 SpinLoop(int64 initial_wait_timestamp, Atomic32* wait_cycles);</a>
+<a name="ln141">  inline int32 CalculateWaitCycles(int64 wait_start_time);</a>
+<a name="ln142"> </a>
+<a name="ln143">  DISALLOW_COPY_AND_ASSIGN(SpinLock);</a>
+<a name="ln144">};</a>
+<a name="ln145"> </a>
+<a name="ln146">// Corresponding locker object that arranges to acquire a spinlock for</a>
+<a name="ln147">// the duration of a C++ scope.</a>
+<a name="ln148">class SCOPED_CAPABILITY SpinLockHolder {</a>
+<a name="ln149"> private:</a>
+<a name="ln150">  SpinLock* lock_;</a>
+<a name="ln151"> public:</a>
+<a name="ln152">  inline explicit SpinLockHolder(SpinLock* l) ACQUIRE(l)</a>
+<a name="ln153">      : lock_(l) {</a>
+<a name="ln154">    l-&gt;Lock();</a>
+<a name="ln155">  }</a>
+<a name="ln156"> </a>
+<a name="ln157">  inline ~SpinLockHolder() RELEASE() { lock_-&gt;Unlock(); }</a>
+<a name="ln158">};</a>
+<a name="ln159">// Catch bug where variable name is omitted, e.g. SpinLockHolder (&amp;lock);</a>
+<a name="ln160">#define SpinLockHolder(x) COMPILE_ASSERT(0, spin_lock_decl_missing_var_name)</a>
+<a name="ln161"> </a>
+<a name="ln162">} // namespace base</a>
+<a name="ln163"> </a>
+<a name="ln164">#endif  // YB_GUTIL_SPINLOCK_H</a>
+
+</code></pre>
+<div class="balloon" rel="79"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: lockword_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

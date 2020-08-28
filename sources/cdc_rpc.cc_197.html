@@ -1,0 +1,322 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>cdc_rpc.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/cdc/cdc_rpc.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/cdc/cdc_service.pb.h&quot;</a>
+<a name="ln19">#include &quot;yb/cdc/cdc_service.proxy.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln22">#include &quot;yb/client/client-internal.h&quot;</a>
+<a name="ln23">#include &quot;yb/client/meta_cache.h&quot;</a>
+<a name="ln24">#include &quot;yb/client/tablet_rpc.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/rpc/rpc.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/tserver/tserver_service.pb.h&quot;</a>
+<a name="ln29">#include &quot;yb/tserver/tserver_service.proxy.h&quot;</a>
+<a name="ln30">#include &quot;yb/tserver/tserver.pb.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32"> </a>
+<a name="ln33">using namespace std::literals;</a>
+<a name="ln34"> </a>
+<a name="ln35">using yb::tserver::TabletServerErrorPB;</a>
+<a name="ln36">using yb::tserver::TabletServerServiceProxy;</a>
+<a name="ln37">using yb::tserver::WriteRequestPB;</a>
+<a name="ln38">using yb::tserver::WriteResponsePB;</a>
+<a name="ln39"> </a>
+<a name="ln40">namespace yb {</a>
+<a name="ln41">namespace cdc {</a>
+<a name="ln42"> </a>
+<a name="ln43">class CDCWriteRpc : public rpc::Rpc, public client::internal::TabletRpc {</a>
+<a name="ln44"> public:</a>
+<a name="ln45">  CDCWriteRpc(CoarseTimePoint deadline,</a>
+<a name="ln46">              client::internal::RemoteTablet *tablet,</a>
+<a name="ln47">              client::YBClient *client,</a>
+<a name="ln48">              WriteRequestPB *req,</a>
+<a name="ln49">              WriteCDCRecordCallback callback,</a>
+<a name="ln50">              bool use_local_tserver)</a>
+<a name="ln51">      : rpc::Rpc(deadline, client-&gt;messenger(), &amp;client-&gt;proxy_cache()),</a>
+<a name="ln52">        trace_(new Trace),</a>
+<a name="ln53">        invoker_(use_local_tserver /* local_tserver_only */,</a>
+<a name="ln54">                 false /* consistent_prefix */,</a>
+<a name="ln55">                 client,</a>
+<a name="ln56">                 this,</a>
+<a name="ln57">                 this,</a>
+<a name="ln58">                 tablet,</a>
+<a name="ln59">                 mutable_retrier(),</a>
+<a name="ln60">                 trace_.get()),</a>
+<a name="ln61">        callback_(std::move(callback)) {</a>
+<a name="ln62">    req_.Swap(req);</a>
+<a name="ln63">  }</a>
+<a name="ln64"> </a>
+<a name="ln65">  virtual ~CDCWriteRpc() {</a>
+<a name="ln66">    CHECK(called_);</a>
+<a name="ln67">  }</a>
+<a name="ln68"> </a>
+<a name="ln69">  void SendRpc() override {</a>
+<a name="ln70">    invoker_.Execute(tablet_id());</a>
+<a name="ln71">  }</a>
+<a name="ln72"> </a>
+<a name="ln73">  void Finished(const Status &amp;status) override {</a>
+<a name="ln74">    Status new_status = status;</a>
+<a name="ln75">    if (invoker_.Done(&amp;new_status)) {</a>
+<a name="ln76">      InvokeCallback(new_status);</a>
+<a name="ln77">    }</a>
+<a name="ln78">  }</a>
+<a name="ln79"> </a>
+<a name="ln80">  void Failed(const Status &amp;status) override {}</a>
+<a name="ln81"> </a>
+<a name="ln82">  void Abort() override {</a>
+<a name="ln83">    rpc::Rpc::Abort();</a>
+<a name="ln84">  }</a>
+<a name="ln85"> </a>
+<a name="ln86">  const TabletServerErrorPB *response_error() const override {</a>
+<a name="ln87">    return resp_.has_error() ? &amp;resp_.error() : nullptr;</a>
+<a name="ln88">  }</a>
+<a name="ln89"> </a>
+<a name="ln90"> private:</a>
+<a name="ln91">  void SendRpcToTserver(int attempt_num) override {</a>
+<a name="ln92">    InvokeAsync(invoker_.proxy().get(),</a>
+<a name="ln93">                PrepareController(),</a>
+<a name="ln94">                std::bind(&amp;CDCWriteRpc::Finished, this, Status::OK()));</a>
+<a name="ln95">  }</a>
+<a name="ln96"> </a>
+<a name="ln97">  const std::string &amp;tablet_id() const {</a>
+<a name="ln98">    return req_.tablet_id();</a>
+<a name="ln99">  }</a>
+<a name="ln100"> </a>
+<a name="ln101">  std::string ToString() const override {</a>
+<a name="ln102">    return Format(&quot;CDCWriteRpc: $0, retrier: $1&quot;, req_, retrier());</a>
+<a name="ln103">  }</a>
+<a name="ln104"> </a>
+<a name="ln105">  void InvokeCallback(const Status &amp;status) {</a>
+<a name="ln106">    if (!called_) {</a>
+<a name="ln107">      called_ = true;</a>
+<a name="ln108">      callback_(status, resp_);</a>
+<a name="ln109">    } else {</a>
+<a name="ln110">      LOG(WARNING) &lt;&lt; &quot;Multiple invocation of CDCWriteRpc: &quot;</a>
+<a name="ln111">                   &lt;&lt; status.ToString() &lt;&lt; &quot; : &quot; &lt;&lt; resp_.DebugString();</a>
+<a name="ln112">    }</a>
+<a name="ln113">  }</a>
+<a name="ln114"> </a>
+<a name="ln115">  void InvokeAsync(TabletServerServiceProxy *proxy,</a>
+<a name="ln116">                   rpc::RpcController *controller,</a>
+<a name="ln117">                   rpc::ResponseCallback callback) {</a>
+<a name="ln118">    proxy-&gt;WriteAsync(req_, &amp;resp_, controller, std::move(callback));</a>
+<a name="ln119">  }</a>
+<a name="ln120"> </a>
+<a name="ln121">  TracePtr trace_;</a>
+<a name="ln122">  client::internal::TabletInvoker invoker_;</a>
+<a name="ln123">  WriteRequestPB req_;</a>
+<a name="ln124">  WriteResponsePB resp_;</a>
+<a name="ln125">  WriteCDCRecordCallback callback_;</a>
+<a name="ln126">  bool called_ = false;</a>
+<a name="ln127">};</a>
+<a name="ln128"> </a>
+<a name="ln129">rpc::RpcCommandPtr CreateCDCWriteRpc(</a>
+<a name="ln130">    CoarseTimePoint deadline,</a>
+<a name="ln131">    client::internal::RemoteTablet* tablet,</a>
+<a name="ln132">    client::YBClient* client,</a>
+<a name="ln133">    WriteRequestPB* req,</a>
+<a name="ln134">    WriteCDCRecordCallback callback,</a>
+<a name="ln135">    bool use_local_tserver) {</a>
+<a name="ln136">  return std::make_shared&lt;CDCWriteRpc&gt;(</a>
+<a name="ln137">      deadline, tablet, client, req, std::move(callback), use_local_tserver);</a>
+<a name="ln138">}</a>
+<a name="ln139"> </a>
+<a name="ln140">///////////////////////////////////////////////////////////////////////////////</a>
+<a name="ln141">///////////////////////////////////////////////////////////////////////////////</a>
+<a name="ln142">///////////////////////////////////////////////////////////////////////////////</a>
+<a name="ln143"> </a>
+<a name="ln144">class CDCReadRpc : public rpc::Rpc, public client::internal::TabletRpc {</a>
+<a name="ln145"> public:</a>
+<a name="ln146">  CDCReadRpc(CoarseTimePoint deadline,</a>
+<a name="ln147">             client::internal::RemoteTablet *tablet,</a>
+<a name="ln148">             client::YBClient *client,</a>
+<a name="ln149">             GetChangesRequestPB* req,</a>
+<a name="ln150">             GetChangesCDCRpcCallback callback)</a>
+<a name="ln151">      : rpc::Rpc(deadline, client-&gt;messenger(), &amp;client-&gt;proxy_cache()),</a>
+<a name="ln152">        trace_(new Trace),</a>
+<a name="ln153">        invoker_(false /* local_tserver_only */,</a>
+<a name="ln154">                 false /* consistent_prefix */,</a>
+<a name="ln155">                 client,</a>
+<a name="ln156">                 this,</a>
+<a name="ln157">                 this,</a>
+<a name="ln158">                 tablet,</a>
+<a name="ln159">                 mutable_retrier(),</a>
+<a name="ln160">                 trace_.get()),</a>
+<a name="ln161">        callback_(std::move(callback)) {</a>
+<a name="ln162">    req_.Swap(req);</a>
+<a name="ln163">  }</a>
+<a name="ln164"> </a>
+<a name="ln165">  virtual ~CDCReadRpc() {</a>
+<a name="ln166">    CHECK(called_);</a>
+<a name="ln167">  }</a>
+<a name="ln168"> </a>
+<a name="ln169">  void SendRpc() override {</a>
+<a name="ln170">    invoker_.Execute(tablet_id());</a>
+<a name="ln171">  }</a>
+<a name="ln172"> </a>
+<a name="ln173">  void Finished(const Status &amp;status) override {</a>
+<a name="ln174">    auto retained = shared_from_this(); // Ensure we don't destruct until after the callback.</a>
+<a name="ln175">    Status new_status = status;</a>
+<a name="ln176">    if (invoker_.Done(&amp;new_status)) {</a>
+<a name="ln177">      InvokeCallback(new_status);</a>
+<a name="ln178">    }</a>
+<a name="ln179">  }</a>
+<a name="ln180"> </a>
+<a name="ln181">  void Failed(const Status &amp;status) override { }</a>
+<a name="ln182"> </a>
+<a name="ln183">  void Abort() override {</a>
+<a name="ln184">    rpc::Rpc::Abort();</a>
+<a name="ln185">  }</a>
+<a name="ln186"> </a>
+<a name="ln187">  const tserver::TabletServerErrorPB *response_error() const override {</a>
+<a name="ln188">    // Clear the contents of last_error_, since this function is invoked again on retry.</a>
+<a name="ln189">    last_error_.Clear();</a>
+<a name="ln190"> </a>
+<a name="ln191">    if (resp_.has_error()) {</a>
+<a name="ln192">      if (resp_.error().has_code()) {</a>
+<a name="ln193">        // Map CDC Errors to TabletServer Errors.</a>
+<a name="ln194">        switch (resp_.error().code()) {</a>
+<a name="ln195">          case CDCErrorPB::TABLET_NOT_FOUND:</a>
+<a name="ln196">            last_error_.set_code(tserver::TabletServerErrorPB::TABLET_NOT_FOUND);</a>
+<a name="ln197">            if (resp_.error().has_status()) {</a>
+<a name="ln198">              last_error_.mutable_status()-&gt;CopyFrom(resp_.error().status());</a>
+<a name="ln199">            }</a>
+<a name="ln200">            return &amp;last_error_;</a>
+<a name="ln201">          case CDCErrorPB::LEADER_NOT_READY:</a>
+<a name="ln202">            last_error_.set_code(tserver::TabletServerErrorPB::LEADER_NOT_READY_TO_SERVE);</a>
+<a name="ln203">            if (resp_.error().has_status()) {</a>
+<a name="ln204">              last_error_.mutable_status()-&gt;CopyFrom(resp_.error().status());</a>
+<a name="ln205">            }</a>
+<a name="ln206">            return &amp;last_error_;</a>
+<a name="ln207">          // TS.STALE_FOLLOWER =&gt; pattern not used.</a>
+<a name="ln208">          default:</a>
+<a name="ln209">            break;</a>
+<a name="ln210">        }</a>
+<a name="ln211">      }</a>
+<a name="ln212">    }</a>
+<a name="ln213">    return nullptr;</a>
+<a name="ln214">  }</a>
+<a name="ln215"> </a>
+<a name="ln216">  void SendRpcToTserver(int attempt_num) override {</a>
+<a name="ln217">    // should be fast because the proxy cache has EndPoint from the tablet lookup.</a>
+<a name="ln218">    cdc_proxy_ = std::make_shared&lt;CDCServiceProxy&gt;(</a>
+<a name="ln219">       &amp;invoker_.client().proxy_cache(), invoker_.ProxyEndpoint());</a>
+<a name="ln220"> </a>
+<a name="ln221">    InvokeAsync(cdc_proxy_.get(),</a>
+<a name="ln222">        PrepareController(),</a>
+<a name="ln223">        std::bind(&amp;CDCReadRpc::Finished, this, Status::OK()));</a>
+<a name="ln224">  }</a>
+<a name="ln225"> </a>
+<a name="ln226"> private:</a>
+<a name="ln227">  const std::string &amp;tablet_id() const {</a>
+<a name="ln228">    return req_.tablet_id();</a>
+<a name="ln229">  }</a>
+<a name="ln230"> </a>
+<a name="ln231">  std::string ToString() const override {</a>
+<a name="ln232">    return Format(&quot;CDCReadRpc: $0, retrier: $1&quot;, req_, retrier());</a>
+<a name="ln233">  }</a>
+<a name="ln234"> </a>
+<a name="ln235">  void InvokeCallback(const Status &amp;status) {</a>
+<a name="ln236">    if (!called_) {</a>
+<a name="ln237">      called_ = true;</a>
+<a name="ln238">      callback_(status, std::move(resp_));</a>
+<a name="ln239">    } else {</a>
+<a name="ln240">      LOG(WARNING) &lt;&lt; &quot;Multiple invocation of CDCReadRpc: &quot;</a>
+<a name="ln241">                   &lt;&lt; status.ToString() &lt;&lt; &quot; : &quot; &lt;&lt; resp_.DebugString();</a>
+<a name="ln242">    }</a>
+<a name="ln243">  }</a>
+<a name="ln244"> </a>
+<a name="ln245">  void InvokeAsync(CDCServiceProxy *cdc_proxy,</a>
+<a name="ln246">                   rpc::RpcController *controller,</a>
+<a name="ln247">                   rpc::ResponseCallback callback) {</a>
+<a name="ln248">    cdc_proxy-&gt;GetChangesAsync(req_, &amp;resp_, controller, std::move(callback));</a>
+<a name="ln249">  }</a>
+<a name="ln250"> </a>
+<a name="ln251">  TracePtr trace_;</a>
+<a name="ln252">  client::internal::TabletInvoker invoker_;</a>
+<a name="ln253"> </a>
+<a name="ln254">  GetChangesRequestPB req_;</a>
+<a name="ln255">  GetChangesResponsePB resp_;</a>
+<a name="ln256">  GetChangesCDCRpcCallback callback_;</a>
+<a name="ln257"> </a>
+<a name="ln258">  std::shared_ptr&lt;CDCServiceProxy&gt; cdc_proxy_;</a>
+<a name="ln259">  mutable tserver::TabletServerErrorPB last_error_;</a>
+<a name="ln260">  bool called_ = false;</a>
+<a name="ln261">};</a>
+<a name="ln262"> </a>
+<a name="ln263">MUST_USE_RESULT rpc::RpcCommandPtr CreateGetChangesCDCRpc(</a>
+<a name="ln264">    CoarseTimePoint deadline,</a>
+<a name="ln265">    client::internal::RemoteTablet* tablet,</a>
+<a name="ln266">    client::YBClient* client,</a>
+<a name="ln267">    GetChangesRequestPB* req,</a>
+<a name="ln268">    GetChangesCDCRpcCallback callback) {</a>
+<a name="ln269">  return std::make_shared&lt;CDCReadRpc&gt;(</a>
+<a name="ln270">      deadline, tablet, client, req, std::move(callback));</a>
+<a name="ln271">}</a>
+<a name="ln272"> </a>
+<a name="ln273"> </a>
+<a name="ln274">} // namespace cdc</a>
+<a name="ln275">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="66"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="166"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,366 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>operation_tracker.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/tablet/operations/operation_tracker.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;algorithm&gt;</a>
+<a name="ln36">#include &lt;limits&gt;</a>
+<a name="ln37">#include &lt;vector&gt;</a>
+<a name="ln38"> </a>
+<a name="ln39"> </a>
+<a name="ln40">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln41">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln42">#include &quot;yb/tablet/tablet.h&quot;</a>
+<a name="ln43">#include &quot;yb/tablet/tablet_peer.h&quot;</a>
+<a name="ln44">#include &quot;yb/tablet/operations/operation_driver.h&quot;</a>
+<a name="ln45">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln46">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln47">#include &quot;yb/util/mem_tracker.h&quot;</a>
+<a name="ln48">#include &quot;yb/util/metrics.h&quot;</a>
+<a name="ln49">#include &quot;yb/util/monotime.h&quot;</a>
+<a name="ln50">#include &quot;yb/util/tsan_util.h&quot;</a>
+<a name="ln51"> </a>
+<a name="ln52">DEFINE_int64(tablet_operation_memory_limit_mb, 1024,</a>
+<a name="ln53">             &quot;Maximum amount of memory that may be consumed by all in-flight &quot;</a>
+<a name="ln54">             &quot;operations belonging to a particular tablet. When this limit &quot;</a>
+<a name="ln55">             &quot;is reached, new operations will be rejected and clients will &quot;</a>
+<a name="ln56">             &quot;be forced to retry them. If -1, operation memory tracking is &quot;</a>
+<a name="ln57">             &quot;disabled.&quot;);</a>
+<a name="ln58">TAG_FLAG(tablet_operation_memory_limit_mb, advanced);</a>
+<a name="ln59"> </a>
+<a name="ln60">METRIC_DEFINE_gauge_uint64(tablet, all_operations_inflight,</a>
+<a name="ln61">                           &quot;Operations In Flight&quot;,</a>
+<a name="ln62">                           yb::MetricUnit::kOperations,</a>
+<a name="ln63">                           &quot;Number of operations currently in-flight, including any type.&quot;);</a>
+<a name="ln64">METRIC_DEFINE_gauge_uint64(tablet, write_operations_inflight,</a>
+<a name="ln65">                           &quot;Write Operations In Flight&quot;,</a>
+<a name="ln66">                           yb::MetricUnit::kOperations,</a>
+<a name="ln67">                           &quot;Number of write operations currently in-flight&quot;);</a>
+<a name="ln68">METRIC_DEFINE_gauge_uint64(tablet, alter_schema_operations_inflight,</a>
+<a name="ln69">                           &quot;Change Metadata Operations In Flight&quot;,</a>
+<a name="ln70">                           yb::MetricUnit::kOperations,</a>
+<a name="ln71">                           &quot;Number of change metadata operations currently in-flight&quot;);</a>
+<a name="ln72">METRIC_DEFINE_gauge_uint64(tablet, update_transaction_operations_inflight,</a>
+<a name="ln73">                           &quot;Update Transaction Operations In Flight&quot;,</a>
+<a name="ln74">                           yb::MetricUnit::kOperations,</a>
+<a name="ln75">                           &quot;Number of update transaction operations currently in-flight&quot;);</a>
+<a name="ln76">METRIC_DEFINE_gauge_uint64(tablet, snapshot_operations_inflight,</a>
+<a name="ln77">                           &quot;Snapshot Operations In Flight&quot;,</a>
+<a name="ln78">                           yb::MetricUnit::kOperations,</a>
+<a name="ln79">                           &quot;Number of snapshot operations currently in-flight&quot;);</a>
+<a name="ln80">METRIC_DEFINE_gauge_uint64(tablet, split_operations_inflight,</a>
+<a name="ln81">                           &quot;Split Operations In Flight&quot;,</a>
+<a name="ln82">                           yb::MetricUnit::kOperations,</a>
+<a name="ln83">                           &quot;Number of split operations currently in-flight&quot;);</a>
+<a name="ln84">METRIC_DEFINE_gauge_uint64(tablet, truncate_operations_inflight,</a>
+<a name="ln85">                           &quot;Truncate Operations In Flight&quot;,</a>
+<a name="ln86">                           yb::MetricUnit::kOperations,</a>
+<a name="ln87">                           &quot;Number of truncate operations currently in-flight&quot;);</a>
+<a name="ln88">METRIC_DEFINE_gauge_uint64(tablet, empty_operations_inflight,</a>
+<a name="ln89">                           &quot;Empty Operations In Flight&quot;,</a>
+<a name="ln90">                           yb::MetricUnit::kOperations,</a>
+<a name="ln91">                           &quot;Number of none operations currently in-flight&quot;);</a>
+<a name="ln92">METRIC_DEFINE_gauge_uint64(tablet, history_cutoff_operations_inflight,</a>
+<a name="ln93">                           &quot;History Cutoff Operations In Flight&quot;,</a>
+<a name="ln94">                           yb::MetricUnit::kOperations,</a>
+<a name="ln95">                           &quot;Number of history cutoff operations currently in-flight&quot;);</a>
+<a name="ln96"> </a>
+<a name="ln97">METRIC_DEFINE_counter(tablet, operation_memory_pressure_rejections,</a>
+<a name="ln98">                      &quot;Operation Memory Pressure Rejections&quot;,</a>
+<a name="ln99">                      yb::MetricUnit::kOperations,</a>
+<a name="ln100">                      &quot;Number of operations rejected because the tablet's &quot;</a>
+<a name="ln101">                      &quot;operation memory limit was reached.&quot;);</a>
+<a name="ln102"> </a>
+<a name="ln103">using namespace std::literals;</a>
+<a name="ln104">using std::shared_ptr;</a>
+<a name="ln105">using std::vector;</a>
+<a name="ln106"> </a>
+<a name="ln107">namespace yb {</a>
+<a name="ln108">namespace tablet {</a>
+<a name="ln109"> </a>
+<a name="ln110">using strings::Substitute;</a>
+<a name="ln111"> </a>
+<a name="ln112">#define MINIT(x) x(METRIC_##x.Instantiate(entity))</a>
+<a name="ln113">#define GINIT(x) x(METRIC_##x.Instantiate(entity, 0))</a>
+<a name="ln114">#define INSTANTIATE(upper, lower) \</a>
+<a name="ln115">  operations_inflight[to_underlying(OperationType::BOOST_PP_CAT(k, upper))] = \</a>
+<a name="ln116">      BOOST_PP_CAT(BOOST_PP_CAT(METRIC_, lower), _operations_inflight).Instantiate(entity, 0);</a>
+<a name="ln117">OperationTracker::Metrics::Metrics(const scoped_refptr&lt;MetricEntity&gt;&amp; entity)</a>
+<a name="ln118">    : GINIT(all_operations_inflight),</a>
+<a name="ln119">      MINIT(operation_memory_pressure_rejections) {</a>
+<a name="ln120">  INSTANTIATE(Write, write);</a>
+<a name="ln121">  INSTANTIATE(ChangeMetadata, alter_schema);</a>
+<a name="ln122">  INSTANTIATE(UpdateTransaction, update_transaction);</a>
+<a name="ln123">  INSTANTIATE(Snapshot, snapshot);</a>
+<a name="ln124">  INSTANTIATE(Split, split);</a>
+<a name="ln125">  INSTANTIATE(Truncate, truncate);</a>
+<a name="ln126">  INSTANTIATE(Empty, empty);</a>
+<a name="ln127">  INSTANTIATE(HistoryCutoff, history_cutoff);</a>
+<a name="ln128">  static_assert(8 == kElementsInOperationType, &quot;Init metrics for all operation types&quot;);</a>
+<a name="ln129">}</a>
+<a name="ln130">#undef INSTANTIATE</a>
+<a name="ln131">#undef GINIT</a>
+<a name="ln132">#undef MINIT</a>
+<a name="ln133"> </a>
+<a name="ln134">OperationTracker::OperationTracker(const std::string&amp; log_prefix)</a>
+<a name="ln135">    : log_prefix_(log_prefix) {</a>
+<a name="ln136">}</a>
+<a name="ln137"> </a>
+<a name="ln138">OperationTracker::~OperationTracker() {</a>
+<a name="ln139">  std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln140">  CHECK_EQ(pending_operations_.size(), 0);</a>
+<a name="ln141">  if (mem_tracker_) {</a>
+<a name="ln142">    mem_tracker_-&gt;UnregisterFromParent();</a>
+<a name="ln143">  }</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146">Status OperationTracker::Add(OperationDriver* driver) {</a>
+<a name="ln147">  int64_t driver_mem_footprint = driver-&gt;SpaceUsed();</a>
+<a name="ln148">  if (mem_tracker_ &amp;&amp; !mem_tracker_-&gt;TryConsume(driver_mem_footprint)) {</a>
+<a name="ln149">    if (metrics_) {</a>
+<a name="ln150">      metrics_-&gt;operation_memory_pressure_rejections-&gt;Increment();</a>
+<a name="ln151">    }</a>
+<a name="ln152"> </a>
+<a name="ln153">    // May be null in unit tests.</a>
+<a name="ln154">    Tablet* tablet = driver-&gt;state()-&gt;tablet();</a>
+<a name="ln155"> </a>
+<a name="ln156">    string msg = Substitute(</a>
+<a name="ln157">        &quot;Operation failed, tablet $0 operation memory consumption ($1) &quot;</a>
+<a name="ln158">        &quot;has exceeded its limit ($2) or the limit of an ancestral tracker&quot;,</a>
+<a name="ln159">        tablet ? tablet-&gt;tablet_id() : &quot;(unknown)&quot;,</a>
+<a name="ln160">        mem_tracker_-&gt;consumption(), mem_tracker_-&gt;limit());</a>
+<a name="ln161"> </a>
+<a name="ln162">    YB_LOG_EVERY_N_SECS(WARNING, 1) &lt;&lt; msg &lt;&lt; THROTTLE_MSG;</a>
+<a name="ln163"> </a>
+<a name="ln164">    return STATUS(ServiceUnavailable, msg);</a>
+<a name="ln165">  }</a>
+<a name="ln166"> </a>
+<a name="ln167">  IncrementCounters(*driver);</a>
+<a name="ln168"> </a>
+<a name="ln169">  // Cache the operation memory footprint so we needn't refer to the request</a>
+<a name="ln170">  // again, as it may disappear between now and then.</a>
+<a name="ln171">  State st;</a>
+<a name="ln172">  st.memory_footprint = driver_mem_footprint;</a>
+<a name="ln173">  std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln174">  CHECK(pending_operations_.emplace(driver, st).second);</a>
+<a name="ln175">  return Status::OK();</a>
+<a name="ln176">}</a>
+<a name="ln177"> </a>
+<a name="ln178">void OperationTracker::IncrementCounters(const OperationDriver&amp; driver) const {</a>
+<a name="ln179">  if (!metrics_) {</a>
+<a name="ln180">    return;</a>
+<a name="ln181">  }</a>
+<a name="ln182"> </a>
+<a name="ln183">  metrics_-&gt;all_operations_inflight-&gt;Increment();</a>
+<a name="ln184">  metrics_-&gt;operations_inflight[to_underlying(driver.operation_type())]-&gt;Increment();</a>
+<a name="ln185">}</a>
+<a name="ln186"> </a>
+<a name="ln187">void OperationTracker::DecrementCounters(const OperationDriver&amp; driver) const {</a>
+<a name="ln188">  if (!metrics_) {</a>
+<a name="ln189">    return;</a>
+<a name="ln190">  }</a>
+<a name="ln191"> </a>
+<a name="ln192">  DCHECK_GT(metrics_-&gt;all_operations_inflight-&gt;value(), 0);</a>
+<a name="ln193">  metrics_-&gt;all_operations_inflight-&gt;Decrement();</a>
+<a name="ln194">  auto index = to_underlying(driver.operation_type());</a>
+<a name="ln195">  DCHECK_GT(metrics_-&gt;operations_inflight[index]-&gt;value(), 0);</a>
+<a name="ln196">  metrics_-&gt;operations_inflight[index]-&gt;Decrement();</a>
+<a name="ln197">}</a>
+<a name="ln198"> </a>
+<a name="ln199">void OperationTracker::Release(OperationDriver* driver, OpIds* applied_op_ids) {</a>
+<a name="ln200">  DecrementCounters(*driver);</a>
+<a name="ln201"> </a>
+<a name="ln202">  State st;</a>
+<a name="ln203">  yb::OpId op_id = driver-&gt;GetOpId();</a>
+<a name="ln204">  OperationType operation_type = driver-&gt;operation_type();</a>
+<a name="ln205">  bool notify;</a>
+<a name="ln206">  {</a>
+<a name="ln207">    // Remove the operation from the map, retaining the state for use</a>
+<a name="ln208">    // below.</a>
+<a name="ln209">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln210">    st = FindOrDie(pending_operations_, driver);</a>
+<a name="ln211">    if (PREDICT_FALSE(pending_operations_.erase(driver) != 1)) {</a>
+<a name="ln212">      LOG_WITH_PREFIX(FATAL) &lt;&lt; &quot;Could not remove pending operation from map: &quot;</a>
+<a name="ln213">          &lt;&lt; driver-&gt;ToStringUnlocked();</a>
+<a name="ln214">    }</a>
+<a name="ln215">    notify = pending_operations_.empty();</a>
+<a name="ln216">  }</a>
+<a name="ln217">  if (notify) {</a>
+<a name="ln218">    cond_.notify_all();</a>
+<a name="ln219">  }</a>
+<a name="ln220"> </a>
+<a name="ln221">  if (mem_tracker_ &amp;&amp; st.memory_footprint) {</a>
+<a name="ln222">    mem_tracker_-&gt;Release(st.memory_footprint);</a>
+<a name="ln223">  }</a>
+<a name="ln224"> </a>
+<a name="ln225">  if (operation_type != OperationType::kEmpty) {</a>
+<a name="ln226">    if (applied_op_ids) {</a>
+<a name="ln227">      applied_op_ids-&gt;push_back(op_id);</a>
+<a name="ln228">    } else if (post_tracker_) {</a>
+<a name="ln229">      post_tracker_(op_id);</a>
+<a name="ln230">    }</a>
+<a name="ln231">  }</a>
+<a name="ln232">}</a>
+<a name="ln233"> </a>
+<a name="ln234">std::vector&lt;scoped_refptr&lt;OperationDriver&gt;&gt; OperationTracker::GetPendingOperations() const {</a>
+<a name="ln235">  std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln236">  return GetPendingOperationsUnlocked();</a>
+<a name="ln237">}</a>
+<a name="ln238"> </a>
+<a name="ln239">std::vector&lt;scoped_refptr&lt;OperationDriver&gt;&gt; OperationTracker::GetPendingOperationsUnlocked() const {</a>
+<a name="ln240">  std::vector&lt;scoped_refptr&lt;OperationDriver&gt;&gt; result;</a>
+<a name="ln241">  result.reserve(pending_operations_.size());</a>
+<a name="ln242">  for (const auto&amp; e : pending_operations_) {</a>
+<a name="ln243">    result.push_back(e.first);</a>
+<a name="ln244">  }</a>
+<a name="ln245">  return result;</a>
+<a name="ln246">}</a>
+<a name="ln247"> </a>
+<a name="ln248"> </a>
+<a name="ln249">int OperationTracker::GetNumPendingForTests() const {</a>
+<a name="ln250">  std::lock_guard&lt;std::mutex&gt; l(mutex_);</a>
+<a name="ln251">  return pending_operations_.size();</a>
+<a name="ln252">}</a>
+<a name="ln253"> </a>
+<a name="ln254">void OperationTracker::WaitForAllToFinish() const {</a>
+<a name="ln255">  // Wait indefinitely.</a>
+<a name="ln256">  CHECK_OK(WaitForAllToFinish(MonoDelta::FromNanoseconds(std::numeric_limits&lt;int64_t&gt;::max())));</a>
+<a name="ln257">}</a>
+<a name="ln258"> </a>
+<a name="ln259">Status OperationTracker::WaitForAllToFinish(const MonoDelta&amp; timeout) const</a>
+<a name="ln260">    NO_THREAD_SAFETY_ANALYSIS {</a>
+<a name="ln261">  const MonoDelta kComplainInterval = 1000ms * kTimeMultiplier;</a>
+<a name="ln262">  MonoDelta wait_time = 250ms * kTimeMultiplier;</a>
+<a name="ln263">  int num_complaints = 0;</a>
+<a name="ln264">  MonoTime start_time = MonoTime::Now();</a>
+<a name="ln265">  auto operations = GetPendingOperations();</a>
+<a name="ln266">  if (operations.empty()) {</a>
+<a name="ln267">    return Status::OK();</a>
+<a name="ln268">  }</a>
+<a name="ln269">  for (;;) {</a>
+<a name="ln270">    MonoDelta diff = MonoTime::Now().GetDeltaSince(start_time);</a>
+<a name="ln271">    if (diff.MoreThan(timeout)) {</a>
+<a name="ln272">      return STATUS(TimedOut, Substitute(&quot;Timed out waiting for all operations to finish. &quot;</a>
+<a name="ln273">                                         &quot;$0 operations pending. Waited for $1&quot;,</a>
+<a name="ln274">                                         operations.size(), diff.ToString()));</a>
+<a name="ln275">    }</a>
+<a name="ln276">    if (diff &gt; kComplainInterval * num_complaints) {</a>
+<a name="ln277">      LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln278">          &lt;&lt; Format(&quot;OperationTracker waiting for $0 outstanding operations to&quot;</a>
+<a name="ln279">                        &quot; complete now for $1&quot;, operations.size(), diff);</a>
+<a name="ln280">      num_complaints++;</a>
+<a name="ln281">    }</a>
+<a name="ln282">    wait_time = std::min&lt;MonoDelta&gt;(wait_time * 5 / 4, 1s);</a>
+<a name="ln283"> </a>
+<a name="ln284">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Dumping currently running operations: &quot;;</a>
+<a name="ln285">    for (scoped_refptr&lt;OperationDriver&gt; driver : operations) {</a>
+<a name="ln286">      LOG_WITH_PREFIX(INFO) &lt;&lt; driver-&gt;ToString();</a>
+<a name="ln287">    }</a>
+<a name="ln288">    {</a>
+<a name="ln289">      std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln290">      if (pending_operations_.empty()) {</a>
+<a name="ln291">        break;</a>
+<a name="ln292">      }</a>
+<a name="ln293">      if (cond_.wait_for(lock, wait_time.ToSteadyDuration()) == std::cv_status::no_timeout &amp;&amp;</a>
+<a name="ln294">          pending_operations_.empty()) {</a>
+<a name="ln295">        break;</a>
+<a name="ln296">      }</a>
+<a name="ln297">      operations = GetPendingOperationsUnlocked();</a>
+<a name="ln298">    }</a>
+<a name="ln299">  }</a>
+<a name="ln300">  return Status::OK();</a>
+<a name="ln301">}</a>
+<a name="ln302"> </a>
+<a name="ln303">void OperationTracker::StartInstrumentation(</a>
+<a name="ln304">    const scoped_refptr&lt;MetricEntity&gt;&amp; metric_entity) {</a>
+<a name="ln305">  metrics_.reset(new Metrics(metric_entity));</a>
+<a name="ln306">}</a>
+<a name="ln307"> </a>
+<a name="ln308">void OperationTracker::StartMemoryTracking(</a>
+<a name="ln309">    const shared_ptr&lt;MemTracker&gt;&amp; parent_mem_tracker) {</a>
+<a name="ln310">  if (FLAGS_tablet_operation_memory_limit_mb != -1) {</a>
+<a name="ln311">    mem_tracker_ = MemTracker::CreateTracker(</a>
+<a name="ln312">        FLAGS_tablet_operation_memory_limit_mb * 1024 * 1024,</a>
+<a name="ln313">        &quot;operation_tracker&quot;,</a>
+<a name="ln314">        parent_mem_tracker);</a>
+<a name="ln315">  }</a>
+<a name="ln316">}</a>
+<a name="ln317"> </a>
+<a name="ln318">}  // namespace tablet</a>
+<a name="ln319">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="174"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="256"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

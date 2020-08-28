@@ -1,0 +1,292 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>transaction_status_resolver.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/tablet/transaction_status_resolver.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/client/transaction_rpc.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/rpc/rpc.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;yb/tserver/tserver_service.pb.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">DEFINE_test_flag(int32, inject_status_resolver_delay_ms, 0,</a>
+<a name="ln29">                 &quot;Inject delay before launching transaction status resolver RPC.&quot;);</a>
+<a name="ln30"> </a>
+<a name="ln31">using namespace std::literals;</a>
+<a name="ln32">using namespace std::placeholders;</a>
+<a name="ln33"> </a>
+<a name="ln34">namespace yb {</a>
+<a name="ln35">namespace tablet {</a>
+<a name="ln36"> </a>
+<a name="ln37">class TransactionStatusResolver::Impl {</a>
+<a name="ln38"> public:</a>
+<a name="ln39">  Impl(TransactionParticipantContext* participant_context, rpc::Rpcs* rpcs,</a>
+<a name="ln40">       size_t max_transactions_per_request, TransactionStatusResolverCallback callback)</a>
+<a name="ln41">      : participant_context_(*participant_context), rpcs_(*rpcs),</a>
+<a name="ln42">        max_transactions_per_request_(max_transactions_per_request), callback_(std::move(callback)),</a>
+<a name="ln43">        log_prefix_(participant_context-&gt;LogPrefix()), handle_(rpcs_.InvalidHandle()) {}</a>
+<a name="ln44"> </a>
+<a name="ln45">  void Shutdown() {</a>
+<a name="ln46">    closing_.store(true, std::memory_order_release);</a>
+<a name="ln47">    for (;;) {</a>
+<a name="ln48">      if (run_latch_.WaitFor(10s)) {</a>
+<a name="ln49">        break;</a>
+<a name="ln50">      }</a>
+<a name="ln51">      LOG(DFATAL) &lt;&lt; &quot;Long wait for transaction status resolver to shutdown&quot;;</a>
+<a name="ln52">    }</a>
+<a name="ln53">  }</a>
+<a name="ln54"> </a>
+<a name="ln55">  void Start(CoarseTimePoint deadline) {</a>
+<a name="ln56">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Start, queues: &quot; &lt;&lt; queues_.size();</a>
+<a name="ln57"> </a>
+<a name="ln58">    deadline_ = deadline;</a>
+<a name="ln59">    run_latch_.Reset(1);</a>
+<a name="ln60">    Execute();</a>
+<a name="ln61">  }</a>
+<a name="ln62"> </a>
+<a name="ln63">  std::future&lt;Status&gt; ResultFuture() {</a>
+<a name="ln64">    return result_promise_.get_future();</a>
+<a name="ln65">  }</a>
+<a name="ln66"> </a>
+<a name="ln67">  void Add(const TabletId&amp; status_tablet, const TransactionId&amp; transaction_id) {</a>
+<a name="ln68">    LOG_IF(DFATAL, run_latch_.count()) &lt;&lt; &quot;Add while running&quot;;</a>
+<a name="ln69">    queues_[status_tablet].push_back(transaction_id);</a>
+<a name="ln70">  }</a>
+<a name="ln71"> </a>
+<a name="ln72"> private:</a>
+<a name="ln73">  void Execute() {</a>
+<a name="ln74">    LOG_IF(DFATAL, !run_latch_.count()) &lt;&lt; &quot;Execute while running is false&quot;;</a>
+<a name="ln75"> </a>
+<a name="ln76">    if (CoarseMonoClock::now() &gt;= deadline_) {</a>
+<a name="ln77">      Complete(STATUS(TimedOut, &quot;Timed out to resolve transaction statuses&quot;));</a>
+<a name="ln78">      return;</a>
+<a name="ln79">    }</a>
+<a name="ln80">    if (closing_.load(std::memory_order_acquire)) {</a>
+<a name="ln81">      Complete(STATUS(Aborted, &quot;Aborted because of shutdown&quot;));</a>
+<a name="ln82">      return;</a>
+<a name="ln83">    }</a>
+<a name="ln84">    if (queues_.empty() || max_transactions_per_request_ &lt;= 0) {</a>
+<a name="ln85">      Complete(Status::OK());</a>
+<a name="ln86">      return;</a>
+<a name="ln87">    }</a>
+<a name="ln88"> </a>
+<a name="ln89">    // We access queues_ only while adding transaction and after that while resolving</a>
+<a name="ln90">    // transaction statuses, which is NOT concurrent.</a>
+<a name="ln91">    // So we could avoid doing synchronization here.</a>
+<a name="ln92">    auto&amp; tablet_id_and_queue = *queues_.begin();</a>
+<a name="ln93">    tserver::GetTransactionStatusRequestPB req;</a>
+<a name="ln94">    req.set_tablet_id(tablet_id_and_queue.first);</a>
+<a name="ln95">    req.set_propagated_hybrid_time(participant_context_.Now().ToUint64());</a>
+<a name="ln96">    const auto&amp; tablet_queue = tablet_id_and_queue.second;</a>
+<a name="ln97">    auto request_size = std::min&lt;size_t&gt;(max_transactions_per_request_, tablet_queue.size());</a>
+<a name="ln98">    for (size_t i = 0; i != request_size; ++i) {</a>
+<a name="ln99">      const auto&amp; txn_id = tablet_queue[i];</a>
+<a name="ln100">      VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Checking txn status: &quot; &lt;&lt; txn_id;</a>
+<a name="ln101">      req.add_transaction_id()-&gt;assign(pointer_cast&lt;const char*&gt;(txn_id.data()), txn_id.size());</a>
+<a name="ln102">    }</a>
+<a name="ln103"> </a>
+<a name="ln104">    auto injected_delay = FLAGS_TEST_inject_status_resolver_delay_ms;</a>
+<a name="ln105">    if (injected_delay &gt; 0) {</a>
+<a name="ln106">      std::this_thread::sleep_for(1ms * injected_delay);</a>
+<a name="ln107">    }</a>
+<a name="ln108"> </a>
+<a name="ln109">    auto client = participant_context_.client_future().get();</a>
+<a name="ln110">    if (!client || !rpcs_.RegisterAndStart(</a>
+<a name="ln111">        client::GetTransactionStatus(</a>
+<a name="ln112">            std::min(deadline_, TransactionRpcDeadline()),</a>
+<a name="ln113">            nullptr /* tablet */,</a>
+<a name="ln114">            client,</a>
+<a name="ln115">            &amp;req,</a>
+<a name="ln116">            std::bind(&amp;Impl::StatusReceived, this, _1, _2, request_size)),</a>
+<a name="ln117">        &amp;handle_)) {</a>
+<a name="ln118">      Complete(STATUS(Aborted, &quot;Aborted because cannot start RPC&quot;));</a>
+<a name="ln119">    }</a>
+<a name="ln120">  }</a>
+<a name="ln121"> </a>
+<a name="ln122">  const std::string&amp; LogPrefix() const {</a>
+<a name="ln123">    return log_prefix_;</a>
+<a name="ln124">  }</a>
+<a name="ln125"> </a>
+<a name="ln126">  void StatusReceived(Status status,</a>
+<a name="ln127">                      const tserver::GetTransactionStatusResponsePB&amp; response,</a>
+<a name="ln128">                      size_t request_size) {</a>
+<a name="ln129">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Received statuses: &quot; &lt;&lt; status &lt;&lt; &quot;, &quot; &lt;&lt; response.ShortDebugString();</a>
+<a name="ln130"> </a>
+<a name="ln131">    rpcs_.Unregister(&amp;handle_);</a>
+<a name="ln132"> </a>
+<a name="ln133">    if (status.ok() &amp;&amp; response.has_error()) {</a>
+<a name="ln134">      status = StatusFromPB(response.error().status());</a>
+<a name="ln135">    }</a>
+<a name="ln136"> </a>
+<a name="ln137">    if (!status.ok()) {</a>
+<a name="ln138">      LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Failed to request transaction statuses: &quot; &lt;&lt; status;</a>
+<a name="ln139">      if (status.IsAborted()) {</a>
+<a name="ln140">        Complete(status);</a>
+<a name="ln141">      } else {</a>
+<a name="ln142">        Execute();</a>
+<a name="ln143">      }</a>
+<a name="ln144">      return;</a>
+<a name="ln145">    }</a>
+<a name="ln146"> </a>
+<a name="ln147">    if (response.has_propagated_hybrid_time()) {</a>
+<a name="ln148">      participant_context_.UpdateClock(HybridTime(response.propagated_hybrid_time()));</a>
+<a name="ln149">    }</a>
+<a name="ln150"> </a>
+<a name="ln151">    if (response.status().size() != 1 &amp;&amp; response.status().size() != request_size) {</a>
+<a name="ln152">      // Node with old software version would always return 1 status.</a>
+<a name="ln153">      LOG_WITH_PREFIX(DFATAL)</a>
+<a name="ln154">          &lt;&lt; &quot;Bad response size, expected &quot; &lt;&lt; request_size &lt;&lt; &quot; entries, but found: &quot;</a>
+<a name="ln155">          &lt;&lt; response.ShortDebugString();</a>
+<a name="ln156">      Execute();</a>
+<a name="ln157">      return;</a>
+<a name="ln158">    }</a>
+<a name="ln159"> </a>
+<a name="ln160">    status_infos_.clear();</a>
+<a name="ln161">    status_infos_.reserve(request_size);</a>
+<a name="ln162">    auto it = queues_.begin();</a>
+<a name="ln163">    auto&amp; queue = it-&gt;second;</a>
+<a name="ln164">    for (size_t i = 0; i != response.status().size(); ++i) {</a>
+<a name="ln165">      auto txn_status = response.status(i);</a>
+<a name="ln166">      VLOG_WITH_PREFIX(4)</a>
+<a name="ln167">          &lt;&lt; &quot;Status of &quot; &lt;&lt; queue.front() &lt;&lt; &quot;: &quot; &lt;&lt; TransactionStatus_Name(txn_status);</a>
+<a name="ln168">      HybridTime status_hybrid_time;</a>
+<a name="ln169">      if (i &lt; response.status_hybrid_time().size()) {</a>
+<a name="ln170">        status_hybrid_time = HybridTime(response.status_hybrid_time(i));</a>
+<a name="ln171">      // Could happend only when coordinator has an old version.</a>
+<a name="ln172">      } else if (txn_status == TransactionStatus::ABORTED) {</a>
+<a name="ln173">        status_hybrid_time = HybridTime::kMax;</a>
+<a name="ln174">      } else {</a>
+<a name="ln175">        Complete(STATUS_FORMAT(</a>
+<a name="ln176">            IllegalState, &quot;Missing status hybrid time for transaction status: $0&quot;,</a>
+<a name="ln177">            TransactionStatus_Name(txn_status)));</a>
+<a name="ln178">        return;</a>
+<a name="ln179">      }</a>
+<a name="ln180">      status_infos_.push_back({queue.front(), txn_status, status_hybrid_time});</a>
+<a name="ln181">      queue.pop_front();</a>
+<a name="ln182">    }</a>
+<a name="ln183">    if (queue.empty()) {</a>
+<a name="ln184">      LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Processed queue for: &quot; &lt;&lt; it-&gt;first;</a>
+<a name="ln185">      queues_.erase(it);</a>
+<a name="ln186">    }</a>
+<a name="ln187"> </a>
+<a name="ln188">    callback_(status_infos_);</a>
+<a name="ln189"> </a>
+<a name="ln190">    Execute();</a>
+<a name="ln191">  }</a>
+<a name="ln192"> </a>
+<a name="ln193">  void Complete(const Status&amp; status) {</a>
+<a name="ln194">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Complete: &quot; &lt;&lt; status;</a>
+<a name="ln195">    result_promise_.set_value(status);</a>
+<a name="ln196">    run_latch_.CountDown();</a>
+<a name="ln197">  }</a>
+<a name="ln198"> </a>
+<a name="ln199">  TransactionParticipantContext&amp; participant_context_;</a>
+<a name="ln200">  rpc::Rpcs&amp; rpcs_;</a>
+<a name="ln201">  const size_t max_transactions_per_request_;</a>
+<a name="ln202">  TransactionStatusResolverCallback callback_;</a>
+<a name="ln203"> </a>
+<a name="ln204">  const std::string log_prefix_;</a>
+<a name="ln205">  rpc::Rpcs::Handle handle_;</a>
+<a name="ln206"> </a>
+<a name="ln207">  std::atomic&lt;bool&gt; closing_{false};</a>
+<a name="ln208">  CountDownLatch run_latch_{0};</a>
+<a name="ln209">  CoarseTimePoint deadline_;</a>
+<a name="ln210">  std::unordered_map&lt;TabletId, std::deque&lt;TransactionId&gt;&gt; queues_;</a>
+<a name="ln211">  std::vector&lt;TransactionStatusInfo&gt; status_infos_;</a>
+<a name="ln212">  std::promise&lt;Status&gt; result_promise_;</a>
+<a name="ln213">};</a>
+<a name="ln214"> </a>
+<a name="ln215">TransactionStatusResolver::TransactionStatusResolver(</a>
+<a name="ln216">    TransactionParticipantContext* participant_context, rpc::Rpcs* rpcs,</a>
+<a name="ln217">    size_t max_transactions_per_request, TransactionStatusResolverCallback callback)</a>
+<a name="ln218">    : impl_(new Impl(</a>
+<a name="ln219">        participant_context, rpcs, max_transactions_per_request, std::move(callback))) {</a>
+<a name="ln220">}</a>
+<a name="ln221"> </a>
+<a name="ln222">TransactionStatusResolver::~TransactionStatusResolver() {}</a>
+<a name="ln223"> </a>
+<a name="ln224">void TransactionStatusResolver::Shutdown() {</a>
+<a name="ln225">  impl_-&gt;Shutdown();</a>
+<a name="ln226">}</a>
+<a name="ln227"> </a>
+<a name="ln228">void TransactionStatusResolver::Add(</a>
+<a name="ln229">    const TabletId&amp; status_tablet, const TransactionId&amp; transaction_id) {</a>
+<a name="ln230">  impl_-&gt;Add(status_tablet, transaction_id);</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233">void TransactionStatusResolver::Start(CoarseTimePoint deadline) {</a>
+<a name="ln234">  impl_-&gt;Start(deadline);</a>
+<a name="ln235">}</a>
+<a name="ln236"> </a>
+<a name="ln237">std::future&lt;Status&gt; TransactionStatusResolver::ResultFuture() {</a>
+<a name="ln238">  return impl_-&gt;ResultFuture();</a>
+<a name="ln239">}</a>
+<a name="ln240"> </a>
+<a name="ln241">} // namespace tablet</a>
+<a name="ln242">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="68"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="74"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="100"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="129"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="166"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

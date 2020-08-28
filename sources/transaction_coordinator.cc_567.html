@@ -1,0 +1,1506 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>transaction_coordinator.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/tablet/transaction_coordinator.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;condition_variable&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &lt;boost/multi_index_container.hpp&gt;</a>
+<a name="ln21">#include &lt;boost/multi_index/hashed_index.hpp&gt;</a>
+<a name="ln22">#include &lt;boost/multi_index/mem_fun.hpp&gt;</a>
+<a name="ln23">#include &lt;boost/multi_index/ordered_index.hpp&gt;</a>
+<a name="ln24">#include &lt;boost/multi_index/tag.hpp&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;boost/uuid/uuid_io.hpp&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln29">#include &quot;yb/client/transaction_cleanup.h&quot;</a>
+<a name="ln30">#include &quot;yb/client/transaction_rpc.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32">#include &quot;yb/common/entity_ids.h&quot;</a>
+<a name="ln33">#include &quot;yb/common/transaction.h&quot;</a>
+<a name="ln34">#include &quot;yb/common/transaction_error.h&quot;</a>
+<a name="ln35">#include &quot;yb/common/pgsql_error.h&quot;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &quot;yb/consensus/consensus.h&quot;</a>
+<a name="ln38">#include &quot;yb/consensus/consensus_util.h&quot;</a>
+<a name="ln39">#include &quot;yb/consensus/opid_util.h&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln42">#include &quot;yb/rpc/poller.h&quot;</a>
+<a name="ln43">#include &quot;yb/rpc/rpc.h&quot;</a>
+<a name="ln44"> </a>
+<a name="ln45">#include &quot;yb/server/clock.h&quot;</a>
+<a name="ln46"> </a>
+<a name="ln47">#include &quot;yb/tablet/tablet.h&quot;</a>
+<a name="ln48">#include &quot;yb/tablet/operations/update_txn_operation.h&quot;</a>
+<a name="ln49"> </a>
+<a name="ln50">#include &quot;yb/tserver/service_util.h&quot;</a>
+<a name="ln51">#include &quot;yb/tserver/tserver.pb.h&quot;</a>
+<a name="ln52">#include &quot;yb/tserver/tserver_service.pb.h&quot;</a>
+<a name="ln53"> </a>
+<a name="ln54">#include &quot;yb/util/enums.h&quot;</a>
+<a name="ln55">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln56">#include &quot;yb/util/metrics.h&quot;</a>
+<a name="ln57">#include &quot;yb/util/random_util.h&quot;</a>
+<a name="ln58">#include &quot;yb/util/result.h&quot;</a>
+<a name="ln59">#include &quot;yb/util/scope_exit.h&quot;</a>
+<a name="ln60">#include &quot;yb/util/tsan_util.h&quot;</a>
+<a name="ln61">#include &quot;yb/util/yb_pg_errcodes.h&quot;</a>
+<a name="ln62"> </a>
+<a name="ln63">DECLARE_uint64(transaction_heartbeat_usec);</a>
+<a name="ln64">DEFINE_double(transaction_max_missed_heartbeat_periods, 10.0 * yb::kTimeMultiplier,</a>
+<a name="ln65">              &quot;Maximum heartbeat periods that a pending transaction can miss before the &quot;</a>
+<a name="ln66">              &quot;transaction coordinator expires the transaction. The total expiration time in &quot;</a>
+<a name="ln67">              &quot;microseconds is transaction_heartbeat_usec times &quot;</a>
+<a name="ln68">              &quot;transaction_max_missed_heartbeat_periods. The value passed to this flag may be &quot;</a>
+<a name="ln69">              &quot;fractional.&quot;);</a>
+<a name="ln70">DEFINE_uint64(transaction_check_interval_usec, 500000, &quot;Transaction check interval in usec.&quot;);</a>
+<a name="ln71">DEFINE_uint64(transaction_resend_applying_interval_usec, 5000000,</a>
+<a name="ln72">              &quot;Transaction resend applying interval in usec.&quot;);</a>
+<a name="ln73"> </a>
+<a name="ln74">DEFINE_int64(avoid_abort_after_sealing_ms, 20,</a>
+<a name="ln75">             &quot;If transaction was only sealed, we will try to abort it not earlier than this &quot;</a>
+<a name="ln76">                 &quot;period in milliseconds.&quot;);</a>
+<a name="ln77"> </a>
+<a name="ln78">DEFINE_test_flag(uint64, inject_txn_get_status_delay_ms, 0,</a>
+<a name="ln79">                 &quot;Inject specified delay to transaction get status requests.&quot;);</a>
+<a name="ln80"> </a>
+<a name="ln81">using namespace std::literals;</a>
+<a name="ln82">using namespace std::placeholders;</a>
+<a name="ln83"> </a>
+<a name="ln84">namespace yb {</a>
+<a name="ln85">namespace tablet {</a>
+<a name="ln86"> </a>
+<a name="ln87">std::chrono::microseconds GetTransactionTimeout() {</a>
+<a name="ln88">  const double timeout = GetAtomicFlag(&amp;FLAGS_transaction_max_missed_heartbeat_periods) *</a>
+<a name="ln89">                         GetAtomicFlag(&amp;FLAGS_transaction_heartbeat_usec);</a>
+<a name="ln90">  return timeout &gt;= std::chrono::microseconds::max().count()</a>
+<a name="ln91">      ? std::chrono::microseconds::max()</a>
+<a name="ln92">      : std::chrono::microseconds(static_cast&lt;int64_t&gt;(timeout));</a>
+<a name="ln93">}</a>
+<a name="ln94"> </a>
+<a name="ln95">namespace {</a>
+<a name="ln96"> </a>
+<a name="ln97">struct NotifyApplyingData {</a>
+<a name="ln98">  TabletId tablet;</a>
+<a name="ln99">  TransactionId transaction;</a>
+<a name="ln100">  HybridTime commit_time;</a>
+<a name="ln101">  bool sealed;</a>
+<a name="ln102"> </a>
+<a name="ln103">  std::string ToString() const {</a>
+<a name="ln104">    return Format(&quot;{ tablet: $0 transaction: $1 commit_time: $2 sealed: $3}&quot;,</a>
+<a name="ln105">                  tablet, transaction, commit_time, sealed);</a>
+<a name="ln106">  }</a>
+<a name="ln107">};</a>
+<a name="ln108"> </a>
+<a name="ln109">struct ExpectedTabletBatches {</a>
+<a name="ln110">  TabletId tablet;</a>
+<a name="ln111">  size_t batches;</a>
+<a name="ln112"> </a>
+<a name="ln113">  std::string ToString() const {</a>
+<a name="ln114">    return Format(&quot;{ tablet: $0 batches: $1 }&quot;, tablet, batches);</a>
+<a name="ln115">  }</a>
+<a name="ln116">};</a>
+<a name="ln117"> </a>
+<a name="ln118">// Context for transaction state. I.e. access to external facilities required by</a>
+<a name="ln119">// transaction state to do its job.</a>
+<a name="ln120">class TransactionStateContext {</a>
+<a name="ln121"> public:</a>
+<a name="ln122">  virtual TransactionCoordinatorContext&amp; coordinator_context() = 0;</a>
+<a name="ln123"> </a>
+<a name="ln124">  virtual void NotifyApplying(NotifyApplyingData data) = 0;</a>
+<a name="ln125"> </a>
+<a name="ln126">  virtual Counter&amp; expired_metric() = 0;</a>
+<a name="ln127"> </a>
+<a name="ln128">  // Submits update transaction to the RAFT log. Returns false if was not able to submit.</a>
+<a name="ln129">  virtual MUST_USE_RESULT bool SubmitUpdateTransaction(</a>
+<a name="ln130">      std::unique_ptr&lt;UpdateTxnOperationState&gt; state) = 0;</a>
+<a name="ln131"> </a>
+<a name="ln132">  virtual void CompleteWithStatus(</a>
+<a name="ln133">      std::unique_ptr&lt;UpdateTxnOperationState&gt; request, Status status) = 0;</a>
+<a name="ln134"> </a>
+<a name="ln135">  virtual void CompleteWithStatus(UpdateTxnOperationState* request, Status status) = 0;</a>
+<a name="ln136"> </a>
+<a name="ln137">  virtual bool leader() const = 0;</a>
+<a name="ln138"> </a>
+<a name="ln139"> protected:</a>
+<a name="ln140">  ~TransactionStateContext() {}</a>
+<a name="ln141">};</a>
+<a name="ln142"> </a>
+<a name="ln143">std::string BuildLogPrefix(const std::string&amp; parent_log_prefix, const TransactionId&amp; id) {</a>
+<a name="ln144">  auto id_string = id.ToString();</a>
+<a name="ln145">  return parent_log_prefix.substr(0, parent_log_prefix.length() - 2) + &quot; ID &quot; + id_string + &quot;: &quot;;</a>
+<a name="ln146">}</a>
+<a name="ln147"> </a>
+<a name="ln148">// TransactionState keeps state of single transaction.</a>
+<a name="ln149">// User of this class should guarantee that it does NOT invoke methods concurrently.</a>
+<a name="ln150">class TransactionState {</a>
+<a name="ln151"> public:</a>
+<a name="ln152">  explicit TransactionState(TransactionStateContext* context,</a>
+<a name="ln153">                            const TransactionId&amp; id,</a>
+<a name="ln154">                            HybridTime last_touch,</a>
+<a name="ln155">                            const std::string&amp; parent_log_prefix)</a>
+<a name="ln156">      : context_(*context),</a>
+<a name="ln157">        id_(id),</a>
+<a name="ln158">        log_prefix_(BuildLogPrefix(parent_log_prefix, id)),</a>
+<a name="ln159">        last_touch_(last_touch) {</a>
+<a name="ln160">  }</a>
+<a name="ln161"> </a>
+<a name="ln162">  ~TransactionState() {</a>
+<a name="ln163">    DCHECK(abort_waiters_.empty());</a>
+<a name="ln164">    DCHECK(request_queue_.empty());</a>
+<a name="ln165">    DCHECK(replicating_ == nullptr) &lt;&lt; Format(&quot;Replicating: $0&quot;, static_cast&lt;void*&gt;(replicating_));</a>
+<a name="ln166">  }</a>
+<a name="ln167"> </a>
+<a name="ln168">  // Id of transaction.</a>
+<a name="ln169">  const TransactionId&amp; id() const {</a>
+<a name="ln170">    return id_;</a>
+<a name="ln171">  }</a>
+<a name="ln172"> </a>
+<a name="ln173">  // Time when we last heard from transaction. I.e. hybrid time of replicated raft log entry</a>
+<a name="ln174">  // that updates status of this transaction.</a>
+<a name="ln175">  HybridTime last_touch() const {</a>
+<a name="ln176">    return last_touch_;</a>
+<a name="ln177">  }</a>
+<a name="ln178"> </a>
+<a name="ln179">  // Status of transaction.</a>
+<a name="ln180">  TransactionStatus status() const {</a>
+<a name="ln181">    return status_;</a>
+<a name="ln182">  }</a>
+<a name="ln183"> </a>
+<a name="ln184">  // RAFT index of first RAFT log entry required by this transaction.</a>
+<a name="ln185">  int64_t first_entry_raft_index() const {</a>
+<a name="ln186">    return first_entry_raft_index_;</a>
+<a name="ln187">  }</a>
+<a name="ln188"> </a>
+<a name="ln189">  std::string ToString() const {</a>
+<a name="ln190">    return Format(&quot;{ id: $0 last_touch: $1 status: $2 unnotified_tablets: $3 replicating: $4 &quot;</a>
+<a name="ln191">                      &quot; request_queue: $5 first_entry_raft_index: $6 }&quot;,</a>
+<a name="ln192">                  id_, last_touch_, TransactionStatus_Name(status_),</a>
+<a name="ln193">                  involved_tablets_, replicating_, request_queue_, first_entry_raft_index_);</a>
+<a name="ln194">  }</a>
+<a name="ln195"> </a>
+<a name="ln196">  // Whether this transaction expired at specified time.</a>
+<a name="ln197">  bool ExpiredAt(HybridTime now) const {</a>
+<a name="ln198">    if (ShouldBeCommitted() || ShouldBeInStatus(TransactionStatus::SEALED)) {</a>
+<a name="ln199">      return false;</a>
+<a name="ln200">    }</a>
+<a name="ln201">    const int64_t passed = now.GetPhysicalValueMicros() - last_touch_.GetPhysicalValueMicros();</a>
+<a name="ln202">    if (std::chrono::microseconds(passed) &gt; GetTransactionTimeout()) {</a>
+<a name="ln203">      context_.expired_metric().Increment();</a>
+<a name="ln204">      return true;</a>
+<a name="ln205">    }</a>
+<a name="ln206">    return false;</a>
+<a name="ln207">  }</a>
+<a name="ln208"> </a>
+<a name="ln209">  // Whether this transaction has completed.</a>
+<a name="ln210">  bool Completed() const {</a>
+<a name="ln211">    return status_ == TransactionStatus::ABORTED ||</a>
+<a name="ln212">           status_ == TransactionStatus::APPLIED_IN_ALL_INVOLVED_TABLETS;</a>
+<a name="ln213">  }</a>
+<a name="ln214"> </a>
+<a name="ln215">  // Applies new state to transaction.</a>
+<a name="ln216">  CHECKED_STATUS ProcessReplicated(const TransactionCoordinator::ReplicatedData&amp; data) {</a>
+<a name="ln217">    VLOG_WITH_PREFIX(4)</a>
+<a name="ln218">        &lt;&lt; Format(&quot;ProcessReplicated: $0, replicating: $1&quot;, data, replicating_);</a>
+<a name="ln219"> </a>
+<a name="ln220">    if (replicating_ != nullptr) {</a>
+<a name="ln221">      auto replicating_op_id = replicating_-&gt;consensus_round()-&gt;id();</a>
+<a name="ln222">      if (replicating_op_id.IsInitialized()) {</a>
+<a name="ln223">        if (!consensus::OpIdEquals(replicating_-&gt;consensus_round()-&gt;id(), data.op_id)) {</a>
+<a name="ln224">          LOG_WITH_PREFIX(DFATAL)</a>
+<a name="ln225">              &lt;&lt; &quot;Replicated unexpected operation, replicating: &quot; &lt;&lt; AsString(replicating_)</a>
+<a name="ln226">              &lt;&lt; &quot;, replicated: &quot; &lt;&lt; AsString(data);</a>
+<a name="ln227">        }</a>
+<a name="ln228">      } else if (data.leader_term != OpId::kUnknownTerm) {</a>
+<a name="ln229">        LOG_WITH_PREFIX(DFATAL)</a>
+<a name="ln230">            &lt;&lt; &quot;Leader replicated operation without op id, replicating: &quot; &lt;&lt; AsString(replicating_)</a>
+<a name="ln231">            &lt;&lt; &quot;, replicated: &quot; &lt;&lt; AsString(data);</a>
+<a name="ln232">      } else {</a>
+<a name="ln233">        LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Cancel replicating without id: &quot; &lt;&lt; AsString(replicating_)</a>
+<a name="ln234">                              &lt;&lt; &quot;, because &quot; &lt;&lt; AsString(data) &lt;&lt; &quot; was replicated&quot;;</a>
+<a name="ln235">      }</a>
+<a name="ln236">      replicating_ = nullptr;</a>
+<a name="ln237">    }</a>
+<a name="ln238"> </a>
+<a name="ln239">    auto status = DoProcessReplicated(data);</a>
+<a name="ln240"> </a>
+<a name="ln241">    if (data.leader_term == OpId::kUnknownTerm) {</a>
+<a name="ln242">      ClearRequests(STATUS(IllegalState, &quot;Leader changed&quot;));</a>
+<a name="ln243">    } else {</a>
+<a name="ln244">      switch(status_) {</a>
+<a name="ln245">        case TransactionStatus::APPLIED_IN_ALL_INVOLVED_TABLETS:</a>
+<a name="ln246">          ClearRequests(STATUS(AlreadyPresent, &quot;Transaction committed&quot;));</a>
+<a name="ln247">          break;</a>
+<a name="ln248">        case TransactionStatus::ABORTED:</a>
+<a name="ln249">          ClearRequests(</a>
+<a name="ln250">              STATUS(Expired, &quot;Transaction aborted&quot;,</a>
+<a name="ln251">                     TransactionError(TransactionErrorCode::kAborted)));</a>
+<a name="ln252">          break;</a>
+<a name="ln253">        case TransactionStatus::CREATED: FALLTHROUGH_INTENDED;</a>
+<a name="ln254">        case TransactionStatus::PENDING: FALLTHROUGH_INTENDED;</a>
+<a name="ln255">        case TransactionStatus::SEALED: FALLTHROUGH_INTENDED;</a>
+<a name="ln256">        case TransactionStatus::COMMITTED: FALLTHROUGH_INTENDED;</a>
+<a name="ln257">        case TransactionStatus::APPLYING: FALLTHROUGH_INTENDED;</a>
+<a name="ln258">        case TransactionStatus::APPLIED_IN_ONE_OF_INVOLVED_TABLETS: FALLTHROUGH_INTENDED;</a>
+<a name="ln259">        case TransactionStatus::CLEANUP:</a>
+<a name="ln260">          ProcessQueue();</a>
+<a name="ln261">          break;</a>
+<a name="ln262">      }</a>
+<a name="ln263">    }</a>
+<a name="ln264"> </a>
+<a name="ln265">    return status;</a>
+<a name="ln266">  }</a>
+<a name="ln267"> </a>
+<a name="ln268">  void ProcessAborted(const TransactionCoordinator::AbortedData&amp; data) {</a>
+<a name="ln269">    VLOG_WITH_PREFIX(4) &lt;&lt; Format(&quot;ProcessAborted: $0, replicating: $1&quot;, data.state, replicating_);</a>
+<a name="ln270"> </a>
+<a name="ln271">    DCHECK(replicating_ == nullptr || !replicating_-&gt;op_id().IsInitialized() ||</a>
+<a name="ln272">           consensus::OpIdEquals(replicating_-&gt;op_id(), data.op_id));</a>
+<a name="ln273">    replicating_ = nullptr;</a>
+<a name="ln274"> </a>
+<a name="ln275">    // We are not leader, so could abort all queued requests.</a>
+<a name="ln276">    ClearRequests(STATUS(Aborted, &quot;Replication failed&quot;));</a>
+<a name="ln277">  }</a>
+<a name="ln278"> </a>
+<a name="ln279">  // Clear requests of this transaction.</a>
+<a name="ln280">  void ClearRequests(const Status&amp; status) {</a>
+<a name="ln281">    VLOG_WITH_PREFIX(4) &lt;&lt; Format(&quot;ClearRequests: $0, replicating: $1&quot;, status, replicating_);</a>
+<a name="ln282">    if (replicating_ != nullptr) {</a>
+<a name="ln283">      context_.CompleteWithStatus(replicating_, status);</a>
+<a name="ln284">      replicating_ = nullptr;</a>
+<a name="ln285">    }</a>
+<a name="ln286"> </a>
+<a name="ln287">    for (auto&amp; entry : request_queue_) {</a>
+<a name="ln288">      context_.CompleteWithStatus(std::move(entry), status);</a>
+<a name="ln289">    }</a>
+<a name="ln290">    request_queue_.clear();</a>
+<a name="ln291"> </a>
+<a name="ln292">    NotifyAbortWaiters(status);</a>
+<a name="ln293">  }</a>
+<a name="ln294"> </a>
+<a name="ln295">  // Used only during transaction sealing.</a>
+<a name="ln296">  void ReplicatedAllBatchesAt(const TabletId&amp; tablet, HybridTime last_time) {</a>
+<a name="ln297">    auto it = involved_tablets_.find(tablet);</a>
+<a name="ln298">    // We could be notified several times, so avoid double handling.</a>
+<a name="ln299">    if (it == involved_tablets_.end() || it-&gt;second.all_batches_replicated) {</a>
+<a name="ln300">      return;</a>
+<a name="ln301">    }</a>
+<a name="ln302"> </a>
+<a name="ln303">    // If transaction was sealed, then its commit time is max of seal record time and intent</a>
+<a name="ln304">    // replication times from all participating tablets.</a>
+<a name="ln305">    commit_time_ = std::max(commit_time_, last_time);</a>
+<a name="ln306">    --tablets_with_not_replicated_batches_;</a>
+<a name="ln307">    it-&gt;second.all_batches_replicated = true;</a>
+<a name="ln308"> </a>
+<a name="ln309">    if (tablets_with_not_replicated_batches_ == 0) {</a>
+<a name="ln310">      StartApply();</a>
+<a name="ln311">    }</a>
+<a name="ln312">  }</a>
+<a name="ln313"> </a>
+<a name="ln314">  Result&lt;TransactionStatusResult&gt; GetStatus(</a>
+<a name="ln315">      std::vector&lt;ExpectedTabletBatches&gt;* expected_tablet_batches) const {</a>
+<a name="ln316">    switch (status_) {</a>
+<a name="ln317">      case TransactionStatus::COMMITTED: FALLTHROUGH_INTENDED;</a>
+<a name="ln318">      case TransactionStatus::APPLIED_IN_ALL_INVOLVED_TABLETS:</a>
+<a name="ln319">        return TransactionStatusResult{TransactionStatus::COMMITTED, commit_time_};</a>
+<a name="ln320">      case TransactionStatus::SEALED:</a>
+<a name="ln321">        if (tablets_with_not_replicated_batches_ == 0) {</a>
+<a name="ln322">          return TransactionStatusResult{TransactionStatus::COMMITTED, commit_time_};</a>
+<a name="ln323">        }</a>
+<a name="ln324">        FillExpectedTabletBatches(expected_tablet_batches);</a>
+<a name="ln325">        return TransactionStatusResult{TransactionStatus::SEALED, commit_time_};</a>
+<a name="ln326">      case TransactionStatus::ABORTED:</a>
+<a name="ln327">        return TransactionStatusResult{TransactionStatus::ABORTED, HybridTime::kMax};</a>
+<a name="ln328">      case TransactionStatus::PENDING: {</a>
+<a name="ln329">        HybridTime status_ht = context_.coordinator_context().clock().Now();</a>
+<a name="ln330">        if (replicating_) {</a>
+<a name="ln331">          auto replicating_status = replicating_-&gt;request()-&gt;status();</a>
+<a name="ln332">          if (replicating_status == TransactionStatus::COMMITTED ||</a>
+<a name="ln333">              replicating_status == TransactionStatus::ABORTED) {</a>
+<a name="ln334">            auto replicating_ht = replicating_-&gt;hybrid_time_even_if_unset();</a>
+<a name="ln335">            if (replicating_ht.is_valid()) {</a>
+<a name="ln336">              status_ht = replicating_ht;</a>
+<a name="ln337">            }</a>
+<a name="ln338">          }</a>
+<a name="ln339">        }</a>
+<a name="ln340">        status_ht = std::min(status_ht, context_.coordinator_context().HtLeaseExpiration());</a>
+<a name="ln341">        return TransactionStatusResult{TransactionStatus::PENDING, status_ht.Decremented()};</a>
+<a name="ln342">      }</a>
+<a name="ln343">      case TransactionStatus::CREATED: FALLTHROUGH_INTENDED;</a>
+<a name="ln344">      case TransactionStatus::APPLYING: FALLTHROUGH_INTENDED;</a>
+<a name="ln345">      case TransactionStatus::APPLIED_IN_ONE_OF_INVOLVED_TABLETS: FALLTHROUGH_INTENDED;</a>
+<a name="ln346">      case TransactionStatus::CLEANUP:</a>
+<a name="ln347">        return STATUS_FORMAT(Corruption, &quot;Transaction has unexpected status: $0&quot;,</a>
+<a name="ln348">                             TransactionStatus_Name(status_));</a>
+<a name="ln349">    }</a>
+<a name="ln350">    FATAL_INVALID_ENUM_VALUE(TransactionStatus, status_);</a>
+<a name="ln351">  }</a>
+<a name="ln352"> </a>
+<a name="ln353">  void Aborted() {</a>
+<a name="ln354">    status_ = TransactionStatus::ABORTED;</a>
+<a name="ln355">    NotifyAbortWaiters(TransactionStatusResult::Aborted());</a>
+<a name="ln356">  }</a>
+<a name="ln357"> </a>
+<a name="ln358">  TransactionStatusResult Abort(TransactionAbortCallback* callback) {</a>
+<a name="ln359">    if (status_ == TransactionStatus::COMMITTED ||</a>
+<a name="ln360">        status_ == TransactionStatus::APPLIED_IN_ALL_INVOLVED_TABLETS) {</a>
+<a name="ln361">      return TransactionStatusResult(TransactionStatus::COMMITTED, commit_time_);</a>
+<a name="ln362">    } else if (ShouldBeCommitted()) {</a>
+<a name="ln363">      return TransactionStatusResult(TransactionStatus::COMMITTED, HybridTime::kMax);</a>
+<a name="ln364">    } else if (status_ == TransactionStatus::ABORTED) {</a>
+<a name="ln365">      return TransactionStatusResult::Aborted();</a>
+<a name="ln366">    } else {</a>
+<a name="ln367">      VLOG_WITH_PREFIX(1) &lt;&lt; &quot;External abort request&quot;;</a>
+<a name="ln368">      CHECK_EQ(TransactionStatus::PENDING, status_);</a>
+<a name="ln369">      abort_waiters_.emplace_back(std::move(*callback));</a>
+<a name="ln370">      Abort();</a>
+<a name="ln371">      return TransactionStatusResult(TransactionStatus::PENDING, HybridTime::kMax);</a>
+<a name="ln372">    }</a>
+<a name="ln373">  }</a>
+<a name="ln374"> </a>
+<a name="ln375">  void Handle(std::unique_ptr&lt;tablet::UpdateTxnOperationState&gt; request) {</a>
+<a name="ln376">    auto&amp; state = *request-&gt;request();</a>
+<a name="ln377">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Handle: &quot; &lt;&lt; state.ShortDebugString();</a>
+<a name="ln378">    if (state.status() == TransactionStatus::APPLIED_IN_ONE_OF_INVOLVED_TABLETS) {</a>
+<a name="ln379">      auto status = AppliedInOneOfInvolvedTablets(state);</a>
+<a name="ln380">      context_.CompleteWithStatus(std::move(request), status);</a>
+<a name="ln381">      return;</a>
+<a name="ln382">    }</a>
+<a name="ln383">    if (replicating_) {</a>
+<a name="ln384">      request_queue_.push_back(std::move(request));</a>
+<a name="ln385">      return;</a>
+<a name="ln386">    }</a>
+<a name="ln387">    DoHandle(std::move(request));</a>
+<a name="ln388">  }</a>
+<a name="ln389"> </a>
+<a name="ln390">  // Aborts this transaction.</a>
+<a name="ln391">  void Abort() {</a>
+<a name="ln392">    if (ShouldBeCommitted()) {</a>
+<a name="ln393">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Transaction abort in wrong state: &quot; &lt;&lt; status_;</a>
+<a name="ln394">      return;</a>
+<a name="ln395">    }</a>
+<a name="ln396">    if (ShouldBeAborted()) {</a>
+<a name="ln397">      return;</a>
+<a name="ln398">    }</a>
+<a name="ln399">    if (status_ != TransactionStatus::PENDING) {</a>
+<a name="ln400">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Unexpected status during abort: &quot;</a>
+<a name="ln401">                              &lt;&lt; TransactionStatus_Name(status_);</a>
+<a name="ln402">      return;</a>
+<a name="ln403">    }</a>
+<a name="ln404">    SubmitUpdateStatus(TransactionStatus::ABORTED);</a>
+<a name="ln405">  }</a>
+<a name="ln406"> </a>
+<a name="ln407">  // Returns logs prefix for this transaction.</a>
+<a name="ln408">  const std::string&amp; LogPrefix() {</a>
+<a name="ln409">    return log_prefix_;</a>
+<a name="ln410">  }</a>
+<a name="ln411"> </a>
+<a name="ln412">  // now_physical is just optimization to avoid querying the current time multiple times.</a>
+<a name="ln413">  void Poll(bool leader, MonoTime now_physical) {</a>
+<a name="ln414">    if (status_ != TransactionStatus::COMMITTED &amp;&amp;</a>
+<a name="ln415">        (status_ != TransactionStatus::SEALED || tablets_with_not_replicated_batches_ != 0)) {</a>
+<a name="ln416">      return;</a>
+<a name="ln417">    }</a>
+<a name="ln418">    if (tablets_with_not_applied_intents_ == 0) {</a>
+<a name="ln419">      if (leader &amp;&amp; !ShouldBeInStatus(TransactionStatus::APPLIED_IN_ALL_INVOLVED_TABLETS)) {</a>
+<a name="ln420">        SubmitUpdateStatus(TransactionStatus::APPLIED_IN_ALL_INVOLVED_TABLETS);</a>
+<a name="ln421">      }</a>
+<a name="ln422">    } else if (now_physical &gt;= resend_applying_time_) {</a>
+<a name="ln423">      if (leader) {</a>
+<a name="ln424">        for (auto&amp; tablet : involved_tablets_) {</a>
+<a name="ln425">          if (!tablet.second.all_intents_applied) {</a>
+<a name="ln426">            context_.NotifyApplying({</a>
+<a name="ln427">                .tablet = tablet.first,</a>
+<a name="ln428">                .transaction = id_,</a>
+<a name="ln429">                .commit_time = commit_time_,</a>
+<a name="ln430">                .sealed = status_ == TransactionStatus::SEALED });</a>
+<a name="ln431">          }</a>
+<a name="ln432">        }</a>
+<a name="ln433">      }</a>
+<a name="ln434">      resend_applying_time_ = now_physical +</a>
+<a name="ln435">          std::chrono::microseconds(FLAGS_transaction_resend_applying_interval_usec);</a>
+<a name="ln436">    }</a>
+<a name="ln437">  }</a>
+<a name="ln438"> </a>
+<a name="ln439">  CHECKED_STATUS AppliedInOneOfInvolvedTablets(const tserver::TransactionStatePB&amp; state) {</a>
+<a name="ln440">    if (status_ != TransactionStatus::COMMITTED &amp;&amp; status_ != TransactionStatus::SEALED) {</a>
+<a name="ln441">      // We could ignore this request, because it will be re-send if required.</a>
+<a name="ln442">      LOG_WITH_PREFIX(DFATAL)</a>
+<a name="ln443">          &lt;&lt; &quot;AppliedInOneOfInvolvedTablets in wrong state: &quot; &lt;&lt; TransactionStatus_Name(status_)</a>
+<a name="ln444">          &lt;&lt; &quot;, request: &quot; &lt;&lt; state.ShortDebugString();</a>
+<a name="ln445">      return Status::OK();</a>
+<a name="ln446">    }</a>
+<a name="ln447"> </a>
+<a name="ln448">    if (state.tablets_size() != 1) {</a>
+<a name="ln449">      return STATUS_FORMAT(</a>
+<a name="ln450">          InvalidArgument, &quot;Expected exactly one tablet in $0: $1&quot;, __func__, state);</a>
+<a name="ln451">    }</a>
+<a name="ln452"> </a>
+<a name="ln453">    auto it = involved_tablets_.find(state.tablets(0));</a>
+<a name="ln454">    if (it == involved_tablets_.end()) {</a>
+<a name="ln455">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Applied in unknown tablet: &quot; &lt;&lt; state.tablets(0);</a>
+<a name="ln456">      return Status::OK();</a>
+<a name="ln457">    }</a>
+<a name="ln458">    if (!it-&gt;second.all_intents_applied) {</a>
+<a name="ln459">      --tablets_with_not_applied_intents_;</a>
+<a name="ln460">      it-&gt;second.all_intents_applied = true;</a>
+<a name="ln461">      VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Applied to &quot; &lt;&lt; state.tablets(0) &lt;&lt; &quot;, left not applied: &quot;</a>
+<a name="ln462">                          &lt;&lt; tablets_with_not_applied_intents_;</a>
+<a name="ln463">      if (tablets_with_not_applied_intents_ == 0) {</a>
+<a name="ln464">        SubmitUpdateStatus(TransactionStatus::APPLIED_IN_ALL_INVOLVED_TABLETS);</a>
+<a name="ln465">      }</a>
+<a name="ln466">    }</a>
+<a name="ln467">    return Status::OK();</a>
+<a name="ln468">  }</a>
+<a name="ln469"> </a>
+<a name="ln470"> private:</a>
+<a name="ln471">  // Checks whether we in specified status or going to be in this status when replication is</a>
+<a name="ln472">  // finished.</a>
+<a name="ln473">  bool ShouldBeInStatus(TransactionStatus status) const {</a>
+<a name="ln474">    if (status_ == status) {</a>
+<a name="ln475">      return true;</a>
+<a name="ln476">    }</a>
+<a name="ln477">    if (replicating_) {</a>
+<a name="ln478">      if (replicating_-&gt;request()-&gt;status() == status) {</a>
+<a name="ln479">        return true;</a>
+<a name="ln480">      }</a>
+<a name="ln481"> </a>
+<a name="ln482">      for (const auto&amp; entry : request_queue_) {</a>
+<a name="ln483">        if (entry-&gt;request()-&gt;status() == status) {</a>
+<a name="ln484">          return true;</a>
+<a name="ln485">        }</a>
+<a name="ln486">      }</a>
+<a name="ln487">    }</a>
+<a name="ln488"> </a>
+<a name="ln489">    return false;</a>
+<a name="ln490">  }</a>
+<a name="ln491"> </a>
+<a name="ln492">  bool ShouldBeCommitted() const {</a>
+<a name="ln493">    return ShouldBeInStatus(TransactionStatus::COMMITTED) ||</a>
+<a name="ln494">           ShouldBeInStatus(TransactionStatus::APPLIED_IN_ALL_INVOLVED_TABLETS);</a>
+<a name="ln495">  }</a>
+<a name="ln496"> </a>
+<a name="ln497">  bool ShouldBeAborted() const {</a>
+<a name="ln498">    return ShouldBeInStatus(TransactionStatus::ABORTED);</a>
+<a name="ln499">  }</a>
+<a name="ln500"> </a>
+<a name="ln501">  // Process operation that was replicated in RAFT.</a>
+<a name="ln502">  CHECKED_STATUS DoProcessReplicated(const TransactionCoordinator::ReplicatedData&amp; data) {</a>
+<a name="ln503">    switch (data.state.status()) {</a>
+<a name="ln504">      case TransactionStatus::ABORTED:</a>
+<a name="ln505">        return AbortedReplicationFinished(data);</a>
+<a name="ln506">      case TransactionStatus::SEALED:</a>
+<a name="ln507">        return SealedReplicationFinished(data);</a>
+<a name="ln508">      case TransactionStatus::COMMITTED:</a>
+<a name="ln509">        return CommittedReplicationFinished(data);</a>
+<a name="ln510">      case TransactionStatus::CREATED: FALLTHROUGH_INTENDED;</a>
+<a name="ln511">      case TransactionStatus::PENDING:</a>
+<a name="ln512">        return PendingReplicationFinished(data);</a>
+<a name="ln513">      case TransactionStatus::APPLYING:</a>
+<a name="ln514">        // APPLYING is handled separately, because it is received for transactions not managed by</a>
+<a name="ln515">        // this tablet as a transaction status tablet, but tablets that are involved in the data</a>
+<a name="ln516">        // path (receive write intents) for this transactions</a>
+<a name="ln517">        FATAL_INVALID_ENUM_VALUE(TransactionStatus, data.state.status());</a>
+<a name="ln518">      case TransactionStatus::APPLIED_IN_ONE_OF_INVOLVED_TABLETS:</a>
+<a name="ln519">        // APPLIED_IN_ONE_OF_INVOLVED_TABLETS handled w/o use of RAFT log</a>
+<a name="ln520">        FATAL_INVALID_ENUM_VALUE(TransactionStatus, data.state.status());</a>
+<a name="ln521">      case TransactionStatus::APPLIED_IN_ALL_INVOLVED_TABLETS:</a>
+<a name="ln522">        return AppliedInAllInvolvedTabletsReplicationFinished(data);</a>
+<a name="ln523">      case TransactionStatus::CLEANUP:</a>
+<a name="ln524">        // CLEANUP is handled separately, because it is received for transactions not managed by</a>
+<a name="ln525">        // this tablet as a transaction status tablet, but tablets that are involved in the data</a>
+<a name="ln526">        // path (receive write intents) for this transactions</a>
+<a name="ln527">        FATAL_INVALID_ENUM_VALUE(TransactionStatus, data.state.status());</a>
+<a name="ln528">    }</a>
+<a name="ln529">    FATAL_INVALID_ENUM_VALUE(TransactionStatus, data.state.status());</a>
+<a name="ln530">  }</a>
+<a name="ln531"> </a>
+<a name="ln532">  void DoHandle(std::unique_ptr&lt;tablet::UpdateTxnOperationState&gt; request) {</a>
+<a name="ln533">    const auto&amp; state = *request-&gt;request();</a>
+<a name="ln534"> </a>
+<a name="ln535">    Status status;</a>
+<a name="ln536">    if (state.status() == TransactionStatus::COMMITTED) {</a>
+<a name="ln537">      status = HandleCommit();</a>
+<a name="ln538">    } else if (state.status() == TransactionStatus::PENDING) {</a>
+<a name="ln539">      if (status_ != TransactionStatus::PENDING) {</a>
+<a name="ln540">        status = STATUS_FORMAT(IllegalState,</a>
+<a name="ln541">            &quot;Transaction in wrong state during heartbeat: $0&quot;,</a>
+<a name="ln542">            TransactionStatus_Name(status_));</a>
+<a name="ln543">      } else {</a>
+<a name="ln544">        status = Status::OK();</a>
+<a name="ln545">      }</a>
+<a name="ln546">    } else {</a>
+<a name="ln547">      status = Status::OK();</a>
+<a name="ln548">    }</a>
+<a name="ln549"> </a>
+<a name="ln550">    if (!status.ok()) {</a>
+<a name="ln551">      context_.CompleteWithStatus(std::move(request), std::move(status));</a>
+<a name="ln552">      return;</a>
+<a name="ln553">    }</a>
+<a name="ln554"> </a>
+<a name="ln555">    VLOG_WITH_PREFIX(4) &lt;&lt; Format(&quot;DoHandle, replicating = $0&quot;, replicating_);</a>
+<a name="ln556">    replicating_ = request.get();</a>
+<a name="ln557">    auto submitted = context_.SubmitUpdateTransaction(std::move(request));</a>
+<a name="ln558">    CHECK(submitted);</a>
+<a name="ln559">  }</a>
+<a name="ln560"> </a>
+<a name="ln561">  CHECKED_STATUS HandleCommit() {</a>
+<a name="ln562">    auto hybrid_time = context_.coordinator_context().clock().Now();</a>
+<a name="ln563">    if (ExpiredAt(hybrid_time)) {</a>
+<a name="ln564">      auto status = STATUS(Expired, &quot;Commit of expired transaction&quot;);</a>
+<a name="ln565">      VLOG_WITH_PREFIX(4) &lt;&lt; status;</a>
+<a name="ln566">      Abort();</a>
+<a name="ln567">      return status;</a>
+<a name="ln568">    }</a>
+<a name="ln569">    if (status_ != TransactionStatus::PENDING) {</a>
+<a name="ln570">      return STATUS_FORMAT(IllegalState,</a>
+<a name="ln571">                           &quot;Transaction in wrong state when starting to commit: $0&quot;,</a>
+<a name="ln572">                           TransactionStatus_Name(status_));</a>
+<a name="ln573">    }</a>
+<a name="ln574"> </a>
+<a name="ln575">    return Status::OK();</a>
+<a name="ln576">  }</a>
+<a name="ln577"> </a>
+<a name="ln578">  void SubmitUpdateStatus(TransactionStatus status) {</a>
+<a name="ln579">    VLOG_WITH_PREFIX(4) &lt;&lt; &quot;SubmitUpdateStatus(&quot; &lt;&lt; TransactionStatus_Name(status) &lt;&lt; &quot;)&quot;;</a>
+<a name="ln580"> </a>
+<a name="ln581">    tserver::TransactionStatePB state;</a>
+<a name="ln582">    state.set_transaction_id(id_.data(), id_.size());</a>
+<a name="ln583">    state.set_status(status);</a>
+<a name="ln584"> </a>
+<a name="ln585">    auto request = context_.coordinator_context().CreateUpdateTransactionState(&amp;state);</a>
+<a name="ln586">    if (replicating_) {</a>
+<a name="ln587">      request_queue_.push_back(std::move(request));</a>
+<a name="ln588">    } else {</a>
+<a name="ln589">      replicating_ = request.get();</a>
+<a name="ln590">      VLOG_WITH_PREFIX(4) &lt;&lt; Format(&quot;SubmitUpdateStatus, replicating = $0&quot;, replicating_);</a>
+<a name="ln591">      if (!context_.SubmitUpdateTransaction(std::move(request))) {</a>
+<a name="ln592">        // Was not able to submit update transaction, for instance we are not leader.</a>
+<a name="ln593">        // So we are not replicating.</a>
+<a name="ln594">        replicating_ = nullptr;</a>
+<a name="ln595">      }</a>
+<a name="ln596">    }</a>
+<a name="ln597">  }</a>
+<a name="ln598"> </a>
+<a name="ln599">  void ProcessQueue() {</a>
+<a name="ln600">    while (!replicating_ &amp;&amp; !request_queue_.empty()) {</a>
+<a name="ln601">      auto request = std::move(request_queue_.front());</a>
+<a name="ln602">      request_queue_.pop_front();</a>
+<a name="ln603">      DoHandle(std::move(request));</a>
+<a name="ln604">    }</a>
+<a name="ln605">  }</a>
+<a name="ln606"> </a>
+<a name="ln607">  CHECKED_STATUS AbortedReplicationFinished(const TransactionCoordinator::ReplicatedData&amp; data) {</a>
+<a name="ln608">    if (status_ != TransactionStatus::ABORTED &amp;&amp;</a>
+<a name="ln609">        status_ != TransactionStatus::PENDING) {</a>
+<a name="ln610">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Invalid status of aborted transaction: &quot;</a>
+<a name="ln611">                              &lt;&lt; TransactionStatus_Name(status_);</a>
+<a name="ln612">    }</a>
+<a name="ln613"> </a>
+<a name="ln614">    status_ = TransactionStatus::ABORTED;</a>
+<a name="ln615">    first_entry_raft_index_ = data.op_id.index();</a>
+<a name="ln616">    NotifyAbortWaiters(TransactionStatusResult::Aborted());</a>
+<a name="ln617">    return Status::OK();</a>
+<a name="ln618">  }</a>
+<a name="ln619"> </a>
+<a name="ln620">  CHECKED_STATUS SealedReplicationFinished(</a>
+<a name="ln621">      const TransactionCoordinator::ReplicatedData&amp; data) {</a>
+<a name="ln622">    if (status_ != TransactionStatus::PENDING) {</a>
+<a name="ln623">      auto status = STATUS_FORMAT(</a>
+<a name="ln624">          IllegalState,</a>
+<a name="ln625">          &quot;Unexpected status during CommittedReplicationFinished: $0&quot;,</a>
+<a name="ln626">          TransactionStatus_Name(status_));</a>
+<a name="ln627">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; status;</a>
+<a name="ln628">      return status;</a>
+<a name="ln629">    }</a>
+<a name="ln630"> </a>
+<a name="ln631">    last_touch_ = data.hybrid_time;</a>
+<a name="ln632">    commit_time_ = data.hybrid_time;</a>
+<a name="ln633">    // TODO(dtxn) Not yet implemented</a>
+<a name="ln634">    next_abort_after_sealing_ = CoarseMonoClock::now() + FLAGS_avoid_abort_after_sealing_ms * 1ms;</a>
+<a name="ln635">    VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Seal time: &quot; &lt;&lt; commit_time_;</a>
+<a name="ln636">    status_ = TransactionStatus::SEALED;</a>
+<a name="ln637"> </a>
+<a name="ln638">    involved_tablets_.reserve(data.state.tablets().size());</a>
+<a name="ln639">    for (int idx = 0; idx != data.state.tablets().size(); ++idx) {</a>
+<a name="ln640">      auto tablet_batches = data.state.tablet_batches(idx);</a>
+<a name="ln641">      LOG_IF_WITH_PREFIX(DFATAL, tablet_batches == 0)</a>
+<a name="ln642">          &lt;&lt; &quot;Tablet without batches: &quot; &lt;&lt; data.state.ShortDebugString();</a>
+<a name="ln643">      ++tablets_with_not_replicated_batches_;</a>
+<a name="ln644">      InvolvedTabletState state = {</a>
+<a name="ln645">        .required_replicated_batches = static_cast&lt;size_t&gt;(tablet_batches),</a>
+<a name="ln646">        .all_batches_replicated = false,</a>
+<a name="ln647">        .all_intents_applied = false</a>
+<a name="ln648">      };</a>
+<a name="ln649">      involved_tablets_.emplace(data.state.tablets(idx), state);</a>
+<a name="ln650">    }</a>
+<a name="ln651"> </a>
+<a name="ln652">    first_entry_raft_index_ = data.op_id.index();</a>
+<a name="ln653">    return Status::OK();</a>
+<a name="ln654">  }</a>
+<a name="ln655"> </a>
+<a name="ln656">  CHECKED_STATUS CommittedReplicationFinished(const TransactionCoordinator::ReplicatedData&amp; data) {</a>
+<a name="ln657">    if (status_ != TransactionStatus::PENDING) {</a>
+<a name="ln658">      auto status = STATUS_FORMAT(</a>
+<a name="ln659">          IllegalState,</a>
+<a name="ln660">          &quot;Unexpected status during CommittedReplicationFinished: $0&quot;,</a>
+<a name="ln661">          TransactionStatus_Name(status_));</a>
+<a name="ln662">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; status;</a>
+<a name="ln663">      return status;</a>
+<a name="ln664">    }</a>
+<a name="ln665"> </a>
+<a name="ln666">    last_touch_ = data.hybrid_time;</a>
+<a name="ln667">    commit_time_ = data.hybrid_time;</a>
+<a name="ln668">    first_entry_raft_index_ = data.op_id.index();</a>
+<a name="ln669">    involved_tablets_.reserve(data.state.tablets().size());</a>
+<a name="ln670">    for (const auto&amp; tablet : data.state.tablets()) {</a>
+<a name="ln671">      InvolvedTabletState state = {</a>
+<a name="ln672">        .required_replicated_batches = 0,</a>
+<a name="ln673">        .all_batches_replicated = true,</a>
+<a name="ln674">        .all_intents_applied = false</a>
+<a name="ln675">      };</a>
+<a name="ln676">      involved_tablets_.emplace(tablet, state);</a>
+<a name="ln677">    }</a>
+<a name="ln678"> </a>
+<a name="ln679">    status_ = TransactionStatus::COMMITTED;</a>
+<a name="ln680">    StartApply();</a>
+<a name="ln681">    return Status::OK();</a>
+<a name="ln682">  }</a>
+<a name="ln683"> </a>
+<a name="ln684">  CHECKED_STATUS AppliedInAllInvolvedTabletsReplicationFinished(</a>
+<a name="ln685">      const TransactionCoordinator::ReplicatedData&amp; data) {</a>
+<a name="ln686">    if (status_ != TransactionStatus::COMMITTED &amp;&amp; status_ != TransactionStatus::SEALED) {</a>
+<a name="ln687">      // That could happen in old version, because we could drop all entries before</a>
+<a name="ln688">      // APPLIED_IN_ALL_INVOLVED_TABLETS.</a>
+<a name="ln689">      LOG_WITH_PREFIX(DFATAL)</a>
+<a name="ln690">          &lt;&lt; &quot;AppliedInAllInvolvedTabletsReplicationFinished in wrong state: &quot;</a>
+<a name="ln691">          &lt;&lt; TransactionStatus_Name(status_) &lt;&lt; &quot;, request: &quot; &lt;&lt; data.state.ShortDebugString();</a>
+<a name="ln692">      CHECK_EQ(status_, TransactionStatus::PENDING);</a>
+<a name="ln693">    }</a>
+<a name="ln694">    VLOG_WITH_PREFIX(4) &lt;&lt; __func__ &lt;&lt; &quot;, status: &quot; &lt;&lt; TransactionStatus_Name(status_)</a>
+<a name="ln695">                        &lt;&lt; &quot;, leader: &quot; &lt;&lt; context_.leader();</a>
+<a name="ln696">    last_touch_ = data.hybrid_time;</a>
+<a name="ln697">    status_ = TransactionStatus::APPLIED_IN_ALL_INVOLVED_TABLETS;</a>
+<a name="ln698">    return Status::OK();</a>
+<a name="ln699">  }</a>
+<a name="ln700"> </a>
+<a name="ln701">  // Used for PENDING and CREATED records. Because when we apply replicated operations they have</a>
+<a name="ln702">  // the same meaning.</a>
+<a name="ln703">  CHECKED_STATUS PendingReplicationFinished(const TransactionCoordinator::ReplicatedData&amp; data) {</a>
+<a name="ln704">    if (context_.leader() &amp;&amp; ExpiredAt(data.hybrid_time)) {</a>
+<a name="ln705">      VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Expired during replication of PENDING or CREATED operations.&quot;;</a>
+<a name="ln706">      Abort();</a>
+<a name="ln707">      return Status::OK();</a>
+<a name="ln708">    }</a>
+<a name="ln709">    if (status_ != TransactionStatus::PENDING) {</a>
+<a name="ln710">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Bad status during &quot; &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; data.ToString()</a>
+<a name="ln711">                              &lt;&lt; &quot;): &quot; &lt;&lt; ToString();</a>
+<a name="ln712">      return Status::OK();</a>
+<a name="ln713">    }</a>
+<a name="ln714">    last_touch_ = data.hybrid_time;</a>
+<a name="ln715">    first_entry_raft_index_ = data.op_id.index();</a>
+<a name="ln716">    return Status::OK();</a>
+<a name="ln717">  }</a>
+<a name="ln718"> </a>
+<a name="ln719">  void NotifyAbortWaiters(const Result&lt;TransactionStatusResult&gt;&amp; result) {</a>
+<a name="ln720">    for (auto&amp; waiter : abort_waiters_) {</a>
+<a name="ln721">      waiter(result);</a>
+<a name="ln722">    }</a>
+<a name="ln723">    abort_waiters_.clear();</a>
+<a name="ln724">  }</a>
+<a name="ln725"> </a>
+<a name="ln726">  void StartApply() {</a>
+<a name="ln727">    VLOG_WITH_PREFIX(4) &lt;&lt; __func__ &lt;&lt; &quot;, commit time: &quot; &lt;&lt; commit_time_ &lt;&lt; &quot;, involved tablets: &quot;</a>
+<a name="ln728">                        &lt;&lt; AsString(involved_tablets_);</a>
+<a name="ln729">    resend_applying_time_ = MonoTime::Now() +</a>
+<a name="ln730">        std::chrono::microseconds(FLAGS_transaction_resend_applying_interval_usec);</a>
+<a name="ln731">    tablets_with_not_applied_intents_ = involved_tablets_.size();</a>
+<a name="ln732">    if (context_.leader()) {</a>
+<a name="ln733">      for (const auto&amp; tablet : involved_tablets_) {</a>
+<a name="ln734">        context_.NotifyApplying({</a>
+<a name="ln735">            .tablet = tablet.first,</a>
+<a name="ln736">            .transaction = id_,</a>
+<a name="ln737">            .commit_time = commit_time_,</a>
+<a name="ln738">            .sealed = status_ == TransactionStatus::SEALED});</a>
+<a name="ln739">      }</a>
+<a name="ln740">    }</a>
+<a name="ln741">    NotifyAbortWaiters(TransactionStatusResult(TransactionStatus::COMMITTED, commit_time_));</a>
+<a name="ln742">  }</a>
+<a name="ln743"> </a>
+<a name="ln744">  void FillExpectedTabletBatches(</a>
+<a name="ln745">      std::vector&lt;ExpectedTabletBatches&gt;* expected_tablet_batches) const {</a>
+<a name="ln746">    if (!expected_tablet_batches) {</a>
+<a name="ln747">      return;</a>
+<a name="ln748">    }</a>
+<a name="ln749"> </a>
+<a name="ln750">    for (const auto&amp; tablet_id_and_state : involved_tablets_) {</a>
+<a name="ln751">      if (!tablet_id_and_state.second.all_batches_replicated) {</a>
+<a name="ln752">        expected_tablet_batches-&gt;push_back(ExpectedTabletBatches{</a>
+<a name="ln753">            tablet_id_and_state.first,</a>
+<a name="ln754">            tablet_id_and_state.second.required_replicated_batches});</a>
+<a name="ln755">      }</a>
+<a name="ln756">    }</a>
+<a name="ln757">  }</a>
+<a name="ln758"> </a>
+<a name="ln759">  TransactionStateContext&amp; context_;</a>
+<a name="ln760">  const TransactionId id_;</a>
+<a name="ln761">  const std::string log_prefix_;</a>
+<a name="ln762">  TransactionStatus status_ = TransactionStatus::PENDING;</a>
+<a name="ln763">  HybridTime last_touch_;</a>
+<a name="ln764">  // It should match last_touch_, but it is possible that because of some code errors it</a>
+<a name="ln765">  // would not be so. To add stability we introduce a separate field for it.</a>
+<a name="ln766">  HybridTime commit_time_;</a>
+<a name="ln767"> </a>
+<a name="ln768">  // If transaction was only sealed, we will try to abort it not earlier than this time.</a>
+<a name="ln769">  CoarseTimePoint next_abort_after_sealing_;</a>
+<a name="ln770"> </a>
+<a name="ln771">  struct InvolvedTabletState {</a>
+<a name="ln772">    // How many batches should be replicated at this tablet.</a>
+<a name="ln773">    size_t required_replicated_batches = 0;</a>
+<a name="ln774"> </a>
+<a name="ln775">    // True if this tablet already replicated all batches.</a>
+<a name="ln776">    bool all_batches_replicated = false;</a>
+<a name="ln777"> </a>
+<a name="ln778">    // True if this tablet already applied all intents.</a>
+<a name="ln779">    bool all_intents_applied = false;</a>
+<a name="ln780"> </a>
+<a name="ln781">    std::string ToString() const {</a>
+<a name="ln782">      return Format(&quot;{ required_replicated_batches: $0 all_batches_replicated: $1 &quot;</a>
+<a name="ln783">                        &quot;all_intents_applied: $2 }&quot;,</a>
+<a name="ln784">                    required_replicated_batches, all_batches_replicated, all_intents_applied);</a>
+<a name="ln785">    }</a>
+<a name="ln786">  };</a>
+<a name="ln787"> </a>
+<a name="ln788">  // Tablets participating in this transaction.</a>
+<a name="ln789">  std::unordered_map&lt;TabletId, InvolvedTabletState&gt; involved_tablets_;</a>
+<a name="ln790">  // Number of tablets that have not yet replicated all batches.</a>
+<a name="ln791">  size_t tablets_with_not_replicated_batches_ = 0;</a>
+<a name="ln792">  // Number of tablets that have not yet applied intents.</a>
+<a name="ln793">  size_t tablets_with_not_applied_intents_ = 0;</a>
+<a name="ln794">  // Don't resend applying until this time.</a>
+<a name="ln795">  MonoTime resend_applying_time_;</a>
+<a name="ln796">  int64_t first_entry_raft_index_ = std::numeric_limits&lt;int64_t&gt;::max();</a>
+<a name="ln797"> </a>
+<a name="ln798">  // The operation that we a currently replicating in RAFT.</a>
+<a name="ln799">  // It is owned by TransactionDriver (that will be renamed to OperationDriver).</a>
+<a name="ln800">  tablet::UpdateTxnOperationState* replicating_ = nullptr;</a>
+<a name="ln801">  std::deque&lt;std::unique_ptr&lt;tablet::UpdateTxnOperationState&gt;&gt; request_queue_;</a>
+<a name="ln802"> </a>
+<a name="ln803">  std::vector&lt;TransactionAbortCallback&gt; abort_waiters_;</a>
+<a name="ln804">};</a>
+<a name="ln805"> </a>
+<a name="ln806">struct CompleteWithStatusEntry {</a>
+<a name="ln807">  std::unique_ptr&lt;UpdateTxnOperationState&gt; holder;</a>
+<a name="ln808">  UpdateTxnOperationState* request;</a>
+<a name="ln809">  Status status;</a>
+<a name="ln810">};</a>
+<a name="ln811"> </a>
+<a name="ln812">// Contains actions that should be executed after lock in transaction coordinator is released.</a>
+<a name="ln813">struct PostponedLeaderActions {</a>
+<a name="ln814">  int64_t leader_term = OpId::kUnknownTerm;</a>
+<a name="ln815">  // List of tablets with transaction id, that should be notified that this transaction</a>
+<a name="ln816">  // is applying.</a>
+<a name="ln817">  std::vector&lt;NotifyApplyingData&gt; notify_applying;</a>
+<a name="ln818">  // List of update transaction records, that should be replicated via RAFT.</a>
+<a name="ln819">  std::vector&lt;std::unique_ptr&lt;UpdateTxnOperationState&gt;&gt; updates;</a>
+<a name="ln820"> </a>
+<a name="ln821">  std::vector&lt;CompleteWithStatusEntry&gt; complete_with_status;</a>
+<a name="ln822"> </a>
+<a name="ln823">  void Swap(PostponedLeaderActions* other) {</a>
+<a name="ln824">    std::swap(leader_term, other-&gt;leader_term);</a>
+<a name="ln825">    notify_applying.swap(other-&gt;notify_applying);</a>
+<a name="ln826">    updates.swap(other-&gt;updates);</a>
+<a name="ln827">    complete_with_status.swap(other-&gt;complete_with_status);</a>
+<a name="ln828">  }</a>
+<a name="ln829"> </a>
+<a name="ln830">  bool leader() const {</a>
+<a name="ln831">    return leader_term != OpId::kUnknownTerm;</a>
+<a name="ln832">  }</a>
+<a name="ln833">};</a>
+<a name="ln834"> </a>
+<a name="ln835">} // namespace</a>
+<a name="ln836"> </a>
+<a name="ln837">// Real implementation of transaction coordinator, as in PImpl idiom.</a>
+<a name="ln838">class TransactionCoordinator::Impl : public TransactionStateContext {</a>
+<a name="ln839"> public:</a>
+<a name="ln840">  Impl(const std::string&amp; permanent_uuid,</a>
+<a name="ln841">       TransactionCoordinatorContext* context,</a>
+<a name="ln842">       Counter* expired_metric)</a>
+<a name="ln843">      : context_(*context),</a>
+<a name="ln844">        expired_metric_(*expired_metric),</a>
+<a name="ln845">        log_prefix_(consensus::MakeTabletLogPrefix(context-&gt;tablet_id(), permanent_uuid)),</a>
+<a name="ln846">        poller_(log_prefix_, std::bind(&amp;Impl::Poll, this)) {</a>
+<a name="ln847">  }</a>
+<a name="ln848"> </a>
+<a name="ln849">  virtual ~Impl() {</a>
+<a name="ln850">    Shutdown();</a>
+<a name="ln851">  }</a>
+<a name="ln852"> </a>
+<a name="ln853">  void Shutdown() {</a>
+<a name="ln854">    poller_.Shutdown();</a>
+<a name="ln855">    rpcs_.Shutdown();</a>
+<a name="ln856">  }</a>
+<a name="ln857"> </a>
+<a name="ln858">  CHECKED_STATUS GetStatus(const google::protobuf::RepeatedPtrField&lt;std::string&gt;&amp; transaction_ids,</a>
+<a name="ln859">                           CoarseTimePoint deadline,</a>
+<a name="ln860">                           tserver::GetTransactionStatusResponsePB* response) {</a>
+<a name="ln861">    AtomicFlagSleepMs(&amp;FLAGS_TEST_inject_txn_get_status_delay_ms);</a>
+<a name="ln862">    auto leader_term = context_.LeaderTerm();</a>
+<a name="ln863">    PostponedLeaderActions postponed_leader_actions;</a>
+<a name="ln864">    {</a>
+<a name="ln865">      std::unique_lock&lt;std::mutex&gt; lock(managed_mutex_);</a>
+<a name="ln866">      postponed_leader_actions_.leader_term = leader_term;</a>
+<a name="ln867">      for (const auto&amp; transaction_id : transaction_ids) {</a>
+<a name="ln868">        auto id = VERIFY_RESULT(FullyDecodeTransactionId(transaction_id));</a>
+<a name="ln869"> </a>
+<a name="ln870">        auto it = managed_transactions_.find(id);</a>
+<a name="ln871">        std::vector&lt;ExpectedTabletBatches&gt; expected_tablet_batches;</a>
+<a name="ln872">        auto txn_status_with_ht = it != managed_transactions_.end()</a>
+<a name="ln873">            ? VERIFY_RESULT(it-&gt;GetStatus(&amp;expected_tablet_batches))</a>
+<a name="ln874">            : TransactionStatusResult(TransactionStatus::ABORTED, HybridTime::kMax);</a>
+<a name="ln875">        VLOG_WITH_PREFIX(4) &lt;&lt; __func__ &lt;&lt; &quot;: &quot; &lt;&lt; id &lt;&lt; &quot; =&gt; &quot; &lt;&lt; txn_status_with_ht;</a>
+<a name="ln876">        if (txn_status_with_ht.status == TransactionStatus::SEALED) {</a>
+<a name="ln877">          // TODO(dtxn) Avoid concurrent resolve</a>
+<a name="ln878">          txn_status_with_ht = VERIFY_RESULT(ResolveSealedStatus(</a>
+<a name="ln879">              id, txn_status_with_ht.status_time, expected_tablet_batches,</a>
+<a name="ln880">              /* abort_if_not_replicated = */ false, &amp;lock));</a>
+<a name="ln881">        }</a>
+<a name="ln882">        response-&gt;add_status(txn_status_with_ht.status);</a>
+<a name="ln883">        response-&gt;add_status_hybrid_time(txn_status_with_ht.status_time.ToUint64());</a>
+<a name="ln884">      }</a>
+<a name="ln885">      postponed_leader_actions.Swap(&amp;postponed_leader_actions_);</a>
+<a name="ln886">    }</a>
+<a name="ln887"> </a>
+<a name="ln888">    ExecutePostponedLeaderActions(&amp;postponed_leader_actions);</a>
+<a name="ln889">    return Status::OK();</a>
+<a name="ln890">  }</a>
+<a name="ln891"> </a>
+<a name="ln892">  Result&lt;TransactionStatusResult&gt; ResolveSealedStatus(</a>
+<a name="ln893">      const TransactionId&amp; transaction_id,</a>
+<a name="ln894">      HybridTime commit_time,</a>
+<a name="ln895">      const std::vector&lt;ExpectedTabletBatches&gt;&amp; expected_tablet_batches,</a>
+<a name="ln896">      bool abort_if_not_replicated,</a>
+<a name="ln897">      std::unique_lock&lt;std::mutex&gt;* lock) {</a>
+<a name="ln898">    VLOG_WITH_PREFIX(4)</a>
+<a name="ln899">        &lt;&lt; __func__ &lt;&lt; &quot;, txn: &quot; &lt;&lt; transaction_id &lt;&lt; &quot;, commit time: &quot; &lt;&lt; commit_time</a>
+<a name="ln900">        &lt;&lt; &quot;, expected tablet batches: &quot; &lt;&lt; AsString(expected_tablet_batches)</a>
+<a name="ln901">        &lt;&lt; &quot;, abort if not replicated: &quot; &lt;&lt; abort_if_not_replicated;</a>
+<a name="ln902"> </a>
+<a name="ln903">    auto deadline = TransactionRpcDeadline();</a>
+<a name="ln904">    auto now_ht = context_.clock().Now();</a>
+<a name="ln905">    CountDownLatch latch(expected_tablet_batches.size());</a>
+<a name="ln906">    std::vector&lt;HybridTime&gt; write_hybrid_times(expected_tablet_batches.size());</a>
+<a name="ln907">    {</a>
+<a name="ln908">      lock-&gt;unlock();</a>
+<a name="ln909">      auto scope_exit = ScopeExit([lock] {</a>
+<a name="ln910">        if (lock) {</a>
+<a name="ln911">          lock-&gt;lock();</a>
+<a name="ln912">        }</a>
+<a name="ln913">      });</a>
+<a name="ln914">      size_t idx = 0;</a>
+<a name="ln915">      for (const auto&amp; p : expected_tablet_batches) {</a>
+<a name="ln916">        tserver::GetTransactionStatusAtParticipantRequestPB req;</a>
+<a name="ln917">        req.set_tablet_id(p.tablet);</a>
+<a name="ln918">        req.set_transaction_id(</a>
+<a name="ln919">            pointer_cast&lt;const char*&gt;(transaction_id.data()), transaction_id.size());</a>
+<a name="ln920">        req.set_propagated_hybrid_time(now_ht.ToUint64());</a>
+<a name="ln921">        if (abort_if_not_replicated) {</a>
+<a name="ln922">          req.set_required_num_replicated_batches(p.batches);</a>
+<a name="ln923">        }</a>
+<a name="ln924"> </a>
+<a name="ln925">        auto handle = rpcs_.Prepare();</a>
+<a name="ln926">        if (handle != rpcs_.InvalidHandle()) {</a>
+<a name="ln927">          *handle = GetTransactionStatusAtParticipant(</a>
+<a name="ln928">              deadline,</a>
+<a name="ln929">              nullptr /* remote_tablet */,</a>
+<a name="ln930">              context_.client_future().get(),</a>
+<a name="ln931">              &amp;req,</a>
+<a name="ln932">              [this, handle, idx, &amp;write_hybrid_times, &amp;expected_tablet_batches, &amp;latch,</a>
+<a name="ln933">               &amp;transaction_id, &amp;p](</a>
+<a name="ln934">                  const Status&amp; status,</a>
+<a name="ln935">                  const tserver::GetTransactionStatusAtParticipantResponsePB&amp; resp) {</a>
+<a name="ln936">                client::UpdateClock(resp, &amp;context_);</a>
+<a name="ln937">                rpcs_.Unregister(handle);</a>
+<a name="ln938"> </a>
+<a name="ln939">                VLOG_WITH_PREFIX(4)</a>
+<a name="ln940">                    &lt;&lt; &quot;TXN: &quot; &lt;&lt; transaction_id &lt;&lt; &quot; batch status at &quot; &lt;&lt; p.tablet &lt;&lt; &quot;: &quot;</a>
+<a name="ln941">                    &lt;&lt; &quot;idx: &quot; &lt;&lt; idx &lt;&lt; &quot;, resp: &quot; &lt;&lt; resp.ShortDebugString() &lt;&lt; &quot;, expected: &quot;</a>
+<a name="ln942">                    &lt;&lt; expected_tablet_batches[idx].batches;</a>
+<a name="ln943">                if (status.ok()) {</a>
+<a name="ln944">                  if (resp.aborted()) {</a>
+<a name="ln945">                    write_hybrid_times[idx] = HybridTime::kMin;</a>
+<a name="ln946">                  } else if (resp.num_replicated_batches() ==</a>
+<a name="ln947">                                 expected_tablet_batches[idx].batches) {</a>
+<a name="ln948">                    write_hybrid_times[idx] = HybridTime(resp.status_hybrid_time());</a>
+<a name="ln949">                    LOG_IF_WITH_PREFIX(DFATAL, !write_hybrid_times[idx].is_valid())</a>
+<a name="ln950">                        &lt;&lt; &quot;Received invalid hybrid time when all batches were replicated: &quot;</a>
+<a name="ln951">                        &lt;&lt; resp.ShortDebugString();</a>
+<a name="ln952">                  }</a>
+<a name="ln953">                }</a>
+<a name="ln954">                latch.CountDown();</a>
+<a name="ln955">              });</a>
+<a name="ln956">          (**handle).SendRpc();</a>
+<a name="ln957">        } else {</a>
+<a name="ln958">          latch.CountDown();</a>
+<a name="ln959">        }</a>
+<a name="ln960">        ++idx;</a>
+<a name="ln961">      }</a>
+<a name="ln962">      latch.Wait();</a>
+<a name="ln963">    }</a>
+<a name="ln964"> </a>
+<a name="ln965">    auto txn_it = managed_transactions_.find(transaction_id);</a>
+<a name="ln966">    if (txn_it == managed_transactions_.end()) {</a>
+<a name="ln967">      // Transaction was completed (aborted/committed) during this procedure.</a>
+<a name="ln968">      return TransactionStatusResult{TransactionStatus::PENDING, commit_time.Decremented()};</a>
+<a name="ln969">    }</a>
+<a name="ln970"> </a>
+<a name="ln971">    for (size_t idx = 0; idx != expected_tablet_batches.size(); ++idx) {</a>
+<a name="ln972">      if (write_hybrid_times[idx] == HybridTime::kMin) {</a>
+<a name="ln973">        managed_transactions_.modify(txn_it, [](TransactionState&amp; state) {</a>
+<a name="ln974">          state.Aborted();</a>
+<a name="ln975">        });</a>
+<a name="ln976">      } else if (write_hybrid_times[idx].is_valid()) {</a>
+<a name="ln977">        managed_transactions_.modify(</a>
+<a name="ln978">            txn_it, [idx, &amp;expected_tablet_batches, &amp;write_hybrid_times](TransactionState&amp; state) {</a>
+<a name="ln979">          state.ReplicatedAllBatchesAt(</a>
+<a name="ln980">              expected_tablet_batches[idx].tablet, write_hybrid_times[idx]);</a>
+<a name="ln981">        });</a>
+<a name="ln982">      }</a>
+<a name="ln983">    }</a>
+<a name="ln984">    auto result = VERIFY_RESULT(txn_it-&gt;GetStatus(/* expected_tablet_batches = */ nullptr));</a>
+<a name="ln985">    if (result.status != TransactionStatus::SEALED) {</a>
+<a name="ln986">      VLOG_WITH_PREFIX(4) &lt;&lt; &quot;TXN: &quot; &lt;&lt; transaction_id &lt;&lt; &quot; status resolved: &quot;</a>
+<a name="ln987">                          &lt;&lt; TransactionStatus_Name(result.status);</a>
+<a name="ln988">      return result;</a>
+<a name="ln989">    }</a>
+<a name="ln990"> </a>
+<a name="ln991">    VLOG_WITH_PREFIX(4) &lt;&lt; &quot;TXN: &quot; &lt;&lt; transaction_id &lt;&lt; &quot; status NOT resolved&quot;;</a>
+<a name="ln992">    return TransactionStatusResult{TransactionStatus::PENDING, result.status_time.Decremented()};</a>
+<a name="ln993">  }</a>
+<a name="ln994"> </a>
+<a name="ln995">  void Abort(const std::string&amp; transaction_id, int64_t term, TransactionAbortCallback callback) {</a>
+<a name="ln996">    AtomicFlagSleepMs(&amp;FLAGS_TEST_inject_txn_get_status_delay_ms);</a>
+<a name="ln997"> </a>
+<a name="ln998">    auto id = FullyDecodeTransactionId(transaction_id);</a>
+<a name="ln999">    if (!id.ok()) {</a>
+<a name="ln1000">      callback(id.status());</a>
+<a name="ln1001">      return;</a>
+<a name="ln1002">    }</a>
+<a name="ln1003"> </a>
+<a name="ln1004">    PostponedLeaderActions actions;</a>
+<a name="ln1005">    {</a>
+<a name="ln1006">      std::unique_lock&lt;std::mutex&gt; lock(managed_mutex_);</a>
+<a name="ln1007">      auto it = managed_transactions_.find(*id);</a>
+<a name="ln1008">      if (it == managed_transactions_.end()) {</a>
+<a name="ln1009">        lock.unlock();</a>
+<a name="ln1010">        callback(TransactionStatusResult::Aborted());</a>
+<a name="ln1011">        return;</a>
+<a name="ln1012">      }</a>
+<a name="ln1013">      postponed_leader_actions_.leader_term = term;</a>
+<a name="ln1014">      boost::optional&lt;TransactionStatusResult&gt; status;</a>
+<a name="ln1015">      managed_transactions_.modify(it, [&amp;status, &amp;callback](TransactionState&amp; state) {</a>
+<a name="ln1016">        status = state.Abort(&amp;callback);</a>
+<a name="ln1017">      });</a>
+<a name="ln1018">      if (callback) {</a>
+<a name="ln1019">        lock.unlock();</a>
+<a name="ln1020">        callback(*status);</a>
+<a name="ln1021">        return;</a>
+<a name="ln1022">      }</a>
+<a name="ln1023">      actions.Swap(&amp;postponed_leader_actions_);</a>
+<a name="ln1024">    }</a>
+<a name="ln1025"> </a>
+<a name="ln1026">    ExecutePostponedLeaderActions(&amp;actions);</a>
+<a name="ln1027">  }</a>
+<a name="ln1028"> </a>
+<a name="ln1029">  size_t test_count_transactions() {</a>
+<a name="ln1030">    std::lock_guard&lt;std::mutex&gt; lock(managed_mutex_);</a>
+<a name="ln1031">    return managed_transactions_.size();</a>
+<a name="ln1032">  }</a>
+<a name="ln1033"> </a>
+<a name="ln1034">  CHECKED_STATUS ProcessReplicated(const ReplicatedData&amp; data) {</a>
+<a name="ln1035">    auto id = FullyDecodeTransactionId(data.state.transaction_id());</a>
+<a name="ln1036">    if (!id.ok()) {</a>
+<a name="ln1037">      return std::move(id.status());</a>
+<a name="ln1038">    }</a>
+<a name="ln1039"> </a>
+<a name="ln1040">    PostponedLeaderActions actions;</a>
+<a name="ln1041">    Status result;</a>
+<a name="ln1042">    {</a>
+<a name="ln1043">      std::lock_guard&lt;std::mutex&gt; lock(managed_mutex_);</a>
+<a name="ln1044">      postponed_leader_actions_.leader_term = data.leader_term;</a>
+<a name="ln1045">      auto it = GetTransaction(*id, data.state.status(), data.hybrid_time);</a>
+<a name="ln1046">      if (it == managed_transactions_.end()) {</a>
+<a name="ln1047">        return Status::OK();</a>
+<a name="ln1048">      }</a>
+<a name="ln1049">      managed_transactions_.modify(it, [&amp;result, &amp;data](TransactionState&amp; state) {</a>
+<a name="ln1050">        result = state.ProcessReplicated(data);</a>
+<a name="ln1051">      });</a>
+<a name="ln1052">      CheckCompleted(it);</a>
+<a name="ln1053">      actions.Swap(&amp;postponed_leader_actions_);</a>
+<a name="ln1054">    }</a>
+<a name="ln1055">    ExecutePostponedLeaderActions(&amp;actions);</a>
+<a name="ln1056"> </a>
+<a name="ln1057">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Processed: &quot; &lt;&lt; data.ToString();</a>
+<a name="ln1058">    return result;</a>
+<a name="ln1059">  }</a>
+<a name="ln1060"> </a>
+<a name="ln1061">  void ProcessAborted(const AbortedData&amp; data) {</a>
+<a name="ln1062">    auto id = FullyDecodeTransactionId(data.state.transaction_id());</a>
+<a name="ln1063">    if (!id.ok()) {</a>
+<a name="ln1064">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Abort of transaction with bad id &quot;</a>
+<a name="ln1065">                              &lt;&lt; data.state.ShortDebugString() &lt;&lt; &quot;: &quot; &lt;&lt; id.status();</a>
+<a name="ln1066">      return;</a>
+<a name="ln1067">    }</a>
+<a name="ln1068"> </a>
+<a name="ln1069">    PostponedLeaderActions actions;</a>
+<a name="ln1070">    {</a>
+<a name="ln1071">      std::lock_guard&lt;std::mutex&gt; lock(managed_mutex_);</a>
+<a name="ln1072">      postponed_leader_actions_.leader_term = OpId::kUnknownTerm;</a>
+<a name="ln1073">      auto it = managed_transactions_.find(*id);</a>
+<a name="ln1074">      if (it == managed_transactions_.end()) {</a>
+<a name="ln1075">        LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Aborted operation for unknown transaction: &quot; &lt;&lt; *id;</a>
+<a name="ln1076">        return;</a>
+<a name="ln1077">      }</a>
+<a name="ln1078">      managed_transactions_.modify(</a>
+<a name="ln1079">          it, [&amp;](TransactionState&amp; ts) {</a>
+<a name="ln1080">            ts.ProcessAborted(data);</a>
+<a name="ln1081">          });</a>
+<a name="ln1082">      CheckCompleted(it);</a>
+<a name="ln1083">      actions.Swap(&amp;postponed_leader_actions_);</a>
+<a name="ln1084">    }</a>
+<a name="ln1085">    ExecutePostponedLeaderActions(&amp;actions);</a>
+<a name="ln1086"> </a>
+<a name="ln1087">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Aborted, state: &quot; &lt;&lt; data.state.ShortDebugString()</a>
+<a name="ln1088">                        &lt;&lt; &quot;, op id: &quot; &lt;&lt; data.op_id;</a>
+<a name="ln1089">  }</a>
+<a name="ln1090"> </a>
+<a name="ln1091">  void Start() {</a>
+<a name="ln1092">    poller_.Start(</a>
+<a name="ln1093">        &amp;context_.client_future().get()-&gt;messenger()-&gt;scheduler(),</a>
+<a name="ln1094">        std::chrono::microseconds(kTimeMultiplier * FLAGS_transaction_check_interval_usec));</a>
+<a name="ln1095">  }</a>
+<a name="ln1096"> </a>
+<a name="ln1097">  void Handle(std::unique_ptr&lt;tablet::UpdateTxnOperationState&gt; request, int64_t term) {</a>
+<a name="ln1098">    auto&amp; state = *request-&gt;request();</a>
+<a name="ln1099">    auto id = FullyDecodeTransactionId(state.transaction_id());</a>
+<a name="ln1100">    if (!id.ok()) {</a>
+<a name="ln1101">      LOG(WARNING) &lt;&lt; &quot;Failed to decode id from &quot; &lt;&lt; state.ShortDebugString() &lt;&lt; &quot;: &quot; &lt;&lt; id;</a>
+<a name="ln1102">      request-&gt;CompleteWithStatus(id.status());</a>
+<a name="ln1103">      return;</a>
+<a name="ln1104">    }</a>
+<a name="ln1105"> </a>
+<a name="ln1106">    PostponedLeaderActions actions;</a>
+<a name="ln1107">    {</a>
+<a name="ln1108">      std::unique_lock&lt;std::mutex&gt; lock(managed_mutex_);</a>
+<a name="ln1109">      postponed_leader_actions_.leader_term = term;</a>
+<a name="ln1110">      auto it = managed_transactions_.find(*id);</a>
+<a name="ln1111">      if (it == managed_transactions_.end()) {</a>
+<a name="ln1112">        if (state.status() == TransactionStatus::CREATED) {</a>
+<a name="ln1113">          it = managed_transactions_.emplace(</a>
+<a name="ln1114">              this, *id, context_.clock().Now(), log_prefix_).first;</a>
+<a name="ln1115">        } else {</a>
+<a name="ln1116">          lock.unlock();</a>
+<a name="ln1117">          YB_LOG_HIGHER_SEVERITY_WHEN_TOO_MANY(INFO, WARNING, 1s, 50)</a>
+<a name="ln1118">              &lt;&lt; LogPrefix() &lt;&lt; &quot;Request to unknown transaction &quot; &lt;&lt; id &lt;&lt; &quot;: &quot;</a>
+<a name="ln1119">              &lt;&lt; state.ShortDebugString();</a>
+<a name="ln1120">          auto status = STATUS(Expired, &quot;Transaction expired or aborted by a conflict&quot;,</a>
+<a name="ln1121">                               PgsqlError(YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE));</a>
+<a name="ln1122">          status = status.CloneAndAddErrorCode(TransactionError(TransactionErrorCode::kAborted));</a>
+<a name="ln1123">          request-&gt;CompleteWithStatus(status);</a>
+<a name="ln1124">          return;</a>
+<a name="ln1125">        }</a>
+<a name="ln1126">      }</a>
+<a name="ln1127"> </a>
+<a name="ln1128">      managed_transactions_.modify(it, [&amp;request](TransactionState&amp; state) {</a>
+<a name="ln1129">        state.Handle(std::move(request));</a>
+<a name="ln1130">      });</a>
+<a name="ln1131">      postponed_leader_actions_.Swap(&amp;actions);</a>
+<a name="ln1132">    }</a>
+<a name="ln1133"> </a>
+<a name="ln1134">    ExecutePostponedLeaderActions(&amp;actions);</a>
+<a name="ln1135">  }</a>
+<a name="ln1136"> </a>
+<a name="ln1137">  int64_t PrepareGC(std::string* details) {</a>
+<a name="ln1138">    std::lock_guard&lt;std::mutex&gt; lock(managed_mutex_);</a>
+<a name="ln1139">    if (!managed_transactions_.empty()) {</a>
+<a name="ln1140">      auto&amp; txn = *managed_transactions_.get&lt;FirstEntryIndexTag&gt;().begin();</a>
+<a name="ln1141">      if (details) {</a>
+<a name="ln1142">        *details += Format(&quot;Transaction coordinator: $0\n&quot;, txn);</a>
+<a name="ln1143">      }</a>
+<a name="ln1144">      return txn.first_entry_raft_index();</a>
+<a name="ln1145">    }</a>
+<a name="ln1146">    return std::numeric_limits&lt;int64_t&gt;::max();</a>
+<a name="ln1147">  }</a>
+<a name="ln1148"> </a>
+<a name="ln1149">  // Returns logs prefix for this transaction coordinator.</a>
+<a name="ln1150">  const std::string&amp; LogPrefix() {</a>
+<a name="ln1151">    return log_prefix_;</a>
+<a name="ln1152">  }</a>
+<a name="ln1153"> </a>
+<a name="ln1154">  std::string DumpTransactions() {</a>
+<a name="ln1155">    std::string result;</a>
+<a name="ln1156">    std::lock_guard&lt;std::mutex&gt; lock(managed_mutex_);</a>
+<a name="ln1157">    for (const auto&amp; txn : managed_transactions_) {</a>
+<a name="ln1158">      result += txn.ToString();</a>
+<a name="ln1159">      result += &quot;\n&quot;;</a>
+<a name="ln1160">    }</a>
+<a name="ln1161">    return result;</a>
+<a name="ln1162">  }</a>
+<a name="ln1163"> </a>
+<a name="ln1164"> private:</a>
+<a name="ln1165">  class LastTouchTag;</a>
+<a name="ln1166">  class FirstEntryIndexTag;</a>
+<a name="ln1167"> </a>
+<a name="ln1168">  typedef boost::multi_index_container&lt;TransactionState,</a>
+<a name="ln1169">      boost::multi_index::indexed_by &lt;</a>
+<a name="ln1170">          boost::multi_index::hashed_unique &lt;</a>
+<a name="ln1171">              boost::multi_index::const_mem_fun&lt;TransactionState,</a>
+<a name="ln1172">                                                const TransactionId&amp;,</a>
+<a name="ln1173">                                                &amp;TransactionState::id&gt;</a>
+<a name="ln1174">          &gt;,</a>
+<a name="ln1175">          boost::multi_index::ordered_non_unique &lt;</a>
+<a name="ln1176">              boost::multi_index::tag&lt;LastTouchTag&gt;,</a>
+<a name="ln1177">              boost::multi_index::const_mem_fun&lt;TransactionState,</a>
+<a name="ln1178">                                                HybridTime,</a>
+<a name="ln1179">                                                &amp;TransactionState::last_touch&gt;</a>
+<a name="ln1180">          &gt;,</a>
+<a name="ln1181">          boost::multi_index::ordered_non_unique &lt;</a>
+<a name="ln1182">              boost::multi_index::tag&lt;FirstEntryIndexTag&gt;,</a>
+<a name="ln1183">              boost::multi_index::const_mem_fun&lt;TransactionState,</a>
+<a name="ln1184">                                                int64_t,</a>
+<a name="ln1185">                                                &amp;TransactionState::first_entry_raft_index&gt;</a>
+<a name="ln1186">          &gt;</a>
+<a name="ln1187">      &gt;</a>
+<a name="ln1188">  &gt; ManagedTransactions;</a>
+<a name="ln1189"> </a>
+<a name="ln1190">  void ExecutePostponedLeaderActions(PostponedLeaderActions* actions) {</a>
+<a name="ln1191">    for (const auto&amp; p : actions-&gt;complete_with_status) {</a>
+<a name="ln1192">      p.request-&gt;CompleteWithStatus(p.status);</a>
+<a name="ln1193">    }</a>
+<a name="ln1194"> </a>
+<a name="ln1195">    if (!actions-&gt;leader()) {</a>
+<a name="ln1196">      return;</a>
+<a name="ln1197">    }</a>
+<a name="ln1198"> </a>
+<a name="ln1199">    if (!actions-&gt;notify_applying.empty()) {</a>
+<a name="ln1200">      auto deadline = TransactionRpcDeadline();</a>
+<a name="ln1201">      for (const auto&amp; action : actions-&gt;notify_applying) {</a>
+<a name="ln1202">        VLOG_WITH_PREFIX(3) &lt;&lt; &quot;Notify applying: &quot; &lt;&lt; action.ToString();</a>
+<a name="ln1203"> </a>
+<a name="ln1204">        tserver::UpdateTransactionRequestPB req;</a>
+<a name="ln1205">        req.set_tablet_id(action.tablet);</a>
+<a name="ln1206">        auto&amp; state = *req.mutable_state();</a>
+<a name="ln1207">        state.set_transaction_id(action.transaction.data(), action.transaction.size());</a>
+<a name="ln1208">        state.set_status(TransactionStatus::APPLYING);</a>
+<a name="ln1209">        state.add_tablets(context_.tablet_id());</a>
+<a name="ln1210">        state.set_commit_hybrid_time(action.commit_time.ToUint64());</a>
+<a name="ln1211">        state.set_sealed(action.sealed);</a>
+<a name="ln1212"> </a>
+<a name="ln1213">        auto handle = rpcs_.Prepare();</a>
+<a name="ln1214">        if (handle != rpcs_.InvalidHandle()) {</a>
+<a name="ln1215">          *handle = UpdateTransaction(</a>
+<a name="ln1216">              deadline,</a>
+<a name="ln1217">              nullptr /* remote_tablet */,</a>
+<a name="ln1218">              context_.client_future().get(),</a>
+<a name="ln1219">              &amp;req,</a>
+<a name="ln1220">              [this, handle, txn_id = action.transaction, tablet = action.tablet]</a>
+<a name="ln1221">                  (const Status&amp; status, const tserver::UpdateTransactionResponsePB&amp; resp) {</a>
+<a name="ln1222">                client::UpdateClock(resp, &amp;context_);</a>
+<a name="ln1223">                rpcs_.Unregister(handle);</a>
+<a name="ln1224">                LOG_IF_WITH_PREFIX(WARNING, !status.ok()) &lt;&lt; &quot;Failed to send apply: &quot; &lt;&lt; status;</a>
+<a name="ln1225">                // Tablet was deleted, so we should mark it as applied to cleanup transaction.</a>
+<a name="ln1226">                if (status.IsNotFound()) {</a>
+<a name="ln1227">                  std::lock_guard&lt;std::mutex&gt; lock(managed_mutex_);</a>
+<a name="ln1228">                  auto it = managed_transactions_.find(txn_id);</a>
+<a name="ln1229">                  if (it != managed_transactions_.end()) {</a>
+<a name="ln1230">                    managed_transactions_.modify(it, [&amp;tablet](TransactionState&amp; state) {</a>
+<a name="ln1231">                      tserver::TransactionStatePB transaction_state;</a>
+<a name="ln1232">                      transaction_state.add_tablets(tablet);</a>
+<a name="ln1233">                      WARN_NOT_OK(state.AppliedInOneOfInvolvedTablets(transaction_state),</a>
+<a name="ln1234">                                  &quot;AppliedInOneOfInvolvedTablets for removed tabled failed: &quot;);</a>
+<a name="ln1235">                    });</a>
+<a name="ln1236">                  }</a>
+<a name="ln1237">                }</a>
+<a name="ln1238">              });</a>
+<a name="ln1239">          (**handle).SendRpc();</a>
+<a name="ln1240">        }</a>
+<a name="ln1241">      }</a>
+<a name="ln1242">    }</a>
+<a name="ln1243"> </a>
+<a name="ln1244">    for (auto&amp; update : actions-&gt;updates) {</a>
+<a name="ln1245">      context_.SubmitUpdateTransaction(std::move(update), actions-&gt;leader_term);</a>
+<a name="ln1246">    }</a>
+<a name="ln1247">  }</a>
+<a name="ln1248"> </a>
+<a name="ln1249">  ManagedTransactions::iterator GetTransaction(const TransactionId&amp; id,</a>
+<a name="ln1250">                                               TransactionStatus status,</a>
+<a name="ln1251">                                               HybridTime hybrid_time) {</a>
+<a name="ln1252">    auto it = managed_transactions_.find(id);</a>
+<a name="ln1253">    if (it == managed_transactions_.end()) {</a>
+<a name="ln1254">      if (status != TransactionStatus::APPLIED_IN_ALL_INVOLVED_TABLETS) {</a>
+<a name="ln1255">        it = managed_transactions_.emplace(this, id, hybrid_time, log_prefix_).first;</a>
+<a name="ln1256">        VLOG_WITH_PREFIX(1) &lt;&lt; Format(&quot;Added: $0&quot;, *it);</a>
+<a name="ln1257">      }</a>
+<a name="ln1258">    }</a>
+<a name="ln1259">    return it;</a>
+<a name="ln1260">  }</a>
+<a name="ln1261"> </a>
+<a name="ln1262">  TransactionCoordinatorContext&amp; coordinator_context() override {</a>
+<a name="ln1263">    return context_;</a>
+<a name="ln1264">  }</a>
+<a name="ln1265"> </a>
+<a name="ln1266">  void NotifyApplying(NotifyApplyingData data) override {</a>
+<a name="ln1267">    if (!leader()) {</a>
+<a name="ln1268">      LOG_WITH_PREFIX(WARNING) &lt;&lt; __func__ &lt;&lt; &quot; at non leader: &quot; &lt;&lt; data.ToString();</a>
+<a name="ln1269">      return;</a>
+<a name="ln1270">    }</a>
+<a name="ln1271">    postponed_leader_actions_.notify_applying.push_back(std::move(data));</a>
+<a name="ln1272">  }</a>
+<a name="ln1273"> </a>
+<a name="ln1274">  MUST_USE_RESULT bool SubmitUpdateTransaction(</a>
+<a name="ln1275">      std::unique_ptr&lt;UpdateTxnOperationState&gt; state) override {</a>
+<a name="ln1276">    if (postponed_leader_actions_.leader()) {</a>
+<a name="ln1277">      postponed_leader_actions_.updates.push_back(std::move(state));</a>
+<a name="ln1278">      return true;</a>
+<a name="ln1279">    } else {</a>
+<a name="ln1280">      auto status = STATUS(IllegalState, &quot;Submit update transaction on non leader&quot;);</a>
+<a name="ln1281">      VLOG_WITH_PREFIX(1) &lt;&lt; status;</a>
+<a name="ln1282">      state-&gt;CompleteWithStatus(status);</a>
+<a name="ln1283">      return false;</a>
+<a name="ln1284">    }</a>
+<a name="ln1285">  }</a>
+<a name="ln1286"> </a>
+<a name="ln1287">  void CompleteWithStatus(</a>
+<a name="ln1288">      std::unique_ptr&lt;UpdateTxnOperationState&gt; request, Status status) override {</a>
+<a name="ln1289">    auto ptr = request.get();</a>
+<a name="ln1290">    postponed_leader_actions_.complete_with_status.push_back({</a>
+<a name="ln1291">        std::move(request), ptr, std::move(status)});</a>
+<a name="ln1292">  }</a>
+<a name="ln1293"> </a>
+<a name="ln1294">  void CompleteWithStatus(UpdateTxnOperationState* request, Status status) override {</a>
+<a name="ln1295">    postponed_leader_actions_.complete_with_status.push_back({</a>
+<a name="ln1296">        nullptr /* holder */, request, std::move(status)});</a>
+<a name="ln1297">  }</a>
+<a name="ln1298"> </a>
+<a name="ln1299">  bool leader() const override {</a>
+<a name="ln1300">    return postponed_leader_actions_.leader();</a>
+<a name="ln1301">  }</a>
+<a name="ln1302"> </a>
+<a name="ln1303">  Counter&amp; expired_metric() override {</a>
+<a name="ln1304">    return expired_metric_;</a>
+<a name="ln1305">  }</a>
+<a name="ln1306"> </a>
+<a name="ln1307">  void Poll() {</a>
+<a name="ln1308">    auto now = context_.clock().Now();</a>
+<a name="ln1309"> </a>
+<a name="ln1310">    auto leader_term = context_.LeaderTerm();</a>
+<a name="ln1311">    PostponedLeaderActions actions;</a>
+<a name="ln1312">    {</a>
+<a name="ln1313">      std::lock_guard&lt;std::mutex&gt; lock(managed_mutex_);</a>
+<a name="ln1314">      postponed_leader_actions_.leader_term = leader_term;</a>
+<a name="ln1315"> </a>
+<a name="ln1316">      auto&amp; index = managed_transactions_.get&lt;LastTouchTag&gt;();</a>
+<a name="ln1317"> </a>
+<a name="ln1318">      for (auto it = index.begin(); it != index.end() &amp;&amp; it-&gt;ExpiredAt(now);) {</a>
+<a name="ln1319">        if (it-&gt;status() == TransactionStatus::ABORTED) {</a>
+<a name="ln1320">          it = index.erase(it);</a>
+<a name="ln1321">        } else {</a>
+<a name="ln1322">          bool modified = index.modify(it, [](TransactionState&amp; state) {</a>
+<a name="ln1323">            VLOG(4) &lt;&lt; state.LogPrefix() &lt;&lt; &quot;Cleanup expired transaction&quot;;</a>
+<a name="ln1324">            state.Abort();</a>
+<a name="ln1325">          });</a>
+<a name="ln1326">          DCHECK(modified);</a>
+<a name="ln1327">          ++it;</a>
+<a name="ln1328">        }</a>
+<a name="ln1329">      }</a>
+<a name="ln1330">      auto now_physical = MonoTime::Now();</a>
+<a name="ln1331">      for (auto&amp; transaction : managed_transactions_) {</a>
+<a name="ln1332">        const_cast&lt;TransactionState&amp;&gt;(transaction).Poll(</a>
+<a name="ln1333">            leader_term != OpId::kUnknownTerm, now_physical);</a>
+<a name="ln1334">      }</a>
+<a name="ln1335">      postponed_leader_actions_.Swap(&amp;actions);</a>
+<a name="ln1336">    }</a>
+<a name="ln1337">    ExecutePostponedLeaderActions(&amp;actions);</a>
+<a name="ln1338">  }</a>
+<a name="ln1339"> </a>
+<a name="ln1340">  void CheckCompleted(ManagedTransactions::iterator it) {</a>
+<a name="ln1341">    if (it-&gt;Completed()) {</a>
+<a name="ln1342">      auto status = STATUS_FORMAT(Expired, &quot;Transaction completed: $0&quot;, *it);</a>
+<a name="ln1343">      VLOG_WITH_PREFIX(1) &lt;&lt; status;</a>
+<a name="ln1344">      managed_transactions_.modify(it, [&amp;status](TransactionState&amp; state) {</a>
+<a name="ln1345">        state.ClearRequests(status);</a>
+<a name="ln1346">      });</a>
+<a name="ln1347">      managed_transactions_.erase(it);</a>
+<a name="ln1348">    }</a>
+<a name="ln1349">  }</a>
+<a name="ln1350"> </a>
+<a name="ln1351">  TransactionCoordinatorContext&amp; context_;</a>
+<a name="ln1352">  Counter&amp; expired_metric_;</a>
+<a name="ln1353">  const std::string log_prefix_;</a>
+<a name="ln1354"> </a>
+<a name="ln1355">  std::mutex managed_mutex_;</a>
+<a name="ln1356">  ManagedTransactions managed_transactions_;</a>
+<a name="ln1357"> </a>
+<a name="ln1358">  // Actions that should be executed after mutex is unlocked.</a>
+<a name="ln1359">  PostponedLeaderActions postponed_leader_actions_;</a>
+<a name="ln1360"> </a>
+<a name="ln1361">  rpc::Poller poller_;</a>
+<a name="ln1362">  rpc::Rpcs rpcs_;</a>
+<a name="ln1363">};</a>
+<a name="ln1364"> </a>
+<a name="ln1365">TransactionCoordinator::TransactionCoordinator(const std::string&amp; permanent_uuid,</a>
+<a name="ln1366">                                               TransactionCoordinatorContext* context,</a>
+<a name="ln1367">                                               Counter* expired_metric)</a>
+<a name="ln1368">    : impl_(new Impl(permanent_uuid, context, expired_metric)) {</a>
+<a name="ln1369">}</a>
+<a name="ln1370"> </a>
+<a name="ln1371">TransactionCoordinator::~TransactionCoordinator() {</a>
+<a name="ln1372">}</a>
+<a name="ln1373"> </a>
+<a name="ln1374">Status TransactionCoordinator::ProcessReplicated(const ReplicatedData&amp; data) {</a>
+<a name="ln1375">  return impl_-&gt;ProcessReplicated(data);</a>
+<a name="ln1376">}</a>
+<a name="ln1377"> </a>
+<a name="ln1378">void TransactionCoordinator::ProcessAborted(const AbortedData&amp; data) {</a>
+<a name="ln1379">  impl_-&gt;ProcessAborted(data);</a>
+<a name="ln1380">}</a>
+<a name="ln1381"> </a>
+<a name="ln1382">int64_t TransactionCoordinator::PrepareGC(std::string* details) {</a>
+<a name="ln1383">  return impl_-&gt;PrepareGC(details);</a>
+<a name="ln1384">}</a>
+<a name="ln1385"> </a>
+<a name="ln1386">size_t TransactionCoordinator::test_count_transactions() const {</a>
+<a name="ln1387">  return impl_-&gt;test_count_transactions();</a>
+<a name="ln1388">}</a>
+<a name="ln1389"> </a>
+<a name="ln1390">void TransactionCoordinator::Handle(</a>
+<a name="ln1391">    std::unique_ptr&lt;tablet::UpdateTxnOperationState&gt; request, int64_t term) {</a>
+<a name="ln1392">  impl_-&gt;Handle(std::move(request), term);</a>
+<a name="ln1393">}</a>
+<a name="ln1394"> </a>
+<a name="ln1395">void TransactionCoordinator::Start() {</a>
+<a name="ln1396">  impl_-&gt;Start();</a>
+<a name="ln1397">}</a>
+<a name="ln1398"> </a>
+<a name="ln1399">void TransactionCoordinator::Shutdown() {</a>
+<a name="ln1400">  impl_-&gt;Shutdown();</a>
+<a name="ln1401">}</a>
+<a name="ln1402"> </a>
+<a name="ln1403">Status TransactionCoordinator::GetStatus(</a>
+<a name="ln1404">    const google::protobuf::RepeatedPtrField&lt;std::string&gt;&amp; transaction_ids,</a>
+<a name="ln1405">    CoarseTimePoint deadline,</a>
+<a name="ln1406">    tserver::GetTransactionStatusResponsePB* response) {</a>
+<a name="ln1407">  return impl_-&gt;GetStatus(transaction_ids, deadline, response);</a>
+<a name="ln1408">}</a>
+<a name="ln1409"> </a>
+<a name="ln1410">void TransactionCoordinator::Abort(const std::string&amp; transaction_id,</a>
+<a name="ln1411">                                   int64_t term,</a>
+<a name="ln1412">                                   TransactionAbortCallback callback) {</a>
+<a name="ln1413">  impl_-&gt;Abort(transaction_id, term, std::move(callback));</a>
+<a name="ln1414">}</a>
+<a name="ln1415"> </a>
+<a name="ln1416">std::string TransactionCoordinator::DumpTransactions() {</a>
+<a name="ln1417">  return impl_-&gt;DumpTransactions();</a>
+<a name="ln1418">}</a>
+<a name="ln1419"> </a>
+<a name="ln1420">std::string TransactionCoordinator::ReplicatedData::ToString() const {</a>
+<a name="ln1421">  return Format(&quot;{ leader_term: $0 state: $1 op_id: $2 hybrid_time: $3 }&quot;,</a>
+<a name="ln1422">                leader_term, state, op_id, hybrid_time);</a>
+<a name="ln1423">}</a>
+<a name="ln1424"> </a>
+<a name="ln1425">} // namespace tablet</a>
+<a name="ln1426">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="163"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="164"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="165"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="217"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="269"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="271"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="281"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="367"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="377"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="461"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="555"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="558"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="565"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="579"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="590"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="635"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="641"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="694"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="705"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="727"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="875"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="898"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="939"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="949"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="986"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="991"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1057"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1087"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1202"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1224"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1256"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1281"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1323"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1326"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1343"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

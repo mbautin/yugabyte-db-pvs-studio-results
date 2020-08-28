@@ -1,0 +1,1107 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>pg_session.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;memory&gt;</a>
+<a name="ln17">#include &lt;boost/optional.hpp&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &quot;yb/yql/pggate/pg_expr.h&quot;</a>
+<a name="ln20">#include &quot;yb/yql/pggate/pg_session.h&quot;</a>
+<a name="ln21">#include &quot;yb/yql/pggate/pggate_flags.h&quot;</a>
+<a name="ln22">#include &quot;yb/yql/pggate/pg_txn_manager.h&quot;</a>
+<a name="ln23">#include &quot;yb/yql/pggate/ybc_pggate.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;yb/client/batcher.h&quot;</a>
+<a name="ln26">#include &quot;yb/client/error.h&quot;</a>
+<a name="ln27">#include &quot;yb/client/session.h&quot;</a>
+<a name="ln28">#include &quot;yb/client/table.h&quot;</a>
+<a name="ln29">#include &quot;yb/client/table_alterer.h&quot;</a>
+<a name="ln30">#include &quot;yb/client/table_creator.h&quot;</a>
+<a name="ln31">#include &quot;yb/client/transaction.h&quot;</a>
+<a name="ln32">#include &quot;yb/client/yb_op.h&quot;</a>
+<a name="ln33"> </a>
+<a name="ln34">#include &quot;yb/common/pgsql_error.h&quot;</a>
+<a name="ln35">#include &quot;yb/common/ql_expr.h&quot;</a>
+<a name="ln36">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln37">#include &quot;yb/common/row_mark.h&quot;</a>
+<a name="ln38">#include &quot;yb/common/transaction_error.h&quot;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &quot;yb/docdb/doc_key.h&quot;</a>
+<a name="ln41">#include &quot;yb/docdb/primitive_value.h&quot;</a>
+<a name="ln42"> </a>
+<a name="ln43">#include &quot;yb/tserver/tserver_shared_mem.h&quot;</a>
+<a name="ln44"> </a>
+<a name="ln45">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln46">#include &quot;yb/util/string_util.h&quot;</a>
+<a name="ln47"> </a>
+<a name="ln48">#include &quot;yb/master/master.proxy.h&quot;</a>
+<a name="ln49"> </a>
+<a name="ln50">namespace yb {</a>
+<a name="ln51">namespace pggate {</a>
+<a name="ln52"> </a>
+<a name="ln53">using std::make_shared;</a>
+<a name="ln54">using std::unique_ptr;</a>
+<a name="ln55">using std::shared_ptr;</a>
+<a name="ln56">using std::string;</a>
+<a name="ln57"> </a>
+<a name="ln58">using client::YBClient;</a>
+<a name="ln59">using client::YBSession;</a>
+<a name="ln60">using client::YBMetaDataCache;</a>
+<a name="ln61">using client::YBSchema;</a>
+<a name="ln62">using client::YBOperation;</a>
+<a name="ln63">using client::YBTable;</a>
+<a name="ln64">using client::YBTableName;</a>
+<a name="ln65">using client::YBTableType;</a>
+<a name="ln66"> </a>
+<a name="ln67">using yb::master::GetNamespaceInfoResponsePB;</a>
+<a name="ln68">using yb::master::IsInitDbDoneRequestPB;</a>
+<a name="ln69">using yb::master::IsInitDbDoneResponsePB;</a>
+<a name="ln70">using yb::master::MasterServiceProxy;</a>
+<a name="ln71"> </a>
+<a name="ln72">using yb::tserver::TServerSharedObject;</a>
+<a name="ln73"> </a>
+<a name="ln74">#if defined(__APPLE__) &amp;&amp; !defined(NDEBUG)</a>
+<a name="ln75">// We are experiencing more slowness in tests on macOS in debug mode.</a>
+<a name="ln76">const int kDefaultPgYbSessionTimeoutMs = 120 * 1000;</a>
+<a name="ln77">#else</a>
+<a name="ln78">const int kDefaultPgYbSessionTimeoutMs = 60 * 1000;</a>
+<a name="ln79">#endif</a>
+<a name="ln80"> </a>
+<a name="ln81">DEFINE_int32(pg_yb_session_timeout_ms, kDefaultPgYbSessionTimeoutMs,</a>
+<a name="ln82">             &quot;Timeout for operations between PostgreSQL server and YugaByte DocDB services&quot;);</a>
+<a name="ln83"> </a>
+<a name="ln84">namespace {</a>
+<a name="ln85">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln86">// Constants used for the sequences data table.</a>
+<a name="ln87">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln88">static constexpr const char* const kPgSequencesNamespaceName = &quot;system_postgres&quot;;</a>
+<a name="ln89">static constexpr const char* const kPgSequencesDataTableName = &quot;sequences_data&quot;;</a>
+<a name="ln90"> </a>
+<a name="ln91">static const string kPgSequencesDataNamespaceId = GetPgsqlNamespaceId(kPgSequencesDataDatabaseOid);</a>
+<a name="ln92"> </a>
+<a name="ln93">// Columns names and ids.</a>
+<a name="ln94">static constexpr const char* const kPgSequenceDbOidColName = &quot;db_oid&quot;;</a>
+<a name="ln95"> </a>
+<a name="ln96">static constexpr const char* const kPgSequenceSeqOidColName = &quot;seq_oid&quot;;</a>
+<a name="ln97"> </a>
+<a name="ln98">static constexpr const char* const kPgSequenceLastValueColName = &quot;last_value&quot;;</a>
+<a name="ln99">static constexpr const size_t kPgSequenceLastValueColIdx = 2;</a>
+<a name="ln100"> </a>
+<a name="ln101">static constexpr const char* const kPgSequenceIsCalledColName = &quot;is_called&quot;;</a>
+<a name="ln102">static constexpr const size_t kPgSequenceIsCalledColIdx = 3;</a>
+<a name="ln103"> </a>
+<a name="ln104">string GetStatusStringSet(const client::CollectedErrors&amp; errors) {</a>
+<a name="ln105">  std::set&lt;string&gt; status_strings;</a>
+<a name="ln106">  for (const auto&amp; error : errors) {</a>
+<a name="ln107">    status_strings.insert(error-&gt;status().ToString());</a>
+<a name="ln108">  }</a>
+<a name="ln109">  return RangeToString(status_strings.begin(), status_strings.end());</a>
+<a name="ln110">}</a>
+<a name="ln111"> </a>
+<a name="ln112">bool IsHomogeneousErrors(const client::CollectedErrors&amp; errors) {</a>
+<a name="ln113">  if (errors.size() &lt; 2) {</a>
+<a name="ln114">    return true;</a>
+<a name="ln115">  }</a>
+<a name="ln116">  auto i = errors.begin();</a>
+<a name="ln117">  const auto&amp; status = (**i).status();</a>
+<a name="ln118">  const auto codes = status.ErrorCodesSlice();</a>
+<a name="ln119">  for (++i; i != errors.end(); ++i) {</a>
+<a name="ln120">    const auto&amp; s = (**i).status();</a>
+<a name="ln121">    if (s.code() != status.code() || codes != s.ErrorCodesSlice()) {</a>
+<a name="ln122">      return false;</a>
+<a name="ln123">    }</a>
+<a name="ln124">  }</a>
+<a name="ln125">  return true;</a>
+<a name="ln126">}</a>
+<a name="ln127"> </a>
+<a name="ln128">boost::optional&lt;YBPgErrorCode&gt; PsqlErrorCode(const Status&amp; status) {</a>
+<a name="ln129">  const uint8_t* err_data = status.ErrorData(PgsqlErrorTag::kCategory);</a>
+<a name="ln130">  if (err_data) {</a>
+<a name="ln131">    return PgsqlErrorTag::Decode(err_data);</a>
+<a name="ln132">  }</a>
+<a name="ln133">  return boost::none;</a>
+<a name="ln134">}</a>
+<a name="ln135"> </a>
+<a name="ln136">// Get a common Postgres error code from the status and all errors, and append it to a previous</a>
+<a name="ln137">// result.</a>
+<a name="ln138">// If any of those have different conflicting error codes, previous result is returned as-is.</a>
+<a name="ln139">Status AppendPsqlErrorCode(const Status&amp; status,</a>
+<a name="ln140">                           const client::CollectedErrors&amp; errors) {</a>
+<a name="ln141">  boost::optional&lt;YBPgErrorCode&gt; common_psql_error =  boost::make_optional(false, YBPgErrorCode());</a>
+<a name="ln142">  for(const auto&amp; error : errors) {</a>
+<a name="ln143">    const auto psql_error = PsqlErrorCode(error-&gt;status());</a>
+<a name="ln144">    if (!common_psql_error) {</a>
+<a name="ln145">      common_psql_error = psql_error;</a>
+<a name="ln146">    } else if (psql_error &amp;&amp; common_psql_error != psql_error) {</a>
+<a name="ln147">      common_psql_error = boost::none;</a>
+<a name="ln148">      break;</a>
+<a name="ln149">    }</a>
+<a name="ln150">  }</a>
+<a name="ln151">  return common_psql_error ? status.CloneAndAddErrorCode(PgsqlError(*common_psql_error)) : status;</a>
+<a name="ln152">}</a>
+<a name="ln153"> </a>
+<a name="ln154">// Given a set of errors from operations, this function attempts to combine them into one status</a>
+<a name="ln155">// that is later passed to PostgreSQL and further converted into a more specific error code.</a>
+<a name="ln156">Status CombineErrorsToStatus(client::CollectedErrors errors, Status status) {</a>
+<a name="ln157">  if (errors.empty())</a>
+<a name="ln158">    return status;</a>
+<a name="ln159"> </a>
+<a name="ln160">  if (status.IsIOError() &amp;&amp;</a>
+<a name="ln161">      // TODO: move away from string comparison here and use a more specific status than IOError.</a>
+<a name="ln162">      // See https://github.com/YugaByte/yugabyte-db/issues/702</a>
+<a name="ln163">      status.message() == client::internal::Batcher::kErrorReachingOutToTServersMsg &amp;&amp;</a>
+<a name="ln164">      IsHomogeneousErrors(errors)) {</a>
+<a name="ln165">    const auto&amp; result = errors.front()-&gt;status();</a>
+<a name="ln166">    if (errors.size() == 1) {</a>
+<a name="ln167">      return result;</a>
+<a name="ln168">    }</a>
+<a name="ln169">    return Status(result.code(),</a>
+<a name="ln170">                  __FILE__,</a>
+<a name="ln171">                  __LINE__,</a>
+<a name="ln172">                  GetStatusStringSet(errors),</a>
+<a name="ln173">                  result.ErrorCodesSlice(),</a>
+<a name="ln174">                  DupFileName::kFalse);</a>
+<a name="ln175">  }</a>
+<a name="ln176"> </a>
+<a name="ln177">  Status result =</a>
+<a name="ln178">    status.ok()</a>
+<a name="ln179">    ? STATUS(InternalError, GetStatusStringSet(errors))</a>
+<a name="ln180">    : status.CloneAndAppend(&quot;. Errors from tablet servers: &quot; + GetStatusStringSet(errors));</a>
+<a name="ln181"> </a>
+<a name="ln182">  return AppendPsqlErrorCode(result, errors);</a>
+<a name="ln183">}</a>
+<a name="ln184"> </a>
+<a name="ln185">docdb::PrimitiveValue NullValue(ColumnSchema::SortingType sorting) {</a>
+<a name="ln186">  using SortingType = ColumnSchema::SortingType;</a>
+<a name="ln187"> </a>
+<a name="ln188">  return docdb::PrimitiveValue(</a>
+<a name="ln189">      sorting == SortingType::kAscendingNullsLast || sorting == SortingType::kDescendingNullsLast</a>
+<a name="ln190">          ? docdb::ValueType::kNullHigh</a>
+<a name="ln191">          : docdb::ValueType::kNullLow);</a>
+<a name="ln192">}</a>
+<a name="ln193"> </a>
+<a name="ln194">void InitKeyColumnPrimitiveValues(</a>
+<a name="ln195">    const google::protobuf::RepeatedPtrField&lt;PgsqlExpressionPB&gt; &amp;column_values,</a>
+<a name="ln196">    const YBSchema &amp;schema,</a>
+<a name="ln197">    size_t start_idx,</a>
+<a name="ln198">    vector&lt;docdb::PrimitiveValue&gt; *components) {</a>
+<a name="ln199">  size_t column_idx = start_idx;</a>
+<a name="ln200">  for (const auto&amp; column_value : column_values) {</a>
+<a name="ln201">    const auto sorting_type = schema.Column(column_idx).sorting_type();</a>
+<a name="ln202">    if (column_value.has_value()) {</a>
+<a name="ln203">      const auto&amp; value = column_value.value();</a>
+<a name="ln204">      components-&gt;push_back(</a>
+<a name="ln205">          IsNull(value)</a>
+<a name="ln206">          ? NullValue(sorting_type)</a>
+<a name="ln207">          : docdb::PrimitiveValue::FromQLValuePB(value, sorting_type));</a>
+<a name="ln208">    } else {</a>
+<a name="ln209">      // TODO(neil) The current setup only works for CQL as it assumes primary key value must not</a>
+<a name="ln210">      // be dependent on any column values. This needs to be fixed as PostgreSQL expression might</a>
+<a name="ln211">      // require a read from a table.</a>
+<a name="ln212">      //</a>
+<a name="ln213">      // Use regular executor for now.</a>
+<a name="ln214">      QLExprExecutor executor;</a>
+<a name="ln215">      QLExprResult result;</a>
+<a name="ln216">      auto s = executor.EvalExpr(column_value, nullptr, result.Writer());</a>
+<a name="ln217"> </a>
+<a name="ln218">      components-&gt;push_back(docdb::PrimitiveValue::FromQLValuePB(result.Value(), sorting_type));</a>
+<a name="ln219">    }</a>
+<a name="ln220">    ++column_idx;</a>
+<a name="ln221">  }</a>
+<a name="ln222">}</a>
+<a name="ln223"> </a>
+<a name="ln224">} // namespace</a>
+<a name="ln225"> </a>
+<a name="ln226">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln227">// Class PgSessionAsyncRunResult</a>
+<a name="ln228">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln229"> </a>
+<a name="ln230">PgSessionAsyncRunResult::PgSessionAsyncRunResult(PgsqlOpBuffer buffered_operations,</a>
+<a name="ln231">                                                 std::future&lt;Status&gt; future_status,</a>
+<a name="ln232">                                                 client::YBSessionPtr session)</a>
+<a name="ln233">    : buffered_operations_(std::move(buffered_operations)),</a>
+<a name="ln234">      future_status_(std::move(future_status)),</a>
+<a name="ln235">      session_(std::move(session)) {</a>
+<a name="ln236">}</a>
+<a name="ln237"> </a>
+<a name="ln238">Status PgSessionAsyncRunResult::GetStatus(const PgSession&amp; pg_session) {</a>
+<a name="ln239">  SCHECK(InProgress(), IllegalState, &quot;Request must be in progress&quot;);</a>
+<a name="ln240">  auto status = future_status_.get();</a>
+<a name="ln241">  future_status_ = std::future&lt;Status&gt;();</a>
+<a name="ln242">  RETURN_NOT_OK(CombineErrorsToStatus(session_-&gt;GetPendingErrors(), status));</a>
+<a name="ln243">  for (const auto&amp; bop : buffered_operations_) {</a>
+<a name="ln244">    RETURN_NOT_OK(pg_session.HandleResponse(*bop.operation, bop.relation_id));</a>
+<a name="ln245">  }</a>
+<a name="ln246">  return Status::OK();</a>
+<a name="ln247">}</a>
+<a name="ln248"> </a>
+<a name="ln249">bool PgSessionAsyncRunResult::InProgress() const {</a>
+<a name="ln250">  return future_status_.valid();</a>
+<a name="ln251">}</a>
+<a name="ln252"> </a>
+<a name="ln253">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln254">// Class PgSession::RunHelper</a>
+<a name="ln255">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln256"> </a>
+<a name="ln257">PgSession::RunHelper::RunHelper(const PgObjectId&amp; relation_id,</a>
+<a name="ln258">                                PgSession* pg_session,</a>
+<a name="ln259">                                bool transactional)</a>
+<a name="ln260">    : relation_id_(relation_id),</a>
+<a name="ln261">      pg_session_(*pg_session),</a>
+<a name="ln262">      transactional_(transactional),</a>
+<a name="ln263">      buffer_(transactional_ ? pg_session_.buffered_txn_ops_</a>
+<a name="ln264">                             : pg_session_.buffered_ops_) {</a>
+<a name="ln265">  if (!transactional_) {</a>
+<a name="ln266">    pg_session_.InvalidateForeignKeyReferenceCache();</a>
+<a name="ln267">  }</a>
+<a name="ln268">}</a>
+<a name="ln269"> </a>
+<a name="ln270">Status PgSession::RunHelper::Apply(std::shared_ptr&lt;client::YBPgsqlOp&gt; op,</a>
+<a name="ln271">                                   uint64_t* read_time,</a>
+<a name="ln272">                                   bool force_non_bufferable) {</a>
+<a name="ln273">  auto&amp; buffered_keys = pg_session_.buffered_keys_;</a>
+<a name="ln274">  // Try buffering this operation if it is a write operation, buffering is enabled and no</a>
+<a name="ln275">  // operations have been already applied to current session (yb session does not exist).</a>
+<a name="ln276">  if (!yb_session_ &amp;&amp;</a>
+<a name="ln277">      pg_session_.buffering_enabled_ &amp;&amp;</a>
+<a name="ln278">      !force_non_bufferable &amp;&amp;</a>
+<a name="ln279">      op-&gt;type() == YBOperation::Type::PGSQL_WRITE) {</a>
+<a name="ln280">    const auto&amp; wop = *down_cast&lt;client::YBPgsqlWriteOp*&gt;(op.get());</a>
+<a name="ln281">    // Check for buffered operation related to same row.</a>
+<a name="ln282">    // If multiple operations are performed in context of single RPC second operation will not</a>
+<a name="ln283">    // see the results of first operation on DocDB side.</a>
+<a name="ln284">    // Multiple operations on same row must be performed in context of different RPC.</a>
+<a name="ln285">    // Flush is required in this case.</a>
+<a name="ln286">    if (PREDICT_FALSE(!buffered_keys.insert(RowIdentifier(wop)).second)) {</a>
+<a name="ln287">      RETURN_NOT_OK(pg_session_.FlushBufferedOperations());</a>
+<a name="ln288">      buffered_keys.insert(RowIdentifier(wop));</a>
+<a name="ln289">    }</a>
+<a name="ln290">    if (PREDICT_FALSE(yb_debug_log_docdb_requests)) {</a>
+<a name="ln291">      LOG(INFO) &lt;&lt; &quot;Buffering operation: &quot; &lt;&lt; op-&gt;ToString();</a>
+<a name="ln292">    }</a>
+<a name="ln293">    buffer_.push_back({std::move(op), relation_id_});</a>
+<a name="ln294">    // Flush buffers in case limit of operations in single RPC exceeded.</a>
+<a name="ln295">    return PREDICT_TRUE(buffered_keys.size() &lt; FLAGS_ysql_session_max_batch_size)</a>
+<a name="ln296">        ? Status::OK()</a>
+<a name="ln297">        : pg_session_.FlushBufferedOperations();</a>
+<a name="ln298">  }</a>
+<a name="ln299">  bool read_only = op-&gt;read_only();</a>
+<a name="ln300">  // Flush all buffered operations (if any) before performing non-bufferable operation</a>
+<a name="ln301">  if (!buffered_keys.empty()) {</a>
+<a name="ln302">    SCHECK(!yb_session_,</a>
+<a name="ln303">           IllegalState,</a>
+<a name="ln304">           &quot;Buffered operations must be flushed before applying first non-bufferable operation&quot;);</a>
+<a name="ln305">    // Buffered operations can't be combined within single RPC with non bufferable operation</a>
+<a name="ln306">    // in case non bufferable operation has preset read_time.</a>
+<a name="ln307">    // Buffered operations must be flushed independently in this case.</a>
+<a name="ln308">    bool full_flush_required = (transactional_ &amp;&amp; read_time &amp;&amp; *read_time);</a>
+<a name="ln309">    // Check for buffered operation that affected same table as current operation.</a>
+<a name="ln310">    for (auto i = buffered_keys.begin(); !full_flush_required &amp;&amp; i != buffered_keys.end(); ++i) {</a>
+<a name="ln311">      full_flush_required = i-&gt;table_id() == op-&gt;table()-&gt;id();</a>
+<a name="ln312">    }</a>
+<a name="ln313">    if (full_flush_required) {</a>
+<a name="ln314">      RETURN_NOT_OK(pg_session_.FlushBufferedOperations());</a>
+<a name="ln315">    } else {</a>
+<a name="ln316">      RETURN_NOT_OK(pg_session_.FlushBufferedOperationsImpl(</a>
+<a name="ln317">          [this](auto ops, auto transactional) -&gt; Status {</a>
+<a name="ln318">            if (transactional == transactional_) {</a>
+<a name="ln319">              // Save buffered operations for further applying before non-buffered operation.</a>
+<a name="ln320">              pending_ops_.swap(ops);</a>
+<a name="ln321">              return Status::OK();</a>
+<a name="ln322">            }</a>
+<a name="ln323">            return pg_session_.FlushOperations(std::move(ops), transactional);</a>
+<a name="ln324">          }</a>
+<a name="ln325">      ));</a>
+<a name="ln326">      read_only = read_only &amp;&amp; pending_ops_.empty();</a>
+<a name="ln327">    }</a>
+<a name="ln328">  }</a>
+<a name="ln329">  bool needs_pessimistic_locking = false;</a>
+<a name="ln330">  if (op-&gt;type() == YBOperation::Type::PGSQL_READ) {</a>
+<a name="ln331">    const PgsqlReadRequestPB&amp; read_req = down_cast&lt;client::YBPgsqlReadOp*&gt;(op.get())-&gt;request();</a>
+<a name="ln332">    auto row_mark_type = GetRowMarkTypeFromPB(read_req);</a>
+<a name="ln333">    read_only = read_only &amp;&amp; !IsValidRowMarkType(row_mark_type);</a>
+<a name="ln334">    needs_pessimistic_locking = RowMarkNeedsPessimisticLock(row_mark_type);</a>
+<a name="ln335">  }</a>
+<a name="ln336"> </a>
+<a name="ln337">  auto session = VERIFY_RESULT(pg_session_.GetSession(transactional_,</a>
+<a name="ln338">                                                      read_only,</a>
+<a name="ln339">                                                      needs_pessimistic_locking));</a>
+<a name="ln340">  if (!yb_session_) {</a>
+<a name="ln341">    yb_session_ = session-&gt;shared_from_this();</a>
+<a name="ln342">    if (transactional_ &amp;&amp; read_time) {</a>
+<a name="ln343">      if (!*read_time) {</a>
+<a name="ln344">        *read_time = pg_session_.clock_-&gt;Now().ToUint64();</a>
+<a name="ln345">      }</a>
+<a name="ln346">      yb_session_-&gt;SetInTxnLimit(HybridTime(*read_time));</a>
+<a name="ln347">    }</a>
+<a name="ln348">    for (const auto&amp; bop : pending_ops_) {</a>
+<a name="ln349">      RETURN_NOT_OK(pg_session_.ApplyOperation(yb_session_.get(), transactional_, bop));</a>
+<a name="ln350">    }</a>
+<a name="ln351">  } else {</a>
+<a name="ln352">    // Session must not be changed as all operations belong to single session</a>
+<a name="ln353">    // (transactional or non-transactional)</a>
+<a name="ln354">    DCHECK_EQ(yb_session_.get(), session);</a>
+<a name="ln355">  }</a>
+<a name="ln356">  if (PREDICT_FALSE(yb_debug_log_docdb_requests)) {</a>
+<a name="ln357">    LOG(INFO) &lt;&lt; &quot;Applying operation : &quot; &lt;&lt; op-&gt;ToString();</a>
+<a name="ln358">  }</a>
+<a name="ln359">  return yb_session_-&gt;Apply(std::move(op));</a>
+<a name="ln360">}</a>
+<a name="ln361"> </a>
+<a name="ln362">Result&lt;PgSessionAsyncRunResult&gt; PgSession::RunHelper::Flush() {</a>
+<a name="ln363">  if (yb_session_) {</a>
+<a name="ln364">    auto future_status = MakeFuture&lt;Status&gt;([this](auto callback) {</a>
+<a name="ln365">      yb_session_-&gt;FlushAsync([callback](const Status&amp; status) { callback(status); });</a>
+<a name="ln366">    });</a>
+<a name="ln367">    return PgSessionAsyncRunResult(</a>
+<a name="ln368">        std::move(pending_ops_), std::move(future_status), std::move(yb_session_));</a>
+<a name="ln369">  }</a>
+<a name="ln370">  // All operations were buffered, no need to flush.</a>
+<a name="ln371">  return PgSessionAsyncRunResult();</a>
+<a name="ln372">}</a>
+<a name="ln373"> </a>
+<a name="ln374">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln375">// Class RowIdentifier</a>
+<a name="ln376">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln377"> </a>
+<a name="ln378">RowIdentifier::RowIdentifier(const client::YBPgsqlWriteOp&amp; op) :</a>
+<a name="ln379">  table_id_(&amp;op.table()-&gt;id()) {</a>
+<a name="ln380">  auto&amp; request = op.request();</a>
+<a name="ln381">  if (request.has_ybctid_column_value()) {</a>
+<a name="ln382">    ybctid_ = &amp;request.ybctid_column_value().value().binary_value();</a>
+<a name="ln383">  } else {</a>
+<a name="ln384">    vector&lt;docdb::PrimitiveValue&gt; hashed_components;</a>
+<a name="ln385">    vector&lt;docdb::PrimitiveValue&gt; range_components;</a>
+<a name="ln386">    const auto&amp; schema = op.table()-&gt;schema();</a>
+<a name="ln387">    InitKeyColumnPrimitiveValues(request.partition_column_values(),</a>
+<a name="ln388">                                 schema,</a>
+<a name="ln389">                                 0 /* start_idx */,</a>
+<a name="ln390">                                 &amp;hashed_components);</a>
+<a name="ln391">    InitKeyColumnPrimitiveValues(request.range_column_values(),</a>
+<a name="ln392">                                 schema,</a>
+<a name="ln393">                                 schema.num_hash_key_columns(),</a>
+<a name="ln394">                                 &amp;range_components);</a>
+<a name="ln395">    if (hashed_components.empty()) {</a>
+<a name="ln396">      ybctid_holder_ = docdb::DocKey(std::move(range_components)).Encode().ToStringBuffer();</a>
+<a name="ln397">    } else {</a>
+<a name="ln398">      ybctid_holder_ = docdb::DocKey(request.hash_code(),</a>
+<a name="ln399">                                     std::move(hashed_components),</a>
+<a name="ln400">                                     std::move(range_components)).Encode().ToStringBuffer();</a>
+<a name="ln401">    }</a>
+<a name="ln402">    ybctid_ = nullptr;</a>
+<a name="ln403">  }</a>
+<a name="ln404">}</a>
+<a name="ln405"> </a>
+<a name="ln406">const string&amp; RowIdentifier::ybctid() const {</a>
+<a name="ln407">  return ybctid_ ? *ybctid_ : ybctid_holder_;</a>
+<a name="ln408">}</a>
+<a name="ln409"> </a>
+<a name="ln410">const string&amp; RowIdentifier::table_id() const {</a>
+<a name="ln411">  return *table_id_;</a>
+<a name="ln412">}</a>
+<a name="ln413"> </a>
+<a name="ln414">bool operator==(const RowIdentifier&amp; k1, const RowIdentifier&amp; k2) {</a>
+<a name="ln415">  return k1.table_id() == k2.table_id() &amp;&amp; k1.ybctid() == k2.ybctid();</a>
+<a name="ln416">}</a>
+<a name="ln417"> </a>
+<a name="ln418">size_t hash_value(const RowIdentifier&amp; key) {</a>
+<a name="ln419">  size_t hash = 0;</a>
+<a name="ln420">  boost::hash_combine(hash, key.table_id());</a>
+<a name="ln421">  boost::hash_combine(hash, key.ybctid());</a>
+<a name="ln422">  return hash;</a>
+<a name="ln423">}</a>
+<a name="ln424"> </a>
+<a name="ln425">bool operator==(const PgForeignKeyReference&amp; k1, const PgForeignKeyReference&amp; k2) {</a>
+<a name="ln426">  return k1.table_id == k2.table_id &amp;&amp;</a>
+<a name="ln427">      k1.ybctid == k2.ybctid;</a>
+<a name="ln428">}</a>
+<a name="ln429"> </a>
+<a name="ln430">size_t hash_value(const PgForeignKeyReference&amp; key) {</a>
+<a name="ln431">  size_t hash = 0;</a>
+<a name="ln432">  boost::hash_combine(hash, key.table_id);</a>
+<a name="ln433">  boost::hash_combine(hash, key.ybctid);</a>
+<a name="ln434">  return hash;</a>
+<a name="ln435">}</a>
+<a name="ln436"> </a>
+<a name="ln437">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln438">// Class PgSession</a>
+<a name="ln439">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln440"> </a>
+<a name="ln441">PgSession::PgSession(</a>
+<a name="ln442">    client::YBClient* client,</a>
+<a name="ln443">    const string&amp; database_name,</a>
+<a name="ln444">    scoped_refptr&lt;PgTxnManager&gt; pg_txn_manager,</a>
+<a name="ln445">    scoped_refptr&lt;server::HybridClock&gt; clock,</a>
+<a name="ln446">    const tserver::TServerSharedObject* tserver_shared_object,</a>
+<a name="ln447">    const YBCPgCallbacks&amp; pg_callbacks)</a>
+<a name="ln448">    : client_(client),</a>
+<a name="ln449">      session_(client_-&gt;NewSession()),</a>
+<a name="ln450">      pg_txn_manager_(std::move(pg_txn_manager)),</a>
+<a name="ln451">      clock_(std::move(clock)),</a>
+<a name="ln452">      tserver_shared_object_(tserver_shared_object),</a>
+<a name="ln453">      pg_callbacks_(pg_callbacks) {</a>
+<a name="ln454"> </a>
+<a name="ln455">  // Sets the timeout for each rpc as well as the whole operation to</a>
+<a name="ln456">  // 'FLAGS_pg_yb_session_timeout_ms'.</a>
+<a name="ln457">  session_-&gt;SetTimeout(MonoDelta::FromMilliseconds(FLAGS_pg_yb_session_timeout_ms));</a>
+<a name="ln458"> </a>
+<a name="ln459">  session_-&gt;SetForceConsistentRead(client::ForceConsistentRead::kTrue);</a>
+<a name="ln460">}</a>
+<a name="ln461"> </a>
+<a name="ln462">PgSession::~PgSession() {</a>
+<a name="ln463">}</a>
+<a name="ln464"> </a>
+<a name="ln465">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln466"> </a>
+<a name="ln467">Status PgSession::ConnectDatabase(const string&amp; database_name) {</a>
+<a name="ln468">  connected_database_ = database_name;</a>
+<a name="ln469">  return Status::OK();</a>
+<a name="ln470">}</a>
+<a name="ln471"> </a>
+<a name="ln472">Status PgSession::IsDatabaseColocated(const PgOid database_oid, bool *colocated) {</a>
+<a name="ln473">  GetNamespaceInfoResponsePB resp;</a>
+<a name="ln474">  RETURN_NOT_OK(client_-&gt;GetNamespaceInfo(</a>
+<a name="ln475">      GetPgsqlNamespaceId(database_oid), &quot;&quot; /* namespace_name */, YQL_DATABASE_PGSQL, &amp;resp));</a>
+<a name="ln476">  *colocated = resp.colocated();</a>
+<a name="ln477">  return Status::OK();</a>
+<a name="ln478">}</a>
+<a name="ln479"> </a>
+<a name="ln480">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln481"> </a>
+<a name="ln482">Status PgSession::CreateDatabase(const string&amp; database_name,</a>
+<a name="ln483">                                 const PgOid database_oid,</a>
+<a name="ln484">                                 const PgOid source_database_oid,</a>
+<a name="ln485">                                 const PgOid next_oid,</a>
+<a name="ln486">                                 const bool colocated) {</a>
+<a name="ln487">  return client_-&gt;CreateNamespace(database_name,</a>
+<a name="ln488">                                  YQL_DATABASE_PGSQL,</a>
+<a name="ln489">                                  &quot;&quot; /* creator_role_name */,</a>
+<a name="ln490">                                  GetPgsqlNamespaceId(database_oid),</a>
+<a name="ln491">                                  source_database_oid != kPgInvalidOid</a>
+<a name="ln492">                                  ? GetPgsqlNamespaceId(source_database_oid) : &quot;&quot;,</a>
+<a name="ln493">                                  next_oid,</a>
+<a name="ln494">                                  colocated);</a>
+<a name="ln495">}</a>
+<a name="ln496"> </a>
+<a name="ln497">Status PgSession::DropDatabase(const string&amp; database_name, PgOid database_oid) {</a>
+<a name="ln498">  RETURN_NOT_OK(client_-&gt;DeleteNamespace(database_name,</a>
+<a name="ln499">                                         YQL_DATABASE_PGSQL,</a>
+<a name="ln500">                                         GetPgsqlNamespaceId(database_oid)));</a>
+<a name="ln501">  RETURN_NOT_OK(DeleteDBSequences(database_oid));</a>
+<a name="ln502">  return Status::OK();</a>
+<a name="ln503">}</a>
+<a name="ln504"> </a>
+<a name="ln505">client::YBNamespaceAlterer* PgSession::NewNamespaceAlterer(</a>
+<a name="ln506">    const std::string&amp; namespace_name, PgOid database_oid) {</a>
+<a name="ln507">  return client_-&gt;NewNamespaceAlterer(namespace_name, GetPgsqlNamespaceId(database_oid));</a>
+<a name="ln508">}</a>
+<a name="ln509"> </a>
+<a name="ln510">Status PgSession::ReserveOids(const PgOid database_oid,</a>
+<a name="ln511">                              const PgOid next_oid,</a>
+<a name="ln512">                              const uint32_t count,</a>
+<a name="ln513">                              PgOid *begin_oid,</a>
+<a name="ln514">                              PgOid *end_oid) {</a>
+<a name="ln515">  return client_-&gt;ReservePgsqlOids(GetPgsqlNamespaceId(database_oid), next_oid, count,</a>
+<a name="ln516">                                   begin_oid, end_oid);</a>
+<a name="ln517">}</a>
+<a name="ln518"> </a>
+<a name="ln519">Status PgSession::GetCatalogMasterVersion(uint64_t *version) {</a>
+<a name="ln520">  return client_-&gt;GetYsqlCatalogMasterVersion(version);</a>
+<a name="ln521">}</a>
+<a name="ln522"> </a>
+<a name="ln523">Status PgSession::CreateSequencesDataTable() {</a>
+<a name="ln524">  const YBTableName table_name(YQL_DATABASE_PGSQL,</a>
+<a name="ln525">                               kPgSequencesDataNamespaceId,</a>
+<a name="ln526">                               kPgSequencesNamespaceName,</a>
+<a name="ln527">                               kPgSequencesDataTableName);</a>
+<a name="ln528">  RETURN_NOT_OK(client_-&gt;CreateNamespaceIfNotExists(kPgSequencesNamespaceName,</a>
+<a name="ln529">                                                    YQLDatabase::YQL_DATABASE_PGSQL,</a>
+<a name="ln530">                                                    &quot;&quot; /* creator_role_name */,</a>
+<a name="ln531">                                                    kPgSequencesDataNamespaceId));</a>
+<a name="ln532"> </a>
+<a name="ln533">  // Set up the schema.</a>
+<a name="ln534">  client::YBSchemaBuilder schemaBuilder;</a>
+<a name="ln535">  schemaBuilder.AddColumn(kPgSequenceDbOidColName)-&gt;HashPrimaryKey()-&gt;Type(yb::INT64)-&gt;NotNull();</a>
+<a name="ln536">  schemaBuilder.AddColumn(kPgSequenceSeqOidColName)-&gt;HashPrimaryKey()-&gt;Type(yb::INT64)-&gt;NotNull();</a>
+<a name="ln537">  schemaBuilder.AddColumn(kPgSequenceLastValueColName)-&gt;Type(yb::INT64)-&gt;NotNull();</a>
+<a name="ln538">  schemaBuilder.AddColumn(kPgSequenceIsCalledColName)-&gt;Type(yb::BOOL)-&gt;NotNull();</a>
+<a name="ln539">  client::YBSchema schema;</a>
+<a name="ln540">  CHECK_OK(schemaBuilder.Build(&amp;schema));</a>
+<a name="ln541"> </a>
+<a name="ln542">  // Generate the table id.</a>
+<a name="ln543">  pggate::PgObjectId oid(kPgSequencesDataDatabaseOid, kPgSequencesDataTableOid);</a>
+<a name="ln544"> </a>
+<a name="ln545">  // Try to create the table.</a>
+<a name="ln546">  std::unique_ptr&lt;yb::client::YBTableCreator&gt; table_creator(client_-&gt;NewTableCreator());</a>
+<a name="ln547"> </a>
+<a name="ln548">  Status s = table_creator-&gt;table_name(table_name)</a>
+<a name="ln549">      .schema(&amp;schema)</a>
+<a name="ln550">      .table_type(yb::client::YBTableType::PGSQL_TABLE_TYPE)</a>
+<a name="ln551">      .table_id(oid.GetYBTableId())</a>
+<a name="ln552">      .hash_schema(YBHashSchema::kPgsqlHash)</a>
+<a name="ln553">      .Create();</a>
+<a name="ln554">  // If we could create it, then all good!</a>
+<a name="ln555">  if (s.ok()) {</a>
+<a name="ln556">    LOG(INFO) &lt;&lt; &quot;Table '&quot; &lt;&lt; table_name.ToString() &lt;&lt; &quot;' created.&quot;;</a>
+<a name="ln557">    // If the table was already there, also not an error...</a>
+<a name="ln558">  } else if (s.IsAlreadyPresent()) {</a>
+<a name="ln559">    LOG(INFO) &lt;&lt; &quot;Table '&quot; &lt;&lt; table_name.ToString() &lt;&lt; &quot;' already exists&quot;;</a>
+<a name="ln560">  } else {</a>
+<a name="ln561">    // If any other error, report that!</a>
+<a name="ln562">    LOG(ERROR) &lt;&lt; &quot;Error creating table '&quot; &lt;&lt; table_name.ToString() &lt;&lt; &quot;': &quot; &lt;&lt; s;</a>
+<a name="ln563">    RETURN_NOT_OK(s);</a>
+<a name="ln564">  }</a>
+<a name="ln565">  return Status::OK();</a>
+<a name="ln566">}</a>
+<a name="ln567"> </a>
+<a name="ln568">Status PgSession::InsertSequenceTuple(int64_t db_oid,</a>
+<a name="ln569">                                      int64_t seq_oid,</a>
+<a name="ln570">                                      uint64_t ysql_catalog_version,</a>
+<a name="ln571">                                      int64_t last_val,</a>
+<a name="ln572">                                      bool is_called) {</a>
+<a name="ln573">  pggate::PgObjectId oid(kPgSequencesDataDatabaseOid, kPgSequencesDataTableOid);</a>
+<a name="ln574">  auto result = LoadTable(oid);</a>
+<a name="ln575">  if (!result.ok()) {</a>
+<a name="ln576">    RETURN_NOT_OK(CreateSequencesDataTable());</a>
+<a name="ln577">    // Try one more time.</a>
+<a name="ln578">    result = LoadTable(oid);</a>
+<a name="ln579">  }</a>
+<a name="ln580">  PgTableDesc::ScopedRefPtr t = VERIFY_RESULT(result);</a>
+<a name="ln581"> </a>
+<a name="ln582">  auto psql_write(t-&gt;NewPgsqlInsert());</a>
+<a name="ln583"> </a>
+<a name="ln584">  auto write_request = psql_write-&gt;mutable_request();</a>
+<a name="ln585">  write_request-&gt;set_ysql_catalog_version(ysql_catalog_version);</a>
+<a name="ln586"> </a>
+<a name="ln587">  write_request-&gt;add_partition_column_values()-&gt;mutable_value()-&gt;set_int64_value(db_oid);</a>
+<a name="ln588">  write_request-&gt;add_partition_column_values()-&gt;mutable_value()-&gt;set_int64_value(seq_oid);</a>
+<a name="ln589"> </a>
+<a name="ln590">  PgsqlColumnValuePB* column_value = write_request-&gt;add_column_values();</a>
+<a name="ln591">  column_value-&gt;set_column_id(t-&gt;table()-&gt;schema().ColumnId(kPgSequenceLastValueColIdx));</a>
+<a name="ln592">  column_value-&gt;mutable_expr()-&gt;mutable_value()-&gt;set_int64_value(last_val);</a>
+<a name="ln593"> </a>
+<a name="ln594">  column_value = write_request-&gt;add_column_values();</a>
+<a name="ln595">  column_value-&gt;set_column_id(t-&gt;table()-&gt;schema().ColumnId(kPgSequenceIsCalledColIdx));</a>
+<a name="ln596">  column_value-&gt;mutable_expr()-&gt;mutable_value()-&gt;set_bool_value(is_called);</a>
+<a name="ln597"> </a>
+<a name="ln598">  return session_-&gt;ApplyAndFlush(std::move(psql_write));</a>
+<a name="ln599">}</a>
+<a name="ln600"> </a>
+<a name="ln601">Status PgSession::UpdateSequenceTuple(int64_t db_oid,</a>
+<a name="ln602">                                      int64_t seq_oid,</a>
+<a name="ln603">                                      uint64_t ysql_catalog_version,</a>
+<a name="ln604">                                      int64_t last_val,</a>
+<a name="ln605">                                      bool is_called,</a>
+<a name="ln606">                                      boost::optional&lt;int64_t&gt; expected_last_val,</a>
+<a name="ln607">                                      boost::optional&lt;bool&gt; expected_is_called,</a>
+<a name="ln608">                                      bool* skipped) {</a>
+<a name="ln609">  pggate::PgObjectId oid(kPgSequencesDataDatabaseOid, kPgSequencesDataTableOid);</a>
+<a name="ln610">  PgTableDesc::ScopedRefPtr t = VERIFY_RESULT(LoadTable(oid));</a>
+<a name="ln611"> </a>
+<a name="ln612">  std::shared_ptr&lt;client::YBPgsqlWriteOp&gt; psql_write(t-&gt;NewPgsqlUpdate());</a>
+<a name="ln613"> </a>
+<a name="ln614">  auto write_request = psql_write-&gt;mutable_request();</a>
+<a name="ln615">  write_request-&gt;set_ysql_catalog_version(ysql_catalog_version);</a>
+<a name="ln616"> </a>
+<a name="ln617">  write_request-&gt;add_partition_column_values()-&gt;mutable_value()-&gt;set_int64_value(db_oid);</a>
+<a name="ln618">  write_request-&gt;add_partition_column_values()-&gt;mutable_value()-&gt;set_int64_value(seq_oid);</a>
+<a name="ln619"> </a>
+<a name="ln620">  PgsqlColumnValuePB* column_value = write_request-&gt;add_column_new_values();</a>
+<a name="ln621">  column_value-&gt;set_column_id(t-&gt;table()-&gt;schema().ColumnId(kPgSequenceLastValueColIdx));</a>
+<a name="ln622">  column_value-&gt;mutable_expr()-&gt;mutable_value()-&gt;set_int64_value(last_val);</a>
+<a name="ln623"> </a>
+<a name="ln624">  column_value = write_request-&gt;add_column_new_values();</a>
+<a name="ln625">  column_value-&gt;set_column_id(t-&gt;table()-&gt;schema().ColumnId(kPgSequenceIsCalledColIdx));</a>
+<a name="ln626">  column_value-&gt;mutable_expr()-&gt;mutable_value()-&gt;set_bool_value(is_called);</a>
+<a name="ln627"> </a>
+<a name="ln628">  auto where_pb = write_request-&gt;mutable_where_expr()-&gt;mutable_condition();</a>
+<a name="ln629"> </a>
+<a name="ln630">  if (expected_last_val &amp;&amp; expected_is_called) {</a>
+<a name="ln631">    // WHERE clause =&gt; WHERE last_val == expected_last_val AND is_called == expected_is_called.</a>
+<a name="ln632">    where_pb-&gt;set_op(QL_OP_AND);</a>
+<a name="ln633"> </a>
+<a name="ln634">    auto cond = where_pb-&gt;add_operands()-&gt;mutable_condition();</a>
+<a name="ln635">    cond-&gt;set_op(QL_OP_EQUAL);</a>
+<a name="ln636">    cond-&gt;add_operands()-&gt;set_column_id(t-&gt;table()-&gt;schema().ColumnId(kPgSequenceLastValueColIdx));</a>
+<a name="ln637">    cond-&gt;add_operands()-&gt;mutable_value()-&gt;set_int64_value(*expected_last_val);</a>
+<a name="ln638"> </a>
+<a name="ln639">    cond = where_pb-&gt;add_operands()-&gt;mutable_condition();</a>
+<a name="ln640">    cond-&gt;set_op(QL_OP_EQUAL);</a>
+<a name="ln641">    cond-&gt;add_operands()-&gt;set_column_id(t-&gt;table()-&gt;schema().ColumnId(kPgSequenceIsCalledColIdx));</a>
+<a name="ln642">    cond-&gt;add_operands()-&gt;mutable_value()-&gt;set_bool_value(*expected_is_called);</a>
+<a name="ln643">  } else {</a>
+<a name="ln644">    where_pb-&gt;set_op(QL_OP_EXISTS);</a>
+<a name="ln645">  }</a>
+<a name="ln646"> </a>
+<a name="ln647">  write_request-&gt;mutable_column_refs()-&gt;add_ids(</a>
+<a name="ln648">      t-&gt;table()-&gt;schema().ColumnId(kPgSequenceLastValueColIdx));</a>
+<a name="ln649">  write_request-&gt;mutable_column_refs()-&gt;add_ids(</a>
+<a name="ln650">      t-&gt;table()-&gt;schema().ColumnId(kPgSequenceIsCalledColIdx));</a>
+<a name="ln651"> </a>
+<a name="ln652">  RETURN_NOT_OK(session_-&gt;ApplyAndFlush(psql_write));</a>
+<a name="ln653">  if (skipped) {</a>
+<a name="ln654">    *skipped = psql_write-&gt;response().skipped();</a>
+<a name="ln655">  }</a>
+<a name="ln656">  return Status::OK();</a>
+<a name="ln657">}</a>
+<a name="ln658"> </a>
+<a name="ln659">Status PgSession::ReadSequenceTuple(int64_t db_oid,</a>
+<a name="ln660">                                    int64_t seq_oid,</a>
+<a name="ln661">                                    uint64_t ysql_catalog_version,</a>
+<a name="ln662">                                    int64_t *last_val,</a>
+<a name="ln663">                                    bool *is_called) {</a>
+<a name="ln664">  pggate::PgObjectId oid(kPgSequencesDataDatabaseOid, kPgSequencesDataTableOid);</a>
+<a name="ln665">  PgTableDesc::ScopedRefPtr t = VERIFY_RESULT(LoadTable(oid));</a>
+<a name="ln666"> </a>
+<a name="ln667">  std::shared_ptr&lt;client::YBPgsqlReadOp&gt; psql_read(t-&gt;NewPgsqlSelect());</a>
+<a name="ln668"> </a>
+<a name="ln669">  auto read_request = psql_read-&gt;mutable_request();</a>
+<a name="ln670">  read_request-&gt;set_ysql_catalog_version(ysql_catalog_version);</a>
+<a name="ln671"> </a>
+<a name="ln672">  read_request-&gt;add_partition_column_values()-&gt;mutable_value()-&gt;set_int64_value(db_oid);</a>
+<a name="ln673">  read_request-&gt;add_partition_column_values()-&gt;mutable_value()-&gt;set_int64_value(seq_oid);</a>
+<a name="ln674"> </a>
+<a name="ln675">  read_request-&gt;add_targets()-&gt;set_column_id(</a>
+<a name="ln676">      t-&gt;table()-&gt;schema().ColumnId(kPgSequenceLastValueColIdx));</a>
+<a name="ln677">  read_request-&gt;add_targets()-&gt;set_column_id(</a>
+<a name="ln678">      t-&gt;table()-&gt;schema().ColumnId(kPgSequenceIsCalledColIdx));</a>
+<a name="ln679"> </a>
+<a name="ln680">  read_request-&gt;mutable_column_refs()-&gt;add_ids(</a>
+<a name="ln681">      t-&gt;table()-&gt;schema().ColumnId(kPgSequenceLastValueColIdx));</a>
+<a name="ln682">  read_request-&gt;mutable_column_refs()-&gt;add_ids(</a>
+<a name="ln683">      t-&gt;table()-&gt;schema().ColumnId(kPgSequenceIsCalledColIdx));</a>
+<a name="ln684"> </a>
+<a name="ln685">  RETURN_NOT_OK(session_-&gt;ReadSync(psql_read));</a>
+<a name="ln686"> </a>
+<a name="ln687">  Slice cursor;</a>
+<a name="ln688">  int64_t row_count = 0;</a>
+<a name="ln689">  PgDocData::LoadCache(psql_read-&gt;rows_data(), &amp;row_count, &amp;cursor);</a>
+<a name="ln690">  if (row_count == 0) {</a>
+<a name="ln691">    return STATUS_SUBSTITUTE(NotFound, &quot;Unable to find relation for sequence $0&quot;, seq_oid);</a>
+<a name="ln692">  }</a>
+<a name="ln693"> </a>
+<a name="ln694">  PgWireDataHeader header = PgDocData::ReadDataHeader(&amp;cursor);</a>
+<a name="ln695">  if (header.is_null()) {</a>
+<a name="ln696">    return STATUS_SUBSTITUTE(NotFound, &quot;Unable to find relation for sequence $0&quot;, seq_oid);</a>
+<a name="ln697">  }</a>
+<a name="ln698">  size_t read_size = PgDocData::ReadNumber(&amp;cursor, last_val);</a>
+<a name="ln699">  cursor.remove_prefix(read_size);</a>
+<a name="ln700"> </a>
+<a name="ln701">  header = PgDocData::ReadDataHeader(&amp;cursor);</a>
+<a name="ln702">  if (header.is_null()) {</a>
+<a name="ln703">    return STATUS_SUBSTITUTE(NotFound, &quot;Unable to find relation for sequence $0&quot;, seq_oid);</a>
+<a name="ln704">  }</a>
+<a name="ln705">  read_size = PgDocData::ReadNumber(&amp;cursor, is_called);</a>
+<a name="ln706">  return Status::OK();</a>
+<a name="ln707">}</a>
+<a name="ln708"> </a>
+<a name="ln709">Status PgSession::DeleteSequenceTuple(int64_t db_oid, int64_t seq_oid) {</a>
+<a name="ln710">  pggate::PgObjectId oid(kPgSequencesDataDatabaseOid, kPgSequencesDataTableOid);</a>
+<a name="ln711">  PgTableDesc::ScopedRefPtr t = VERIFY_RESULT(LoadTable(oid));</a>
+<a name="ln712"> </a>
+<a name="ln713">  auto psql_delete(t-&gt;NewPgsqlDelete());</a>
+<a name="ln714">  auto delete_request = psql_delete-&gt;mutable_request();</a>
+<a name="ln715"> </a>
+<a name="ln716">  delete_request-&gt;add_partition_column_values()-&gt;mutable_value()-&gt;set_int64_value(db_oid);</a>
+<a name="ln717">  delete_request-&gt;add_partition_column_values()-&gt;mutable_value()-&gt;set_int64_value(seq_oid);</a>
+<a name="ln718"> </a>
+<a name="ln719">  return session_-&gt;ApplyAndFlush(std::move(psql_delete));</a>
+<a name="ln720">}</a>
+<a name="ln721"> </a>
+<a name="ln722">Status PgSession::DeleteDBSequences(int64_t db_oid) {</a>
+<a name="ln723">  pggate::PgObjectId oid(kPgSequencesDataDatabaseOid, kPgSequencesDataTableOid);</a>
+<a name="ln724">  Result&lt;PgTableDesc::ScopedRefPtr&gt; r = LoadTable(oid);</a>
+<a name="ln725">  if (!r.ok()) {</a>
+<a name="ln726">    // Sequence table is not yet created.</a>
+<a name="ln727">    return Status::OK();</a>
+<a name="ln728">  }</a>
+<a name="ln729"> </a>
+<a name="ln730">  PgTableDesc::ScopedRefPtr t = CHECK_RESULT(r);</a>
+<a name="ln731">  if (t == nullptr) {</a>
+<a name="ln732">    return Status::OK();</a>
+<a name="ln733">  }</a>
+<a name="ln734"> </a>
+<a name="ln735">  auto psql_delete(t-&gt;NewPgsqlDelete());</a>
+<a name="ln736">  auto delete_request = psql_delete-&gt;mutable_request();</a>
+<a name="ln737"> </a>
+<a name="ln738">  delete_request-&gt;add_partition_column_values()-&gt;mutable_value()-&gt;set_int64_value(db_oid);</a>
+<a name="ln739">  return session_-&gt;ApplyAndFlush(std::move(psql_delete));</a>
+<a name="ln740">}</a>
+<a name="ln741"> </a>
+<a name="ln742">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln743"> </a>
+<a name="ln744">unique_ptr&lt;client::YBTableCreator&gt; PgSession::NewTableCreator() {</a>
+<a name="ln745">  return client_-&gt;NewTableCreator();</a>
+<a name="ln746">}</a>
+<a name="ln747"> </a>
+<a name="ln748">unique_ptr&lt;client::YBTableAlterer&gt; PgSession::NewTableAlterer(const YBTableName&amp; table_name) {</a>
+<a name="ln749">  return client_-&gt;NewTableAlterer(table_name);</a>
+<a name="ln750">}</a>
+<a name="ln751"> </a>
+<a name="ln752">unique_ptr&lt;client::YBTableAlterer&gt; PgSession::NewTableAlterer(const string table_id) {</a>
+<a name="ln753">  return client_-&gt;NewTableAlterer(table_id);</a>
+<a name="ln754">}</a>
+<a name="ln755"> </a>
+<a name="ln756">Status PgSession::DropTable(const PgObjectId&amp; table_id) {</a>
+<a name="ln757">  return client_-&gt;DeleteTable(table_id.GetYBTableId());</a>
+<a name="ln758">}</a>
+<a name="ln759"> </a>
+<a name="ln760">Status PgSession::DropIndex(</a>
+<a name="ln761">    const PgObjectId&amp; index_id,</a>
+<a name="ln762">    client::YBTableName* indexed_table_name,</a>
+<a name="ln763">    bool wait) {</a>
+<a name="ln764">  return client_-&gt;DeleteIndexTable(</a>
+<a name="ln765">      index_id.GetYBTableId(),</a>
+<a name="ln766">      indexed_table_name,</a>
+<a name="ln767">      wait);</a>
+<a name="ln768">}</a>
+<a name="ln769"> </a>
+<a name="ln770">Status PgSession::TruncateTable(const PgObjectId&amp; table_id) {</a>
+<a name="ln771">  return client_-&gt;TruncateTable(table_id.GetYBTableId());</a>
+<a name="ln772">}</a>
+<a name="ln773"> </a>
+<a name="ln774">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln775"> </a>
+<a name="ln776">Status PgSession::CreateTablegroup(const string&amp; database_name,</a>
+<a name="ln777">                                   const PgOid database_oid,</a>
+<a name="ln778">                                   PgOid tablegroup_oid) {</a>
+<a name="ln779">  return client_-&gt;CreateTablegroup(database_name,</a>
+<a name="ln780">                                   GetPgsqlNamespaceId(database_oid),</a>
+<a name="ln781">                                   GetPgsqlTablegroupId(database_oid, tablegroup_oid));</a>
+<a name="ln782">}</a>
+<a name="ln783"> </a>
+<a name="ln784">Status PgSession::DropTablegroup(const PgOid database_oid,</a>
+<a name="ln785">                                 PgOid tablegroup_oid) {</a>
+<a name="ln786">  Status s = client_-&gt;DeleteTablegroup(GetPgsqlNamespaceId(database_oid),</a>
+<a name="ln787">                                       GetPgsqlTablegroupId(database_oid, tablegroup_oid));</a>
+<a name="ln788">  table_cache_.erase(GetPgsqlTablegroupId(database_oid, tablegroup_oid) +</a>
+<a name="ln789">      &quot;.tablegroup.parent.uuid&quot;);</a>
+<a name="ln790">  return s;</a>
+<a name="ln791">}</a>
+<a name="ln792"> </a>
+<a name="ln793">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln794"> </a>
+<a name="ln795">Result&lt;PgTableDesc::ScopedRefPtr&gt; PgSession::LoadTable(const PgObjectId&amp; table_id) {</a>
+<a name="ln796">  VLOG(3) &lt;&lt; &quot;Loading table descriptor for &quot; &lt;&lt; table_id;</a>
+<a name="ln797">  const TableId yb_table_id = table_id.GetYBTableId();</a>
+<a name="ln798">  shared_ptr&lt;YBTable&gt; table;</a>
+<a name="ln799"> </a>
+<a name="ln800">  auto cached_yb_table = table_cache_.find(yb_table_id);</a>
+<a name="ln801">  if (cached_yb_table == table_cache_.end()) {</a>
+<a name="ln802">    VLOG(4) &lt;&lt; &quot;Table cache MISS: &quot; &lt;&lt; table_id;</a>
+<a name="ln803">    Status s = client_-&gt;OpenTable(yb_table_id, &amp;table);</a>
+<a name="ln804">    if (!s.ok()) {</a>
+<a name="ln805">      VLOG(3) &lt;&lt; &quot;LoadTable: Server returns an error: &quot; &lt;&lt; s;</a>
+<a name="ln806">      // TODO: NotFound might not always be the right status here.</a>
+<a name="ln807">      return STATUS_FORMAT(NotFound, &quot;Error loading table with oid $0 in database with oid $1: $2&quot;,</a>
+<a name="ln808">                           table_id.object_oid, table_id.database_oid, s.ToUserMessage());</a>
+<a name="ln809">    }</a>
+<a name="ln810">    table_cache_[yb_table_id] = table;</a>
+<a name="ln811">  } else {</a>
+<a name="ln812">    VLOG(4) &lt;&lt; &quot;Table cache HIT: &quot; &lt;&lt; table_id;</a>
+<a name="ln813">    table = cached_yb_table-&gt;second;</a>
+<a name="ln814">  }</a>
+<a name="ln815"> </a>
+<a name="ln816">  DCHECK_EQ(table-&gt;table_type(), YBTableType::PGSQL_TABLE_TYPE);</a>
+<a name="ln817"> </a>
+<a name="ln818">  return make_scoped_refptr&lt;PgTableDesc&gt;(table);</a>
+<a name="ln819">}</a>
+<a name="ln820"> </a>
+<a name="ln821">void PgSession::InvalidateTableCache(const PgObjectId&amp; table_id) {</a>
+<a name="ln822">  const TableId yb_table_id = table_id.GetYBTableId();</a>
+<a name="ln823">  table_cache_.erase(yb_table_id);</a>
+<a name="ln824">}</a>
+<a name="ln825"> </a>
+<a name="ln826">void PgSession::StartOperationsBuffering() {</a>
+<a name="ln827">  DCHECK(!buffering_enabled_);</a>
+<a name="ln828">  DCHECK(buffered_keys_.empty());</a>
+<a name="ln829">  buffering_enabled_ = true;</a>
+<a name="ln830">}</a>
+<a name="ln831"> </a>
+<a name="ln832">Status PgSession::StopOperationsBuffering() {</a>
+<a name="ln833">  DCHECK(buffering_enabled_);</a>
+<a name="ln834">  buffering_enabled_ = false;</a>
+<a name="ln835">  return FlushBufferedOperations();</a>
+<a name="ln836">}</a>
+<a name="ln837"> </a>
+<a name="ln838">Status PgSession::ResetOperationsBuffering() {</a>
+<a name="ln839">  SCHECK(buffered_keys_.empty(),</a>
+<a name="ln840">         IllegalState,</a>
+<a name="ln841">         Format(&quot;Pending operations are not expected, $0 found&quot;, buffered_keys_.size()));</a>
+<a name="ln842">  buffering_enabled_ = false;</a>
+<a name="ln843">  return Status::OK();</a>
+<a name="ln844">}</a>
+<a name="ln845"> </a>
+<a name="ln846">Status PgSession::FlushBufferedOperations() {</a>
+<a name="ln847">  return FlushBufferedOperationsImpl(</a>
+<a name="ln848">      [this](auto ops, auto txn) { return this-&gt;FlushOperations(std::move(ops), txn); });</a>
+<a name="ln849">}</a>
+<a name="ln850"> </a>
+<a name="ln851">void PgSession::DropBufferedOperations() {</a>
+<a name="ln852">  VLOG_IF(1, !buffered_keys_.empty())</a>
+<a name="ln853">          &lt;&lt; &quot;Dropping &quot; &lt;&lt; buffered_keys_.size() &lt;&lt; &quot; pending operations&quot;;</a>
+<a name="ln854">  buffered_keys_.clear();</a>
+<a name="ln855">  buffered_ops_.clear();</a>
+<a name="ln856">  buffered_txn_ops_.clear();</a>
+<a name="ln857">}</a>
+<a name="ln858"> </a>
+<a name="ln859">Status PgSession::FlushBufferedOperationsImpl(const Flusher&amp; flusher) {</a>
+<a name="ln860">  auto ops = std::move(buffered_ops_);</a>
+<a name="ln861">  auto txn_ops = std::move(buffered_txn_ops_);</a>
+<a name="ln862">  buffered_keys_.clear();</a>
+<a name="ln863">  buffered_ops_.clear();</a>
+<a name="ln864">  buffered_txn_ops_.clear();</a>
+<a name="ln865">  if (!ops.empty()) {</a>
+<a name="ln866">    RETURN_NOT_OK(flusher(std::move(ops), false /* transactional */));</a>
+<a name="ln867">  }</a>
+<a name="ln868">  if (!txn_ops.empty()) {</a>
+<a name="ln869">    SCHECK(!YBCIsInitDbModeEnvVarSet(),</a>
+<a name="ln870">           IllegalState,</a>
+<a name="ln871">           &quot;No transactional operations are expected in the initdb mode&quot;);</a>
+<a name="ln872">    RETURN_NOT_OK(flusher(std::move(txn_ops), true /* transactional */));</a>
+<a name="ln873">  }</a>
+<a name="ln874">  return Status::OK();</a>
+<a name="ln875">}</a>
+<a name="ln876"> </a>
+<a name="ln877">bool PgSession::ShouldHandleTransactionally(const client::YBPgsqlOp&amp; op) {</a>
+<a name="ln878">  return op.IsTransactional() &amp;&amp;  !YBCIsInitDbModeEnvVarSet() &amp;&amp;</a>
+<a name="ln879">         (!op.IsYsqlCatalogOp() || pg_txn_manager_-&gt;IsDdlMode() ||</a>
+<a name="ln880">             // In this mode, used for some tests, we will execute direct statements on YSQL system</a>
+<a name="ln881">             // catalog tables in the user-controlled transaction, as opposed to executing them</a>
+<a name="ln882">             // non-transactionally.</a>
+<a name="ln883">             FLAGS_ysql_enable_manual_sys_table_txn_ctl);</a>
+<a name="ln884">}</a>
+<a name="ln885"> </a>
+<a name="ln886">Result&lt;YBSession*&gt; PgSession::GetSession(bool transactional,</a>
+<a name="ln887">                                         bool read_only_op,</a>
+<a name="ln888">                                         bool needs_pessimistic_locking) {</a>
+<a name="ln889">  if (transactional) {</a>
+<a name="ln890">    YBSession* txn_session = VERIFY_RESULT(pg_txn_manager_-&gt;GetTransactionalSession());</a>
+<a name="ln891">    RETURN_NOT_OK(pg_txn_manager_-&gt;BeginWriteTransactionIfNecessary(read_only_op,</a>
+<a name="ln892">                                                                    needs_pessimistic_locking));</a>
+<a name="ln893">    VLOG(2) &lt;&lt; __PRETTY_FUNCTION__</a>
+<a name="ln894">            &lt;&lt; &quot;: read_only_op=&quot; &lt;&lt; read_only_op &lt;&lt; &quot;, returning transactional session: &quot;</a>
+<a name="ln895">            &lt;&lt; txn_session;</a>
+<a name="ln896">    return txn_session;</a>
+<a name="ln897">  }</a>
+<a name="ln898">  VLOG(2) &lt;&lt; __PRETTY_FUNCTION__</a>
+<a name="ln899">          &lt;&lt; &quot;: read_only_op=&quot; &lt;&lt; read_only_op &lt;&lt; &quot;, returning non-transactional session &quot;</a>
+<a name="ln900">          &lt;&lt; session_.get();</a>
+<a name="ln901">  return session_.get();</a>
+<a name="ln902">}</a>
+<a name="ln903"> </a>
+<a name="ln904">Result&lt;bool&gt; PgSession::IsInitDbDone() {</a>
+<a name="ln905">  HostPort master_leader_host_port = client_-&gt;GetMasterLeaderAddress();</a>
+<a name="ln906">  auto proxy  = std::make_shared&lt;MasterServiceProxy&gt;(</a>
+<a name="ln907">      &amp;client_-&gt;proxy_cache(), master_leader_host_port);</a>
+<a name="ln908">  rpc::RpcController rpc;</a>
+<a name="ln909">  IsInitDbDoneRequestPB req;</a>
+<a name="ln910">  IsInitDbDoneResponsePB resp;</a>
+<a name="ln911">  RETURN_NOT_OK(proxy-&gt;IsInitDbDone(req, &amp;resp, &amp;rpc));</a>
+<a name="ln912">  if (resp.has_error()) {</a>
+<a name="ln913">    return STATUS_FORMAT(</a>
+<a name="ln914">        RuntimeError,</a>
+<a name="ln915">        &quot;IsInitDbDone RPC response hit error: $0&quot;,</a>
+<a name="ln916">        resp.error().ShortDebugString());</a>
+<a name="ln917">  }</a>
+<a name="ln918">  if (resp.done() &amp;&amp; resp.has_initdb_error() &amp;&amp; !resp.initdb_error().empty()) {</a>
+<a name="ln919">    return STATUS_FORMAT(RuntimeError, &quot;initdb failed: $0&quot;, resp.initdb_error());</a>
+<a name="ln920">  }</a>
+<a name="ln921">  VLOG(1) &lt;&lt; &quot;IsInitDbDone response: &quot; &lt;&lt; resp.ShortDebugString();</a>
+<a name="ln922">  // We return true if initdb finished running, as well as if we know that it created the first</a>
+<a name="ln923">  // table (pg_proc) to make initdb idempotent on upgrades.</a>
+<a name="ln924">  return resp.done() || resp.pg_proc_exists();</a>
+<a name="ln925">}</a>
+<a name="ln926"> </a>
+<a name="ln927">Status PgSession::ApplyOperation(client::YBSession *session,</a>
+<a name="ln928">                                 bool transactional,</a>
+<a name="ln929">                                 const BufferableOperation&amp; bop) {</a>
+<a name="ln930">  const auto&amp; op = bop.operation;</a>
+<a name="ln931">  SCHECK_EQ(ShouldHandleTransactionally(*op),</a>
+<a name="ln932">            transactional,</a>
+<a name="ln933">            IllegalState,</a>
+<a name="ln934">            Format(&quot;Table name: $0, table is transactional: $1, initdb mode: $2&quot;,</a>
+<a name="ln935">                   op-&gt;table()-&gt;name(),</a>
+<a name="ln936">                   op-&gt;table()-&gt;schema().table_properties().is_transactional(),</a>
+<a name="ln937">                   YBCIsInitDbModeEnvVarSet()));</a>
+<a name="ln938">  return session-&gt;Apply(op);</a>
+<a name="ln939">}</a>
+<a name="ln940"> </a>
+<a name="ln941">Status PgSession::FlushOperations(PgsqlOpBuffer ops, bool transactional) {</a>
+<a name="ln942">  DCHECK(ops.size() &gt; 0 &amp;&amp; ops.size() &lt;= FLAGS_ysql_session_max_batch_size);</a>
+<a name="ln943">  auto session = VERIFY_RESULT(GetSession(transactional, false /* read_only_op */));</a>
+<a name="ln944">  if (session != session_.get()) {</a>
+<a name="ln945">    DCHECK(transactional);</a>
+<a name="ln946">    session-&gt;SetInTxnLimit(HybridTime(clock_-&gt;Now().ToUint64()));</a>
+<a name="ln947">  }</a>
+<a name="ln948">  if (PREDICT_FALSE(yb_debug_log_docdb_requests)) {</a>
+<a name="ln949">    LOG(INFO) &lt;&lt; &quot;Flushing buffered operations, using &quot;</a>
+<a name="ln950">              &lt;&lt; (transactional ? &quot; transactional&quot; : &quot;non-transactional&quot;)</a>
+<a name="ln951">              &lt;&lt; &quot;session (num ops: &quot; &lt;&lt; ops.size() &lt;&lt; &quot;)&quot;;</a>
+<a name="ln952">  }</a>
+<a name="ln953">  for (const auto&amp; buffered_op : ops) {</a>
+<a name="ln954">    RETURN_NOT_OK(ApplyOperation(session, transactional, buffered_op));</a>
+<a name="ln955">  }</a>
+<a name="ln956">  const auto status = session-&gt;FlushFuture().get();</a>
+<a name="ln957">  RETURN_NOT_OK(CombineErrorsToStatus(session-&gt;GetPendingErrors(), status));</a>
+<a name="ln958">  for (const auto&amp; buffered_op : ops) {</a>
+<a name="ln959">    RETURN_NOT_OK(HandleResponse(*buffered_op.operation, buffered_op.relation_id));</a>
+<a name="ln960">  }</a>
+<a name="ln961">  return Status::OK();</a>
+<a name="ln962">}</a>
+<a name="ln963"> </a>
+<a name="ln964">Result&lt;uint64_t&gt; PgSession::GetSharedCatalogVersion() {</a>
+<a name="ln965">  if (tserver_shared_object_) {</a>
+<a name="ln966">    return (**tserver_shared_object_).ysql_catalog_version();</a>
+<a name="ln967">  } else {</a>
+<a name="ln968">    return STATUS(NotSupported, &quot;Tablet server shared memory has not been opened&quot;);</a>
+<a name="ln969">  }</a>
+<a name="ln970">}</a>
+<a name="ln971"> </a>
+<a name="ln972">bool PgSession::ForeignKeyReferenceExists(uint32_t table_id, std::string&amp;&amp; ybctid) {</a>
+<a name="ln973">  PgForeignKeyReference reference = {table_id, std::move(ybctid)};</a>
+<a name="ln974">  return fk_reference_cache_.find(reference) != fk_reference_cache_.end();</a>
+<a name="ln975">}</a>
+<a name="ln976"> </a>
+<a name="ln977">Status PgSession::CacheForeignKeyReference(uint32_t table_id, std::string&amp;&amp; ybctid) {</a>
+<a name="ln978">  PgForeignKeyReference reference = {table_id, std::move(ybctid)};</a>
+<a name="ln979">  fk_reference_cache_.emplace(reference);</a>
+<a name="ln980">  return Status::OK();</a>
+<a name="ln981">}</a>
+<a name="ln982"> </a>
+<a name="ln983">Status PgSession::DeleteForeignKeyReference(uint32_t table_id, std::string&amp;&amp; ybctid) {</a>
+<a name="ln984">  PgForeignKeyReference reference = {table_id, std::move(ybctid)};</a>
+<a name="ln985">  fk_reference_cache_.erase(reference);</a>
+<a name="ln986">  return Status::OK();</a>
+<a name="ln987">}</a>
+<a name="ln988"> </a>
+<a name="ln989">Status PgSession::HandleResponse(const client::YBPgsqlOp&amp; op, const PgObjectId&amp; relation_id) const {</a>
+<a name="ln990">  if (op.succeeded()) {</a>
+<a name="ln991">    return Status::OK();</a>
+<a name="ln992">  }</a>
+<a name="ln993">  const auto&amp; response = op.response();</a>
+<a name="ln994">  YBPgErrorCode pg_error_code = YBPgErrorCode::YB_PG_INTERNAL_ERROR;</a>
+<a name="ln995">  if (response.has_pg_error_code()) {</a>
+<a name="ln996">    pg_error_code = static_cast&lt;YBPgErrorCode&gt;(response.pg_error_code());</a>
+<a name="ln997">  }</a>
+<a name="ln998"> </a>
+<a name="ln999">  TransactionErrorCode txn_error_code = TransactionErrorCode::kNone;</a>
+<a name="ln1000">  if (response.has_txn_error_code()) {</a>
+<a name="ln1001">    txn_error_code = static_cast&lt;TransactionErrorCode&gt;(response.txn_error_code());</a>
+<a name="ln1002">  }</a>
+<a name="ln1003"> </a>
+<a name="ln1004">  Status s;</a>
+<a name="ln1005">  if (response.status() == PgsqlResponsePB::PGSQL_STATUS_DUPLICATE_KEY_ERROR) {</a>
+<a name="ln1006">    char constraint_name[0xFF];</a>
+<a name="ln1007">    constraint_name[sizeof(constraint_name) - 1] = 0;</a>
+<a name="ln1008">    pg_callbacks_.FetchUniqueConstraintName(relation_id.object_oid,</a>
+<a name="ln1009">                                            constraint_name,</a>
+<a name="ln1010">                                            sizeof(constraint_name) - 1);</a>
+<a name="ln1011">    s = STATUS(</a>
+<a name="ln1012">        AlreadyPresent,</a>
+<a name="ln1013">        Format(&quot;duplicate key value violates unique constraint \&quot;$0\&quot;&quot;, Slice(constraint_name)),</a>
+<a name="ln1014">        Slice(),</a>
+<a name="ln1015">        PgsqlError(YBPgErrorCode::YB_PG_UNIQUE_VIOLATION));</a>
+<a name="ln1016">  } else {</a>
+<a name="ln1017">    s = STATUS(QLError, op.response().error_message(), Slice(),</a>
+<a name="ln1018">               PgsqlError(pg_error_code));</a>
+<a name="ln1019">  }</a>
+<a name="ln1020">  s = s.CloneAndAddErrorCode(TransactionError(txn_error_code));</a>
+<a name="ln1021">  return s;</a>
+<a name="ln1022">}</a>
+<a name="ln1023"> </a>
+<a name="ln1024">Status PgSession::TabletServerCount(int *tserver_count, bool primary_only, bool use_cache) {</a>
+<a name="ln1025">  return client_-&gt;TabletServerCount(tserver_count, primary_only, use_cache);</a>
+<a name="ln1026">}</a>
+<a name="ln1027"> </a>
+<a name="ln1028">void PgSession::SetTimeout(const int timeout_ms) {</a>
+<a name="ln1029">  session_-&gt;SetTimeout(MonoDelta::FromMilliseconds(timeout_ms));</a>
+<a name="ln1030">}</a>
+<a name="ln1031"> </a>
+<a name="ln1032">Result&lt;IndexPermissions&gt; PgSession::WaitUntilIndexPermissionsAtLeast(</a>
+<a name="ln1033">    const PgObjectId&amp; table_id,</a>
+<a name="ln1034">    const PgObjectId&amp; index_id,</a>
+<a name="ln1035">    const IndexPermissions&amp; target_index_permissions) {</a>
+<a name="ln1036">  return client_-&gt;WaitUntilIndexPermissionsAtLeast(</a>
+<a name="ln1037">      table_id.GetYBTableId(),</a>
+<a name="ln1038">      index_id.GetYBTableId(),</a>
+<a name="ln1039">      target_index_permissions);</a>
+<a name="ln1040">}</a>
+<a name="ln1041"> </a>
+<a name="ln1042">Status PgSession::AsyncUpdateIndexPermissions(const PgObjectId&amp; indexed_table_id) {</a>
+<a name="ln1043">  return client_-&gt;AsyncUpdateIndexPermissions(indexed_table_id.GetYBTableId());</a>
+<a name="ln1044">}</a>
+<a name="ln1045"> </a>
+<a name="ln1046">}  // namespace pggate</a>
+<a name="ln1047">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="540"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="730"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="796"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="802"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="805"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="812"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="827"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="828"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="833"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="852"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="893"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="898"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="921"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="942"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="945"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

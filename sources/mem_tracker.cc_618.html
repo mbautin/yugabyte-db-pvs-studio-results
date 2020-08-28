@@ -1,0 +1,920 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>mem_tracker.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/util/mem_tracker.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;algorithm&gt;</a>
+<a name="ln36">#include &lt;deque&gt;</a>
+<a name="ln37">#include &lt;limits&gt;</a>
+<a name="ln38">#include &lt;list&gt;</a>
+<a name="ln39">#include &lt;memory&gt;</a>
+<a name="ln40">#include &lt;mutex&gt;</a>
+<a name="ln41"> </a>
+<a name="ln42">#ifdef TCMALLOC_ENABLED</a>
+<a name="ln43">#include &lt;gperftools/malloc_extension.h&gt;</a>
+<a name="ln44">#endif</a>
+<a name="ln45"> </a>
+<a name="ln46">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln47">#include &quot;yb/gutil/once.h&quot;</a>
+<a name="ln48">#include &quot;yb/gutil/strings/join.h&quot;</a>
+<a name="ln49">#include &quot;yb/gutil/strings/human_readable.h&quot;</a>
+<a name="ln50">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln51">#include &quot;yb/util/debug-util.h&quot;</a>
+<a name="ln52">#include &quot;yb/util/debug/trace_event.h&quot;</a>
+<a name="ln53">#include &quot;yb/util/env.h&quot;</a>
+<a name="ln54">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln55">#include &quot;yb/util/memory/memory.h&quot;</a>
+<a name="ln56">#include &quot;yb/util/metrics.h&quot;</a>
+<a name="ln57">#include &quot;yb/util/mutex.h&quot;</a>
+<a name="ln58">#include &quot;yb/util/random_util.h&quot;</a>
+<a name="ln59">#include &quot;yb/util/status.h&quot;</a>
+<a name="ln60">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln61"> </a>
+<a name="ln62">using namespace std::literals;</a>
+<a name="ln63"> </a>
+<a name="ln64">DEFINE_int64(memory_limit_hard_bytes, 0,</a>
+<a name="ln65">             &quot;Maximum amount of memory this daemon should use, in bytes. &quot;</a>
+<a name="ln66">             &quot;A value of 0 autosizes based on the total system memory. &quot;</a>
+<a name="ln67">             &quot;A value of -1 disables all memory limiting.&quot;);</a>
+<a name="ln68">TAG_FLAG(memory_limit_hard_bytes, stable);</a>
+<a name="ln69">DEFINE_double(default_memory_limit_to_ram_ratio, 0.85,</a>
+<a name="ln70">              &quot;If memory_limit_hard_bytes is left unspecified, then it is &quot;</a>
+<a name="ln71">              &quot;set to default_memory_limit_to_ram_ratio * Available RAM.&quot;);</a>
+<a name="ln72">TAG_FLAG(default_memory_limit_to_ram_ratio, advanced);</a>
+<a name="ln73">TAG_FLAG(default_memory_limit_to_ram_ratio, hidden);</a>
+<a name="ln74"> </a>
+<a name="ln75">DEFINE_int32(memory_limit_soft_percentage, 85,</a>
+<a name="ln76">             &quot;Percentage of the hard memory limit that this daemon may &quot;</a>
+<a name="ln77">             &quot;consume before memory throttling of writes begins. The greater &quot;</a>
+<a name="ln78">             &quot;the excess, the higher the chance of throttling. In general, a &quot;</a>
+<a name="ln79">             &quot;lower soft limit leads to smoother write latencies but &quot;</a>
+<a name="ln80">             &quot;decreased throughput, and vice versa for a higher soft limit.&quot;);</a>
+<a name="ln81">TAG_FLAG(memory_limit_soft_percentage, advanced);</a>
+<a name="ln82"> </a>
+<a name="ln83">DEFINE_int32(memory_limit_warn_threshold_percentage, 98,</a>
+<a name="ln84">             &quot;Percentage of the hard memory limit that this daemon may &quot;</a>
+<a name="ln85">             &quot;consume before WARNING level messages are periodically logged.&quot;);</a>
+<a name="ln86">TAG_FLAG(memory_limit_warn_threshold_percentage, advanced);</a>
+<a name="ln87"> </a>
+<a name="ln88">#ifdef TCMALLOC_ENABLED</a>
+<a name="ln89">DEFINE_int32(tcmalloc_max_free_bytes_percentage, 10,</a>
+<a name="ln90">             &quot;Maximum percentage of the RSS that tcmalloc is allowed to use for &quot;</a>
+<a name="ln91">             &quot;reserved but unallocated memory.&quot;);</a>
+<a name="ln92">TAG_FLAG(tcmalloc_max_free_bytes_percentage, advanced);</a>
+<a name="ln93">#endif</a>
+<a name="ln94"> </a>
+<a name="ln95">DEFINE_bool(mem_tracker_logging, false,</a>
+<a name="ln96">            &quot;Enable logging of memory tracker consume/release operations&quot;);</a>
+<a name="ln97"> </a>
+<a name="ln98">DEFINE_bool(mem_tracker_log_stack_trace, false,</a>
+<a name="ln99">            &quot;Enable logging of stack traces on memory tracker consume/release operations. &quot;</a>
+<a name="ln100">            &quot;Only takes effect if mem_tracker_logging is also enabled.&quot;);</a>
+<a name="ln101"> </a>
+<a name="ln102">DEFINE_int64(mem_tracker_update_consumption_interval_us, 2000000,</a>
+<a name="ln103">             &quot;Interval that is used to update memory consumption from external source. &quot;</a>
+<a name="ln104">             &quot;For instance from tcmalloc statistics.&quot;);</a>
+<a name="ln105"> </a>
+<a name="ln106">namespace yb {</a>
+<a name="ln107"> </a>
+<a name="ln108">// NOTE: this class has been adapted from Impala, so the code style varies</a>
+<a name="ln109">// somewhat from yb.</a>
+<a name="ln110"> </a>
+<a name="ln111">using std::deque;</a>
+<a name="ln112">using std::list;</a>
+<a name="ln113">using std::string;</a>
+<a name="ln114">using std::stringstream;</a>
+<a name="ln115">using std::shared_ptr;</a>
+<a name="ln116">using std::vector;</a>
+<a name="ln117"> </a>
+<a name="ln118">using strings::Substitute;</a>
+<a name="ln119"> </a>
+<a name="ln120">namespace {</a>
+<a name="ln121"> </a>
+<a name="ln122">// The ancestor for all trackers. Every tracker is visible from the root down.</a>
+<a name="ln123">shared_ptr&lt;MemTracker&gt; root_tracker;</a>
+<a name="ln124">GoogleOnceType root_tracker_once = GOOGLE_ONCE_INIT;</a>
+<a name="ln125"> </a>
+<a name="ln126">// Total amount of memory from calls to Release() since the last GC. If this</a>
+<a name="ln127">// is greater than GC_RELEASE_SIZE, this will trigger a tcmalloc gc.</a>
+<a name="ln128">Atomic64 released_memory_since_gc;</a>
+<a name="ln129"> </a>
+<a name="ln130">// Validate that various flags are percentages.</a>
+<a name="ln131">bool ValidatePercentage(const char* flagname, int value) {</a>
+<a name="ln132">  if (value &gt;= 0 &amp;&amp; value &lt;= 100) {</a>
+<a name="ln133">    return true;</a>
+<a name="ln134">  }</a>
+<a name="ln135">  LOG(ERROR) &lt;&lt; Substitute(&quot;$0 must be a percentage, value $1 is invalid&quot;,</a>
+<a name="ln136">      flagname, value);</a>
+<a name="ln137">  return false;</a>
+<a name="ln138">}</a>
+<a name="ln139"> </a>
+<a name="ln140">// Marked as unused because this is not referenced in release mode.</a>
+<a name="ln141">bool dummy[] __attribute__((unused)) = {</a>
+<a name="ln142">    google::RegisterFlagValidator(&amp;FLAGS_memory_limit_soft_percentage, &amp;ValidatePercentage),</a>
+<a name="ln143">    google::RegisterFlagValidator(&amp;FLAGS_memory_limit_warn_threshold_percentage,</a>
+<a name="ln144">        &amp;ValidatePercentage)</a>
+<a name="ln145">#ifdef TCMALLOC_ENABLED</a>
+<a name="ln146">    , google::RegisterFlagValidator(&amp;FLAGS_tcmalloc_max_free_bytes_percentage, &amp;ValidatePercentage)</a>
+<a name="ln147">#endif</a>
+<a name="ln148">};</a>
+<a name="ln149"> </a>
+<a name="ln150">template &lt;class TrackerMetrics&gt;</a>
+<a name="ln151">bool TryIncrementBy(int64_t delta, int64_t max, HighWaterMark* consumption,</a>
+<a name="ln152">                    const std::unique_ptr&lt;TrackerMetrics&gt;&amp; metrics) {</a>
+<a name="ln153">  if (consumption-&gt;TryIncrementBy(delta, max)) {</a>
+<a name="ln154">    if (metrics) {</a>
+<a name="ln155">      metrics-&gt;metric_-&gt;IncrementBy(delta);</a>
+<a name="ln156">    }</a>
+<a name="ln157">    return true;</a>
+<a name="ln158">  }</a>
+<a name="ln159">  return false;</a>
+<a name="ln160">}</a>
+<a name="ln161"> </a>
+<a name="ln162">template &lt;class TrackerMetrics&gt;</a>
+<a name="ln163">void IncrementBy(int64_t amount, HighWaterMark* consumption,</a>
+<a name="ln164">                 const std::unique_ptr&lt;TrackerMetrics&gt;&amp; metrics) {</a>
+<a name="ln165">  consumption-&gt;IncrementBy(amount);</a>
+<a name="ln166">  if (metrics) {</a>
+<a name="ln167">    metrics-&gt;metric_-&gt;IncrementBy(amount);</a>
+<a name="ln168">  }</a>
+<a name="ln169">}</a>
+<a name="ln170"> </a>
+<a name="ln171">std::string CreateMetricName(const MemTracker&amp; mem_tracker) {</a>
+<a name="ln172">  if (mem_tracker.metric_entity() &amp;&amp;</a>
+<a name="ln173">        (!mem_tracker.parent() ||</a>
+<a name="ln174">            mem_tracker.parent()-&gt;metric_entity().get() != mem_tracker.metric_entity().get())) {</a>
+<a name="ln175">    return &quot;mem_tracker&quot;;</a>
+<a name="ln176">  }</a>
+<a name="ln177">  std::string id = mem_tracker.id();</a>
+<a name="ln178">  EscapeMetricNameForPrometheus(&amp;id);</a>
+<a name="ln179">  if (mem_tracker.parent()) {</a>
+<a name="ln180">    return CreateMetricName(*mem_tracker.parent()) + &quot;_&quot; + id;</a>
+<a name="ln181">  } else {</a>
+<a name="ln182">    return id;</a>
+<a name="ln183">  }</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186">std::string CreateMetricLabel(const MemTracker&amp; mem_tracker) {</a>
+<a name="ln187">  return Format(&quot;Memory consumed by $0&quot;, mem_tracker.ToString());</a>
+<a name="ln188">}</a>
+<a name="ln189"> </a>
+<a name="ln190">std::string CreateMetricDescription(const MemTracker&amp; mem_tracker) {</a>
+<a name="ln191">  return CreateMetricLabel(mem_tracker);</a>
+<a name="ln192">}</a>
+<a name="ln193"> </a>
+<a name="ln194">} // namespace</a>
+<a name="ln195"> </a>
+<a name="ln196">class MemTracker::TrackerMetrics {</a>
+<a name="ln197"> public:</a>
+<a name="ln198">  explicit TrackerMetrics(const MetricEntityPtr&amp; metric_entity)</a>
+<a name="ln199">      : metric_entity_(metric_entity) {</a>
+<a name="ln200">  }</a>
+<a name="ln201"> </a>
+<a name="ln202">  void Init(const MemTracker&amp; mem_tracker, const std::string&amp; name_suffix) {</a>
+<a name="ln203">    std::string name = CreateMetricName(mem_tracker);</a>
+<a name="ln204">    if (!name_suffix.empty()) {</a>
+<a name="ln205">      name += &quot;_&quot;;</a>
+<a name="ln206">      name += name_suffix;</a>
+<a name="ln207">    }</a>
+<a name="ln208">    metric_ = metric_entity_-&gt;FindOrCreateGauge(</a>
+<a name="ln209">        std::unique_ptr&lt;GaugePrototype&lt;int64_t&gt;&gt;(new OwningGaugePrototype&lt;int64_t&gt;(</a>
+<a name="ln210">          metric_entity_-&gt;prototype().name(), std::move(name),</a>
+<a name="ln211">          CreateMetricLabel(mem_tracker), MetricUnit::kBytes,</a>
+<a name="ln212">          CreateMetricDescription(mem_tracker), yb::MetricLevel::kInfo)),</a>
+<a name="ln213">        mem_tracker.consumption());</a>
+<a name="ln214">  }</a>
+<a name="ln215"> </a>
+<a name="ln216">  TrackerMetrics(TrackerMetrics&amp;) = delete;</a>
+<a name="ln217">  void operator=(const TrackerMetrics&amp;) = delete;</a>
+<a name="ln218"> </a>
+<a name="ln219">  ~TrackerMetrics() {</a>
+<a name="ln220">    metric_entity_-&gt;Remove(metric_-&gt;prototype());</a>
+<a name="ln221">  }</a>
+<a name="ln222"> </a>
+<a name="ln223">  MetricEntityPtr metric_entity_;</a>
+<a name="ln224">  scoped_refptr&lt;AtomicGauge&lt;int64_t&gt;&gt; metric_;</a>
+<a name="ln225">};</a>
+<a name="ln226"> </a>
+<a name="ln227">void MemTracker::CreateRootTracker() {</a>
+<a name="ln228">  DCHECK_ONLY_NOTNULL(dummy);</a>
+<a name="ln229">  int64_t limit = FLAGS_memory_limit_hard_bytes;</a>
+<a name="ln230">  if (limit == 0) {</a>
+<a name="ln231">    // If no limit is provided, we'll use</a>
+<a name="ln232">    // - 85% of the RAM for tservers.</a>
+<a name="ln233">    // - 10% of the RAM for masters.</a>
+<a name="ln234">    int64_t total_ram;</a>
+<a name="ln235">    CHECK_OK(Env::Default()-&gt;GetTotalRAMBytes(&amp;total_ram));</a>
+<a name="ln236">    limit = total_ram * FLAGS_default_memory_limit_to_ram_ratio;</a>
+<a name="ln237">  }</a>
+<a name="ln238"> </a>
+<a name="ln239">  ConsumptionFunctor consumption_functor;</a>
+<a name="ln240"> </a>
+<a name="ln241">  #ifdef TCMALLOC_ENABLED</a>
+<a name="ln242">  consumption_functor = &amp;MemTracker::GetTCMallocActualHeapSizeBytes;</a>
+<a name="ln243">  #endif</a>
+<a name="ln244"> </a>
+<a name="ln245">  root_tracker = std::make_shared&lt;MemTracker&gt;(</a>
+<a name="ln246">      limit, &quot;root&quot;, std::move(consumption_functor), nullptr /* parent */, AddToParent::kTrue,</a>
+<a name="ln247">      CreateMetrics::kFalse);</a>
+<a name="ln248"> </a>
+<a name="ln249">  LOG(INFO) &lt;&lt; StringPrintf(&quot;MemTracker: hard memory limit is %.6f GB&quot;,</a>
+<a name="ln250">                            (static_cast&lt;float&gt;(limit) / (1024.0 * 1024.0 * 1024.0)));</a>
+<a name="ln251">  LOG(INFO) &lt;&lt; StringPrintf(&quot;MemTracker: soft memory limit is %.6f GB&quot;,</a>
+<a name="ln252">                            (static_cast&lt;float&gt;(root_tracker-&gt;soft_limit_) /</a>
+<a name="ln253">                                (1024.0 * 1024.0 * 1024.0)));</a>
+<a name="ln254">}</a>
+<a name="ln255"> </a>
+<a name="ln256">shared_ptr&lt;MemTracker&gt; MemTracker::CreateTracker(int64_t byte_limit,</a>
+<a name="ln257">                                                 const string&amp; id,</a>
+<a name="ln258">                                                 ConsumptionFunctor consumption_functor,</a>
+<a name="ln259">                                                 const shared_ptr&lt;MemTracker&gt;&amp; parent,</a>
+<a name="ln260">                                                 AddToParent add_to_parent,</a>
+<a name="ln261">                                                 CreateMetrics create_metrics) {</a>
+<a name="ln262">  shared_ptr&lt;MemTracker&gt; real_parent = parent ? parent : GetRootTracker();</a>
+<a name="ln263">  return real_parent-&gt;CreateChild(</a>
+<a name="ln264">      byte_limit, id, std::move(consumption_functor), MayExist::kFalse, add_to_parent,</a>
+<a name="ln265">      create_metrics);</a>
+<a name="ln266">}</a>
+<a name="ln267"> </a>
+<a name="ln268">shared_ptr&lt;MemTracker&gt; MemTracker::CreateChild(int64_t byte_limit,</a>
+<a name="ln269">                                               const string&amp; id,</a>
+<a name="ln270">                                               ConsumptionFunctor consumption_functor,</a>
+<a name="ln271">                                               MayExist may_exist,</a>
+<a name="ln272">                                               AddToParent add_to_parent,</a>
+<a name="ln273">                                               CreateMetrics create_metrics) {</a>
+<a name="ln274">  std::lock_guard&lt;std::mutex&gt; lock(child_trackers_mutex_);</a>
+<a name="ln275">  if (may_exist) {</a>
+<a name="ln276">    auto result = FindChildUnlocked(id);</a>
+<a name="ln277">    if (result) {</a>
+<a name="ln278">      return result;</a>
+<a name="ln279">    }</a>
+<a name="ln280">  }</a>
+<a name="ln281">  auto result = std::make_shared&lt;MemTracker&gt;(</a>
+<a name="ln282">      byte_limit, id, std::move(consumption_functor), shared_from_this(), add_to_parent,</a>
+<a name="ln283">      create_metrics);</a>
+<a name="ln284">  auto p = child_trackers_.emplace(id, result);</a>
+<a name="ln285">  if (!p.second) {</a>
+<a name="ln286">    auto existing = p.first-&gt;second.lock();</a>
+<a name="ln287">    if (existing) {</a>
+<a name="ln288">      LOG(DFATAL) &lt;&lt; Format(&quot;Duplicate memory tracker (id $0) on parent $1&quot;, id, ToString());</a>
+<a name="ln289">      return existing;</a>
+<a name="ln290">    }</a>
+<a name="ln291">    p.first-&gt;second = result;</a>
+<a name="ln292">  }</a>
+<a name="ln293"> </a>
+<a name="ln294">  return result;</a>
+<a name="ln295">}</a>
+<a name="ln296"> </a>
+<a name="ln297">MemTracker::MemTracker(int64_t byte_limit, const string&amp; id,</a>
+<a name="ln298">                       ConsumptionFunctor consumption_functor, std::shared_ptr&lt;MemTracker&gt; parent,</a>
+<a name="ln299">                       AddToParent add_to_parent, CreateMetrics create_metrics)</a>
+<a name="ln300">    : limit_(byte_limit),</a>
+<a name="ln301">      soft_limit_(limit_ == -1 ? -1 : (limit_ * FLAGS_memory_limit_soft_percentage) / 100),</a>
+<a name="ln302">      id_(id),</a>
+<a name="ln303">      consumption_functor_(std::move(consumption_functor)),</a>
+<a name="ln304">      descr_(Substitute(&quot;memory consumption for $0&quot;, id)),</a>
+<a name="ln305">      parent_(std::move(parent)),</a>
+<a name="ln306">      rand_(GetRandomSeed32()),</a>
+<a name="ln307">      enable_logging_(FLAGS_mem_tracker_logging),</a>
+<a name="ln308">      log_stack_(FLAGS_mem_tracker_log_stack_trace),</a>
+<a name="ln309">      add_to_parent_(add_to_parent) {</a>
+<a name="ln310">  VLOG(1) &lt;&lt; &quot;Creating tracker &quot; &lt;&lt; ToString();</a>
+<a name="ln311">  UpdateConsumption();</a>
+<a name="ln312"> </a>
+<a name="ln313">  all_trackers_.push_back(this);</a>
+<a name="ln314">  if (has_limit()) {</a>
+<a name="ln315">    limit_trackers_.push_back(this);</a>
+<a name="ln316">  }</a>
+<a name="ln317">  if (parent_ &amp;&amp; add_to_parent) {</a>
+<a name="ln318">    all_trackers_.insert(</a>
+<a name="ln319">        all_trackers_.end(), parent_-&gt;all_trackers_.begin(), parent_-&gt;all_trackers_.end());</a>
+<a name="ln320">    limit_trackers_.insert(</a>
+<a name="ln321">        limit_trackers_.end(), parent_-&gt;limit_trackers_.begin(), parent_-&gt;limit_trackers_.end());</a>
+<a name="ln322">  }</a>
+<a name="ln323"> </a>
+<a name="ln324">  if (create_metrics) {</a>
+<a name="ln325">    for (MemTracker* tracker = this; tracker; tracker = tracker-&gt;parent().get()) {</a>
+<a name="ln326">      if (tracker-&gt;metric_entity()) {</a>
+<a name="ln327">        metrics_ = std::make_unique&lt;TrackerMetrics&gt;(tracker-&gt;metric_entity());</a>
+<a name="ln328">        metrics_-&gt;Init(*this, std::string());</a>
+<a name="ln329">        break;</a>
+<a name="ln330">      }</a>
+<a name="ln331">    }</a>
+<a name="ln332">  }</a>
+<a name="ln333">}</a>
+<a name="ln334"> </a>
+<a name="ln335">MemTracker::~MemTracker() {</a>
+<a name="ln336">  VLOG(1) &lt;&lt; &quot;Destroying tracker &quot; &lt;&lt; ToString();</a>
+<a name="ln337">  if (!consumption_functor_) {</a>
+<a name="ln338">    DCHECK_EQ(consumption(), 0) &lt;&lt; &quot;Memory tracker &quot; &lt;&lt; ToString();</a>
+<a name="ln339">  }</a>
+<a name="ln340">  if (parent_) {</a>
+<a name="ln341">    if (add_to_parent_) {</a>
+<a name="ln342">      parent_-&gt;Release(consumption());</a>
+<a name="ln343">    }</a>
+<a name="ln344">  }</a>
+<a name="ln345">}</a>
+<a name="ln346"> </a>
+<a name="ln347">void MemTracker::UnregisterFromParent() {</a>
+<a name="ln348">  DCHECK(parent_);</a>
+<a name="ln349">  parent_-&gt;UnregisterChild(id_);</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352">void MemTracker::UnregisterChild(const std::string&amp; id) {</a>
+<a name="ln353">  std::lock_guard&lt;std::mutex&gt; lock(child_trackers_mutex_);</a>
+<a name="ln354">  child_trackers_.erase(id);</a>
+<a name="ln355">}</a>
+<a name="ln356"> </a>
+<a name="ln357">string MemTracker::ToString() const {</a>
+<a name="ln358">  string s;</a>
+<a name="ln359">  const MemTracker* tracker = this;</a>
+<a name="ln360">  while (tracker) {</a>
+<a name="ln361">    if (s != &quot;&quot;) {</a>
+<a name="ln362">      s += &quot;-&gt;&quot;;</a>
+<a name="ln363">    }</a>
+<a name="ln364">    s += tracker-&gt;id();</a>
+<a name="ln365">    tracker = tracker-&gt;parent_.get();</a>
+<a name="ln366">  }</a>
+<a name="ln367">  return s;</a>
+<a name="ln368">}</a>
+<a name="ln369"> </a>
+<a name="ln370">MemTrackerPtr MemTracker::FindTracker(const std::string&amp; id,</a>
+<a name="ln371">                                      const MemTrackerPtr&amp; parent) {</a>
+<a name="ln372">  shared_ptr&lt;MemTracker&gt; real_parent = parent ? parent : GetRootTracker();</a>
+<a name="ln373">  return real_parent-&gt;FindChild(id);</a>
+<a name="ln374">}</a>
+<a name="ln375"> </a>
+<a name="ln376">MemTrackerPtr MemTracker::FindChild(const std::string&amp; id) {</a>
+<a name="ln377">  std::lock_guard&lt;std::mutex&gt; lock(child_trackers_mutex_);</a>
+<a name="ln378">  return FindChildUnlocked(id);</a>
+<a name="ln379">}</a>
+<a name="ln380"> </a>
+<a name="ln381">MemTrackerPtr MemTracker::FindChildUnlocked(const std::string&amp; id) {</a>
+<a name="ln382">  auto it = child_trackers_.find(id);</a>
+<a name="ln383">  if (it != child_trackers_.end()) {</a>
+<a name="ln384">    auto result = it-&gt;second.lock();</a>
+<a name="ln385">    if (!result) {</a>
+<a name="ln386">      child_trackers_.erase(it);</a>
+<a name="ln387">    }</a>
+<a name="ln388">    return result;</a>
+<a name="ln389">  }</a>
+<a name="ln390">  return MemTrackerPtr();</a>
+<a name="ln391">}</a>
+<a name="ln392"> </a>
+<a name="ln393">shared_ptr&lt;MemTracker&gt; MemTracker::FindOrCreateTracker(int64_t byte_limit,</a>
+<a name="ln394">                                                       const string&amp; id,</a>
+<a name="ln395">                                                       const shared_ptr&lt;MemTracker&gt;&amp; parent,</a>
+<a name="ln396">                                                       AddToParent add_to_parent,</a>
+<a name="ln397">                                                       CreateMetrics create_metrics) {</a>
+<a name="ln398">  shared_ptr&lt;MemTracker&gt; real_parent = parent ? parent : GetRootTracker();</a>
+<a name="ln399">  return real_parent-&gt;CreateChild(</a>
+<a name="ln400">      byte_limit, id, ConsumptionFunctor(), MayExist::kTrue, add_to_parent, create_metrics);</a>
+<a name="ln401">}</a>
+<a name="ln402"> </a>
+<a name="ln403">std::vector&lt;MemTrackerPtr&gt; MemTracker::ListChildren() {</a>
+<a name="ln404">  std::vector&lt;MemTrackerPtr&gt; result;</a>
+<a name="ln405">  ListDescendantTrackers(&amp;result, OnlyChildren::kTrue);</a>
+<a name="ln406">  return result;</a>
+<a name="ln407">}</a>
+<a name="ln408"> </a>
+<a name="ln409">void MemTracker::ListDescendantTrackers(</a>
+<a name="ln410">    std::vector&lt;MemTrackerPtr&gt;* out, OnlyChildren only_children) {</a>
+<a name="ln411">  size_t begin = out-&gt;size();</a>
+<a name="ln412">  {</a>
+<a name="ln413">    std::lock_guard&lt;std::mutex&gt; lock(child_trackers_mutex_);</a>
+<a name="ln414">    for (auto it = child_trackers_.begin(); it != child_trackers_.end();) {</a>
+<a name="ln415">      auto child = it-&gt;second.lock();</a>
+<a name="ln416">      if (child) {</a>
+<a name="ln417">        out-&gt;push_back(std::move(child));</a>
+<a name="ln418">        ++it;</a>
+<a name="ln419">      } else {</a>
+<a name="ln420">        it = child_trackers_.erase(it);</a>
+<a name="ln421">      }</a>
+<a name="ln422">    }</a>
+<a name="ln423">  }</a>
+<a name="ln424">  if (!only_children) {</a>
+<a name="ln425">    size_t end = out-&gt;size();</a>
+<a name="ln426">    for (size_t i = begin; i != end; ++i) {</a>
+<a name="ln427">      (*out)[i]-&gt;ListDescendantTrackers(out);</a>
+<a name="ln428">    }</a>
+<a name="ln429">  }</a>
+<a name="ln430">}</a>
+<a name="ln431"> </a>
+<a name="ln432">std::vector&lt;MemTrackerPtr&gt; MemTracker::ListTrackers() {</a>
+<a name="ln433">  std::vector&lt;MemTrackerPtr&gt; result;</a>
+<a name="ln434">  auto root = GetRootTracker();</a>
+<a name="ln435">  result.push_back(root);</a>
+<a name="ln436">  root-&gt;ListDescendantTrackers(&amp;result);</a>
+<a name="ln437">  return result;</a>
+<a name="ln438">}</a>
+<a name="ln439"> </a>
+<a name="ln440">bool MemTracker::UpdateConsumption(bool force) {</a>
+<a name="ln441">  if (poll_children_consumption_functors_) {</a>
+<a name="ln442">    poll_children_consumption_functors_();</a>
+<a name="ln443">  }</a>
+<a name="ln444"> </a>
+<a name="ln445">  if (consumption_functor_) {</a>
+<a name="ln446">    auto now = CoarseMonoClock::now();</a>
+<a name="ln447">    auto interval = std::chrono::microseconds(</a>
+<a name="ln448">        GetAtomicFlag(&amp;FLAGS_mem_tracker_update_consumption_interval_us));</a>
+<a name="ln449">    if (force || now &gt; last_consumption_update_ + interval) {</a>
+<a name="ln450">      last_consumption_update_ = now;</a>
+<a name="ln451">      auto value = consumption_functor_();</a>
+<a name="ln452">      consumption_.set_value(value);</a>
+<a name="ln453">      if (metrics_) {</a>
+<a name="ln454">        metrics_-&gt;metric_-&gt;set_value(value);</a>
+<a name="ln455">      }</a>
+<a name="ln456">    }</a>
+<a name="ln457">    return true;</a>
+<a name="ln458">  }</a>
+<a name="ln459"> </a>
+<a name="ln460">  return false;</a>
+<a name="ln461">}</a>
+<a name="ln462"> </a>
+<a name="ln463">void MemTracker::Consume(int64_t bytes) {</a>
+<a name="ln464">  if (bytes &lt; 0) {</a>
+<a name="ln465">    Release(-bytes);</a>
+<a name="ln466">    return;</a>
+<a name="ln467">  }</a>
+<a name="ln468"> </a>
+<a name="ln469">  if (UpdateConsumption()) {</a>
+<a name="ln470">    return;</a>
+<a name="ln471">  }</a>
+<a name="ln472">  if (bytes == 0) {</a>
+<a name="ln473">    return;</a>
+<a name="ln474">  }</a>
+<a name="ln475">  if (PREDICT_FALSE(enable_logging_)) {</a>
+<a name="ln476">    LogUpdate(true, bytes);</a>
+<a name="ln477">  }</a>
+<a name="ln478">  for (auto&amp; tracker : all_trackers_) {</a>
+<a name="ln479">    if (!tracker-&gt;UpdateConsumption()) {</a>
+<a name="ln480">      IncrementBy(bytes, &amp;tracker-&gt;consumption_, tracker-&gt;metrics_);</a>
+<a name="ln481">      DCHECK_GE(tracker-&gt;consumption_.current_value(), 0);</a>
+<a name="ln482">    }</a>
+<a name="ln483">  }</a>
+<a name="ln484">}</a>
+<a name="ln485"> </a>
+<a name="ln486">bool MemTracker::TryConsume(int64_t bytes, MemTracker** blocking_mem_tracker) {</a>
+<a name="ln487">  UpdateConsumption();</a>
+<a name="ln488">  if (bytes &lt;= 0) {</a>
+<a name="ln489">    return true;</a>
+<a name="ln490">  }</a>
+<a name="ln491">  if (PREDICT_FALSE(enable_logging_)) {</a>
+<a name="ln492">    LogUpdate(true, bytes);</a>
+<a name="ln493">  }</a>
+<a name="ln494"> </a>
+<a name="ln495">  int i = 0;</a>
+<a name="ln496">  // Walk the tracker tree top-down, to avoid expanding a limit on a child whose parent</a>
+<a name="ln497">  // won't accommodate the change.</a>
+<a name="ln498">  for (i = all_trackers_.size() - 1; i &gt;= 0; --i) {</a>
+<a name="ln499">    MemTracker *tracker = all_trackers_[i];</a>
+<a name="ln500">    if (tracker-&gt;limit_ &lt; 0) {</a>
+<a name="ln501">      IncrementBy(bytes, &amp;tracker-&gt;consumption_, tracker-&gt;metrics_);</a>
+<a name="ln502">    } else {</a>
+<a name="ln503">      if (!TryIncrementBy(bytes, tracker-&gt;limit_, &amp;tracker-&gt;consumption_, tracker-&gt;metrics_)) {</a>
+<a name="ln504">        // One of the trackers failed, attempt to GC memory or expand our limit. If that</a>
+<a name="ln505">        // succeeds, TryUpdate() again. Bail if either fails.</a>
+<a name="ln506">        if (!tracker-&gt;GcMemory(tracker-&gt;limit_ - bytes) ||</a>
+<a name="ln507">            tracker-&gt;ExpandLimit(bytes)) {</a>
+<a name="ln508">          if (!TryIncrementBy(bytes, tracker-&gt;limit_, &amp;tracker-&gt;consumption_, tracker-&gt;metrics_)) {</a>
+<a name="ln509">            break;</a>
+<a name="ln510">          }</a>
+<a name="ln511">        } else {</a>
+<a name="ln512">          break;</a>
+<a name="ln513">        }</a>
+<a name="ln514">      }</a>
+<a name="ln515">    }</a>
+<a name="ln516">  }</a>
+<a name="ln517">  // Everyone succeeded, return.</a>
+<a name="ln518">  if (i == -1) {</a>
+<a name="ln519">    return true;</a>
+<a name="ln520">  }</a>
+<a name="ln521"> </a>
+<a name="ln522">  // Someone failed, roll back the ones that succeeded.</a>
+<a name="ln523">  // TODO: this doesn't roll it back completely since the max values for</a>
+<a name="ln524">  // the updated trackers aren't decremented. The max values are only used</a>
+<a name="ln525">  // for error reporting so this is probably okay. Rolling those back is</a>
+<a name="ln526">  // pretty hard; we'd need something like 2PC.</a>
+<a name="ln527">  //</a>
+<a name="ln528">  // TODO: This might leave us with an allocated resource that we can't use. Do we need</a>
+<a name="ln529">  // to adjust the consumption of the query tracker to stop the resource from never</a>
+<a name="ln530">  // getting used by a subsequent TryConsume()?</a>
+<a name="ln531">  for (int j = all_trackers_.size() - 1; j &gt; i; --j) {</a>
+<a name="ln532">    IncrementBy(-bytes, &amp;all_trackers_[j]-&gt;consumption_, all_trackers_[j]-&gt;metrics_);</a>
+<a name="ln533">  }</a>
+<a name="ln534">  if (blocking_mem_tracker) {</a>
+<a name="ln535">    *blocking_mem_tracker = all_trackers_[i];</a>
+<a name="ln536">  }</a>
+<a name="ln537"> </a>
+<a name="ln538">  return false;</a>
+<a name="ln539">}</a>
+<a name="ln540"> </a>
+<a name="ln541">void MemTracker::Release(int64_t bytes) {</a>
+<a name="ln542">  if (bytes &lt; 0) {</a>
+<a name="ln543">    Consume(-bytes);</a>
+<a name="ln544">    return;</a>
+<a name="ln545">  }</a>
+<a name="ln546"> </a>
+<a name="ln547">  if (PREDICT_FALSE(base::subtle::Barrier_AtomicIncrement(&amp;released_memory_since_gc, bytes) &gt;</a>
+<a name="ln548">                    GC_RELEASE_SIZE)) {</a>
+<a name="ln549">    GcTcmalloc();</a>
+<a name="ln550">  }</a>
+<a name="ln551"> </a>
+<a name="ln552">  if (UpdateConsumption()) {</a>
+<a name="ln553">    return;</a>
+<a name="ln554">  }</a>
+<a name="ln555"> </a>
+<a name="ln556">  if (bytes == 0) {</a>
+<a name="ln557">    return;</a>
+<a name="ln558">  }</a>
+<a name="ln559">  if (PREDICT_FALSE(enable_logging_)) {</a>
+<a name="ln560">    LogUpdate(false, bytes);</a>
+<a name="ln561">  }</a>
+<a name="ln562"> </a>
+<a name="ln563">  for (auto&amp; tracker : all_trackers_) {</a>
+<a name="ln564">    if (!tracker-&gt;UpdateConsumption()) {</a>
+<a name="ln565">      IncrementBy(-bytes, &amp;tracker-&gt;consumption_, tracker-&gt;metrics_);</a>
+<a name="ln566">      // If a UDF calls FunctionContext::TrackAllocation() but allocates less than the</a>
+<a name="ln567">      // reported amount, the subsequent call to FunctionContext::Free() may cause the</a>
+<a name="ln568">      // process mem tracker to go negative until it is synced back to the tcmalloc</a>
+<a name="ln569">      // metric. Don't blow up in this case. (Note that this doesn't affect non-process</a>
+<a name="ln570">      // trackers since we can enforce that the reported memory usage is internally</a>
+<a name="ln571">      // consistent.)</a>
+<a name="ln572">      DCHECK_GE(tracker-&gt;consumption_.current_value(), 0) &lt;&lt; &quot;Tracker: &quot; &lt;&lt; tracker-&gt;ToString();</a>
+<a name="ln573">    }</a>
+<a name="ln574">  }</a>
+<a name="ln575">}</a>
+<a name="ln576"> </a>
+<a name="ln577">bool MemTracker::AnyLimitExceeded() {</a>
+<a name="ln578">  for (const auto&amp; tracker : limit_trackers_) {</a>
+<a name="ln579">    if (tracker-&gt;LimitExceeded()) {</a>
+<a name="ln580">      return true;</a>
+<a name="ln581">    }</a>
+<a name="ln582">  }</a>
+<a name="ln583">  return false;</a>
+<a name="ln584">}</a>
+<a name="ln585"> </a>
+<a name="ln586">bool MemTracker::LimitExceeded() {</a>
+<a name="ln587">  if (PREDICT_FALSE(CheckLimitExceeded())) {</a>
+<a name="ln588">    return GcMemory(limit_);</a>
+<a name="ln589">  }</a>
+<a name="ln590">  return false;</a>
+<a name="ln591">}</a>
+<a name="ln592"> </a>
+<a name="ln593">SoftLimitExceededResult MemTracker::SoftLimitExceeded(double* score) {</a>
+<a name="ln594">  // Did we exceed the actual limit?</a>
+<a name="ln595">  if (LimitExceeded()) {</a>
+<a name="ln596">    return {true, consumption() * 100.0 / limit()};</a>
+<a name="ln597">  }</a>
+<a name="ln598"> </a>
+<a name="ln599">  // No soft limit defined.</a>
+<a name="ln600">  if (!has_limit() || limit_ == soft_limit_) {</a>
+<a name="ln601">    return {false, 0.0};</a>
+<a name="ln602">  }</a>
+<a name="ln603"> </a>
+<a name="ln604">  // Are we under the soft limit threshold?</a>
+<a name="ln605">  int64_t usage = consumption();</a>
+<a name="ln606">  if (usage &lt; soft_limit_) {</a>
+<a name="ln607">    return {false, 0.0};</a>
+<a name="ln608">  }</a>
+<a name="ln609"> </a>
+<a name="ln610">  // We're over the threshold; were we randomly chosen to be over the soft limit?</a>
+<a name="ln611">  if (*score == 0.0) {</a>
+<a name="ln612">    *score = RandomUniformReal&lt;double&gt;();</a>
+<a name="ln613">  }</a>
+<a name="ln614">  if (usage + (limit_ - soft_limit_) * *score &gt; limit_ &amp;&amp; GcMemory(soft_limit_)) {</a>
+<a name="ln615">    return {true, usage * 100.0 / limit()};</a>
+<a name="ln616">  }</a>
+<a name="ln617">  return {false, 0.0};</a>
+<a name="ln618">}</a>
+<a name="ln619"> </a>
+<a name="ln620">SoftLimitExceededResult MemTracker::AnySoftLimitExceeded(double* score) {</a>
+<a name="ln621">  for (MemTracker* t : limit_trackers_) {</a>
+<a name="ln622">    auto result = t-&gt;SoftLimitExceeded(score);</a>
+<a name="ln623">    if (result.exceeded) {</a>
+<a name="ln624">      return result;</a>
+<a name="ln625">    }</a>
+<a name="ln626">  }</a>
+<a name="ln627">  return {false, 0.0};</a>
+<a name="ln628">}</a>
+<a name="ln629"> </a>
+<a name="ln630">int64_t MemTracker::SpareCapacity() const {</a>
+<a name="ln631">  int64_t result = std::numeric_limits&lt;int64_t&gt;::max();</a>
+<a name="ln632">  for (const auto&amp; tracker : limit_trackers_) {</a>
+<a name="ln633">    int64_t mem_left = tracker-&gt;limit() - tracker-&gt;consumption();</a>
+<a name="ln634">    result = std::min(result, mem_left);</a>
+<a name="ln635">  }</a>
+<a name="ln636">  return result;</a>
+<a name="ln637">}</a>
+<a name="ln638"> </a>
+<a name="ln639">bool MemTracker::GcMemory(int64_t max_consumption) {</a>
+<a name="ln640">  if (max_consumption &lt; 0) {</a>
+<a name="ln641">    // Impossible to GC enough memory to reach the goal.</a>
+<a name="ln642">    return true;</a>
+<a name="ln643">  }</a>
+<a name="ln644"> </a>
+<a name="ln645">  {</a>
+<a name="ln646">    int64_t current_consumption = GetUpdatedConsumption();</a>
+<a name="ln647">    // Check if someone gc'd before us</a>
+<a name="ln648">    if (current_consumption &lt;= max_consumption) {</a>
+<a name="ln649">      return false;</a>
+<a name="ln650">    }</a>
+<a name="ln651"> </a>
+<a name="ln652">    // Create vector of alive garbage collectors. Also remove stale garbage collectors.</a>
+<a name="ln653">    std::vector&lt;std::shared_ptr&lt;GarbageCollector&gt;&gt; collectors;</a>
+<a name="ln654">    {</a>
+<a name="ln655">      std::lock_guard&lt;simple_spinlock&gt; l(gc_mutex_);</a>
+<a name="ln656">      collectors.reserve(gcs_.size());</a>
+<a name="ln657">      auto w = gcs_.begin();</a>
+<a name="ln658">      for (auto i = gcs_.begin(); i != gcs_.end(); ++i) {</a>
+<a name="ln659">        auto gc = i-&gt;lock();</a>
+<a name="ln660">        if (!gc) {</a>
+<a name="ln661">          continue;</a>
+<a name="ln662">        }</a>
+<a name="ln663">        collectors.push_back(gc);</a>
+<a name="ln664">        if (w != i) {</a>
+<a name="ln665">          *w = *i;</a>
+<a name="ln666">        }</a>
+<a name="ln667">        ++w;</a>
+<a name="ln668">      }</a>
+<a name="ln669">      gcs_.erase(w, gcs_.end());</a>
+<a name="ln670">    }</a>
+<a name="ln671"> </a>
+<a name="ln672">    // Try to free up some memory</a>
+<a name="ln673">    for (const auto&amp; gc : collectors) {</a>
+<a name="ln674">      gc-&gt;CollectGarbage(current_consumption - max_consumption);</a>
+<a name="ln675">      current_consumption = GetUpdatedConsumption();</a>
+<a name="ln676">      if (current_consumption &lt;= max_consumption) {</a>
+<a name="ln677">        break;</a>
+<a name="ln678">      }</a>
+<a name="ln679">    }</a>
+<a name="ln680">  }</a>
+<a name="ln681"> </a>
+<a name="ln682">  int64_t current_consumption = GetUpdatedConsumption();</a>
+<a name="ln683">  if (current_consumption &gt; max_consumption) {</a>
+<a name="ln684">    std::vector&lt;MemTrackerPtr&gt; children;</a>
+<a name="ln685">    {</a>
+<a name="ln686">      std::lock_guard&lt;std::mutex&gt; lock(child_trackers_mutex_);</a>
+<a name="ln687">      for (auto it = child_trackers_.begin(); it != child_trackers_.end();) {</a>
+<a name="ln688">        auto child = it-&gt;second.lock();</a>
+<a name="ln689">        if (child) {</a>
+<a name="ln690">          children.push_back(std::move(child));</a>
+<a name="ln691">          ++it;</a>
+<a name="ln692">        } else {</a>
+<a name="ln693">          it = child_trackers_.erase(it);</a>
+<a name="ln694">        }</a>
+<a name="ln695">      }</a>
+<a name="ln696">    }</a>
+<a name="ln697"> </a>
+<a name="ln698">    for (const auto&amp; child : children) {</a>
+<a name="ln699">      bool did_gc = child-&gt;GcMemory(max_consumption - current_consumption + child-&gt;consumption());</a>
+<a name="ln700">      if (did_gc) {</a>
+<a name="ln701">        current_consumption = GetUpdatedConsumption();</a>
+<a name="ln702">        if (current_consumption &lt;= max_consumption) {</a>
+<a name="ln703">          return true;</a>
+<a name="ln704">        }</a>
+<a name="ln705">      }</a>
+<a name="ln706">    }</a>
+<a name="ln707">  }</a>
+<a name="ln708"> </a>
+<a name="ln709">  return consumption() &gt; max_consumption;</a>
+<a name="ln710">}</a>
+<a name="ln711"> </a>
+<a name="ln712">void MemTracker::GcTcmalloc() {</a>
+<a name="ln713">#ifdef TCMALLOC_ENABLED</a>
+<a name="ln714">  released_memory_since_gc = 0;</a>
+<a name="ln715">  TRACE_EVENT0(&quot;process&quot;, &quot;MemTracker::GcTcmalloc&quot;);</a>
+<a name="ln716"> </a>
+<a name="ln717">  // Number of bytes in the 'NORMAL' free list (i.e reserved by tcmalloc but</a>
+<a name="ln718">  // not in use).</a>
+<a name="ln719">  int64_t bytes_overhead = GetTCMallocProperty(&quot;tcmalloc.pageheap_free_bytes&quot;);</a>
+<a name="ln720">  // Bytes allocated by the application.</a>
+<a name="ln721">  int64_t bytes_used = GetTCMallocCurrentAllocatedBytes();</a>
+<a name="ln722"> </a>
+<a name="ln723">  int64_t max_overhead = bytes_used * FLAGS_tcmalloc_max_free_bytes_percentage / 100.0;</a>
+<a name="ln724">  if (bytes_overhead &gt; max_overhead) {</a>
+<a name="ln725">    int64_t extra = bytes_overhead - max_overhead;</a>
+<a name="ln726">    while (extra &gt; 0) {</a>
+<a name="ln727">      // Release 1MB at a time, so that tcmalloc releases its page heap lock</a>
+<a name="ln728">      // allowing other threads to make progress. This still disrupts the current</a>
+<a name="ln729">      // thread, but is better than disrupting all.</a>
+<a name="ln730">      MallocExtension::instance()-&gt;ReleaseToSystem(1024 * 1024);</a>
+<a name="ln731">      extra -= 1024 * 1024;</a>
+<a name="ln732">    }</a>
+<a name="ln733">  }</a>
+<a name="ln734"> </a>
+<a name="ln735">#else</a>
+<a name="ln736">  // Nothing to do if not using tcmalloc.</a>
+<a name="ln737">#endif</a>
+<a name="ln738">}</a>
+<a name="ln739"> </a>
+<a name="ln740">string MemTracker::LogUsage(const string&amp; prefix, size_t usage_threshold, int indent) const {</a>
+<a name="ln741">  stringstream ss;</a>
+<a name="ln742">  ss &lt;&lt; prefix &lt;&lt; std::string(indent, ' ') &lt;&lt; id_ &lt;&lt; &quot;:&quot;;</a>
+<a name="ln743">  if (CheckLimitExceeded()) {</a>
+<a name="ln744">    ss &lt;&lt; &quot; memory limit exceeded.&quot;;</a>
+<a name="ln745">  }</a>
+<a name="ln746">  if (limit_ &gt; 0) {</a>
+<a name="ln747">    ss &lt;&lt; &quot; Limit=&quot; &lt;&lt; HumanReadableNumBytes::ToString(limit_);</a>
+<a name="ln748">  }</a>
+<a name="ln749">  ss &lt;&lt; &quot; Consumption=&quot; &lt;&lt; HumanReadableNumBytes::ToString(consumption());</a>
+<a name="ln750"> </a>
+<a name="ln751">  stringstream prefix_ss;</a>
+<a name="ln752">  prefix_ss &lt;&lt; prefix &lt;&lt; &quot;  &quot;;</a>
+<a name="ln753">  string new_prefix = prefix_ss.str();</a>
+<a name="ln754">  std::lock_guard&lt;std::mutex&gt; lock(child_trackers_mutex_);</a>
+<a name="ln755">  for (const auto&amp; p : child_trackers_) {</a>
+<a name="ln756">    auto child = p.second.lock();</a>
+<a name="ln757">    if (child &amp;&amp; child-&gt;consumption() &gt;= usage_threshold) {</a>
+<a name="ln758">      ss &lt;&lt; std::endl;</a>
+<a name="ln759">      ss &lt;&lt; child-&gt;LogUsage(prefix, usage_threshold, indent + 2);</a>
+<a name="ln760">    }</a>
+<a name="ln761">  }</a>
+<a name="ln762">  return ss.str();</a>
+<a name="ln763">}</a>
+<a name="ln764"> </a>
+<a name="ln765">void MemTracker::LogUpdate(bool is_consume, int64_t bytes) const {</a>
+<a name="ln766">  stringstream ss;</a>
+<a name="ln767">  ss &lt;&lt; this &lt;&lt; &quot; &quot; &lt;&lt; (is_consume ? &quot;Consume: &quot; : &quot;Release: &quot;) &lt;&lt; bytes</a>
+<a name="ln768">     &lt;&lt; &quot; Consumption: &quot; &lt;&lt; consumption() &lt;&lt; &quot; Limit: &quot; &lt;&lt; limit_;</a>
+<a name="ln769">  if (log_stack_) {</a>
+<a name="ln770">    ss &lt;&lt; std::endl &lt;&lt; GetStackTrace();</a>
+<a name="ln771">  }</a>
+<a name="ln772">  LOG(ERROR) &lt;&lt; ss.str();</a>
+<a name="ln773">}</a>
+<a name="ln774"> </a>
+<a name="ln775">shared_ptr&lt;MemTracker&gt; MemTracker::GetRootTracker() {</a>
+<a name="ln776">  GoogleOnceInit(&amp;root_tracker_once, &amp;MemTracker::CreateRootTracker);</a>
+<a name="ln777">  return root_tracker;</a>
+<a name="ln778">}</a>
+<a name="ln779"> </a>
+<a name="ln780">void MemTracker::SetMetricEntity(</a>
+<a name="ln781">    const MetricEntityPtr&amp; metric_entity, const std::string&amp; name_suffix) {</a>
+<a name="ln782">  if (metrics_) {</a>
+<a name="ln783">    LOG_IF(DFATAL, metric_entity-&gt;id() != metrics_-&gt;metric_entity_-&gt;id())</a>
+<a name="ln784">        &lt;&lt; &quot;SetMetricEntity (&quot; &lt;&lt; metric_entity-&gt;id() &lt;&lt; &quot;) while &quot;</a>
+<a name="ln785">        &lt;&lt; ToString() &lt;&lt; &quot; already has a different metric entity &quot;</a>
+<a name="ln786">        &lt;&lt; metrics_-&gt;metric_entity_-&gt;id();</a>
+<a name="ln787">    return;</a>
+<a name="ln788">  }</a>
+<a name="ln789">  metrics_ = std::make_unique&lt;TrackerMetrics&gt;(metric_entity);</a>
+<a name="ln790">  metrics_-&gt;Init(*this, name_suffix);</a>
+<a name="ln791">}</a>
+<a name="ln792"> </a>
+<a name="ln793">scoped_refptr&lt;MetricEntity&gt; MemTracker::metric_entity() const {</a>
+<a name="ln794">  return metrics_ ? metrics_-&gt;metric_entity_ : nullptr;</a>
+<a name="ln795">}</a>
+<a name="ln796"> </a>
+<a name="ln797">const MemTrackerData&amp; CollectMemTrackerData(const MemTrackerPtr&amp; tracker, int depth,</a>
+<a name="ln798">                                            std::vector&lt;MemTrackerData&gt;* output) {</a>
+<a name="ln799">  size_t idx = output-&gt;size();</a>
+<a name="ln800">  output-&gt;push_back({tracker, depth, 0});</a>
+<a name="ln801"> </a>
+<a name="ln802">  auto children = tracker-&gt;ListChildren();</a>
+<a name="ln803">  std::sort(children.begin(), children.end(), [](const auto&amp; lhs, const auto&amp; rhs) {</a>
+<a name="ln804">    return lhs-&gt;id() &lt; rhs-&gt;id();</a>
+<a name="ln805">  });</a>
+<a name="ln806"> </a>
+<a name="ln807">  for (const auto&amp; child : children) {</a>
+<a name="ln808">    const auto&amp; child_data = CollectMemTrackerData(child, depth + 1, output);</a>
+<a name="ln809">    (*output)[idx].consumption_excluded_from_ancestors +=</a>
+<a name="ln810">        child_data.consumption_excluded_from_ancestors;</a>
+<a name="ln811">    if (!child_data.tracker-&gt;add_to_parent()) {</a>
+<a name="ln812">      (*output)[idx].consumption_excluded_from_ancestors += child_data.tracker-&gt;consumption();</a>
+<a name="ln813">    }</a>
+<a name="ln814">  }</a>
+<a name="ln815"> </a>
+<a name="ln816">  return (*output)[idx];</a>
+<a name="ln817">}</a>
+<a name="ln818"> </a>
+<a name="ln819">std::string DumpMemTrackers() {</a>
+<a name="ln820">  std::ostringstream out;</a>
+<a name="ln821">  std::vector&lt;MemTrackerData&gt; trackers;</a>
+<a name="ln822">  CollectMemTrackerData(MemTracker::GetRootTracker(), 0, &amp;trackers);</a>
+<a name="ln823">  for (const auto&amp; data : trackers) {</a>
+<a name="ln824">    const auto&amp; tracker = data.tracker;</a>
+<a name="ln825">    const std::string current_consumption_str =</a>
+<a name="ln826">        HumanReadableNumBytes::ToString(tracker-&gt;consumption());</a>
+<a name="ln827">    out &lt;&lt; std::string(data.depth, ' ') &lt;&lt; tracker-&gt;id() &lt;&lt; &quot;: &quot;;</a>
+<a name="ln828">    if (!data.consumption_excluded_from_ancestors || data.tracker-&gt;UpdateConsumption()) {</a>
+<a name="ln829">      out &lt;&lt; current_consumption_str;</a>
+<a name="ln830">    } else {</a>
+<a name="ln831">      auto full_consumption_str = HumanReadableNumBytes::ToString(</a>
+<a name="ln832">          tracker-&gt;consumption() + data.consumption_excluded_from_ancestors);</a>
+<a name="ln833">      out &lt;&lt; current_consumption_str &lt;&lt; &quot; (&quot; &lt;&lt; full_consumption_str &lt;&lt; &quot;)&quot;;</a>
+<a name="ln834">    }</a>
+<a name="ln835">    out &lt;&lt; std::endl;</a>
+<a name="ln836">  }</a>
+<a name="ln837">  return out.str();</a>
+<a name="ln838">}</a>
+<a name="ln839"> </a>
+<a name="ln840">std::string DumpMemoryUsage() {</a>
+<a name="ln841">  std::ostringstream out;</a>
+<a name="ln842">  auto tcmalloc_stats = TcMallocStats();</a>
+<a name="ln843">  if (!tcmalloc_stats.empty()) {</a>
+<a name="ln844">    out &lt;&lt; &quot;TCMalloc stats: \n&quot; &lt;&lt; tcmalloc_stats &lt;&lt; &quot;\n&quot;;</a>
+<a name="ln845">  }</a>
+<a name="ln846">  out &lt;&lt; &quot;Memory usage: \n&quot; &lt;&lt; DumpMemTrackers();</a>
+<a name="ln847">  return out.str();</a>
+<a name="ln848">}</a>
+<a name="ln849"> </a>
+<a name="ln850">bool CheckMemoryPressureWithLogging(</a>
+<a name="ln851">    const MemTrackerPtr&amp; mem_tracker, double score, const char* error_prefix) {</a>
+<a name="ln852">  const auto soft_limit_exceeded_result = mem_tracker-&gt;AnySoftLimitExceeded(&amp;score);</a>
+<a name="ln853">  if (!soft_limit_exceeded_result.exceeded) {</a>
+<a name="ln854">    return true;</a>
+<a name="ln855">  }</a>
+<a name="ln856"> </a>
+<a name="ln857">  const std::string msg = StringPrintf(</a>
+<a name="ln858">      &quot;Soft memory limit exceeded (at %.2f%% of capacity), score: %.2f&quot;,</a>
+<a name="ln859">      soft_limit_exceeded_result.current_capacity_pct, score);</a>
+<a name="ln860">  if (soft_limit_exceeded_result.current_capacity_pct &gt;=</a>
+<a name="ln861">      FLAGS_memory_limit_warn_threshold_percentage) {</a>
+<a name="ln862">    YB_LOG_EVERY_N_SECS(WARNING, 1) &lt;&lt; error_prefix &lt;&lt; msg &lt;&lt; THROTTLE_MSG;</a>
+<a name="ln863">  } else {</a>
+<a name="ln864">    YB_LOG_EVERY_N_SECS(INFO, 1) &lt;&lt; error_prefix &lt;&lt; msg &lt;&lt; THROTTLE_MSG;</a>
+<a name="ln865">  }</a>
+<a name="ln866"> </a>
+<a name="ln867">  return false;</a>
+<a name="ln868">}</a>
+<a name="ln869"> </a>
+<a name="ln870">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="235"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="310"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="336"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="348"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="783"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

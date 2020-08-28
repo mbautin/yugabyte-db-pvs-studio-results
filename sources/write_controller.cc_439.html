@@ -1,0 +1,190 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>write_controller.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/rocksdb/db/write_controller.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;atomic&gt;</a>
+<a name="ln24">#include &lt;cassert&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/rocksdb/env.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/util/atomic.h&quot;</a>
+<a name="ln29">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31">DEFINE_test_flag(bool, allow_stop_writes, true,</a>
+<a name="ln32">                 &quot;Whether it is allowed to stop writes in tests.&quot;);</a>
+<a name="ln33"> </a>
+<a name="ln34">namespace rocksdb {</a>
+<a name="ln35"> </a>
+<a name="ln36">std::unique_ptr&lt;WriteControllerToken&gt; WriteController::GetStopToken() {</a>
+<a name="ln37">  CHECK(yb::GetAtomicFlag(&amp;FLAGS_TEST_allow_stop_writes));</a>
+<a name="ln38">  ++total_stopped_;</a>
+<a name="ln39">  return std::unique_ptr&lt;WriteControllerToken&gt;(new StopWriteToken(this));</a>
+<a name="ln40">}</a>
+<a name="ln41"> </a>
+<a name="ln42">std::unique_ptr&lt;WriteControllerToken&gt; WriteController::GetDelayToken(</a>
+<a name="ln43">    uint64_t write_rate) {</a>
+<a name="ln44">  total_delayed_++;</a>
+<a name="ln45">  // Reset counters.</a>
+<a name="ln46">  last_refill_time_ = 0;</a>
+<a name="ln47">  bytes_left_ = 0;</a>
+<a name="ln48">  set_delayed_write_rate(write_rate);</a>
+<a name="ln49">  return std::unique_ptr&lt;WriteControllerToken&gt;(new DelayWriteToken(this));</a>
+<a name="ln50">}</a>
+<a name="ln51"> </a>
+<a name="ln52">std::unique_ptr&lt;WriteControllerToken&gt;</a>
+<a name="ln53">WriteController::GetCompactionPressureToken() {</a>
+<a name="ln54">  ++total_compaction_pressure_;</a>
+<a name="ln55">  return std::unique_ptr&lt;WriteControllerToken&gt;(</a>
+<a name="ln56">      new CompactionPressureToken(this));</a>
+<a name="ln57">}</a>
+<a name="ln58"> </a>
+<a name="ln59">bool WriteController::IsStopped() const { return total_stopped_ &gt; 0; }</a>
+<a name="ln60">// This is inside DB mutex, so we can't sleep and need to minimize</a>
+<a name="ln61">// frequency to get time.</a>
+<a name="ln62">// If it turns out to be a performance issue, we can redesign the thread</a>
+<a name="ln63">// synchronization model here.</a>
+<a name="ln64">// The function trust caller will sleep micros returned.</a>
+<a name="ln65">uint64_t WriteController::GetDelay(Env* env, uint64_t num_bytes) {</a>
+<a name="ln66">  if (total_stopped_ &gt; 0) {</a>
+<a name="ln67">    return 0;</a>
+<a name="ln68">  }</a>
+<a name="ln69">  if (total_delayed_ == 0) {</a>
+<a name="ln70">    return 0;</a>
+<a name="ln71">  }</a>
+<a name="ln72"> </a>
+<a name="ln73">  const uint64_t kMicrosPerSecond = 1000000;</a>
+<a name="ln74">  const uint64_t kRefillInterval = 1024U;</a>
+<a name="ln75"> </a>
+<a name="ln76">  if (bytes_left_ &gt;= num_bytes) {</a>
+<a name="ln77">    bytes_left_ -= num_bytes;</a>
+<a name="ln78">    return 0;</a>
+<a name="ln79">  }</a>
+<a name="ln80">  // The frequency to get time inside DB mutex is less than one per refill</a>
+<a name="ln81">  // interval.</a>
+<a name="ln82">  auto time_now = env-&gt;NowMicros();</a>
+<a name="ln83"> </a>
+<a name="ln84">  uint64_t sleep_debt = 0;</a>
+<a name="ln85">  uint64_t time_since_last_refill = 0;</a>
+<a name="ln86">  if (last_refill_time_ != 0) {</a>
+<a name="ln87">    if (last_refill_time_ &gt; time_now) {</a>
+<a name="ln88">      sleep_debt = last_refill_time_ - time_now;</a>
+<a name="ln89">    } else {</a>
+<a name="ln90">      time_since_last_refill = time_now - last_refill_time_;</a>
+<a name="ln91">      bytes_left_ +=</a>
+<a name="ln92">          static_cast&lt;uint64_t&gt;(static_cast&lt;double&gt;(time_since_last_refill) /</a>
+<a name="ln93">                                kMicrosPerSecond * delayed_write_rate_);</a>
+<a name="ln94">      if (time_since_last_refill &gt;= kRefillInterval &amp;&amp;</a>
+<a name="ln95">          bytes_left_ &gt; num_bytes) {</a>
+<a name="ln96">        // If refill interval already passed and we have enough bytes</a>
+<a name="ln97">        // return without extra sleeping.</a>
+<a name="ln98">        last_refill_time_ = time_now;</a>
+<a name="ln99">        bytes_left_ -= num_bytes;</a>
+<a name="ln100">        return 0;</a>
+<a name="ln101">      }</a>
+<a name="ln102">    }</a>
+<a name="ln103">  }</a>
+<a name="ln104"> </a>
+<a name="ln105">  uint64_t single_refill_amount =</a>
+<a name="ln106">      delayed_write_rate_ * kRefillInterval / kMicrosPerSecond;</a>
+<a name="ln107">  if (bytes_left_ + single_refill_amount &gt;= num_bytes) {</a>
+<a name="ln108">    // Wait until a refill interval</a>
+<a name="ln109">    // Never trigger expire for less than one refill interval to avoid to get</a>
+<a name="ln110">    // time.</a>
+<a name="ln111">    bytes_left_ = bytes_left_ + single_refill_amount - num_bytes;</a>
+<a name="ln112">    last_refill_time_ = time_now + kRefillInterval;</a>
+<a name="ln113">    return kRefillInterval + sleep_debt;</a>
+<a name="ln114">  }</a>
+<a name="ln115"> </a>
+<a name="ln116">  // Need to refill more than one interval. Need to sleep longer. Check</a>
+<a name="ln117">  // whether expiration will hit</a>
+<a name="ln118"> </a>
+<a name="ln119">  // Sleep just until `num_bytes` is allowed.</a>
+<a name="ln120">  uint64_t sleep_amount =</a>
+<a name="ln121">      static_cast&lt;uint64_t&gt;(num_bytes /</a>
+<a name="ln122">                            static_cast&lt;long double&gt;(delayed_write_rate_) *</a>
+<a name="ln123">                            kMicrosPerSecond) +</a>
+<a name="ln124">      sleep_debt;</a>
+<a name="ln125">  last_refill_time_ = time_now + sleep_amount;</a>
+<a name="ln126">  return sleep_amount;</a>
+<a name="ln127">}</a>
+<a name="ln128"> </a>
+<a name="ln129">StopWriteToken::~StopWriteToken() {</a>
+<a name="ln130">  assert(controller_-&gt;total_stopped_ &gt;= 1);</a>
+<a name="ln131">  --controller_-&gt;total_stopped_;</a>
+<a name="ln132">}</a>
+<a name="ln133"> </a>
+<a name="ln134">DelayWriteToken::~DelayWriteToken() {</a>
+<a name="ln135">  controller_-&gt;total_delayed_--;</a>
+<a name="ln136">  assert(controller_-&gt;total_delayed_ &gt;= 0);</a>
+<a name="ln137">}</a>
+<a name="ln138"> </a>
+<a name="ln139">CompactionPressureToken::~CompactionPressureToken() {</a>
+<a name="ln140">  controller_-&gt;total_compaction_pressure_--;</a>
+<a name="ln141">  assert(controller_-&gt;total_compaction_pressure_ &gt;= 0);</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144">}  // namespace rocksdb</a>
+
+</code></pre>
+<div class="balloon" rel="37"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

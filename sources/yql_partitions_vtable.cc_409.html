@@ -1,0 +1,228 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>yql_partitions_vtable.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/master/yql_partitions_vtable.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln17">#include &quot;yb/master/catalog_manager.h&quot;</a>
+<a name="ln18">#include &quot;yb/master/master_util.h&quot;</a>
+<a name="ln19">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln20">#include &quot;yb/util/net/dns_resolver.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">DEFINE_bool(use_cache_for_partitions_vtable, true,</a>
+<a name="ln23">            &quot;Whether we should use caching for system.partitions table.&quot;);</a>
+<a name="ln24"> </a>
+<a name="ln25">namespace yb {</a>
+<a name="ln26">namespace master {</a>
+<a name="ln27"> </a>
+<a name="ln28">namespace {</a>
+<a name="ln29"> </a>
+<a name="ln30">const std::string kKeyspaceName = &quot;keyspace_name&quot;;</a>
+<a name="ln31">const std::string kTableName = &quot;table_name&quot;;</a>
+<a name="ln32">const std::string kStartKey = &quot;start_key&quot;;</a>
+<a name="ln33">const std::string kEndKey = &quot;end_key&quot;;</a>
+<a name="ln34">const std::string kId = &quot;id&quot;;</a>
+<a name="ln35">const std::string kReplicaAddresses = &quot;replica_addresses&quot;;</a>
+<a name="ln36"> </a>
+<a name="ln37">}</a>
+<a name="ln38"> </a>
+<a name="ln39">YQLPartitionsVTable::YQLPartitionsVTable(const Master* const master)</a>
+<a name="ln40">    : YQLVirtualTable(master::kSystemPartitionsTableName, master, CreateSchema()) {</a>
+<a name="ln41">}</a>
+<a name="ln42"> </a>
+<a name="ln43">Result&lt;std::shared_ptr&lt;QLRowBlock&gt;&gt; YQLPartitionsVTable::RetrieveData(</a>
+<a name="ln44">    const QLReadRequestPB&amp; request) const {</a>
+<a name="ln45">  CatalogManager* catalog_manager = master_-&gt;catalog_manager();</a>
+<a name="ln46">  {</a>
+<a name="ln47">    std::shared_lock&lt;boost::shared_mutex&gt; lock(mutex_);</a>
+<a name="ln48">    if (FLAGS_use_cache_for_partitions_vtable &amp;&amp;</a>
+<a name="ln49">        catalog_manager-&gt;tablets_version() == cached_tablets_version_ &amp;&amp;</a>
+<a name="ln50">        catalog_manager-&gt;tablet_locations_version() == cached_tablet_locations_version_) {</a>
+<a name="ln51">      // Cache is up to date, so we could use it.</a>
+<a name="ln52">      return cache_;</a>
+<a name="ln53">    }</a>
+<a name="ln54">  }</a>
+<a name="ln55"> </a>
+<a name="ln56">  std::lock_guard&lt;boost::shared_mutex&gt; lock(mutex_);</a>
+<a name="ln57">  auto new_tablets_version = catalog_manager-&gt;tablets_version();</a>
+<a name="ln58">  auto new_tablet_locations_version = catalog_manager-&gt;tablet_locations_version();</a>
+<a name="ln59">  if (FLAGS_use_cache_for_partitions_vtable &amp;&amp;</a>
+<a name="ln60">      new_tablets_version == cached_tablets_version_ &amp;&amp;</a>
+<a name="ln61">      new_tablet_locations_version == cached_tablet_locations_version_) {</a>
+<a name="ln62">    // Cache was updated between locks, and now it is up to date.</a>
+<a name="ln63">    return cache_;</a>
+<a name="ln64">  }</a>
+<a name="ln65"> </a>
+<a name="ln66">  auto vtable = std::make_shared&lt;QLRowBlock&gt;(schema_);</a>
+<a name="ln67">  std::vector&lt;scoped_refptr&lt;TableInfo&gt; &gt; tables;</a>
+<a name="ln68">  catalog_manager-&gt;GetAllTables(&amp;tables, true /* includeOnlyRunningTables */);</a>
+<a name="ln69">  auto&amp; resolver = master_-&gt;messenger()-&gt;resolver();</a>
+<a name="ln70"> </a>
+<a name="ln71">  std::unordered_map&lt;std::string, std::shared_future&lt;Result&lt;IpAddress&gt;&gt;&gt; dns_lookups;</a>
+<a name="ln72">  struct TabletData {</a>
+<a name="ln73">    scoped_refptr&lt;NamespaceInfo&gt; namespace_info;</a>
+<a name="ln74">    scoped_refptr&lt;TableInfo&gt; table;</a>
+<a name="ln75">    scoped_refptr&lt;TabletInfo&gt; tablet;</a>
+<a name="ln76">    TabletLocationsPB locations;</a>
+<a name="ln77">  };</a>
+<a name="ln78">  std::vector&lt;TabletData&gt; tablets;</a>
+<a name="ln79"> </a>
+<a name="ln80">  for (const scoped_refptr&lt;TableInfo&gt;&amp; table : tables) {</a>
+<a name="ln81">    // Skip non-YQL tables.</a>
+<a name="ln82">    if (!CatalogManager::IsYcqlTable(*table)) {</a>
+<a name="ln83">      continue;</a>
+<a name="ln84">    }</a>
+<a name="ln85"> </a>
+<a name="ln86">    // Get namespace for table.</a>
+<a name="ln87">    NamespaceIdentifierPB namespace_id;</a>
+<a name="ln88">    namespace_id.set_id(table-&gt;namespace_id());</a>
+<a name="ln89">    scoped_refptr&lt;NamespaceInfo&gt; namespace_info;</a>
+<a name="ln90">    RETURN_NOT_OK(catalog_manager-&gt;FindNamespace(namespace_id, &amp;namespace_info));</a>
+<a name="ln91"> </a>
+<a name="ln92">    // Get tablets for table.</a>
+<a name="ln93">    std::vector&lt;scoped_refptr&lt;TabletInfo&gt;&gt; tablet_infos;</a>
+<a name="ln94">    table-&gt;GetAllTablets(&amp;tablet_infos);</a>
+<a name="ln95">    tablets.reserve(tablets.size() + tablet_infos.size());</a>
+<a name="ln96">    for (const auto&amp; info : tablet_infos) {</a>
+<a name="ln97">      tablets.emplace_back();</a>
+<a name="ln98">      auto&amp; data = tablets.back();</a>
+<a name="ln99">      data.namespace_info = namespace_info;</a>
+<a name="ln100">      data.table = table;</a>
+<a name="ln101">      data.tablet = info;</a>
+<a name="ln102">      auto s = catalog_manager-&gt;GetTabletLocations(info-&gt;id(), &amp;data.locations);</a>
+<a name="ln103">      if (!s.ok()) {</a>
+<a name="ln104">        data.locations.Clear();</a>
+<a name="ln105">      }</a>
+<a name="ln106">      for (const auto&amp; replica : data.locations.replicas()) {</a>
+<a name="ln107">        auto host = DesiredHostPort(replica.ts_info(), CloudInfoPB()).host();</a>
+<a name="ln108">        if (dns_lookups.count(host) == 0) {</a>
+<a name="ln109">          dns_lookups.emplace(host, resolver.ResolveFuture(host));</a>
+<a name="ln110">        }</a>
+<a name="ln111">      }</a>
+<a name="ln112">    }</a>
+<a name="ln113">  }</a>
+<a name="ln114"> </a>
+<a name="ln115">  std::unordered_map&lt;std::string, InetAddress&gt; dns_results;</a>
+<a name="ln116"> </a>
+<a name="ln117">  for (auto&amp; p : dns_lookups) {</a>
+<a name="ln118">    dns_results.emplace(p.first, InetAddress(VERIFY_RESULT(p.second.get())));</a>
+<a name="ln119">  }</a>
+<a name="ln120"> </a>
+<a name="ln121">  for (const auto&amp; data : tablets) {</a>
+<a name="ln122">    // Skip not-found tablets: they might not be running yet or have been deleted.</a>
+<a name="ln123">    if (data.locations.table_id().empty()) {</a>
+<a name="ln124">      continue;</a>
+<a name="ln125">    }</a>
+<a name="ln126"> </a>
+<a name="ln127">    QLRow&amp; row = vtable-&gt;Extend();</a>
+<a name="ln128">    RETURN_NOT_OK(SetColumnValue(kKeyspaceName, data.namespace_info-&gt;name(), &amp;row));</a>
+<a name="ln129">    RETURN_NOT_OK(SetColumnValue(kTableName, data.table-&gt;name(), &amp;row));</a>
+<a name="ln130"> </a>
+<a name="ln131">    const PartitionPB&amp; partition = data.locations.partition();</a>
+<a name="ln132">    RETURN_NOT_OK(SetColumnValue(kStartKey, partition.partition_key_start(), &amp;row));</a>
+<a name="ln133">    RETURN_NOT_OK(SetColumnValue(kEndKey, partition.partition_key_end(), &amp;row));</a>
+<a name="ln134"> </a>
+<a name="ln135">    // Note: tablet id is in host byte order.</a>
+<a name="ln136">    Uuid uuid;</a>
+<a name="ln137">    RETURN_NOT_OK(uuid.FromHexString(data.tablet-&gt;id()));</a>
+<a name="ln138">    RETURN_NOT_OK(SetColumnValue(kId, uuid, &amp;row));</a>
+<a name="ln139"> </a>
+<a name="ln140">    // Get replicas for tablet.</a>
+<a name="ln141">    QLValuePB replica_addresses;</a>
+<a name="ln142">    QLMapValuePB *map_value = replica_addresses.mutable_map_value();</a>
+<a name="ln143">    for (const auto&amp; replica : data.locations.replicas()) {</a>
+<a name="ln144">      auto host = DesiredHostPort(replica.ts_info(), CloudInfoPB()).host();</a>
+<a name="ln145">      QLValue::set_inetaddress_value(dns_results[host], map_value-&gt;add_keys());</a>
+<a name="ln146"> </a>
+<a name="ln147">      map_value-&gt;add_values()-&gt;set_string_value(consensus::RaftPeerPB::Role_Name(replica.role()));</a>
+<a name="ln148">    }</a>
+<a name="ln149">    RETURN_NOT_OK(SetColumnValue(kReplicaAddresses, replica_addresses, &amp;row));</a>
+<a name="ln150">  }</a>
+<a name="ln151"> </a>
+<a name="ln152">  if (new_tablets_version == catalog_manager-&gt;tablets_version() &amp;&amp;</a>
+<a name="ln153">      new_tablet_locations_version == catalog_manager-&gt;tablet_locations_version()) {</a>
+<a name="ln154">    // Versions were not changed during calculating result, so could update cache for those</a>
+<a name="ln155">    // versions.</a>
+<a name="ln156">    cached_tablets_version_ = new_tablets_version;</a>
+<a name="ln157">    cached_tablet_locations_version_ = new_tablet_locations_version;</a>
+<a name="ln158">    cache_ = vtable;</a>
+<a name="ln159">  }</a>
+<a name="ln160"> </a>
+<a name="ln161">  return vtable;</a>
+<a name="ln162">}</a>
+<a name="ln163"> </a>
+<a name="ln164">Schema YQLPartitionsVTable::CreateSchema() const {</a>
+<a name="ln165">  SchemaBuilder builder;</a>
+<a name="ln166">  CHECK_OK(builder.AddHashKeyColumn(kKeyspaceName, QLType::Create(DataType::STRING)));</a>
+<a name="ln167">  CHECK_OK(builder.AddKeyColumn(kTableName, QLType::Create(DataType::STRING)));</a>
+<a name="ln168">  CHECK_OK(builder.AddKeyColumn(kStartKey, QLType::Create(DataType::BINARY)));</a>
+<a name="ln169">  CHECK_OK(builder.AddColumn(kEndKey, QLType::Create(DataType::BINARY)));</a>
+<a name="ln170">  CHECK_OK(builder.AddColumn(kId, QLType::Create(DataType::UUID)));</a>
+<a name="ln171">  CHECK_OK(builder.AddColumn(kReplicaAddresses,</a>
+<a name="ln172">                             QLType::CreateTypeMap(DataType::INET, DataType::STRING)));</a>
+<a name="ln173">  return builder.Build();</a>
+<a name="ln174">}</a>
+<a name="ln175"> </a>
+<a name="ln176">}  // namespace master</a>
+<a name="ln177">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="166"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="167"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="168"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="169"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="170"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="171"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

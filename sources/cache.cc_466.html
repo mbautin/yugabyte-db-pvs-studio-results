@@ -1,0 +1,1085 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>cache.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Copyright (c) 2011 The LevelDB Authors. All rights reserved.</a>
+<a name="ln21">// Use of this source code is governed by a BSD-style license that can be</a>
+<a name="ln22">// found in the LICENSE file. See the AUTHORS file for names of contributors.</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &lt;assert.h&gt;</a>
+<a name="ln25">#include &lt;stdio.h&gt;</a>
+<a name="ln26">#include &lt;stdlib.h&gt;</a>
+<a name="ln27">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &quot;yb/util/metrics.h&quot;</a>
+<a name="ln30">#include &quot;yb/rocksdb/cache.h&quot;</a>
+<a name="ln31">#include &quot;yb/rocksdb/statistics.h&quot;</a>
+<a name="ln32">#include &quot;yb/rocksdb/port/port.h&quot;</a>
+<a name="ln33">#include &quot;yb/rocksdb/util/autovector.h&quot;</a>
+<a name="ln34">#include &quot;yb/rocksdb/util/hash.h&quot;</a>
+<a name="ln35">#include &quot;yb/rocksdb/util/mutexlock.h&quot;</a>
+<a name="ln36">#include &quot;yb/rocksdb/util/statistics.h&quot;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &quot;yb/util/enums.h&quot;</a>
+<a name="ln39">#include &quot;yb/util/random_util.h&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41">// 0 value means that there exist no single_touch cache and</a>
+<a name="ln42">// 1 means that the entire cache is treated as a multi-touch cache.</a>
+<a name="ln43">DEFINE_double(cache_single_touch_ratio, 0.2,</a>
+<a name="ln44">              &quot;Fraction of the cache dedicated to single-touch items&quot;);</a>
+<a name="ln45"> </a>
+<a name="ln46">DEFINE_bool(cache_overflow_single_touch, true,</a>
+<a name="ln47">            &quot;Whether to enable overflow of single touch cache into the multi touch cache &quot;</a>
+<a name="ln48">            &quot;allocation&quot;);</a>
+<a name="ln49"> </a>
+<a name="ln50">namespace rocksdb {</a>
+<a name="ln51"> </a>
+<a name="ln52">Cache::~Cache() {</a>
+<a name="ln53">}</a>
+<a name="ln54"> </a>
+<a name="ln55">namespace {</a>
+<a name="ln56"> </a>
+<a name="ln57">// LRU cache implementation</a>
+<a name="ln58"> </a>
+<a name="ln59">// An entry is a variable length heap-allocated structure.</a>
+<a name="ln60">// Entries are referenced by cache and/or by any external entity.</a>
+<a name="ln61">// The cache keeps all its entries in table. Some elements</a>
+<a name="ln62">// are also stored on LRU list.</a>
+<a name="ln63">//</a>
+<a name="ln64">// LRUHandle can be in these states:</a>
+<a name="ln65">// 1. Referenced externally AND in hash table.</a>
+<a name="ln66">//  In that case the entry is *not* in the LRU. (refs &gt; 1 &amp;&amp; in_cache == true)</a>
+<a name="ln67">// 2. Not referenced externally and in hash table. In that case the entry is</a>
+<a name="ln68">// in the LRU and can be freed. (refs == 1 &amp;&amp; in_cache == true)</a>
+<a name="ln69">// 3. Referenced externally and not in hash table. In that case the entry is</a>
+<a name="ln70">// in not on LRU and not in table. (refs &gt;= 1 &amp;&amp; in_cache == false)</a>
+<a name="ln71">//</a>
+<a name="ln72">// All newly created LRUHandles are in state 1. If you call LRUCache::Release</a>
+<a name="ln73">// on entry in state 1, it will go into state 2. To move from state 1 to</a>
+<a name="ln74">// state 3, either call LRUCache::Erase or LRUCache::Insert with the same key.</a>
+<a name="ln75">// To move from state 2 to state 1, use LRUCache::Lookup.</a>
+<a name="ln76">// Before destruction, make sure that no handles are in state 1. This means</a>
+<a name="ln77">// that any successful LRUCache::Lookup/LRUCache::Insert have a matching</a>
+<a name="ln78">// RUCache::Release (to move into state 2) or LRUCache::Erase (for state 3)</a>
+<a name="ln79">//</a>
+<a name="ln80">// LRU also supports scan resistant access by allowing it to be one of two</a>
+<a name="ln81">// caches. query_id is to detect that multiple touches from the same query will not</a>
+<a name="ln82">// upgrade the cache element from single touch LRU into the multiple touch LRU.</a>
+<a name="ln83">// query_id == kInMultiTouchId means that the handle is in the multi</a>
+<a name="ln84">// touch cache, which means that this item will be evicted only for new values</a>
+<a name="ln85">// that are accessed multiple times by different queries.</a>
+<a name="ln86">// query_id == kNoCacheQueryId means that this Handle is not going to be added</a>
+<a name="ln87">// into the cache.</a>
+<a name="ln88"> </a>
+<a name="ln89">struct LRUHandle {</a>
+<a name="ln90">  void* value;</a>
+<a name="ln91">  void (*deleter)(const Slice&amp;, void* value);</a>
+<a name="ln92">  LRUHandle* next_hash;</a>
+<a name="ln93">  LRUHandle* next;</a>
+<a name="ln94">  LRUHandle* prev;</a>
+<a name="ln95">  size_t charge;      // TODO(opt): Only allow uint32_t?</a>
+<a name="ln96">  size_t key_length;</a>
+<a name="ln97">  uint32_t refs;      // a number of refs to this entry</a>
+<a name="ln98">                      // cache itself is counted as 1</a>
+<a name="ln99">  bool in_cache;      // true, if this entry is referenced by the hash table</a>
+<a name="ln100">  uint32_t hash;      // Hash of key(); used for fast sharding and comparisons</a>
+<a name="ln101">  QueryId query_id;  // Query id that added the value to the cache.</a>
+<a name="ln102">  char key_data[1];   // Beginning of key</a>
+<a name="ln103"> </a>
+<a name="ln104">  Slice key() const {</a>
+<a name="ln105">    // For cheaper lookups, we allow a temporary Handle object</a>
+<a name="ln106">    // to store a pointer to a key in &quot;value&quot;.</a>
+<a name="ln107">    if (next == this) {</a>
+<a name="ln108">      return *(reinterpret_cast&lt;Slice*&gt;(value));</a>
+<a name="ln109">    } else {</a>
+<a name="ln110">      return Slice(key_data, key_length);</a>
+<a name="ln111">    }</a>
+<a name="ln112">  }</a>
+<a name="ln113"> </a>
+<a name="ln114">  void Free(yb::CacheMetrics* metrics) {</a>
+<a name="ln115">    assert((refs == 1 &amp;&amp; in_cache) || (refs == 0 &amp;&amp; !in_cache));</a>
+<a name="ln116">    (*deleter)(key(), value);</a>
+<a name="ln117">    if (metrics != nullptr) {</a>
+<a name="ln118">      if (GetSubCacheType() == MULTI_TOUCH) {</a>
+<a name="ln119">        metrics-&gt;multi_touch_cache_usage-&gt;DecrementBy(charge);</a>
+<a name="ln120">      } else if (GetSubCacheType() == SINGLE_TOUCH) {</a>
+<a name="ln121">        metrics-&gt;single_touch_cache_usage-&gt;DecrementBy(charge);</a>
+<a name="ln122">      }</a>
+<a name="ln123">      metrics-&gt;cache_usage-&gt;DecrementBy(charge);</a>
+<a name="ln124">    }</a>
+<a name="ln125">    delete[] reinterpret_cast&lt;char*&gt;(this);</a>
+<a name="ln126">  }</a>
+<a name="ln127"> </a>
+<a name="ln128">  SubCacheType GetSubCacheType() const {</a>
+<a name="ln129">    return (query_id == kInMultiTouchId) ? MULTI_TOUCH : SINGLE_TOUCH;</a>
+<a name="ln130">  }</a>
+<a name="ln131">};</a>
+<a name="ln132"> </a>
+<a name="ln133">// We provide our own simple hash table since it removes a whole bunch</a>
+<a name="ln134">// of porting hacks and is also faster than some of the built-in hash</a>
+<a name="ln135">// table implementations in some of the compiler/runtime combinations</a>
+<a name="ln136">// we have tested.  E.g., readrandom speeds up by ~5% over the g++</a>
+<a name="ln137">// 4.4.3's builtin hashtable.</a>
+<a name="ln138">class HandleTable {</a>
+<a name="ln139"> public:</a>
+<a name="ln140">  HandleTable() :</a>
+<a name="ln141">      length_(0), elems_(0), list_(nullptr), metrics_(nullptr) { Resize(); }</a>
+<a name="ln142"> </a>
+<a name="ln143">  template &lt;typename T&gt;</a>
+<a name="ln144">  void ApplyToAllCacheEntries(T func) {</a>
+<a name="ln145">    for (uint32_t i = 0; i &lt; length_; i++) {</a>
+<a name="ln146">      LRUHandle* h = list_[i];</a>
+<a name="ln147">      while (h != nullptr) {</a>
+<a name="ln148">        auto n = h-&gt;next_hash;</a>
+<a name="ln149">        assert(h-&gt;in_cache);</a>
+<a name="ln150">        func(h);</a>
+<a name="ln151">        h = n;</a>
+<a name="ln152">      }</a>
+<a name="ln153">    }</a>
+<a name="ln154">  }</a>
+<a name="ln155"> </a>
+<a name="ln156">  ~HandleTable() {</a>
+<a name="ln157">    ApplyToAllCacheEntries([this](LRUHandle* h) {</a>
+<a name="ln158">      if (h-&gt;refs == 1) {</a>
+<a name="ln159">        h-&gt;Free(metrics_.get());</a>
+<a name="ln160">      }</a>
+<a name="ln161">    });</a>
+<a name="ln162">    delete[] list_;</a>
+<a name="ln163">  }</a>
+<a name="ln164"> </a>
+<a name="ln165">  LRUHandle* Lookup(const Slice&amp; key, uint32_t hash) const {</a>
+<a name="ln166">    return *FindPointer(key, hash);</a>
+<a name="ln167">  }</a>
+<a name="ln168"> </a>
+<a name="ln169">  void SetMetrics(shared_ptr&lt;yb::CacheMetrics&gt; metrics) { metrics_ = metrics; }</a>
+<a name="ln170"> </a>
+<a name="ln171">  // Checks if the newly created handle is a candidate to be inserted into the multi touch cache.</a>
+<a name="ln172">  // It checks to see if the same value is in the multi touch cache, or if it is in the single</a>
+<a name="ln173">  // touch cache, checks to see if the query ids are different.</a>
+<a name="ln174">  SubCacheType GetSubCacheTypeCandidate(LRUHandle* h) {</a>
+<a name="ln175">    if (h-&gt;GetSubCacheType() == MULTI_TOUCH) {</a>
+<a name="ln176">      return MULTI_TOUCH;</a>
+<a name="ln177">    }</a>
+<a name="ln178"> </a>
+<a name="ln179">    LRUHandle* val = Lookup(h-&gt;key(), h-&gt;hash);</a>
+<a name="ln180">    if (val != nullptr &amp;&amp; (val-&gt;GetSubCacheType() == MULTI_TOUCH || val-&gt;query_id != h-&gt;query_id)) {</a>
+<a name="ln181">      h-&gt;query_id = kInMultiTouchId;</a>
+<a name="ln182">      return MULTI_TOUCH;</a>
+<a name="ln183">    }</a>
+<a name="ln184">    return SINGLE_TOUCH;</a>
+<a name="ln185">  }</a>
+<a name="ln186"> </a>
+<a name="ln187">  LRUHandle* Insert(LRUHandle* h) {</a>
+<a name="ln188">    LRUHandle** ptr = FindPointer(h-&gt;key(), h-&gt;hash);</a>
+<a name="ln189">    LRUHandle* old = *ptr;</a>
+<a name="ln190">    h-&gt;next_hash = (old == nullptr ? nullptr : old-&gt;next_hash);</a>
+<a name="ln191">    *ptr = h;</a>
+<a name="ln192">    if (old == nullptr) {</a>
+<a name="ln193">      ++elems_;</a>
+<a name="ln194">      if (elems_ &gt; length_) {</a>
+<a name="ln195">        // Since each cache entry is fairly large, we aim for a small</a>
+<a name="ln196">        // average linked list length (&lt;= 1).</a>
+<a name="ln197">        Resize();</a>
+<a name="ln198">      }</a>
+<a name="ln199">    }</a>
+<a name="ln200">    return old;</a>
+<a name="ln201">  }</a>
+<a name="ln202"> </a>
+<a name="ln203">  LRUHandle* Remove(const Slice&amp; key, uint32_t hash) {</a>
+<a name="ln204">    LRUHandle** ptr = FindPointer(key, hash);</a>
+<a name="ln205">    LRUHandle* result = *ptr;</a>
+<a name="ln206">    if (result != nullptr) {</a>
+<a name="ln207">      *ptr = result-&gt;next_hash;</a>
+<a name="ln208">      --elems_;</a>
+<a name="ln209">    }</a>
+<a name="ln210">    return result;</a>
+<a name="ln211">  }</a>
+<a name="ln212"> </a>
+<a name="ln213"> private:</a>
+<a name="ln214">  // The table consists of an array of buckets where each bucket is</a>
+<a name="ln215">  // a linked list of cache entries that hash into the bucket.</a>
+<a name="ln216">  uint32_t length_;</a>
+<a name="ln217">  uint32_t elems_;</a>
+<a name="ln218">  LRUHandle** list_;</a>
+<a name="ln219">  shared_ptr&lt;yb::CacheMetrics&gt; metrics_;</a>
+<a name="ln220"> </a>
+<a name="ln221">  // Return a pointer to slot that points to a cache entry that</a>
+<a name="ln222">  // matches key/hash.  If there is no such cache entry, return a</a>
+<a name="ln223">  // pointer to the trailing slot in the corresponding linked list.</a>
+<a name="ln224">  LRUHandle** FindPointer(const Slice&amp; key, uint32_t hash) const {</a>
+<a name="ln225">    LRUHandle** ptr = &amp;list_[hash &amp; (length_ - 1)];</a>
+<a name="ln226">    while (*ptr != nullptr &amp;&amp;</a>
+<a name="ln227">           ((*ptr)-&gt;hash != hash || key != (*ptr)-&gt;key())) {</a>
+<a name="ln228">      ptr = &amp;(*ptr)-&gt;next_hash;</a>
+<a name="ln229">    }</a>
+<a name="ln230">    return ptr;</a>
+<a name="ln231">  }</a>
+<a name="ln232"> </a>
+<a name="ln233">  void Resize() {</a>
+<a name="ln234">    uint32_t new_length = 16;</a>
+<a name="ln235">    while (new_length &lt; elems_ * 1.5) {</a>
+<a name="ln236">      new_length *= 2;</a>
+<a name="ln237">    }</a>
+<a name="ln238">    LRUHandle** new_list = new LRUHandle*[new_length];</a>
+<a name="ln239">    memset(new_list, 0, sizeof(new_list[0]) * new_length);</a>
+<a name="ln240">    uint32_t count = 0;</a>
+<a name="ln241">    LRUHandle* h;</a>
+<a name="ln242">    LRUHandle* next;</a>
+<a name="ln243">    LRUHandle** ptr;</a>
+<a name="ln244">    uint32_t hash;</a>
+<a name="ln245">    for (uint32_t i = 0; i &lt; length_; i++) {</a>
+<a name="ln246">      h = list_[i];</a>
+<a name="ln247">      while (h != nullptr) {</a>
+<a name="ln248">        next = h-&gt;next_hash;</a>
+<a name="ln249">        hash = h-&gt;hash;</a>
+<a name="ln250">        ptr = &amp;new_list[hash &amp; (new_length - 1)];</a>
+<a name="ln251">        h-&gt;next_hash = *ptr;</a>
+<a name="ln252">        *ptr = h;</a>
+<a name="ln253">        h = next;</a>
+<a name="ln254">        count++;</a>
+<a name="ln255">      }</a>
+<a name="ln256">    }</a>
+<a name="ln257">    assert(elems_ == count);</a>
+<a name="ln258">    delete[] list_;</a>
+<a name="ln259">    list_ = new_list;</a>
+<a name="ln260">    length_ = new_length;</a>
+<a name="ln261">  }</a>
+<a name="ln262">};</a>
+<a name="ln263"> </a>
+<a name="ln264">// Sub-cache of the LRUCache that is used to track different LRU pointers, capacity and usage.</a>
+<a name="ln265">class LRUSubCache {</a>
+<a name="ln266"> public:</a>
+<a name="ln267">  LRUSubCache();</a>
+<a name="ln268">  ~LRUSubCache();</a>
+<a name="ln269"> </a>
+<a name="ln270">  // Accessors.</a>
+<a name="ln271">  size_t Usage() const {</a>
+<a name="ln272">    return usage_;</a>
+<a name="ln273">  }</a>
+<a name="ln274"> </a>
+<a name="ln275">  size_t LRU_Usage() const {</a>
+<a name="ln276">    return lru_usage_;</a>
+<a name="ln277">  }</a>
+<a name="ln278"> </a>
+<a name="ln279">  LRUHandle&amp; LRU_Head() {</a>
+<a name="ln280">    return lru_;</a>
+<a name="ln281">  }</a>
+<a name="ln282"> </a>
+<a name="ln283">  // Checks if the head of the LRU linked list is pointing to itself,</a>
+<a name="ln284">  // meaning that LRU list is empty.</a>
+<a name="ln285">  bool IsLRUEmpty() const {</a>
+<a name="ln286">    return lru_.next == &amp;lru_;</a>
+<a name="ln287">  }</a>
+<a name="ln288"> </a>
+<a name="ln289">  size_t GetPinnedUsage() const {</a>
+<a name="ln290">    assert(usage_ &gt;= lru_usage_);</a>
+<a name="ln291">    return usage_ - lru_usage_;</a>
+<a name="ln292">  }</a>
+<a name="ln293"> </a>
+<a name="ln294">  void DecrementUsage(const size_t charge) {</a>
+<a name="ln295">    assert(usage_ &gt;= charge);</a>
+<a name="ln296">    usage_ -= charge;</a>
+<a name="ln297">  }</a>
+<a name="ln298"> </a>
+<a name="ln299">  void IncrementUsage(const size_t charge) {</a>
+<a name="ln300">    assert(usage_ + charge &gt; 0);</a>
+<a name="ln301">    usage_ += charge;</a>
+<a name="ln302">  }</a>
+<a name="ln303"> </a>
+<a name="ln304">  void LRU_Remove(LRUHandle* e);</a>
+<a name="ln305">  void LRU_Append(LRUHandle *e);</a>
+<a name="ln306"> </a>
+<a name="ln307"> private:</a>
+<a name="ln308">  // Dummy heads of single-touch and multi-touch LRU list.</a>
+<a name="ln309">  // lru.prev is newest entry, lru.next is oldest entry.</a>
+<a name="ln310">  // LRU contains items which can be evicted, ie referenced only by cache.</a>
+<a name="ln311">  LRUHandle lru_;</a>
+<a name="ln312"> </a>
+<a name="ln313">  // Memory size for entries residing in the cache.</a>
+<a name="ln314">  // Includes entries in the LRU list and referenced by callers and thus not eligible for cleanup.</a>
+<a name="ln315">  size_t usage_;</a>
+<a name="ln316"> </a>
+<a name="ln317">  // Memory size for entries residing only in the LRU list</a>
+<a name="ln318">  size_t lru_usage_;</a>
+<a name="ln319">};</a>
+<a name="ln320"> </a>
+<a name="ln321">LRUSubCache::LRUSubCache() : usage_(0), lru_usage_(0) {</a>
+<a name="ln322">  // Make empty circular linked list</a>
+<a name="ln323">  lru_.next = &amp;lru_;</a>
+<a name="ln324">  lru_.prev = &amp;lru_;</a>
+<a name="ln325">}</a>
+<a name="ln326"> </a>
+<a name="ln327">LRUSubCache::~LRUSubCache() {}</a>
+<a name="ln328"> </a>
+<a name="ln329">// Remove the handle from the LRU list of the sub cache.</a>
+<a name="ln330">void LRUSubCache::LRU_Remove(LRUHandle* e) {</a>
+<a name="ln331">  assert(e-&gt;next != nullptr);</a>
+<a name="ln332">  assert(e-&gt;prev != nullptr);</a>
+<a name="ln333">  e-&gt;next-&gt;prev = e-&gt;prev;</a>
+<a name="ln334">  e-&gt;prev-&gt;next = e-&gt;next;</a>
+<a name="ln335">  e-&gt;prev = e-&gt;next = nullptr;</a>
+<a name="ln336">  lru_usage_ -= e-&gt;charge;</a>
+<a name="ln337">}</a>
+<a name="ln338"> </a>
+<a name="ln339">// Append to the LRU header of the sub cache.</a>
+<a name="ln340">void LRUSubCache::LRU_Append(LRUHandle *e) {</a>
+<a name="ln341">  assert(e-&gt;next == nullptr);</a>
+<a name="ln342">  assert(e-&gt;next == nullptr);</a>
+<a name="ln343">  e-&gt;next = &amp;lru_;</a>
+<a name="ln344">  e-&gt;prev = lru_.prev;</a>
+<a name="ln345">  e-&gt;prev-&gt;next = e;</a>
+<a name="ln346">  e-&gt;next-&gt;prev = e;</a>
+<a name="ln347">  lru_usage_ += e-&gt;charge;</a>
+<a name="ln348">}</a>
+<a name="ln349"> </a>
+<a name="ln350">class LRUHandleDeleter {</a>
+<a name="ln351"> public:</a>
+<a name="ln352">  explicit LRUHandleDeleter(yb::CacheMetrics* metrics) : metrics_(metrics) {}</a>
+<a name="ln353"> </a>
+<a name="ln354">  void Add(LRUHandle* handle) {</a>
+<a name="ln355">    handles_.push_back(handle);</a>
+<a name="ln356">  }</a>
+<a name="ln357"> </a>
+<a name="ln358">  size_t TotalCharge() const {</a>
+<a name="ln359">    size_t result = 0;</a>
+<a name="ln360">    for (LRUHandle* handle : handles_) {</a>
+<a name="ln361">      result += handle-&gt;charge;</a>
+<a name="ln362">    }</a>
+<a name="ln363">    return result;</a>
+<a name="ln364">  }</a>
+<a name="ln365"> </a>
+<a name="ln366">  ~LRUHandleDeleter() {</a>
+<a name="ln367">    for (LRUHandle* handle : handles_) {</a>
+<a name="ln368">      handle-&gt;Free(metrics_);</a>
+<a name="ln369">    }</a>
+<a name="ln370">  }</a>
+<a name="ln371"> </a>
+<a name="ln372"> private:</a>
+<a name="ln373">  yb::CacheMetrics* metrics_;</a>
+<a name="ln374">  autovector&lt;LRUHandle*&gt; handles_;</a>
+<a name="ln375">};</a>
+<a name="ln376"> </a>
+<a name="ln377">// A single shard of sharded cache.</a>
+<a name="ln378">class LRUCache {</a>
+<a name="ln379"> public:</a>
+<a name="ln380">  LRUCache();</a>
+<a name="ln381">  ~LRUCache();</a>
+<a name="ln382"> </a>
+<a name="ln383">  // Separate from constructor so caller can easily make an array of LRUCache</a>
+<a name="ln384">  // if current usage is more than new capacity, the function will attempt to</a>
+<a name="ln385">  // free the needed space</a>
+<a name="ln386">  void SetCapacity(size_t capacity);</a>
+<a name="ln387"> </a>
+<a name="ln388">  void SetMetrics(shared_ptr&lt;yb::CacheMetrics&gt; metrics) {</a>
+<a name="ln389">    metrics_ = metrics;</a>
+<a name="ln390">    table_.SetMetrics(metrics);</a>
+<a name="ln391">  }</a>
+<a name="ln392"> </a>
+<a name="ln393">  // Set the flag to reject insertion if cache if full.</a>
+<a name="ln394">  void SetStrictCapacityLimit(bool strict_capacity_limit);</a>
+<a name="ln395"> </a>
+<a name="ln396">  // Like Cache methods, but with an extra &quot;hash&quot; parameter.</a>
+<a name="ln397">  Status Insert(const Slice&amp; key, uint32_t hash, const QueryId query_id,</a>
+<a name="ln398">                void* value, size_t charge, void (*deleter)(const Slice&amp; key, void* value),</a>
+<a name="ln399">                Cache::Handle** handle, Statistics* statistics);</a>
+<a name="ln400">  Cache::Handle* Lookup(const Slice&amp; key, uint32_t hash, const QueryId query_id,</a>
+<a name="ln401">                        Statistics* statistics = nullptr);</a>
+<a name="ln402">  void Release(Cache::Handle* handle);</a>
+<a name="ln403">  void Erase(const Slice&amp; key, uint32_t hash);</a>
+<a name="ln404">  size_t Evict(size_t required);</a>
+<a name="ln405"> </a>
+<a name="ln406">  // Although in some platforms the update of size_t is atomic, to make sure</a>
+<a name="ln407">  // GetUsage() and GetPinnedUsage() work correctly under any platform, we'll</a>
+<a name="ln408">  // protect them with mutex_.</a>
+<a name="ln409"> </a>
+<a name="ln410">  size_t GetUsage() const {</a>
+<a name="ln411">    MutexLock l(&amp;mutex_);</a>
+<a name="ln412">    return single_touch_sub_cache_.Usage() + multi_touch_sub_cache_.Usage();</a>
+<a name="ln413">  }</a>
+<a name="ln414"> </a>
+<a name="ln415">  size_t GetPinnedUsage() const {</a>
+<a name="ln416">    MutexLock l(&amp;mutex_);</a>
+<a name="ln417">    return single_touch_sub_cache_.GetPinnedUsage() + multi_touch_sub_cache_.GetPinnedUsage();</a>
+<a name="ln418">  }</a>
+<a name="ln419"> </a>
+<a name="ln420">  void ApplyToAllCacheEntries(void (*callback)(void*, size_t),</a>
+<a name="ln421">                              bool thread_safe);</a>
+<a name="ln422"> </a>
+<a name="ln423">  std::pair&lt;size_t, size_t&gt; TEST_GetIndividualUsages() {</a>
+<a name="ln424">    return make_pair&lt;size_t, size_t&gt;(</a>
+<a name="ln425">        single_touch_sub_cache_.Usage(), multi_touch_sub_cache_.Usage());</a>
+<a name="ln426">  }</a>
+<a name="ln427"> </a>
+<a name="ln428"> private:</a>
+<a name="ln429">  void LRU_Remove(LRUHandle* e);</a>
+<a name="ln430">  void LRU_Append(LRUHandle* e);</a>
+<a name="ln431"> </a>
+<a name="ln432">  // Returns the correct SubCache based on the input argument.</a>
+<a name="ln433">  LRUSubCache* GetSubCache(const SubCacheType subcache_type);</a>
+<a name="ln434">  LRUSubCache single_touch_sub_cache_;</a>
+<a name="ln435">  LRUSubCache multi_touch_sub_cache_;</a>
+<a name="ln436"> </a>
+<a name="ln437">  size_t total_capacity_;</a>
+<a name="ln438">  size_t multi_touch_capacity_;</a>
+<a name="ln439"> </a>
+<a name="ln440">  // Just reduce the reference count by 1.</a>
+<a name="ln441">  // Return true if last reference</a>
+<a name="ln442">  bool Unref(LRUHandle* e);</a>
+<a name="ln443"> </a>
+<a name="ln444">  // Returns the capacity of the subcache.</a>
+<a name="ln445">  // For multi touch cache it is the same as its initial allocation.</a>
+<a name="ln446">  // For single touch cache it is the amount of space left in the entire cache.</a>
+<a name="ln447">  size_t GetSubCacheCapacity(const SubCacheType subcache_type);</a>
+<a name="ln448"> </a>
+<a name="ln449">  // Free some space following strict LRU policy until enough space</a>
+<a name="ln450">  // to hold (usage_ + charge) is freed or the lru list is empty.</a>
+<a name="ln451">  // This function is not thread safe - it needs to be executed while</a>
+<a name="ln452">  // holding the mutex_</a>
+<a name="ln453">  void EvictFromLRU(size_t charge, LRUHandleDeleter* deleted, SubCacheType subcache_type);</a>
+<a name="ln454"> </a>
+<a name="ln455">  void DecrementUsage(const SubCacheType subcache_type, const size_t charge);</a>
+<a name="ln456"> </a>
+<a name="ln457">  // Checks if the corresponding subcache contains space.</a>
+<a name="ln458">  bool HasFreeSpace(const SubCacheType subcache_type);</a>
+<a name="ln459"> </a>
+<a name="ln460">  size_t TotalUsage() const {</a>
+<a name="ln461">    return single_touch_sub_cache_.Usage() + multi_touch_sub_cache_.Usage();</a>
+<a name="ln462">  }</a>
+<a name="ln463"> </a>
+<a name="ln464">  // Whether to reject insertion if cache reaches its full capacity.</a>
+<a name="ln465">  bool strict_capacity_limit_ = false;</a>
+<a name="ln466"> </a>
+<a name="ln467">  // mutex_ protects the following state.</a>
+<a name="ln468">  // We don't count mutex_ as the cache's internal state so semantically we</a>
+<a name="ln469">  // don't mind mutex_ invoking the non-const actions.</a>
+<a name="ln470">  mutable port::Mutex mutex_;</a>
+<a name="ln471"> </a>
+<a name="ln472">  HandleTable table_;</a>
+<a name="ln473"> </a>
+<a name="ln474">  shared_ptr&lt;yb::CacheMetrics&gt; metrics_;</a>
+<a name="ln475">};</a>
+<a name="ln476"> </a>
+<a name="ln477">LRUCache::LRUCache() {}</a>
+<a name="ln478"> </a>
+<a name="ln479">LRUCache::~LRUCache() {}</a>
+<a name="ln480"> </a>
+<a name="ln481">bool LRUCache::Unref(LRUHandle* e) {</a>
+<a name="ln482">  assert(e-&gt;refs &gt; 0);</a>
+<a name="ln483">  e-&gt;refs--;</a>
+<a name="ln484">  return e-&gt;refs == 0;</a>
+<a name="ln485">}</a>
+<a name="ln486"> </a>
+<a name="ln487">LRUSubCache* LRUCache::GetSubCache(const SubCacheType subcache_type) {</a>
+<a name="ln488">  if (FLAGS_cache_single_touch_ratio == 0) {</a>
+<a name="ln489">    return &amp;multi_touch_sub_cache_;</a>
+<a name="ln490">  } else if (FLAGS_cache_single_touch_ratio == 1) {</a>
+<a name="ln491">    return &amp;single_touch_sub_cache_;</a>
+<a name="ln492">  }</a>
+<a name="ln493">  return (subcache_type == SubCacheType::MULTI_TOUCH) ? &amp;multi_touch_sub_cache_ :</a>
+<a name="ln494">                                                        &amp;single_touch_sub_cache_;</a>
+<a name="ln495">}</a>
+<a name="ln496"> </a>
+<a name="ln497">void LRUCache::DecrementUsage(const SubCacheType subcache_type, const size_t charge) {</a>
+<a name="ln498">  GetSubCache(subcache_type)-&gt;DecrementUsage(charge);</a>
+<a name="ln499">}</a>
+<a name="ln500"> </a>
+<a name="ln501">// Call deleter and free</a>
+<a name="ln502"> </a>
+<a name="ln503">void LRUCache::ApplyToAllCacheEntries(void (*callback)(void*, size_t),</a>
+<a name="ln504">                                      bool thread_safe) {</a>
+<a name="ln505">  if (thread_safe) {</a>
+<a name="ln506">    mutex_.Lock();</a>
+<a name="ln507">  }</a>
+<a name="ln508">  table_.ApplyToAllCacheEntries([callback](LRUHandle* h) {</a>
+<a name="ln509">    callback(h-&gt;value, h-&gt;charge);</a>
+<a name="ln510">  });</a>
+<a name="ln511">  if (thread_safe) {</a>
+<a name="ln512">    mutex_.Unlock();</a>
+<a name="ln513">  }</a>
+<a name="ln514">}</a>
+<a name="ln515"> </a>
+<a name="ln516">void LRUCache::LRU_Remove(LRUHandle* e) {</a>
+<a name="ln517">  GetSubCache(e-&gt;GetSubCacheType())-&gt;LRU_Remove(e);</a>
+<a name="ln518">}</a>
+<a name="ln519"> </a>
+<a name="ln520">void LRUCache::LRU_Append(LRUHandle* e) {</a>
+<a name="ln521">  // Make &quot;e&quot; newest entry by inserting just before lru_</a>
+<a name="ln522">  GetSubCache(e-&gt;GetSubCacheType())-&gt;LRU_Append(e);</a>
+<a name="ln523">}</a>
+<a name="ln524"> </a>
+<a name="ln525">size_t LRUCache::GetSubCacheCapacity(const SubCacheType subcache_type) {</a>
+<a name="ln526">  switch (subcache_type) {</a>
+<a name="ln527">    case SINGLE_TOUCH :</a>
+<a name="ln528">      if (strict_capacity_limit_ || !FLAGS_cache_overflow_single_touch) {</a>
+<a name="ln529">        return total_capacity_ - multi_touch_capacity_;</a>
+<a name="ln530">      }</a>
+<a name="ln531">      return total_capacity_ - multi_touch_sub_cache_.Usage();</a>
+<a name="ln532">    case MULTI_TOUCH :</a>
+<a name="ln533">      return multi_touch_capacity_;</a>
+<a name="ln534">  }</a>
+<a name="ln535">  FATAL_INVALID_ENUM_VALUE(SubCacheType, subcache_type);</a>
+<a name="ln536">}</a>
+<a name="ln537"> </a>
+<a name="ln538">void LRUCache::EvictFromLRU(const size_t charge,</a>
+<a name="ln539">                            LRUHandleDeleter* deleted,</a>
+<a name="ln540">                            const SubCacheType subcache_type) {</a>
+<a name="ln541">  LRUSubCache* sub_cache =  GetSubCache(subcache_type);</a>
+<a name="ln542">  const size_t capacity = GetSubCacheCapacity(subcache_type);</a>
+<a name="ln543">  while (sub_cache-&gt;Usage() + charge &gt; capacity &amp;&amp; !sub_cache-&gt;IsLRUEmpty())  {</a>
+<a name="ln544">    LRUHandle* old = sub_cache-&gt;LRU_Head().next;</a>
+<a name="ln545">    assert(old-&gt;in_cache);</a>
+<a name="ln546">    assert(old-&gt;refs == 1);  // LRU list contains elements which may be evicted</a>
+<a name="ln547">    sub_cache-&gt;LRU_Remove(old);</a>
+<a name="ln548">    table_.Remove(old-&gt;key(), old-&gt;hash);</a>
+<a name="ln549">    old-&gt;in_cache = false;</a>
+<a name="ln550">    Unref(old);</a>
+<a name="ln551">    sub_cache-&gt;DecrementUsage(old-&gt;charge);</a>
+<a name="ln552">    deleted-&gt;Add(old);</a>
+<a name="ln553">  }</a>
+<a name="ln554">}</a>
+<a name="ln555"> </a>
+<a name="ln556">void LRUCache::SetCapacity(size_t capacity) {</a>
+<a name="ln557">  LRUHandleDeleter last_reference_list(metrics_.get());</a>
+<a name="ln558"> </a>
+<a name="ln559">  {</a>
+<a name="ln560">    MutexLock l(&amp;mutex_);</a>
+<a name="ln561">    multi_touch_capacity_ = round((1 - FLAGS_cache_single_touch_ratio) * capacity);</a>
+<a name="ln562">    total_capacity_ = capacity;</a>
+<a name="ln563">    EvictFromLRU(0, &amp;last_reference_list, MULTI_TOUCH);</a>
+<a name="ln564">    EvictFromLRU(0, &amp;last_reference_list, SINGLE_TOUCH);</a>
+<a name="ln565">  }</a>
+<a name="ln566">}</a>
+<a name="ln567"> </a>
+<a name="ln568">void LRUCache::SetStrictCapacityLimit(bool strict_capacity_limit) {</a>
+<a name="ln569">  MutexLock l(&amp;mutex_);</a>
+<a name="ln570">  // Allow setting strict capacity limit only when there are no elements in the cache.</a>
+<a name="ln571">  // This is because we disable overflowing single touch cache when strict_capacity_limit_ is true.</a>
+<a name="ln572">  // We cannot ensure that single touch cache has not already overflown when the cache already has</a>
+<a name="ln573">  // elements in it.</a>
+<a name="ln574">  assert(TotalUsage() == 0 || !FLAGS_cache_overflow_single_touch);</a>
+<a name="ln575">  strict_capacity_limit_ = strict_capacity_limit;</a>
+<a name="ln576">}</a>
+<a name="ln577"> </a>
+<a name="ln578">Cache::Handle* LRUCache::Lookup(const Slice&amp; key, uint32_t hash, const QueryId query_id,</a>
+<a name="ln579">                                Statistics* statistics)  {</a>
+<a name="ln580">  MutexLock l(&amp;mutex_);</a>
+<a name="ln581">  LRUHandle* e = table_.Lookup(key, hash);</a>
+<a name="ln582">  if (e != nullptr) {</a>
+<a name="ln583">    assert(e-&gt;in_cache);</a>
+<a name="ln584">    // Since the entry is now referenced externally, cannot be evicted, so remove from LRU.</a>
+<a name="ln585">    if (e-&gt;refs == 1) {</a>
+<a name="ln586">      LRU_Remove(e);</a>
+<a name="ln587">    }</a>
+<a name="ln588">    // Increase the number of references and move to state 1. (in cache and not in LRU)</a>
+<a name="ln589">    e-&gt;refs++;</a>
+<a name="ln590"> </a>
+<a name="ln591">    // Now the handle will be added to the multi touch pool only if it exists.</a>
+<a name="ln592">    if (FLAGS_cache_single_touch_ratio &lt; 1 &amp;&amp; e-&gt;GetSubCacheType() != MULTI_TOUCH &amp;&amp;</a>
+<a name="ln593">        e-&gt;query_id != query_id) {</a>
+<a name="ln594">      {</a>
+<a name="ln595">        LRUHandleDeleter multi_touch_eviction_list(metrics_.get());</a>
+<a name="ln596">        EvictFromLRU(e-&gt;charge, &amp;multi_touch_eviction_list, MULTI_TOUCH);</a>
+<a name="ln597">      }</a>
+<a name="ln598">      // Cannot have any single touch elements in this case.</a>
+<a name="ln599">      assert(FLAGS_cache_single_touch_ratio != 0);</a>
+<a name="ln600">      if (!strict_capacity_limit_ ||</a>
+<a name="ln601">          multi_touch_sub_cache_.Usage() - multi_touch_sub_cache_.LRU_Usage() + e-&gt;charge &lt;=</a>
+<a name="ln602">          multi_touch_capacity_) {</a>
+<a name="ln603">        e-&gt;query_id = kInMultiTouchId;</a>
+<a name="ln604">        single_touch_sub_cache_.DecrementUsage(e-&gt;charge);</a>
+<a name="ln605">        multi_touch_sub_cache_.IncrementUsage(e-&gt;charge);</a>
+<a name="ln606">       if (metrics_) {</a>
+<a name="ln607">         metrics_-&gt;multi_touch_cache_usage-&gt;IncrementBy(e-&gt;charge);</a>
+<a name="ln608">         metrics_-&gt;single_touch_cache_usage-&gt;DecrementBy(e-&gt;charge);</a>
+<a name="ln609">       }</a>
+<a name="ln610">      }</a>
+<a name="ln611">    }</a>
+<a name="ln612">    if (statistics != nullptr) {</a>
+<a name="ln613">      // overall cache hit</a>
+<a name="ln614">      RecordTick(statistics, BLOCK_CACHE_HIT);</a>
+<a name="ln615">      // total bytes read from cache</a>
+<a name="ln616">      RecordTick(statistics, BLOCK_CACHE_BYTES_READ, e-&gt;charge);</a>
+<a name="ln617">      if (e-&gt;GetSubCacheType() == SubCacheType::SINGLE_TOUCH) {</a>
+<a name="ln618">        RecordTick(statistics, BLOCK_CACHE_SINGLE_TOUCH_HIT);</a>
+<a name="ln619">        RecordTick(statistics, BLOCK_CACHE_SINGLE_TOUCH_BYTES_READ, e-&gt;charge);</a>
+<a name="ln620">      } else if (e-&gt;GetSubCacheType() == SubCacheType::MULTI_TOUCH) {</a>
+<a name="ln621">        RecordTick(statistics, BLOCK_CACHE_MULTI_TOUCH_HIT);</a>
+<a name="ln622">        RecordTick(statistics, BLOCK_CACHE_MULTI_TOUCH_BYTES_READ, e-&gt;charge);</a>
+<a name="ln623">      }</a>
+<a name="ln624">    }</a>
+<a name="ln625">  } else {</a>
+<a name="ln626">    if (statistics != nullptr) {</a>
+<a name="ln627">      RecordTick(statistics, BLOCK_CACHE_MISS);</a>
+<a name="ln628">    }</a>
+<a name="ln629">  }</a>
+<a name="ln630"> </a>
+<a name="ln631">  if (metrics_ != nullptr) {</a>
+<a name="ln632">    metrics_-&gt;lookups-&gt;Increment();</a>
+<a name="ln633">    bool was_hit = (e != nullptr);</a>
+<a name="ln634">    if (was_hit) {</a>
+<a name="ln635">      metrics_-&gt;cache_hits-&gt;Increment();</a>
+<a name="ln636">    } else {</a>
+<a name="ln637">      metrics_-&gt;cache_misses-&gt;Increment();</a>
+<a name="ln638">    }</a>
+<a name="ln639">  }</a>
+<a name="ln640">  return reinterpret_cast&lt;Cache::Handle*&gt;(e);</a>
+<a name="ln641">}</a>
+<a name="ln642"> </a>
+<a name="ln643">bool LRUCache::HasFreeSpace(const SubCacheType subcache_type) {</a>
+<a name="ln644">  switch(subcache_type) {</a>
+<a name="ln645">    case SINGLE_TOUCH :</a>
+<a name="ln646">      if (strict_capacity_limit_ || !FLAGS_cache_overflow_single_touch) {</a>
+<a name="ln647">        return single_touch_sub_cache_.Usage() &lt;= (total_capacity_ - multi_touch_capacity_);</a>
+<a name="ln648">      }</a>
+<a name="ln649">      return TotalUsage() &lt;= total_capacity_;</a>
+<a name="ln650">    case MULTI_TOUCH : return multi_touch_sub_cache_.Usage() &lt;= multi_touch_capacity_;</a>
+<a name="ln651">  }</a>
+<a name="ln652">  FATAL_INVALID_ENUM_VALUE(SubCacheType, subcache_type);</a>
+<a name="ln653">}</a>
+<a name="ln654"> </a>
+<a name="ln655">void LRUCache::Release(Cache::Handle* handle) {</a>
+<a name="ln656">  if (handle == nullptr) {</a>
+<a name="ln657">    return;</a>
+<a name="ln658">  }</a>
+<a name="ln659">  LRUHandle* e = reinterpret_cast&lt;LRUHandle*&gt;(handle);</a>
+<a name="ln660">  bool last_reference = false;</a>
+<a name="ln661">  {</a>
+<a name="ln662">    MutexLock l(&amp;mutex_);</a>
+<a name="ln663">    LRUSubCache* sub_cache = GetSubCache(e-&gt;GetSubCacheType());</a>
+<a name="ln664">    last_reference = Unref(e);</a>
+<a name="ln665">    if (last_reference) {</a>
+<a name="ln666">      sub_cache-&gt;DecrementUsage(e-&gt;charge);</a>
+<a name="ln667">    }</a>
+<a name="ln668">    if (e-&gt;refs == 1 &amp;&amp; e-&gt;in_cache) {</a>
+<a name="ln669">      // The item is still in cache, and nobody else holds a reference to it</a>
+<a name="ln670">      if (!HasFreeSpace(e-&gt;GetSubCacheType())) {</a>
+<a name="ln671">        // The LRU list must be empty since the cache is full.</a>
+<a name="ln672">        assert(sub_cache-&gt;IsLRUEmpty());</a>
+<a name="ln673">        // take this opportunity and remove the item</a>
+<a name="ln674">        table_.Remove(e-&gt;key(), e-&gt;hash);</a>
+<a name="ln675">        e-&gt;in_cache = false;</a>
+<a name="ln676">        Unref(e);</a>
+<a name="ln677">        sub_cache-&gt;DecrementUsage(e-&gt;charge);</a>
+<a name="ln678">        last_reference = true;</a>
+<a name="ln679">      } else {</a>
+<a name="ln680">        // put the item on the list to be potentially freed.</a>
+<a name="ln681">        LRU_Append(e);</a>
+<a name="ln682">      }</a>
+<a name="ln683">    }</a>
+<a name="ln684">  }</a>
+<a name="ln685"> </a>
+<a name="ln686">  // free outside of mutex</a>
+<a name="ln687">  if (last_reference) {</a>
+<a name="ln688">    e-&gt;Free(metrics_.get());</a>
+<a name="ln689">  }</a>
+<a name="ln690">}</a>
+<a name="ln691"> </a>
+<a name="ln692">size_t LRUCache::Evict(size_t required) {</a>
+<a name="ln693">  LRUHandleDeleter evicted(metrics_.get());</a>
+<a name="ln694">  {</a>
+<a name="ln695">    MutexLock l(&amp;mutex_);</a>
+<a name="ln696">    EvictFromLRU(required, &amp;evicted, SINGLE_TOUCH);</a>
+<a name="ln697">    if (required &gt; evicted.TotalCharge()) {</a>
+<a name="ln698">      EvictFromLRU(required, &amp;evicted, MULTI_TOUCH);</a>
+<a name="ln699">    }</a>
+<a name="ln700">  }</a>
+<a name="ln701">  return evicted.TotalCharge();</a>
+<a name="ln702">}</a>
+<a name="ln703"> </a>
+<a name="ln704">Status LRUCache::Insert(const Slice&amp; key, uint32_t hash, const QueryId query_id,</a>
+<a name="ln705">                        void* value, size_t charge, void (*deleter)(const Slice&amp; key, void* value),</a>
+<a name="ln706">                        Cache::Handle** handle, Statistics* statistics) {</a>
+<a name="ln707">  // Don't use the cache if disabled by the caller using the special query id.</a>
+<a name="ln708">  if (query_id == kNoCacheQueryId) {</a>
+<a name="ln709">    return Status::OK();</a>
+<a name="ln710">  }</a>
+<a name="ln711">  // Allocate the memory here outside of the mutex</a>
+<a name="ln712">  // If the cache is full, we'll have to release it</a>
+<a name="ln713">  // It shouldn't happen very often though.</a>
+<a name="ln714">  LRUHandle* e = reinterpret_cast&lt;LRUHandle*&gt;(</a>
+<a name="ln715">                    new char[sizeof(LRUHandle) - 1 + key.size()]);</a>
+<a name="ln716">  Status s;</a>
+<a name="ln717">  LRUHandleDeleter last_reference_list(metrics_.get());</a>
+<a name="ln718"> </a>
+<a name="ln719">  e-&gt;value = value;</a>
+<a name="ln720">  e-&gt;deleter = deleter;</a>
+<a name="ln721">  e-&gt;charge = charge;</a>
+<a name="ln722">  e-&gt;key_length = key.size();</a>
+<a name="ln723">  e-&gt;hash = hash;</a>
+<a name="ln724">  e-&gt;refs = (handle == nullptr</a>
+<a name="ln725">                 ? 1</a>
+<a name="ln726">                 : 2);  // One from LRUCache, one for the returned handle</a>
+<a name="ln727">  e-&gt;next = e-&gt;prev = nullptr;</a>
+<a name="ln728">  e-&gt;in_cache = true;</a>
+<a name="ln729">  // Adding query id to the handle.</a>
+<a name="ln730">  e-&gt;query_id = query_id;</a>
+<a name="ln731">  memcpy(e-&gt;key_data, key.data(), key.size());</a>
+<a name="ln732"> </a>
+<a name="ln733">  {</a>
+<a name="ln734">    MutexLock l(&amp;mutex_);</a>
+<a name="ln735">    // Free the space following strict LRU policy until enough space</a>
+<a name="ln736">    // is freed or the lru list is empty.</a>
+<a name="ln737">    // Check if there is a single touch cache.</a>
+<a name="ln738">    SubCacheType subcache_type;</a>
+<a name="ln739">    if (FLAGS_cache_single_touch_ratio == 0) {</a>
+<a name="ln740">      e-&gt;query_id = kInMultiTouchId;</a>
+<a name="ln741">      subcache_type = MULTI_TOUCH;</a>
+<a name="ln742">    } else if (FLAGS_cache_single_touch_ratio == 1) {</a>
+<a name="ln743">      // If there is no multi touch cache, default to single cache.</a>
+<a name="ln744">      subcache_type = SINGLE_TOUCH;</a>
+<a name="ln745">    } else {</a>
+<a name="ln746">      subcache_type = table_.GetSubCacheTypeCandidate(e);</a>
+<a name="ln747">    }</a>
+<a name="ln748">    EvictFromLRU(charge, &amp;last_reference_list, subcache_type);</a>
+<a name="ln749">    LRUSubCache* sub_cache = GetSubCache(subcache_type);</a>
+<a name="ln750">    // If the cache no longer has any more space in the given pool.</a>
+<a name="ln751">    if (strict_capacity_limit_ &amp;&amp;</a>
+<a name="ln752">        sub_cache-&gt;Usage() - sub_cache-&gt;LRU_Usage() + charge &gt; GetSubCacheCapacity(subcache_type)) {</a>
+<a name="ln753">      if (handle == nullptr) {</a>
+<a name="ln754">        last_reference_list.Add(e);</a>
+<a name="ln755">      } else {</a>
+<a name="ln756">        delete[] reinterpret_cast&lt;char*&gt;(e);</a>
+<a name="ln757">        *handle = nullptr;</a>
+<a name="ln758">      }</a>
+<a name="ln759">      s = STATUS(Incomplete, &quot;Insert failed due to LRU cache being full.&quot;);</a>
+<a name="ln760">    } else {</a>
+<a name="ln761">      // insert into the cache</a>
+<a name="ln762">      // note that the cache might get larger than its capacity if not enough</a>
+<a name="ln763">      // space was freed</a>
+<a name="ln764">      LRUHandle* old = table_.Insert(e);</a>
+<a name="ln765">      sub_cache-&gt;IncrementUsage(e-&gt;charge);</a>
+<a name="ln766">      if (old != nullptr) {</a>
+<a name="ln767">        old-&gt;in_cache = false;</a>
+<a name="ln768">        if (Unref(old)) {</a>
+<a name="ln769">          DecrementUsage(old-&gt;GetSubCacheType(), old-&gt;charge);</a>
+<a name="ln770">          // old is on LRU because it's in cache and its reference count</a>
+<a name="ln771">          // was just 1 (Unref returned 0)</a>
+<a name="ln772">          LRU_Remove(old);</a>
+<a name="ln773">          last_reference_list.Add(old);</a>
+<a name="ln774">        }</a>
+<a name="ln775">      }</a>
+<a name="ln776">      // No external reference, so put it in LRU to be potentially evicted.</a>
+<a name="ln777">      if (handle == nullptr) {</a>
+<a name="ln778">        LRU_Append(e);</a>
+<a name="ln779">      } else {</a>
+<a name="ln780">        *handle = reinterpret_cast&lt;Cache::Handle*&gt;(e);</a>
+<a name="ln781">      }</a>
+<a name="ln782">      if (subcache_type == MULTI_TOUCH &amp;&amp; FLAGS_cache_single_touch_ratio != 0) {</a>
+<a name="ln783">        // Evict entries from single touch cache if the total size increases. This can happen if</a>
+<a name="ln784">        // single touch entries has overflown and we insert entries directly into the multi touch</a>
+<a name="ln785">        // cache without it going through the single touch cache.</a>
+<a name="ln786">        EvictFromLRU(0, &amp;last_reference_list, SINGLE_TOUCH);</a>
+<a name="ln787">      }</a>
+<a name="ln788">      s = Status::OK();</a>
+<a name="ln789">    }</a>
+<a name="ln790">    if (statistics != nullptr) {</a>
+<a name="ln791">      if (s.ok()) {</a>
+<a name="ln792">        RecordTick(statistics, BLOCK_CACHE_ADD);</a>
+<a name="ln793">        RecordTick(statistics, BLOCK_CACHE_BYTES_WRITE, charge);</a>
+<a name="ln794">        if (subcache_type == SubCacheType::SINGLE_TOUCH) {</a>
+<a name="ln795">          RecordTick(statistics, BLOCK_CACHE_SINGLE_TOUCH_ADD);</a>
+<a name="ln796">          RecordTick(statistics, BLOCK_CACHE_SINGLE_TOUCH_BYTES_WRITE, charge);</a>
+<a name="ln797">        } else if (subcache_type == SubCacheType::MULTI_TOUCH) {</a>
+<a name="ln798">          RecordTick(statistics, BLOCK_CACHE_MULTI_TOUCH_ADD);</a>
+<a name="ln799">          RecordTick(statistics, BLOCK_CACHE_MULTI_TOUCH_BYTES_WRITE, charge);</a>
+<a name="ln800">        }</a>
+<a name="ln801">      } else {</a>
+<a name="ln802">        RecordTick(statistics, BLOCK_CACHE_ADD_FAILURES);</a>
+<a name="ln803">      }</a>
+<a name="ln804">    }</a>
+<a name="ln805">    if (metrics_ != nullptr) {</a>
+<a name="ln806">      if (subcache_type == MULTI_TOUCH) {</a>
+<a name="ln807">        metrics_-&gt;multi_touch_cache_usage-&gt;IncrementBy(charge);</a>
+<a name="ln808">      } else {</a>
+<a name="ln809">        metrics_-&gt;single_touch_cache_usage-&gt;IncrementBy(charge);</a>
+<a name="ln810">      }</a>
+<a name="ln811">      metrics_-&gt;cache_usage-&gt;IncrementBy(charge);</a>
+<a name="ln812">    }</a>
+<a name="ln813">  }</a>
+<a name="ln814"> </a>
+<a name="ln815">  return s;</a>
+<a name="ln816">}</a>
+<a name="ln817"> </a>
+<a name="ln818">void LRUCache::Erase(const Slice&amp; key, uint32_t hash) {</a>
+<a name="ln819">  LRUHandle* e;</a>
+<a name="ln820">  bool last_reference = false;</a>
+<a name="ln821">  {</a>
+<a name="ln822">    MutexLock l(&amp;mutex_);</a>
+<a name="ln823">    e = table_.Remove(key, hash);</a>
+<a name="ln824">    if (e != nullptr) {</a>
+<a name="ln825">      last_reference = Unref(e);</a>
+<a name="ln826">      if (last_reference) {</a>
+<a name="ln827">        DecrementUsage(e-&gt;GetSubCacheType(), e-&gt;charge);</a>
+<a name="ln828">      }</a>
+<a name="ln829">      if (last_reference &amp;&amp; e-&gt;in_cache) {</a>
+<a name="ln830">        LRU_Remove(e);</a>
+<a name="ln831">      }</a>
+<a name="ln832">      e-&gt;in_cache = false;</a>
+<a name="ln833">    }</a>
+<a name="ln834">  }</a>
+<a name="ln835">  // mutex not held here</a>
+<a name="ln836">  // last_reference will only be true if e != nullptr</a>
+<a name="ln837">  if (last_reference) {</a>
+<a name="ln838">    e-&gt;Free(metrics_.get());</a>
+<a name="ln839">  }</a>
+<a name="ln840">}</a>
+<a name="ln841"> </a>
+<a name="ln842">static int kNumShardBits = 4;          // default values, can be overridden</a>
+<a name="ln843"> </a>
+<a name="ln844">class ShardedLRUCache : public Cache {</a>
+<a name="ln845"> private:</a>
+<a name="ln846">  LRUCache* shards_;</a>
+<a name="ln847">  port::Mutex id_mutex_;</a>
+<a name="ln848">  port::Mutex capacity_mutex_;</a>
+<a name="ln849">  uint64_t last_id_;</a>
+<a name="ln850">  size_t num_shard_bits_;</a>
+<a name="ln851">  size_t capacity_;</a>
+<a name="ln852">  bool strict_capacity_limit_;</a>
+<a name="ln853">  shared_ptr&lt;yb::CacheMetrics&gt; metrics_;</a>
+<a name="ln854"> </a>
+<a name="ln855">  static inline uint32_t HashSlice(const Slice&amp; s) {</a>
+<a name="ln856">    return Hash(s.data(), s.size(), 0);</a>
+<a name="ln857">  }</a>
+<a name="ln858"> </a>
+<a name="ln859">  uint32_t Shard(uint32_t hash) {</a>
+<a name="ln860">    // Note, hash &gt;&gt; 32 yields hash in gcc, not the zero we expect!</a>
+<a name="ln861">    return (num_shard_bits_ &gt; 0) ? (hash &gt;&gt; (32 - num_shard_bits_)) : 0;</a>
+<a name="ln862">  }</a>
+<a name="ln863"> </a>
+<a name="ln864">  bool IsValidQueryId(const QueryId query_id) {</a>
+<a name="ln865">    return query_id &gt;= 0 || query_id == kInMultiTouchId || query_id == kNoCacheQueryId;</a>
+<a name="ln866">  }</a>
+<a name="ln867"> </a>
+<a name="ln868"> public:</a>
+<a name="ln869">  ShardedLRUCache(size_t capacity, int num_shard_bits,</a>
+<a name="ln870">                  bool strict_capacity_limit)</a>
+<a name="ln871">      : last_id_(0),</a>
+<a name="ln872">        num_shard_bits_(num_shard_bits),</a>
+<a name="ln873">        capacity_(capacity),</a>
+<a name="ln874">        strict_capacity_limit_(strict_capacity_limit),</a>
+<a name="ln875">        metrics_(nullptr) {</a>
+<a name="ln876">    int num_shards = 1 &lt;&lt; num_shard_bits_;</a>
+<a name="ln877">    shards_ = new LRUCache[num_shards];</a>
+<a name="ln878">    const size_t per_shard = (capacity + (num_shards - 1)) / num_shards;</a>
+<a name="ln879">    for (int s = 0; s &lt; num_shards; s++) {</a>
+<a name="ln880">      shards_[s].SetStrictCapacityLimit(strict_capacity_limit);</a>
+<a name="ln881">      shards_[s].SetCapacity(per_shard);</a>
+<a name="ln882">    }</a>
+<a name="ln883">  }</a>
+<a name="ln884"> </a>
+<a name="ln885">  virtual ~ShardedLRUCache() {</a>
+<a name="ln886">    delete[] shards_;</a>
+<a name="ln887">  }</a>
+<a name="ln888"> </a>
+<a name="ln889">  void SetCapacity(size_t capacity) override {</a>
+<a name="ln890">    int num_shards = 1 &lt;&lt; num_shard_bits_;</a>
+<a name="ln891">    const size_t per_shard = (capacity + (num_shards - 1)) / num_shards;</a>
+<a name="ln892">    MutexLock l(&amp;capacity_mutex_);</a>
+<a name="ln893">    for (int s = 0; s &lt; num_shards; s++) {</a>
+<a name="ln894">      shards_[s].SetCapacity(per_shard);</a>
+<a name="ln895">    }</a>
+<a name="ln896">    capacity_ = capacity;</a>
+<a name="ln897">  }</a>
+<a name="ln898"> </a>
+<a name="ln899">  virtual Status Insert(const Slice&amp; key, const QueryId query_id, void* value, size_t charge,</a>
+<a name="ln900">                        void (*deleter)(const Slice&amp; key, void* value),</a>
+<a name="ln901">                        Handle** handle, Statistics* statistics) override {</a>
+<a name="ln902">    DCHECK(IsValidQueryId(query_id));</a>
+<a name="ln903">    // Queries with no cache query ids are not cached.</a>
+<a name="ln904">    if (query_id == kNoCacheQueryId) {</a>
+<a name="ln905">      return Status::OK();</a>
+<a name="ln906">    }</a>
+<a name="ln907">    const uint32_t hash = HashSlice(key);</a>
+<a name="ln908">    return shards_[Shard(hash)].Insert(key, hash, query_id, value, charge, deleter,</a>
+<a name="ln909">                                       handle, statistics);</a>
+<a name="ln910">  }</a>
+<a name="ln911"> </a>
+<a name="ln912">  size_t Evict(size_t bytes_to_evict) override {</a>
+<a name="ln913">    auto num_shards = 1ULL &lt;&lt; num_shard_bits_;</a>
+<a name="ln914">    size_t total_evicted = 0;</a>
+<a name="ln915">    // Start at random shard.</a>
+<a name="ln916">    auto index = Shard(yb::RandomUniformInt&lt;uint32_t&gt;());</a>
+<a name="ln917">    for (size_t i = 0; bytes_to_evict &gt; total_evicted &amp;&amp; i != num_shards; ++i) {</a>
+<a name="ln918">      total_evicted += shards_[index].Evict(bytes_to_evict - total_evicted);</a>
+<a name="ln919">      index = (index + 1) &amp; (num_shards - 1);</a>
+<a name="ln920">    }</a>
+<a name="ln921">    return total_evicted;</a>
+<a name="ln922">  }</a>
+<a name="ln923"> </a>
+<a name="ln924">  Handle* Lookup(const Slice&amp; key, const QueryId query_id, Statistics* statistics) override {</a>
+<a name="ln925">    DCHECK(IsValidQueryId(query_id));</a>
+<a name="ln926">    if (query_id == kNoCacheQueryId) {</a>
+<a name="ln927">      return nullptr;</a>
+<a name="ln928">    }</a>
+<a name="ln929">    const uint32_t hash = HashSlice(key);</a>
+<a name="ln930">    return shards_[Shard(hash)].Lookup(key, hash, query_id, statistics);</a>
+<a name="ln931">  }</a>
+<a name="ln932"> </a>
+<a name="ln933">  void Release(Handle* handle) override {</a>
+<a name="ln934">    LRUHandle* h = reinterpret_cast&lt;LRUHandle*&gt;(handle);</a>
+<a name="ln935">    shards_[Shard(h-&gt;hash)].Release(handle);</a>
+<a name="ln936">  }</a>
+<a name="ln937"> </a>
+<a name="ln938">  void Erase(const Slice&amp; key) override {</a>
+<a name="ln939">    const uint32_t hash = HashSlice(key);</a>
+<a name="ln940">    shards_[Shard(hash)].Erase(key, hash);</a>
+<a name="ln941">  }</a>
+<a name="ln942"> </a>
+<a name="ln943">  void* Value(Handle* handle) override {</a>
+<a name="ln944">    return reinterpret_cast&lt;LRUHandle*&gt;(handle)-&gt;value;</a>
+<a name="ln945">  }</a>
+<a name="ln946"> </a>
+<a name="ln947">  uint64_t NewId() override {</a>
+<a name="ln948">    MutexLock l(&amp;id_mutex_);</a>
+<a name="ln949">    return ++(last_id_);</a>
+<a name="ln950">  }</a>
+<a name="ln951"> </a>
+<a name="ln952">  size_t GetCapacity() const override { return capacity_; }</a>
+<a name="ln953"> </a>
+<a name="ln954">  bool HasStrictCapacityLimit() const override {</a>
+<a name="ln955">    return strict_capacity_limit_;</a>
+<a name="ln956">  }</a>
+<a name="ln957"> </a>
+<a name="ln958">  size_t GetUsage() const override {</a>
+<a name="ln959">    // We will not lock the cache when getting the usage from shards.</a>
+<a name="ln960">    int num_shards = 1 &lt;&lt; num_shard_bits_;</a>
+<a name="ln961">    size_t usage = 0;</a>
+<a name="ln962">    for (int s = 0; s &lt; num_shards; s++) {</a>
+<a name="ln963">      usage += shards_[s].GetUsage();</a>
+<a name="ln964">    }</a>
+<a name="ln965">    return usage;</a>
+<a name="ln966">  }</a>
+<a name="ln967"> </a>
+<a name="ln968">  size_t GetUsage(Handle* handle) const override {</a>
+<a name="ln969">    return reinterpret_cast&lt;LRUHandle*&gt;(handle)-&gt;charge;</a>
+<a name="ln970">  }</a>
+<a name="ln971"> </a>
+<a name="ln972">  size_t GetPinnedUsage() const override {</a>
+<a name="ln973">    // We will not lock the cache when getting the usage from shards.</a>
+<a name="ln974">    int num_shards = 1 &lt;&lt; num_shard_bits_;</a>
+<a name="ln975">    size_t usage = 0;</a>
+<a name="ln976">    for (int s = 0; s &lt; num_shards; s++) {</a>
+<a name="ln977">      usage += shards_[s].GetPinnedUsage();</a>
+<a name="ln978">    }</a>
+<a name="ln979">    return usage;</a>
+<a name="ln980">  }</a>
+<a name="ln981"> </a>
+<a name="ln982">  SubCacheType GetSubCacheType(Handle* e) const override {</a>
+<a name="ln983">    LRUHandle* h = reinterpret_cast&lt;LRUHandle*&gt;(e);</a>
+<a name="ln984">    return h-&gt;GetSubCacheType();</a>
+<a name="ln985">  }</a>
+<a name="ln986"> </a>
+<a name="ln987">  void DisownData() override {</a>
+<a name="ln988">    shards_ = nullptr;</a>
+<a name="ln989">  }</a>
+<a name="ln990"> </a>
+<a name="ln991">  virtual void ApplyToAllCacheEntries(void (*callback)(void*, size_t),</a>
+<a name="ln992">                                      bool thread_safe) override {</a>
+<a name="ln993">    int num_shards = 1 &lt;&lt; num_shard_bits_;</a>
+<a name="ln994">    for (int s = 0; s &lt; num_shards; s++) {</a>
+<a name="ln995">      shards_[s].ApplyToAllCacheEntries(callback, thread_safe);</a>
+<a name="ln996">    }</a>
+<a name="ln997">  }</a>
+<a name="ln998"> </a>
+<a name="ln999">  virtual void SetMetrics(const scoped_refptr&lt;yb::MetricEntity&gt;&amp; entity) override {</a>
+<a name="ln1000">    int num_shards = 1 &lt;&lt; num_shard_bits_;</a>
+<a name="ln1001">    metrics_ = std::make_shared&lt;yb::CacheMetrics&gt;(entity);</a>
+<a name="ln1002">    for (int s = 0; s &lt; num_shards; s++) {</a>
+<a name="ln1003">      shards_[s].SetMetrics(metrics_);</a>
+<a name="ln1004">    }</a>
+<a name="ln1005">  }</a>
+<a name="ln1006"> </a>
+<a name="ln1007">  virtual std::vector&lt;std::pair&lt;size_t,size_t&gt;&gt; TEST_GetIndividualUsages() override {</a>
+<a name="ln1008">    std::vector&lt;std::pair&lt;size_t, size_t&gt;&gt; cache_sizes;</a>
+<a name="ln1009">    cache_sizes.reserve(1 &lt;&lt; num_shard_bits_);</a>
+<a name="ln1010"> </a>
+<a name="ln1011">    for (int i = 0; i &lt; 1 &lt;&lt; num_shard_bits_; ++i) {</a>
+<a name="ln1012">      cache_sizes.emplace_back(shards_[i].TEST_GetIndividualUsages());</a>
+<a name="ln1013">    }</a>
+<a name="ln1014">    return cache_sizes;</a>
+<a name="ln1015">  }</a>
+<a name="ln1016">};</a>
+<a name="ln1017"> </a>
+<a name="ln1018">}  // end anonymous namespace</a>
+<a name="ln1019"> </a>
+<a name="ln1020">shared_ptr&lt;Cache&gt; NewLRUCache(size_t capacity) {</a>
+<a name="ln1021">  return NewLRUCache(capacity, kNumShardBits, false);</a>
+<a name="ln1022">}</a>
+<a name="ln1023"> </a>
+<a name="ln1024">shared_ptr&lt;Cache&gt; NewLRUCache(size_t capacity, int num_shard_bits) {</a>
+<a name="ln1025">  return NewLRUCache(capacity, num_shard_bits, false);</a>
+<a name="ln1026">}</a>
+<a name="ln1027"> </a>
+<a name="ln1028">shared_ptr&lt;Cache&gt; NewLRUCache(size_t capacity, int num_shard_bits,</a>
+<a name="ln1029">                              bool strict_capacity_limit) {</a>
+<a name="ln1030">  if (num_shard_bits &gt;= 20) {</a>
+<a name="ln1031">    return nullptr;  // the cache cannot be sharded into too many fine pieces</a>
+<a name="ln1032">  }</a>
+<a name="ln1033">  return std::make_shared&lt;ShardedLRUCache&gt;(capacity, num_shard_bits,</a>
+<a name="ln1034">                                           strict_capacity_limit);</a>
+<a name="ln1035">}</a>
+<a name="ln1036"> </a>
+<a name="ln1037">}  // namespace rocksdb</a>
+
+</code></pre>
+<div class="balloon" rel="902"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="925"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="477"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: total_capacity_, multi_touch_capacity_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,1970 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>backupable_db.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Copyright (c) 2011 The LevelDB Authors. All rights reserved.</a>
+<a name="ln21">// Use of this source code is governed by a BSD-style license that can be</a>
+<a name="ln22">// found in the LICENSE file. See the AUTHORS file for names of contributors.</a>
+<a name="ln23"> </a>
+<a name="ln24">#ifndef ROCKSDB_LITE</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/rocksdb/utilities/backupable_db.h&quot;</a>
+<a name="ln27">#include &quot;yb/rocksdb/db/filename.h&quot;</a>
+<a name="ln28">#include &quot;yb/rocksdb/util/channel.h&quot;</a>
+<a name="ln29">#include &quot;yb/rocksdb/util/coding.h&quot;</a>
+<a name="ln30">#include &quot;yb/rocksdb/util/crc32c.h&quot;</a>
+<a name="ln31">#include &quot;yb/rocksdb/util/file_reader_writer.h&quot;</a>
+<a name="ln32">#include &quot;yb/rocksdb/util/logging.h&quot;</a>
+<a name="ln33">#include &quot;yb/util/string_util.h&quot;</a>
+<a name="ln34">#include &quot;yb/rocksdb/rate_limiter.h&quot;</a>
+<a name="ln35">#include &quot;yb/rocksdb/transaction_log.h&quot;</a>
+<a name="ln36">#include &quot;yb/rocksdb/port/port.h&quot;</a>
+<a name="ln37">#include &quot;yb/rocksdb/util/sync_point.h&quot;</a>
+<a name="ln38"> </a>
+<a name="ln39">#ifndef __STDC_FORMAT_MACROS</a>
+<a name="ln40">#define __STDC_FORMAT_MACROS</a>
+<a name="ln41">#endif  // __STDC_FORMAT_MACROS</a>
+<a name="ln42"> </a>
+<a name="ln43">#include &lt;inttypes.h&gt;</a>
+<a name="ln44">#include &lt;stdlib.h&gt;</a>
+<a name="ln45">#include &lt;algorithm&gt;</a>
+<a name="ln46">#include &lt;vector&gt;</a>
+<a name="ln47">#include &lt;map&gt;</a>
+<a name="ln48">#include &lt;mutex&gt;</a>
+<a name="ln49">#include &lt;sstream&gt;</a>
+<a name="ln50">#include &lt;string&gt;</a>
+<a name="ln51">#include &lt;limits&gt;</a>
+<a name="ln52">#include &lt;atomic&gt;</a>
+<a name="ln53">#include &lt;future&gt;</a>
+<a name="ln54">#include &lt;thread&gt;</a>
+<a name="ln55">#include &lt;unordered_map&gt;</a>
+<a name="ln56">#include &lt;unordered_set&gt;</a>
+<a name="ln57"> </a>
+<a name="ln58">namespace rocksdb {</a>
+<a name="ln59"> </a>
+<a name="ln60">void BackupStatistics::IncrementNumberSuccessBackup() {</a>
+<a name="ln61">  number_success_backup++;</a>
+<a name="ln62">}</a>
+<a name="ln63">void BackupStatistics::IncrementNumberFailBackup() {</a>
+<a name="ln64">  number_fail_backup++;</a>
+<a name="ln65">}</a>
+<a name="ln66"> </a>
+<a name="ln67">uint32_t BackupStatistics::GetNumberSuccessBackup() const {</a>
+<a name="ln68">  return number_success_backup;</a>
+<a name="ln69">}</a>
+<a name="ln70">uint32_t BackupStatistics::GetNumberFailBackup() const {</a>
+<a name="ln71">  return number_fail_backup;</a>
+<a name="ln72">}</a>
+<a name="ln73"> </a>
+<a name="ln74">std::string BackupStatistics::ToString() const {</a>
+<a name="ln75">  char result[50];</a>
+<a name="ln76">  snprintf(result, sizeof(result), &quot;# success backup: %u, # fail backup: %u&quot;,</a>
+<a name="ln77">           GetNumberSuccessBackup(), GetNumberFailBackup());</a>
+<a name="ln78">  return result;</a>
+<a name="ln79">}</a>
+<a name="ln80"> </a>
+<a name="ln81">void BackupableDBOptions::Dump(Logger* logger) const {</a>
+<a name="ln82">  RLOG(logger, &quot;               Options.backup_dir: %s&quot;, backup_dir.c_str());</a>
+<a name="ln83">  RLOG(logger, &quot;               Options.backup_env: %p&quot;, backup_env);</a>
+<a name="ln84">  RLOG(logger, &quot;        Options.share_table_files: %d&quot;,</a>
+<a name="ln85">      static_cast&lt;int&gt;(share_table_files));</a>
+<a name="ln86">  RLOG(logger, &quot;                 Options.info_log: %p&quot;, info_log);</a>
+<a name="ln87">  RLOG(logger, &quot;                     Options.sync: %d&quot;, static_cast&lt;int&gt;(sync));</a>
+<a name="ln88">  RLOG(logger, &quot;         Options.destroy_old_data: %d&quot;,</a>
+<a name="ln89">      static_cast&lt;int&gt;(destroy_old_data));</a>
+<a name="ln90">  RLOG(logger, &quot;         Options.backup_log_files: %d&quot;,</a>
+<a name="ln91">      static_cast&lt;int&gt;(backup_log_files));</a>
+<a name="ln92">  RLOG(logger, &quot;        Options.backup_rate_limit: %&quot; PRIu64, backup_rate_limit);</a>
+<a name="ln93">  RLOG(logger, &quot;       Options.restore_rate_limit: %&quot; PRIu64,</a>
+<a name="ln94">      restore_rate_limit);</a>
+<a name="ln95">  RLOG(logger, &quot;Options.max_background_operations: %d&quot;,</a>
+<a name="ln96">      max_background_operations);</a>
+<a name="ln97">}</a>
+<a name="ln98"> </a>
+<a name="ln99">// -------- BackupEngineImpl class ---------</a>
+<a name="ln100">class BackupEngineImpl : public BackupEngine {</a>
+<a name="ln101"> public:</a>
+<a name="ln102">  BackupEngineImpl(Env* db_env, const BackupableDBOptions&amp; options,</a>
+<a name="ln103">                   bool read_only = false);</a>
+<a name="ln104">  ~BackupEngineImpl();</a>
+<a name="ln105">  Status CreateNewBackup(DB* db, bool flush_before_backup = false,</a>
+<a name="ln106">                         std::function&lt;void()&gt; progress_callback = []() {</a>
+<a name="ln107">                         }) override;</a>
+<a name="ln108">  Status PurgeOldBackups(uint32_t num_backups_to_keep) override;</a>
+<a name="ln109">  Status DeleteBackup(BackupID backup_id) override;</a>
+<a name="ln110">  void StopBackup() override {</a>
+<a name="ln111">    stop_backup_.store(true, std::memory_order_release);</a>
+<a name="ln112">  }</a>
+<a name="ln113">  Status GarbageCollect() override;</a>
+<a name="ln114"> </a>
+<a name="ln115">  void GetBackupInfo(std::vector&lt;BackupInfo&gt;* backup_info) override;</a>
+<a name="ln116">  void GetCorruptedBackups(std::vector&lt;BackupID&gt;* corrupt_backup_ids) override;</a>
+<a name="ln117">  Status RestoreDBFromBackup(</a>
+<a name="ln118">      BackupID backup_id, const std::string&amp; db_dir, const std::string&amp; wal_dir,</a>
+<a name="ln119">      const RestoreOptions&amp; restore_options = RestoreOptions()) override;</a>
+<a name="ln120">  Status RestoreDBFromLatestBackup(</a>
+<a name="ln121">      const std::string&amp; db_dir, const std::string&amp; wal_dir,</a>
+<a name="ln122">      const RestoreOptions&amp; restore_options = RestoreOptions()) override {</a>
+<a name="ln123">    return RestoreDBFromBackup(latest_backup_id_, db_dir, wal_dir,</a>
+<a name="ln124">                               restore_options);</a>
+<a name="ln125">  }</a>
+<a name="ln126"> </a>
+<a name="ln127">  Status VerifyBackup(BackupID backup_id) override;</a>
+<a name="ln128"> </a>
+<a name="ln129">  Status Initialize();</a>
+<a name="ln130"> </a>
+<a name="ln131"> private:</a>
+<a name="ln132">  void DeleteChildren(const std::string&amp; dir, uint32_t file_type_filter = 0);</a>
+<a name="ln133"> </a>
+<a name="ln134">  // Extends the &quot;result&quot; map with pathname-&gt;size mappings for the contents of</a>
+<a name="ln135">  // &quot;dir&quot;. Pathnames are prefixed with &quot;dir&quot;.</a>
+<a name="ln136">  Status InsertPathnameToSizeBytes(</a>
+<a name="ln137">      const std::string&amp; dir,</a>
+<a name="ln138">      std::unordered_map&lt;std::string, uint64_t&gt;* result);</a>
+<a name="ln139"> </a>
+<a name="ln140">  void InsertPathnameToSizeBytesWarnNotOk(</a>
+<a name="ln141">      const std::string&amp; dir,</a>
+<a name="ln142">      std::unordered_map&lt;std::string, uint64_t&gt;* result) {</a>
+<a name="ln143">    WARN_NOT_OK(InsertPathnameToSizeBytes(dir, result),</a>
+<a name="ln144">                &quot;Failed to insert pathname to size bytes &quot; + dir);</a>
+<a name="ln145">  }</a>
+<a name="ln146"> </a>
+<a name="ln147">  struct FileInfo {</a>
+<a name="ln148">    FileInfo(const std::string&amp; fname, uint64_t sz, uint32_t checksum)</a>
+<a name="ln149">      : refs(0), filename(fname), size(sz), checksum_value(checksum) {}</a>
+<a name="ln150"> </a>
+<a name="ln151">    FileInfo(const FileInfo&amp;) = delete;</a>
+<a name="ln152">    FileInfo&amp; operator=(const FileInfo&amp;) = delete;</a>
+<a name="ln153"> </a>
+<a name="ln154">    int refs;</a>
+<a name="ln155">    const std::string filename;</a>
+<a name="ln156">    const uint64_t size;</a>
+<a name="ln157">    const uint32_t checksum_value;</a>
+<a name="ln158">  };</a>
+<a name="ln159"> </a>
+<a name="ln160">  class BackupMeta {</a>
+<a name="ln161">   public:</a>
+<a name="ln162">    BackupMeta(const std::string&amp; meta_filename,</a>
+<a name="ln163">        std::unordered_map&lt;std::string, std::shared_ptr&lt;FileInfo&gt;&gt;* file_infos,</a>
+<a name="ln164">        Env* env)</a>
+<a name="ln165">      : timestamp_(0), size_(0), meta_filename_(meta_filename),</a>
+<a name="ln166">        file_infos_(file_infos), env_(env) {}</a>
+<a name="ln167"> </a>
+<a name="ln168">    BackupMeta(const BackupMeta&amp;) = delete;</a>
+<a name="ln169">    BackupMeta&amp; operator=(const BackupMeta&amp;) = delete;</a>
+<a name="ln170"> </a>
+<a name="ln171">    ~BackupMeta() {}</a>
+<a name="ln172"> </a>
+<a name="ln173">    void RecordTimestamp() {</a>
+<a name="ln174">      CHECK_OK(env_-&gt;GetCurrentTime(&amp;timestamp_));</a>
+<a name="ln175">    }</a>
+<a name="ln176">    int64_t GetTimestamp() const {</a>
+<a name="ln177">      return timestamp_;</a>
+<a name="ln178">    }</a>
+<a name="ln179">    uint64_t GetSize() const {</a>
+<a name="ln180">      return size_;</a>
+<a name="ln181">    }</a>
+<a name="ln182">    uint32_t GetNumberFiles() { return static_cast&lt;uint32_t&gt;(files_.size()); }</a>
+<a name="ln183">    void SetSequenceNumber(uint64_t sequence_number) {</a>
+<a name="ln184">      sequence_number_ = sequence_number;</a>
+<a name="ln185">    }</a>
+<a name="ln186">    uint64_t GetSequenceNumber() {</a>
+<a name="ln187">      return sequence_number_;</a>
+<a name="ln188">    }</a>
+<a name="ln189"> </a>
+<a name="ln190">    Status AddFile(std::shared_ptr&lt;FileInfo&gt; file_info);</a>
+<a name="ln191"> </a>
+<a name="ln192">    Status Delete(bool delete_meta = true);</a>
+<a name="ln193"> </a>
+<a name="ln194">    bool Empty() {</a>
+<a name="ln195">      return files_.empty();</a>
+<a name="ln196">    }</a>
+<a name="ln197"> </a>
+<a name="ln198">    std::shared_ptr&lt;FileInfo&gt; GetFile(const std::string&amp; filename) const {</a>
+<a name="ln199">      auto it = file_infos_-&gt;find(filename);</a>
+<a name="ln200">      if (it == file_infos_-&gt;end())</a>
+<a name="ln201">        return nullptr;</a>
+<a name="ln202">      return it-&gt;second;</a>
+<a name="ln203">    }</a>
+<a name="ln204"> </a>
+<a name="ln205">    const std::vector&lt;std::shared_ptr&lt;FileInfo&gt;&gt;&amp; GetFiles() {</a>
+<a name="ln206">      return files_;</a>
+<a name="ln207">    }</a>
+<a name="ln208"> </a>
+<a name="ln209">    // @param abs_path_to_size Pre-fetched file sizes (bytes).</a>
+<a name="ln210">    Status LoadFromFile(</a>
+<a name="ln211">        const std::string&amp; backup_dir,</a>
+<a name="ln212">        const std::unordered_map&lt;std::string, uint64_t&gt;&amp; abs_path_to_size);</a>
+<a name="ln213">    Status StoreToFile(bool sync);</a>
+<a name="ln214"> </a>
+<a name="ln215">    std::string GetInfoString() {</a>
+<a name="ln216">      std::ostringstream ss;</a>
+<a name="ln217">      ss &lt;&lt; &quot;Timestamp: &quot; &lt;&lt; timestamp_ &lt;&lt; std::endl;</a>
+<a name="ln218">      char human_size[16];</a>
+<a name="ln219">      AppendHumanBytes(size_, human_size, sizeof(human_size));</a>
+<a name="ln220">      ss &lt;&lt; &quot;Size: &quot; &lt;&lt; human_size &lt;&lt; std::endl;</a>
+<a name="ln221">      ss &lt;&lt; &quot;Files:&quot; &lt;&lt; std::endl;</a>
+<a name="ln222">      for (const auto&amp; file : files_) {</a>
+<a name="ln223">        AppendHumanBytes(file-&gt;size, human_size, sizeof(human_size));</a>
+<a name="ln224">        ss &lt;&lt; file-&gt;filename &lt;&lt; &quot;, size &quot; &lt;&lt; human_size &lt;&lt; &quot;, refs &quot;</a>
+<a name="ln225">           &lt;&lt; file-&gt;refs &lt;&lt; std::endl;</a>
+<a name="ln226">      }</a>
+<a name="ln227">      return ss.str();</a>
+<a name="ln228">    }</a>
+<a name="ln229"> </a>
+<a name="ln230">   private:</a>
+<a name="ln231">    int64_t timestamp_;</a>
+<a name="ln232">    // sequence number is only approximate, should not be used</a>
+<a name="ln233">    // by clients</a>
+<a name="ln234">    uint64_t sequence_number_;</a>
+<a name="ln235">    uint64_t size_;</a>
+<a name="ln236">    std::string const meta_filename_;</a>
+<a name="ln237">    // files with relative paths (without &quot;/&quot; prefix!!)</a>
+<a name="ln238">    std::vector&lt;std::shared_ptr&lt;FileInfo&gt;&gt; files_;</a>
+<a name="ln239">    std::unordered_map&lt;std::string, std::shared_ptr&lt;FileInfo&gt;&gt;* file_infos_;</a>
+<a name="ln240">    Env* env_;</a>
+<a name="ln241"> </a>
+<a name="ln242">    static const size_t max_backup_meta_file_size_ = 10 * 1024 * 1024;  // 10MB</a>
+<a name="ln243">  };  // BackupMeta</a>
+<a name="ln244"> </a>
+<a name="ln245">  inline std::string GetAbsolutePath(</a>
+<a name="ln246">      const std::string &amp;relative_path = &quot;&quot;) const {</a>
+<a name="ln247">    assert(relative_path.size() == 0 || relative_path[0] != '/');</a>
+<a name="ln248">    return options_.backup_dir + &quot;/&quot; + relative_path;</a>
+<a name="ln249">  }</a>
+<a name="ln250">  inline std::string GetPrivateDirRel() const {</a>
+<a name="ln251">    return &quot;private&quot;;</a>
+<a name="ln252">  }</a>
+<a name="ln253">  inline std::string GetSharedChecksumDirRel() const {</a>
+<a name="ln254">    return &quot;shared_checksum&quot;;</a>
+<a name="ln255">  }</a>
+<a name="ln256">  inline std::string GetPrivateFileRel(BackupID backup_id,</a>
+<a name="ln257">                                       bool tmp = false,</a>
+<a name="ln258">                                       const std::string&amp; file = &quot;&quot;) const {</a>
+<a name="ln259">    assert(file.size() == 0 || file[0] != '/');</a>
+<a name="ln260">    return GetPrivateDirRel() + &quot;/&quot; + rocksdb::ToString(backup_id) +</a>
+<a name="ln261">           (tmp ? &quot;.tmp&quot; : &quot;&quot;) + &quot;/&quot; + file;</a>
+<a name="ln262">  }</a>
+<a name="ln263">  inline std::string GetSharedFileRel(const std::string&amp; file = &quot;&quot;,</a>
+<a name="ln264">                                      bool tmp = false) const {</a>
+<a name="ln265">    assert(file.size() == 0 || file[0] != '/');</a>
+<a name="ln266">    return &quot;shared/&quot; + file + (tmp ? &quot;.tmp&quot; : &quot;&quot;);</a>
+<a name="ln267">  }</a>
+<a name="ln268">  inline std::string GetSharedFileWithChecksumRel(const std::string&amp; file = &quot;&quot;,</a>
+<a name="ln269">                                                  bool tmp = false) const {</a>
+<a name="ln270">    assert(file.size() == 0 || file[0] != '/');</a>
+<a name="ln271">    return GetSharedChecksumDirRel() + &quot;/&quot; + file + (tmp ? &quot;.tmp&quot; : &quot;&quot;);</a>
+<a name="ln272">  }</a>
+<a name="ln273">  inline std::string GetSharedFileWithChecksum(const std::string&amp; file,</a>
+<a name="ln274">                                               const uint32_t checksum_value,</a>
+<a name="ln275">                                               const uint64_t file_size) const {</a>
+<a name="ln276">    assert(file.size() == 0 || file[0] != '/');</a>
+<a name="ln277">    std::string file_copy = file;</a>
+<a name="ln278">    return file_copy.insert(file_copy.find_last_of('.'),</a>
+<a name="ln279">                            &quot;_&quot; + rocksdb::ToString(checksum_value) + &quot;_&quot; +</a>
+<a name="ln280">                                rocksdb::ToString(file_size));</a>
+<a name="ln281">  }</a>
+<a name="ln282">  inline std::string GetFileFromChecksumFile(const std::string&amp; file) const {</a>
+<a name="ln283">    assert(file.size() == 0 || file[0] != '/');</a>
+<a name="ln284">    std::string file_copy = file;</a>
+<a name="ln285">    size_t first_underscore = file_copy.find_first_of('_');</a>
+<a name="ln286">    return file_copy.erase(first_underscore,</a>
+<a name="ln287">                           file_copy.find_last_of('.') - first_underscore);</a>
+<a name="ln288">  }</a>
+<a name="ln289">  inline std::string GetLatestBackupFile(bool tmp = false) const {</a>
+<a name="ln290">    return GetAbsolutePath(std::string(&quot;LATEST_BACKUP&quot;) + (tmp ? &quot;.tmp&quot; : &quot;&quot;));</a>
+<a name="ln291">  }</a>
+<a name="ln292">  inline std::string GetBackupMetaDir() const {</a>
+<a name="ln293">    return GetAbsolutePath(&quot;meta&quot;);</a>
+<a name="ln294">  }</a>
+<a name="ln295">  inline std::string GetBackupMetaFile(BackupID backup_id) const {</a>
+<a name="ln296">    return GetBackupMetaDir() + &quot;/&quot; + rocksdb::ToString(backup_id);</a>
+<a name="ln297">  }</a>
+<a name="ln298"> </a>
+<a name="ln299">  Status PutLatestBackupFileContents(uint32_t latest_backup);</a>
+<a name="ln300"> </a>
+<a name="ln301">  // If size_limit == 0, there is no size limit, copy everything.</a>
+<a name="ln302">  //</a>
+<a name="ln303">  // Exactly one of src and contents must be non-empty.</a>
+<a name="ln304">  //</a>
+<a name="ln305">  // @param src If non-empty, the file is copied from this pathname.</a>
+<a name="ln306">  // @param contents If non-empty, the file will be created with these contents.</a>
+<a name="ln307">  Status CopyOrCreateFile(const std::string&amp; src, const std::string&amp; dst,</a>
+<a name="ln308">                          const std::string&amp; contents, Env* src_env,</a>
+<a name="ln309">                          Env* dst_env, bool sync, RateLimiter* rate_limiter,</a>
+<a name="ln310">                          uint64_t* size = nullptr,</a>
+<a name="ln311">                          uint32_t* checksum_value = nullptr,</a>
+<a name="ln312">                          uint64_t size_limit = 0,</a>
+<a name="ln313">                          std::function&lt;void()&gt; progress_callback = []() {});</a>
+<a name="ln314"> </a>
+<a name="ln315">  Status CalculateChecksum(const std::string&amp; src,</a>
+<a name="ln316">                           Env* src_env,</a>
+<a name="ln317">                           uint64_t size_limit,</a>
+<a name="ln318">                           uint32_t* checksum_value);</a>
+<a name="ln319"> </a>
+<a name="ln320">  struct CopyOrCreateResult {</a>
+<a name="ln321">    uint64_t size;</a>
+<a name="ln322">    uint32_t checksum_value;</a>
+<a name="ln323">    Status status;</a>
+<a name="ln324">  };</a>
+<a name="ln325"> </a>
+<a name="ln326">  // Exactly one of src_path and contents must be non-empty. If src_path is</a>
+<a name="ln327">  // non-empty, the file is copied from this pathname. Otherwise, if contents is</a>
+<a name="ln328">  // non-empty, the file will be created at dst_path with these contents.</a>
+<a name="ln329">  struct CopyOrCreateWorkItem {</a>
+<a name="ln330">    std::string src_path;</a>
+<a name="ln331">    std::string dst_path;</a>
+<a name="ln332">    std::string contents;</a>
+<a name="ln333">    Env* src_env;</a>
+<a name="ln334">    Env* dst_env;</a>
+<a name="ln335">    bool sync;</a>
+<a name="ln336">    RateLimiter* rate_limiter;</a>
+<a name="ln337">    uint64_t size_limit;</a>
+<a name="ln338">    std::promise&lt;CopyOrCreateResult&gt; result;</a>
+<a name="ln339">    std::function&lt;void()&gt; progress_callback;</a>
+<a name="ln340"> </a>
+<a name="ln341">    CopyOrCreateWorkItem() {}</a>
+<a name="ln342">    CopyOrCreateWorkItem(const CopyOrCreateWorkItem&amp;) = delete;</a>
+<a name="ln343">    CopyOrCreateWorkItem&amp; operator=(const CopyOrCreateWorkItem&amp;) = delete;</a>
+<a name="ln344"> </a>
+<a name="ln345">    CopyOrCreateWorkItem(CopyOrCreateWorkItem&amp;&amp; o) ROCKSDB_NOEXCEPT {</a>
+<a name="ln346">      *this = std::move(o);</a>
+<a name="ln347">    }</a>
+<a name="ln348"> </a>
+<a name="ln349">    CopyOrCreateWorkItem&amp; operator=(CopyOrCreateWorkItem&amp;&amp; o) ROCKSDB_NOEXCEPT {</a>
+<a name="ln350">      src_path = std::move(o.src_path);</a>
+<a name="ln351">      dst_path = std::move(o.dst_path);</a>
+<a name="ln352">      contents = std::move(o.contents);</a>
+<a name="ln353">      src_env = o.src_env;</a>
+<a name="ln354">      dst_env = o.dst_env;</a>
+<a name="ln355">      sync = o.sync;</a>
+<a name="ln356">      rate_limiter = o.rate_limiter;</a>
+<a name="ln357">      size_limit = o.size_limit;</a>
+<a name="ln358">      result = std::move(o.result);</a>
+<a name="ln359">      progress_callback = std::move(o.progress_callback);</a>
+<a name="ln360">      return *this;</a>
+<a name="ln361">    }</a>
+<a name="ln362"> </a>
+<a name="ln363">    CopyOrCreateWorkItem(std::string _src_path, std::string _dst_path,</a>
+<a name="ln364">                         std::string _contents, Env* _src_env, Env* _dst_env,</a>
+<a name="ln365">                         bool _sync, RateLimiter* _rate_limiter,</a>
+<a name="ln366">                         uint64_t _size_limit,</a>
+<a name="ln367">                         std::function&lt;void()&gt; _progress_callback = []() {})</a>
+<a name="ln368">        : src_path(std::move(_src_path)),</a>
+<a name="ln369">          dst_path(std::move(_dst_path)),</a>
+<a name="ln370">          contents(std::move(_contents)),</a>
+<a name="ln371">          src_env(_src_env),</a>
+<a name="ln372">          dst_env(_dst_env),</a>
+<a name="ln373">          sync(_sync),</a>
+<a name="ln374">          rate_limiter(_rate_limiter),</a>
+<a name="ln375">          size_limit(_size_limit),</a>
+<a name="ln376">          progress_callback(_progress_callback) {}</a>
+<a name="ln377">  };</a>
+<a name="ln378"> </a>
+<a name="ln379">  struct BackupAfterCopyOrCreateWorkItem {</a>
+<a name="ln380">    std::future&lt;CopyOrCreateResult&gt; result;</a>
+<a name="ln381">    bool shared;</a>
+<a name="ln382">    bool needed_to_copy;</a>
+<a name="ln383">    Env* backup_env;</a>
+<a name="ln384">    std::string dst_path_tmp;</a>
+<a name="ln385">    std::string dst_path;</a>
+<a name="ln386">    std::string dst_relative;</a>
+<a name="ln387">    BackupAfterCopyOrCreateWorkItem() {}</a>
+<a name="ln388"> </a>
+<a name="ln389">    BackupAfterCopyOrCreateWorkItem(BackupAfterCopyOrCreateWorkItem&amp;&amp; o)</a>
+<a name="ln390">        ROCKSDB_NOEXCEPT {</a>
+<a name="ln391">      *this = std::move(o);</a>
+<a name="ln392">    }</a>
+<a name="ln393"> </a>
+<a name="ln394">    BackupAfterCopyOrCreateWorkItem&amp; operator=(</a>
+<a name="ln395">        BackupAfterCopyOrCreateWorkItem&amp;&amp; o) ROCKSDB_NOEXCEPT {</a>
+<a name="ln396">      result = std::move(o.result);</a>
+<a name="ln397">      shared = o.shared;</a>
+<a name="ln398">      needed_to_copy = o.needed_to_copy;</a>
+<a name="ln399">      backup_env = o.backup_env;</a>
+<a name="ln400">      dst_path_tmp = std::move(o.dst_path_tmp);</a>
+<a name="ln401">      dst_path = std::move(o.dst_path);</a>
+<a name="ln402">      dst_relative = std::move(o.dst_relative);</a>
+<a name="ln403">      return *this;</a>
+<a name="ln404">    }</a>
+<a name="ln405"> </a>
+<a name="ln406">    BackupAfterCopyOrCreateWorkItem(std::future&lt;CopyOrCreateResult&gt;&amp;&amp; _result,</a>
+<a name="ln407">                                    bool _shared, bool _needed_to_copy,</a>
+<a name="ln408">                                    Env* _backup_env, std::string _dst_path_tmp,</a>
+<a name="ln409">                                    std::string _dst_path,</a>
+<a name="ln410">                                    std::string _dst_relative)</a>
+<a name="ln411">        : result(std::move(_result)),</a>
+<a name="ln412">          shared(_shared),</a>
+<a name="ln413">          needed_to_copy(_needed_to_copy),</a>
+<a name="ln414">          backup_env(_backup_env),</a>
+<a name="ln415">          dst_path_tmp(std::move(_dst_path_tmp)),</a>
+<a name="ln416">          dst_path(std::move(_dst_path)),</a>
+<a name="ln417">          dst_relative(std::move(_dst_relative)) {}</a>
+<a name="ln418">  };</a>
+<a name="ln419"> </a>
+<a name="ln420">  struct RestoreAfterCopyOrCreateWorkItem {</a>
+<a name="ln421">    std::future&lt;CopyOrCreateResult&gt; result;</a>
+<a name="ln422">    uint32_t checksum_value;</a>
+<a name="ln423">    RestoreAfterCopyOrCreateWorkItem() {}</a>
+<a name="ln424">    RestoreAfterCopyOrCreateWorkItem(std::future&lt;CopyOrCreateResult&gt;&amp;&amp; _result,</a>
+<a name="ln425">                                     uint32_t _checksum_value)</a>
+<a name="ln426">        : result(std::move(_result)), checksum_value(_checksum_value) {}</a>
+<a name="ln427">    RestoreAfterCopyOrCreateWorkItem(RestoreAfterCopyOrCreateWorkItem&amp;&amp; o)</a>
+<a name="ln428">        ROCKSDB_NOEXCEPT {</a>
+<a name="ln429">      *this = std::move(o);</a>
+<a name="ln430">    }</a>
+<a name="ln431"> </a>
+<a name="ln432">    RestoreAfterCopyOrCreateWorkItem&amp; operator=(</a>
+<a name="ln433">        RestoreAfterCopyOrCreateWorkItem&amp;&amp; o) ROCKSDB_NOEXCEPT {</a>
+<a name="ln434">      result = std::move(o.result);</a>
+<a name="ln435">      checksum_value = o.checksum_value;</a>
+<a name="ln436">      return *this;</a>
+<a name="ln437">    }</a>
+<a name="ln438">  };</a>
+<a name="ln439"> </a>
+<a name="ln440">  bool initialized_;</a>
+<a name="ln441">  std::mutex byte_report_mutex_;</a>
+<a name="ln442">  channel&lt;CopyOrCreateWorkItem&gt; files_to_copy_or_create_;</a>
+<a name="ln443">  std::vector&lt;std::thread&gt; threads_;</a>
+<a name="ln444"> </a>
+<a name="ln445">  // Adds a file to the backup work queue to be copied or created if it doesn't</a>
+<a name="ln446">  // already exist.</a>
+<a name="ln447">  //</a>
+<a name="ln448">  // Exactly one of src_dir and contents must be non-empty.</a>
+<a name="ln449">  //</a>
+<a name="ln450">  // @param src_dir If non-empty, the file in this directory named fname will be</a>
+<a name="ln451">  //    copied.</a>
+<a name="ln452">  // @param fname Name of destination file and, in case of copy, source file.</a>
+<a name="ln453">  // @param contents If non-empty, the file will be created with these contents.</a>
+<a name="ln454">  Status AddBackupFileWorkItem(</a>
+<a name="ln455">      std::unordered_set&lt;std::string&gt;* live_dst_paths,</a>
+<a name="ln456">      std::vector&lt;BackupAfterCopyOrCreateWorkItem&gt;* backup_items_to_finish,</a>
+<a name="ln457">      BackupID backup_id, bool shared, const std::string&amp; src_dir,</a>
+<a name="ln458">      const std::string&amp; fname,  // starts with &quot;/&quot;</a>
+<a name="ln459">      RateLimiter* rate_limiter, uint64_t size_bytes, uint64_t size_limit = 0,</a>
+<a name="ln460">      bool shared_checksum = false,</a>
+<a name="ln461">      std::function&lt;void()&gt; progress_callback = []() {},</a>
+<a name="ln462">      const std::string&amp; contents = std::string());</a>
+<a name="ln463"> </a>
+<a name="ln464">  // backup state data</a>
+<a name="ln465">  BackupID latest_backup_id_;</a>
+<a name="ln466">  std::map&lt;BackupID, unique_ptr&lt;BackupMeta&gt;&gt; backups_;</a>
+<a name="ln467">  std::map&lt;BackupID,</a>
+<a name="ln468">           std::pair&lt;Status, unique_ptr&lt;BackupMeta&gt;&gt;&gt; corrupt_backups_;</a>
+<a name="ln469">  std::unordered_map&lt;std::string,</a>
+<a name="ln470">                     std::shared_ptr&lt;FileInfo&gt;&gt; backuped_file_infos_;</a>
+<a name="ln471">  std::atomic&lt;bool&gt; stop_backup_;</a>
+<a name="ln472"> </a>
+<a name="ln473">  // options data</a>
+<a name="ln474">  BackupableDBOptions options_;</a>
+<a name="ln475">  Env* db_env_;</a>
+<a name="ln476">  Env* backup_env_;</a>
+<a name="ln477"> </a>
+<a name="ln478">  // directories</a>
+<a name="ln479">  unique_ptr&lt;Directory&gt; backup_directory_;</a>
+<a name="ln480">  unique_ptr&lt;Directory&gt; shared_directory_;</a>
+<a name="ln481">  unique_ptr&lt;Directory&gt; meta_directory_;</a>
+<a name="ln482">  unique_ptr&lt;Directory&gt; private_directory_;</a>
+<a name="ln483"> </a>
+<a name="ln484">  static const size_t kDefaultCopyFileBufferSize = 5 * 1024 * 1024LL;  // 5MB</a>
+<a name="ln485">  size_t copy_file_buffer_size_;</a>
+<a name="ln486">  bool read_only_;</a>
+<a name="ln487">  BackupStatistics backup_statistics_;</a>
+<a name="ln488">};</a>
+<a name="ln489"> </a>
+<a name="ln490">Status BackupEngine::Open(Env* env, const BackupableDBOptions&amp; options,</a>
+<a name="ln491">                          BackupEngine** backup_engine_ptr) {</a>
+<a name="ln492">  std::unique_ptr&lt;BackupEngineImpl&gt; backup_engine(</a>
+<a name="ln493">      new BackupEngineImpl(env, options));</a>
+<a name="ln494">  auto s = backup_engine-&gt;Initialize();</a>
+<a name="ln495">  if (!s.ok()) {</a>
+<a name="ln496">    *backup_engine_ptr = nullptr;</a>
+<a name="ln497">    return s;</a>
+<a name="ln498">  }</a>
+<a name="ln499">  *backup_engine_ptr = backup_engine.release();</a>
+<a name="ln500">  return Status::OK();</a>
+<a name="ln501">}</a>
+<a name="ln502"> </a>
+<a name="ln503">BackupEngineImpl::BackupEngineImpl(Env* db_env,</a>
+<a name="ln504">                                   const BackupableDBOptions&amp; options,</a>
+<a name="ln505">                                   bool read_only)</a>
+<a name="ln506">    : initialized_(false),</a>
+<a name="ln507">      stop_backup_(false),</a>
+<a name="ln508">      options_(options),</a>
+<a name="ln509">      db_env_(db_env),</a>
+<a name="ln510">      backup_env_(options.backup_env != nullptr ? options.backup_env : db_env_),</a>
+<a name="ln511">      copy_file_buffer_size_(kDefaultCopyFileBufferSize),</a>
+<a name="ln512">      read_only_(read_only) {}</a>
+<a name="ln513"> </a>
+<a name="ln514">BackupEngineImpl::~BackupEngineImpl() {</a>
+<a name="ln515">  files_to_copy_or_create_.sendEof();</a>
+<a name="ln516">  for (auto&amp; t : threads_) {</a>
+<a name="ln517">    t.join();</a>
+<a name="ln518">  }</a>
+<a name="ln519">  LogFlush(options_.info_log);</a>
+<a name="ln520">}</a>
+<a name="ln521"> </a>
+<a name="ln522">Status BackupEngineImpl::Initialize() {</a>
+<a name="ln523">  assert(!initialized_);</a>
+<a name="ln524">  initialized_ = true;</a>
+<a name="ln525">  if (read_only_) {</a>
+<a name="ln526">    RLOG(options_.info_log, &quot;Starting read_only backup engine&quot;);</a>
+<a name="ln527">  }</a>
+<a name="ln528">  options_.Dump(options_.info_log);</a>
+<a name="ln529"> </a>
+<a name="ln530">  if (!read_only_) {</a>
+<a name="ln531">    // gather the list of directories that we need to create</a>
+<a name="ln532">    std::vector&lt;std::pair&lt;std::string, std::unique_ptr&lt;Directory&gt;*&gt;&gt;</a>
+<a name="ln533">        directories;</a>
+<a name="ln534">    directories.emplace_back(GetAbsolutePath(), &amp;backup_directory_);</a>
+<a name="ln535">    if (options_.share_table_files) {</a>
+<a name="ln536">      if (options_.share_files_with_checksum) {</a>
+<a name="ln537">        directories.emplace_back(</a>
+<a name="ln538">            GetAbsolutePath(GetSharedFileWithChecksumRel()),</a>
+<a name="ln539">            &amp;shared_directory_);</a>
+<a name="ln540">      } else {</a>
+<a name="ln541">        directories.emplace_back(GetAbsolutePath(GetSharedFileRel()),</a>
+<a name="ln542">                                 &amp;shared_directory_);</a>
+<a name="ln543">      }</a>
+<a name="ln544">    }</a>
+<a name="ln545">    directories.emplace_back(GetAbsolutePath(GetPrivateDirRel()),</a>
+<a name="ln546">                             &amp;private_directory_);</a>
+<a name="ln547">    directories.emplace_back(GetBackupMetaDir(), &amp;meta_directory_);</a>
+<a name="ln548">    // create all the dirs we need</a>
+<a name="ln549">    for (const auto&amp; d : directories) {</a>
+<a name="ln550">      auto s = backup_env_-&gt;CreateDirIfMissing(d.first);</a>
+<a name="ln551">      if (s.ok()) {</a>
+<a name="ln552">        s = backup_env_-&gt;NewDirectory(d.first, d.second);</a>
+<a name="ln553">      }</a>
+<a name="ln554">      if (!s.ok()) {</a>
+<a name="ln555">        return s;</a>
+<a name="ln556">      }</a>
+<a name="ln557">    }</a>
+<a name="ln558">  }</a>
+<a name="ln559"> </a>
+<a name="ln560">  std::vector&lt;std::string&gt; backup_meta_files;</a>
+<a name="ln561">  {</a>
+<a name="ln562">    auto s = backup_env_-&gt;GetChildren(GetBackupMetaDir(), &amp;backup_meta_files);</a>
+<a name="ln563">    if (!s.ok()) {</a>
+<a name="ln564">      return s;</a>
+<a name="ln565">    }</a>
+<a name="ln566">  }</a>
+<a name="ln567">  // create backups_ structure</a>
+<a name="ln568">  for (auto&amp; file : backup_meta_files) {</a>
+<a name="ln569">    if (file == &quot;.&quot; || file == &quot;..&quot;) {</a>
+<a name="ln570">      continue;</a>
+<a name="ln571">    }</a>
+<a name="ln572">    RLOG(options_.info_log, &quot;Detected backup %s&quot;, file.c_str());</a>
+<a name="ln573">    BackupID backup_id = 0;</a>
+<a name="ln574">    sscanf(file.c_str(), &quot;%u&quot;, &amp;backup_id);</a>
+<a name="ln575">    if (backup_id == 0 || file != rocksdb::ToString(backup_id)) {</a>
+<a name="ln576">      if (!read_only_) {</a>
+<a name="ln577">        // invalid file name, delete that</a>
+<a name="ln578">        auto s = backup_env_-&gt;DeleteFile(GetBackupMetaDir() + &quot;/&quot; + file);</a>
+<a name="ln579">        RLOG(options_.info_log, &quot;Unrecognized meta file %s, deleting -- %s&quot;,</a>
+<a name="ln580">            file.c_str(), s.ToString().c_str());</a>
+<a name="ln581">      }</a>
+<a name="ln582">      continue;</a>
+<a name="ln583">    }</a>
+<a name="ln584">    assert(backups_.find(backup_id) == backups_.end());</a>
+<a name="ln585">    backups_.insert(</a>
+<a name="ln586">        std::make_pair(backup_id, unique_ptr&lt;BackupMeta&gt;(new BackupMeta(</a>
+<a name="ln587">                                      GetBackupMetaFile(backup_id),</a>
+<a name="ln588">                                      &amp;backuped_file_infos_, backup_env_))));</a>
+<a name="ln589">  }</a>
+<a name="ln590"> </a>
+<a name="ln591">  latest_backup_id_ = 0;</a>
+<a name="ln592">  if (options_.destroy_old_data) {  // Destroy old data</a>
+<a name="ln593">    assert(!read_only_);</a>
+<a name="ln594">    RLOG(options_.info_log,</a>
+<a name="ln595">        &quot;Backup Engine started with destroy_old_data == true, deleting all &quot;</a>
+<a name="ln596">        &quot;backups&quot;);</a>
+<a name="ln597">    auto s = PurgeOldBackups(0);</a>
+<a name="ln598">    if (s.ok()) {</a>
+<a name="ln599">      s = GarbageCollect();</a>
+<a name="ln600">    }</a>
+<a name="ln601">    if (!s.ok()) {</a>
+<a name="ln602">      return s;</a>
+<a name="ln603">    }</a>
+<a name="ln604">  } else {  // Load data from storage</a>
+<a name="ln605">    std::unordered_map&lt;std::string, uint64_t&gt; abs_path_to_size;</a>
+<a name="ln606">    for (const auto&amp; rel_dir :</a>
+<a name="ln607">         {GetSharedFileRel(), GetSharedFileWithChecksumRel()}) {</a>
+<a name="ln608">      const auto abs_dir = GetAbsolutePath(rel_dir);</a>
+<a name="ln609">      InsertPathnameToSizeBytesWarnNotOk(abs_dir, &amp;abs_path_to_size);</a>
+<a name="ln610">    }</a>
+<a name="ln611">    // load the backups if any</a>
+<a name="ln612">    for (auto&amp; backup : backups_) {</a>
+<a name="ln613">      InsertPathnameToSizeBytesWarnNotOk(</a>
+<a name="ln614">          GetAbsolutePath(GetPrivateFileRel(backup.first)), &amp;abs_path_to_size);</a>
+<a name="ln615">      Status s =</a>
+<a name="ln616">          backup.second-&gt;LoadFromFile(options_.backup_dir, abs_path_to_size);</a>
+<a name="ln617">      if (!s.ok()) {</a>
+<a name="ln618">        RLOG(options_.info_log, &quot;Backup %u corrupted -- %s&quot;, backup.first,</a>
+<a name="ln619">            s.ToString().c_str());</a>
+<a name="ln620">        corrupt_backups_.insert(std::make_pair(</a>
+<a name="ln621">              backup.first, std::make_pair(s, std::move(backup.second))));</a>
+<a name="ln622">      } else {</a>
+<a name="ln623">        RLOG(options_.info_log, &quot;Loading backup %&quot; PRIu32 &quot; OK:\n%s&quot;,</a>
+<a name="ln624">            backup.first, backup.second-&gt;GetInfoString().c_str());</a>
+<a name="ln625">        latest_backup_id_ = std::max(latest_backup_id_, backup.first);</a>
+<a name="ln626">      }</a>
+<a name="ln627">    }</a>
+<a name="ln628"> </a>
+<a name="ln629">    for (const auto&amp; corrupt : corrupt_backups_) {</a>
+<a name="ln630">      backups_.erase(backups_.find(corrupt.first));</a>
+<a name="ln631">    }</a>
+<a name="ln632">  }</a>
+<a name="ln633"> </a>
+<a name="ln634">  RLOG(options_.info_log, &quot;Latest backup is %u&quot;, latest_backup_id_);</a>
+<a name="ln635"> </a>
+<a name="ln636">  if (!read_only_) {</a>
+<a name="ln637">    auto s = PutLatestBackupFileContents(latest_backup_id_);</a>
+<a name="ln638">    if (!s.ok()) {</a>
+<a name="ln639">      return s;</a>
+<a name="ln640">    }</a>
+<a name="ln641">  }</a>
+<a name="ln642"> </a>
+<a name="ln643">  // set up threads perform copies from files_to_copy_or_create_ in the</a>
+<a name="ln644">  // background</a>
+<a name="ln645">  for (int t = 0; t &lt; options_.max_background_operations; t++) {</a>
+<a name="ln646">    threads_.emplace_back([&amp;]() {</a>
+<a name="ln647">      CopyOrCreateWorkItem work_item;</a>
+<a name="ln648">      while (files_to_copy_or_create_.read(work_item)) {</a>
+<a name="ln649">        CopyOrCreateResult result;</a>
+<a name="ln650">        result.status = CopyOrCreateFile(</a>
+<a name="ln651">            work_item.src_path, work_item.dst_path, work_item.contents,</a>
+<a name="ln652">            work_item.src_env, work_item.dst_env, work_item.sync,</a>
+<a name="ln653">            work_item.rate_limiter, &amp;result.size, &amp;result.checksum_value,</a>
+<a name="ln654">            work_item.size_limit, work_item.progress_callback);</a>
+<a name="ln655">        work_item.result.set_value(std::move(result));</a>
+<a name="ln656">      }</a>
+<a name="ln657">    });</a>
+<a name="ln658">  }</a>
+<a name="ln659"> </a>
+<a name="ln660">  RLOG(options_.info_log, &quot;Initialized BackupEngine&quot;);</a>
+<a name="ln661"> </a>
+<a name="ln662">  return Status::OK();</a>
+<a name="ln663">}</a>
+<a name="ln664"> </a>
+<a name="ln665">Status BackupEngineImpl::CreateNewBackup(</a>
+<a name="ln666">    DB* db, bool flush_before_backup, std::function&lt;void()&gt; progress_callback) {</a>
+<a name="ln667">  assert(initialized_);</a>
+<a name="ln668">  assert(!read_only_);</a>
+<a name="ln669">  Status s;</a>
+<a name="ln670">  std::vector&lt;std::string&gt; live_files;</a>
+<a name="ln671">  VectorLogPtr live_wal_files;</a>
+<a name="ln672">  uint64_t manifest_file_size = 0;</a>
+<a name="ln673">  uint64_t sequence_number = db-&gt;GetLatestSequenceNumber();</a>
+<a name="ln674"> </a>
+<a name="ln675">  s = db-&gt;DisableFileDeletions();</a>
+<a name="ln676">  if (s.ok()) {</a>
+<a name="ln677">    // this will return live_files prefixed with &quot;/&quot;</a>
+<a name="ln678">    s = db-&gt;GetLiveFiles(live_files, &amp;manifest_file_size, flush_before_backup);</a>
+<a name="ln679">  }</a>
+<a name="ln680">  // if we didn't flush before backup, we need to also get WAL files</a>
+<a name="ln681">  if (s.ok() &amp;&amp; !flush_before_backup &amp;&amp; options_.backup_log_files) {</a>
+<a name="ln682">    // returns file names prefixed with &quot;/&quot;</a>
+<a name="ln683">    s = db-&gt;GetSortedWalFiles(&amp;live_wal_files);</a>
+<a name="ln684">  }</a>
+<a name="ln685">  if (!s.ok()) {</a>
+<a name="ln686">    WARN_NOT_OK(db-&gt;EnableFileDeletions(false), &quot;Failed to disable file deletions&quot;);</a>
+<a name="ln687">    return s;</a>
+<a name="ln688">  }</a>
+<a name="ln689">  TEST_SYNC_POINT(&quot;BackupEngineImpl::CreateNewBackup:SavedLiveFiles1&quot;);</a>
+<a name="ln690">  TEST_SYNC_POINT(&quot;BackupEngineImpl::CreateNewBackup:SavedLiveFiles2&quot;);</a>
+<a name="ln691"> </a>
+<a name="ln692">  BackupID new_backup_id = latest_backup_id_ + 1;</a>
+<a name="ln693">  assert(backups_.find(new_backup_id) == backups_.end());</a>
+<a name="ln694">  auto ret = backups_.insert(</a>
+<a name="ln695">      std::make_pair(new_backup_id, unique_ptr&lt;BackupMeta&gt;(new BackupMeta(</a>
+<a name="ln696">                                        GetBackupMetaFile(new_backup_id),</a>
+<a name="ln697">                                        &amp;backuped_file_infos_, backup_env_))));</a>
+<a name="ln698">  assert(ret.second == true);</a>
+<a name="ln699">  auto&amp; new_backup = ret.first-&gt;second;</a>
+<a name="ln700">  new_backup-&gt;RecordTimestamp();</a>
+<a name="ln701">  new_backup-&gt;SetSequenceNumber(sequence_number);</a>
+<a name="ln702"> </a>
+<a name="ln703">  auto start_backup = backup_env_-&gt; NowMicros();</a>
+<a name="ln704"> </a>
+<a name="ln705">  RLOG(options_.info_log, &quot;Started the backup process -- creating backup %u&quot;,</a>
+<a name="ln706">      new_backup_id);</a>
+<a name="ln707"> </a>
+<a name="ln708">  // create temporary private dir</a>
+<a name="ln709">  s = backup_env_-&gt;CreateDir(</a>
+<a name="ln710">      GetAbsolutePath(GetPrivateFileRel(new_backup_id, true)));</a>
+<a name="ln711"> </a>
+<a name="ln712">  unique_ptr&lt;RateLimiter&gt; rate_limiter;</a>
+<a name="ln713">  if (options_.backup_rate_limit &gt; 0) {</a>
+<a name="ln714">    rate_limiter.reset(NewGenericRateLimiter(options_.backup_rate_limit));</a>
+<a name="ln715">    copy_file_buffer_size_ = rate_limiter-&gt;GetSingleBurstBytes();</a>
+<a name="ln716">  }</a>
+<a name="ln717"> </a>
+<a name="ln718">  // A set into which we will insert the dst_paths that are calculated for live</a>
+<a name="ln719">  // files and live WAL files.</a>
+<a name="ln720">  // This is used to check whether a live files shares a dst_path with another</a>
+<a name="ln721">  // live file.</a>
+<a name="ln722">  std::unordered_set&lt;std::string&gt; live_dst_paths;</a>
+<a name="ln723">  live_dst_paths.reserve(live_files.size() + live_wal_files.size());</a>
+<a name="ln724"> </a>
+<a name="ln725">  // Pre-fetch sizes for data files</a>
+<a name="ln726">  std::unordered_map&lt;std::string, uint64_t&gt; data_path_to_size;</a>
+<a name="ln727">  if (s.ok()) {</a>
+<a name="ln728">    s = InsertPathnameToSizeBytes(db-&gt;GetName(), &amp;data_path_to_size);</a>
+<a name="ln729">  }</a>
+<a name="ln730"> </a>
+<a name="ln731">  std::vector&lt;BackupAfterCopyOrCreateWorkItem&gt; backup_items_to_finish;</a>
+<a name="ln732">  // Add a CopyOrCreateWorkItem to the channel for each live file</a>
+<a name="ln733">  std::string manifest_fname, current_fname;</a>
+<a name="ln734">  for (size_t i = 0; s.ok() &amp;&amp; i &lt; live_files.size(); ++i) {</a>
+<a name="ln735">    uint64_t number;</a>
+<a name="ln736">    FileType type;</a>
+<a name="ln737">    bool ok = ParseFileName(live_files[i], &amp;number, &amp;type);</a>
+<a name="ln738">    if (!ok) {</a>
+<a name="ln739">      assert(false);</a>
+<a name="ln740">      return STATUS(Corruption, &quot;Can't parse file name. This is very bad&quot;);</a>
+<a name="ln741">    }</a>
+<a name="ln742">    // we should only get sst, manifest and current files here</a>
+<a name="ln743">    assert(type == kTableFile || type == kTableSBlockFile || type == kDescriptorFile ||</a>
+<a name="ln744">           type == kCurrentFile);</a>
+<a name="ln745">    if (type == kCurrentFile) {</a>
+<a name="ln746">      // We will craft the current file manually to ensure it's consistent with</a>
+<a name="ln747">      // the manifest number. This is necessary because current's file contents</a>
+<a name="ln748">      // can change during backup.</a>
+<a name="ln749">      current_fname = live_files[i];</a>
+<a name="ln750">      continue;</a>
+<a name="ln751">    } else if (type == kDescriptorFile) {</a>
+<a name="ln752">      manifest_fname = live_files[i];</a>
+<a name="ln753">    }</a>
+<a name="ln754"> </a>
+<a name="ln755">    auto data_path_to_size_iter =</a>
+<a name="ln756">        data_path_to_size.find(db-&gt;GetName() + live_files[i]);</a>
+<a name="ln757">    uint64_t size_bytes = data_path_to_size_iter == data_path_to_size.end()</a>
+<a name="ln758">                              ? port::kMaxUint64</a>
+<a name="ln759">                              : data_path_to_size_iter-&gt;second;</a>
+<a name="ln760"> </a>
+<a name="ln761">    // rules:</a>
+<a name="ln762">    // * if it's kTableFile or kTableSBlockFile, then it's shared</a>
+<a name="ln763">    // * if it's kDescriptorFile, limit the size to manifest_file_size</a>
+<a name="ln764">    const bool is_table_file = type == kTableFile || type == kTableSBlockFile;</a>
+<a name="ln765">    s = AddBackupFileWorkItem(</a>
+<a name="ln766">        &amp;live_dst_paths, &amp;backup_items_to_finish, new_backup_id,</a>
+<a name="ln767">        options_.share_table_files &amp;&amp; is_table_file, db-&gt;GetName(),</a>
+<a name="ln768">        live_files[i], rate_limiter.get(), size_bytes,</a>
+<a name="ln769">        (type == kDescriptorFile) ? manifest_file_size : 0,</a>
+<a name="ln770">        options_.share_files_with_checksum &amp;&amp; is_table_file,</a>
+<a name="ln771">        progress_callback);</a>
+<a name="ln772">  }</a>
+<a name="ln773">  if (s.ok() &amp;&amp; !current_fname.empty() &amp;&amp; !manifest_fname.empty()) {</a>
+<a name="ln774">    // Write the current file with the manifest filename as its contents.</a>
+<a name="ln775">    s = AddBackupFileWorkItem(</a>
+<a name="ln776">        &amp;live_dst_paths, &amp;backup_items_to_finish, new_backup_id,</a>
+<a name="ln777">        false /* shared */, &quot;&quot; /* src_dir */, CurrentFileName(&quot;&quot;),</a>
+<a name="ln778">        rate_limiter.get(), manifest_fname.size(), 0 /* size_limit */,</a>
+<a name="ln779">        false /* shared_checksum */, progress_callback,</a>
+<a name="ln780">        manifest_fname.substr(1) + &quot;\n&quot;);</a>
+<a name="ln781">  }</a>
+<a name="ln782"> </a>
+<a name="ln783">  // Pre-fetch sizes for WAL files</a>
+<a name="ln784">  std::unordered_map&lt;std::string, uint64_t&gt; wal_path_to_size;</a>
+<a name="ln785">  if (s.ok()) {</a>
+<a name="ln786">    if (db-&gt;GetOptions().wal_dir != &quot;&quot;) {</a>
+<a name="ln787">      s = InsertPathnameToSizeBytes(db-&gt;GetOptions().wal_dir,</a>
+<a name="ln788">                                    &amp;wal_path_to_size);</a>
+<a name="ln789">    } else {</a>
+<a name="ln790">      wal_path_to_size = std::move(data_path_to_size);</a>
+<a name="ln791">    }</a>
+<a name="ln792">  }</a>
+<a name="ln793"> </a>
+<a name="ln794">  // Add a CopyOrCreateWorkItem to the channel for each WAL file</a>
+<a name="ln795">  for (size_t i = 0; s.ok() &amp;&amp; i &lt; live_wal_files.size(); ++i) {</a>
+<a name="ln796">    auto wal_path_to_size_iter =</a>
+<a name="ln797">        wal_path_to_size.find(live_wal_files[i]-&gt;PathName());</a>
+<a name="ln798">    uint64_t size_bytes = wal_path_to_size_iter == wal_path_to_size.end()</a>
+<a name="ln799">                              ? port::kMaxUint64</a>
+<a name="ln800">                              : wal_path_to_size_iter-&gt;second;</a>
+<a name="ln801">    if (live_wal_files[i]-&gt;Type() == kAliveLogFile) {</a>
+<a name="ln802">      // we only care about live log files</a>
+<a name="ln803">      // copy the file into backup_dir/files/&lt;new backup&gt;/</a>
+<a name="ln804">      s = AddBackupFileWorkItem(&amp;live_dst_paths, &amp;backup_items_to_finish,</a>
+<a name="ln805">                                new_backup_id, false, /* not shared */</a>
+<a name="ln806">                                db-&gt;GetOptions().wal_dir,</a>
+<a name="ln807">                                live_wal_files[i]-&gt;PathName(),</a>
+<a name="ln808">                                rate_limiter.get(), size_bytes);</a>
+<a name="ln809">    }</a>
+<a name="ln810">  }</a>
+<a name="ln811"> </a>
+<a name="ln812">  Status item_status;</a>
+<a name="ln813">  for (auto&amp; item : backup_items_to_finish) {</a>
+<a name="ln814">    item.result.wait();</a>
+<a name="ln815">    auto result = item.result.get();</a>
+<a name="ln816">    item_status = result.status;</a>
+<a name="ln817">    if (item_status.ok() &amp;&amp; item.shared &amp;&amp; item.needed_to_copy) {</a>
+<a name="ln818">      item_status = item.backup_env-&gt;RenameFile(item.dst_path_tmp,</a>
+<a name="ln819">                                                item.dst_path);</a>
+<a name="ln820">    }</a>
+<a name="ln821">    if (item_status.ok()) {</a>
+<a name="ln822">      item_status = new_backup.get()-&gt;AddFile(</a>
+<a name="ln823">              std::make_shared&lt;FileInfo&gt;(item.dst_relative,</a>
+<a name="ln824">                                         result.size,</a>
+<a name="ln825">                                         result.checksum_value));</a>
+<a name="ln826">    }</a>
+<a name="ln827">    if (!item_status.ok()) {</a>
+<a name="ln828">      s = item_status;</a>
+<a name="ln829">    }</a>
+<a name="ln830">  }</a>
+<a name="ln831"> </a>
+<a name="ln832">  // we copied all the files, enable file deletions</a>
+<a name="ln833">  RETURN_NOT_OK(db-&gt;EnableFileDeletions(false));</a>
+<a name="ln834"> </a>
+<a name="ln835">  if (s.ok()) {</a>
+<a name="ln836">    // move tmp private backup to real backup folder</a>
+<a name="ln837">    RLOG(options_.info_log,</a>
+<a name="ln838">        &quot;Moving tmp backup directory to the real one: %s -&gt; %s\n&quot;,</a>
+<a name="ln839">        GetAbsolutePath(GetPrivateFileRel(new_backup_id, true)).c_str(),</a>
+<a name="ln840">        GetAbsolutePath(GetPrivateFileRel(new_backup_id, false)).c_str());</a>
+<a name="ln841">    s = backup_env_-&gt;RenameFile(</a>
+<a name="ln842">        GetAbsolutePath(GetPrivateFileRel(new_backup_id, true)),  // tmp</a>
+<a name="ln843">        GetAbsolutePath(GetPrivateFileRel(new_backup_id, false)));</a>
+<a name="ln844">  }</a>
+<a name="ln845"> </a>
+<a name="ln846">  auto backup_time = backup_env_-&gt;NowMicros() - start_backup;</a>
+<a name="ln847"> </a>
+<a name="ln848">  if (s.ok()) {</a>
+<a name="ln849">    // persist the backup metadata on the disk</a>
+<a name="ln850">    s = new_backup-&gt;StoreToFile(options_.sync);</a>
+<a name="ln851">  }</a>
+<a name="ln852">  if (s.ok()) {</a>
+<a name="ln853">    // install the newly created backup meta! (atomic)</a>
+<a name="ln854">    s = PutLatestBackupFileContents(new_backup_id);</a>
+<a name="ln855">  }</a>
+<a name="ln856">  if (s.ok() &amp;&amp; options_.sync) {</a>
+<a name="ln857">    unique_ptr&lt;Directory&gt; backup_private_directory;</a>
+<a name="ln858">    RETURN_NOT_OK(backup_env_-&gt;NewDirectory(</a>
+<a name="ln859">        GetAbsolutePath(GetPrivateFileRel(new_backup_id, false)),</a>
+<a name="ln860">        &amp;backup_private_directory));</a>
+<a name="ln861">    if (backup_private_directory != nullptr) {</a>
+<a name="ln862">      RETURN_NOT_OK(backup_private_directory-&gt;Fsync());</a>
+<a name="ln863">    }</a>
+<a name="ln864">    if (private_directory_ != nullptr) {</a>
+<a name="ln865">      RETURN_NOT_OK(private_directory_-&gt;Fsync());</a>
+<a name="ln866">    }</a>
+<a name="ln867">    if (meta_directory_ != nullptr) {</a>
+<a name="ln868">      RETURN_NOT_OK(meta_directory_-&gt;Fsync());</a>
+<a name="ln869">    }</a>
+<a name="ln870">    if (shared_directory_ != nullptr) {</a>
+<a name="ln871">      RETURN_NOT_OK(shared_directory_-&gt;Fsync());</a>
+<a name="ln872">    }</a>
+<a name="ln873">    if (backup_directory_ != nullptr) {</a>
+<a name="ln874">      RETURN_NOT_OK(backup_directory_-&gt;Fsync());</a>
+<a name="ln875">    }</a>
+<a name="ln876">  }</a>
+<a name="ln877"> </a>
+<a name="ln878">  if (s.ok()) {</a>
+<a name="ln879">    backup_statistics_.IncrementNumberSuccessBackup();</a>
+<a name="ln880">  }</a>
+<a name="ln881">  if (!s.ok()) {</a>
+<a name="ln882">    backup_statistics_.IncrementNumberFailBackup();</a>
+<a name="ln883">    // clean all the files we might have created</a>
+<a name="ln884">    RLOG(options_.info_log, &quot;Backup failed -- %s&quot;, s.ToString().c_str());</a>
+<a name="ln885">    RLOG(options_.info_log, &quot;Backup Statistics %s\n&quot;,</a>
+<a name="ln886">        backup_statistics_.ToString().c_str());</a>
+<a name="ln887">    // delete files that we might have already written</a>
+<a name="ln888">    WARN_NOT_OK(DeleteBackup(new_backup_id),</a>
+<a name="ln889">                yb::Format(&quot;Failed to delete backup $0&quot;, new_backup_id));</a>
+<a name="ln890">    WARN_NOT_OK(GarbageCollect(), &quot;Garbage collection failed&quot;);</a>
+<a name="ln891">    return s;</a>
+<a name="ln892">  }</a>
+<a name="ln893"> </a>
+<a name="ln894">  // here we know that we succeeded and installed the new backup</a>
+<a name="ln895">  // in the LATEST_BACKUP file</a>
+<a name="ln896">  latest_backup_id_ = new_backup_id;</a>
+<a name="ln897">  RLOG(options_.info_log, &quot;Backup DONE. All is good&quot;);</a>
+<a name="ln898"> </a>
+<a name="ln899">  // backup_speed is in byte/second</a>
+<a name="ln900">  double backup_speed = new_backup-&gt;GetSize() / (1.048576 * backup_time);</a>
+<a name="ln901">  RLOG(options_.info_log, &quot;Backup number of files: %u&quot;,</a>
+<a name="ln902">      new_backup-&gt;GetNumberFiles());</a>
+<a name="ln903">  char human_size[16];</a>
+<a name="ln904">  AppendHumanBytes(new_backup-&gt;GetSize(), human_size, sizeof(human_size));</a>
+<a name="ln905">  RLOG(options_.info_log, &quot;Backup size: %s&quot;, human_size);</a>
+<a name="ln906">  RLOG(options_.info_log, &quot;Backup time: %&quot; PRIu64 &quot; microseconds&quot;, backup_time);</a>
+<a name="ln907">  RLOG(options_.info_log, &quot;Backup speed: %.3f MB/s&quot;, backup_speed);</a>
+<a name="ln908">  RLOG(options_.info_log, &quot;Backup Statistics %s&quot;,</a>
+<a name="ln909">      backup_statistics_.ToString().c_str());</a>
+<a name="ln910">  return s;</a>
+<a name="ln911">}</a>
+<a name="ln912"> </a>
+<a name="ln913">Status BackupEngineImpl::PurgeOldBackups(uint32_t num_backups_to_keep) {</a>
+<a name="ln914">  assert(initialized_);</a>
+<a name="ln915">  assert(!read_only_);</a>
+<a name="ln916">  RLOG(options_.info_log, &quot;Purging old backups, keeping %u&quot;,</a>
+<a name="ln917">      num_backups_to_keep);</a>
+<a name="ln918">  std::vector&lt;BackupID&gt; to_delete;</a>
+<a name="ln919">  auto itr = backups_.begin();</a>
+<a name="ln920">  while ((backups_.size() - to_delete.size()) &gt; num_backups_to_keep) {</a>
+<a name="ln921">    to_delete.push_back(itr-&gt;first);</a>
+<a name="ln922">    itr++;</a>
+<a name="ln923">  }</a>
+<a name="ln924">  for (auto backup_id : to_delete) {</a>
+<a name="ln925">    auto s = DeleteBackup(backup_id);</a>
+<a name="ln926">    if (!s.ok()) {</a>
+<a name="ln927">      return s;</a>
+<a name="ln928">    }</a>
+<a name="ln929">  }</a>
+<a name="ln930">  return Status::OK();</a>
+<a name="ln931">}</a>
+<a name="ln932"> </a>
+<a name="ln933">Status BackupEngineImpl::DeleteBackup(BackupID backup_id) {</a>
+<a name="ln934">  assert(initialized_);</a>
+<a name="ln935">  assert(!read_only_);</a>
+<a name="ln936">  RLOG(options_.info_log, &quot;Deleting backup %u&quot;, backup_id);</a>
+<a name="ln937">  auto backup = backups_.find(backup_id);</a>
+<a name="ln938">  if (backup != backups_.end()) {</a>
+<a name="ln939">    auto s = backup-&gt;second-&gt;Delete();</a>
+<a name="ln940">    if (!s.ok()) {</a>
+<a name="ln941">      return s;</a>
+<a name="ln942">    }</a>
+<a name="ln943">    backups_.erase(backup);</a>
+<a name="ln944">  } else {</a>
+<a name="ln945">    auto corrupt = corrupt_backups_.find(backup_id);</a>
+<a name="ln946">    if (corrupt == corrupt_backups_.end()) {</a>
+<a name="ln947">      return STATUS(NotFound, &quot;Backup not found&quot;);</a>
+<a name="ln948">    }</a>
+<a name="ln949">    auto s = corrupt-&gt;second.second-&gt;Delete();</a>
+<a name="ln950">    if (!s.ok()) {</a>
+<a name="ln951">      return s;</a>
+<a name="ln952">    }</a>
+<a name="ln953">    corrupt_backups_.erase(corrupt);</a>
+<a name="ln954">  }</a>
+<a name="ln955"> </a>
+<a name="ln956">  std::vector&lt;std::string&gt; to_delete;</a>
+<a name="ln957">  for (auto&amp; itr : backuped_file_infos_) {</a>
+<a name="ln958">    if (itr.second-&gt;refs == 0) {</a>
+<a name="ln959">      Status s = backup_env_-&gt;DeleteFile(GetAbsolutePath(itr.first));</a>
+<a name="ln960">      RLOG(options_.info_log, &quot;Deleting %s -- %s&quot;, itr.first.c_str(),</a>
+<a name="ln961">          s.ToString().c_str());</a>
+<a name="ln962">      to_delete.push_back(itr.first);</a>
+<a name="ln963">    }</a>
+<a name="ln964">  }</a>
+<a name="ln965">  for (auto&amp; td : to_delete) {</a>
+<a name="ln966">    backuped_file_infos_.erase(td);</a>
+<a name="ln967">  }</a>
+<a name="ln968"> </a>
+<a name="ln969">  // take care of private dirs -- GarbageCollect() will take care of them</a>
+<a name="ln970">  // if they are not empty</a>
+<a name="ln971">  std::string private_dir = GetPrivateFileRel(backup_id);</a>
+<a name="ln972">  Status s = backup_env_-&gt;DeleteDir(GetAbsolutePath(private_dir));</a>
+<a name="ln973">  RLOG(options_.info_log, &quot;Deleting private dir %s -- %s&quot;,</a>
+<a name="ln974">      private_dir.c_str(), s.ToString().c_str());</a>
+<a name="ln975">  return Status::OK();</a>
+<a name="ln976">}</a>
+<a name="ln977"> </a>
+<a name="ln978">void BackupEngineImpl::GetBackupInfo(std::vector&lt;BackupInfo&gt;* backup_info) {</a>
+<a name="ln979">  assert(initialized_);</a>
+<a name="ln980">  backup_info-&gt;reserve(backups_.size());</a>
+<a name="ln981">  for (auto&amp; backup : backups_) {</a>
+<a name="ln982">    if (!backup.second-&gt;Empty()) {</a>
+<a name="ln983">        backup_info-&gt;push_back(BackupInfo(</a>
+<a name="ln984">            backup.first, backup.second-&gt;GetTimestamp(),</a>
+<a name="ln985">            backup.second-&gt;GetSize(),</a>
+<a name="ln986">            backup.second-&gt;GetNumberFiles()));</a>
+<a name="ln987">    }</a>
+<a name="ln988">  }</a>
+<a name="ln989">}</a>
+<a name="ln990"> </a>
+<a name="ln991">void</a>
+<a name="ln992">BackupEngineImpl::GetCorruptedBackups(</a>
+<a name="ln993">    std::vector&lt;BackupID&gt;* corrupt_backup_ids) {</a>
+<a name="ln994">  assert(initialized_);</a>
+<a name="ln995">  corrupt_backup_ids-&gt;reserve(corrupt_backups_.size());</a>
+<a name="ln996">  for (auto&amp; backup : corrupt_backups_) {</a>
+<a name="ln997">    corrupt_backup_ids-&gt;push_back(backup.first);</a>
+<a name="ln998">  }</a>
+<a name="ln999">}</a>
+<a name="ln1000"> </a>
+<a name="ln1001">Status BackupEngineImpl::RestoreDBFromBackup(</a>
+<a name="ln1002">    BackupID backup_id, const std::string&amp; db_dir, const std::string&amp; wal_dir,</a>
+<a name="ln1003">    const RestoreOptions&amp; restore_options) {</a>
+<a name="ln1004">  assert(initialized_);</a>
+<a name="ln1005">  auto corrupt_itr = corrupt_backups_.find(backup_id);</a>
+<a name="ln1006">  if (corrupt_itr != corrupt_backups_.end()) {</a>
+<a name="ln1007">    return corrupt_itr-&gt;second.first;</a>
+<a name="ln1008">  }</a>
+<a name="ln1009">  auto backup_itr = backups_.find(backup_id);</a>
+<a name="ln1010">  if (backup_itr == backups_.end()) {</a>
+<a name="ln1011">    return STATUS(NotFound, &quot;Backup not found&quot;);</a>
+<a name="ln1012">  }</a>
+<a name="ln1013">  auto&amp; backup = backup_itr-&gt;second;</a>
+<a name="ln1014">  if (backup-&gt;Empty()) {</a>
+<a name="ln1015">    return STATUS(NotFound, &quot;Backup not found&quot;);</a>
+<a name="ln1016">  }</a>
+<a name="ln1017"> </a>
+<a name="ln1018">  RLOG(options_.info_log, &quot;Restoring backup id %u\n&quot;, backup_id);</a>
+<a name="ln1019">  RLOG(options_.info_log, &quot;keep_log_files: %d\n&quot;,</a>
+<a name="ln1020">      static_cast&lt;int&gt;(restore_options.keep_log_files));</a>
+<a name="ln1021"> </a>
+<a name="ln1022">  // just in case. Ignore errors</a>
+<a name="ln1023">  WARN_NOT_OK(db_env_-&gt;CreateDirIfMissing(db_dir), &quot;Failed to create &quot; + db_dir);</a>
+<a name="ln1024">  WARN_NOT_OK(db_env_-&gt;CreateDirIfMissing(wal_dir), &quot;Failed to create &quot; + wal_dir);</a>
+<a name="ln1025"> </a>
+<a name="ln1026">  if (restore_options.keep_log_files) {</a>
+<a name="ln1027">    // delete files in db_dir, but keep all the log files</a>
+<a name="ln1028">    DeleteChildren(db_dir, 1 &lt;&lt; kLogFile);</a>
+<a name="ln1029">    // move all the files from archive dir to wal_dir</a>
+<a name="ln1030">    std::string archive_dir = ArchivalDirectory(wal_dir);</a>
+<a name="ln1031">    std::vector&lt;std::string&gt; archive_files;</a>
+<a name="ln1032">    WARN_NOT_OK(db_env_-&gt;GetChildren(archive_dir, &amp;archive_files),</a>
+<a name="ln1033">                &quot;Failed to get children&quot;);</a>
+<a name="ln1034">    for (const auto&amp; f : archive_files) {</a>
+<a name="ln1035">      uint64_t number;</a>
+<a name="ln1036">      FileType type;</a>
+<a name="ln1037">      bool ok = ParseFileName(f, &amp;number, &amp;type);</a>
+<a name="ln1038">      if (ok &amp;&amp; type == kLogFile) {</a>
+<a name="ln1039">        RLOG(options_.info_log, &quot;Moving log file from archive/ to wal_dir: %s&quot;,</a>
+<a name="ln1040">            f.c_str());</a>
+<a name="ln1041">        Status s =</a>
+<a name="ln1042">            db_env_-&gt;RenameFile(archive_dir + &quot;/&quot; + f, wal_dir + &quot;/&quot; + f);</a>
+<a name="ln1043">        if (!s.ok()) {</a>
+<a name="ln1044">          // if we can't move log file from archive_dir to wal_dir,</a>
+<a name="ln1045">          // we should fail, since it might mean data loss</a>
+<a name="ln1046">          return s;</a>
+<a name="ln1047">        }</a>
+<a name="ln1048">      }</a>
+<a name="ln1049">    }</a>
+<a name="ln1050">  } else {</a>
+<a name="ln1051">    DeleteChildren(wal_dir);</a>
+<a name="ln1052">    DeleteChildren(ArchivalDirectory(wal_dir));</a>
+<a name="ln1053">    DeleteChildren(db_dir);</a>
+<a name="ln1054">  }</a>
+<a name="ln1055"> </a>
+<a name="ln1056">  unique_ptr&lt;RateLimiter&gt; rate_limiter;</a>
+<a name="ln1057">  if (options_.restore_rate_limit &gt; 0) {</a>
+<a name="ln1058">    rate_limiter.reset(NewGenericRateLimiter(options_.restore_rate_limit));</a>
+<a name="ln1059">    copy_file_buffer_size_ = rate_limiter-&gt;GetSingleBurstBytes();</a>
+<a name="ln1060">  }</a>
+<a name="ln1061">  Status s;</a>
+<a name="ln1062">  std::vector&lt;RestoreAfterCopyOrCreateWorkItem&gt; restore_items_to_finish;</a>
+<a name="ln1063">  for (const auto&amp; file_info : backup-&gt;GetFiles()) {</a>
+<a name="ln1064">    const std::string &amp;file = file_info-&gt;filename;</a>
+<a name="ln1065">    std::string dst;</a>
+<a name="ln1066">    // 1. extract the filename</a>
+<a name="ln1067">    size_t slash = file.find_last_of('/');</a>
+<a name="ln1068">    // file will either be shared/&lt;file&gt;, shared_checksum/&lt;file_crc32_size&gt;</a>
+<a name="ln1069">    // or private/&lt;number&gt;/&lt;file&gt;</a>
+<a name="ln1070">    assert(slash != std::string::npos);</a>
+<a name="ln1071">    dst = file.substr(slash + 1);</a>
+<a name="ln1072"> </a>
+<a name="ln1073">    // if the file was in shared_checksum, extract the real file name</a>
+<a name="ln1074">    // in this case the file is &lt;number&gt;_&lt;checksum&gt;_&lt;size&gt;.&lt;type&gt;</a>
+<a name="ln1075">    if (file.substr(0, slash) == GetSharedChecksumDirRel()) {</a>
+<a name="ln1076">      dst = GetFileFromChecksumFile(dst);</a>
+<a name="ln1077">    }</a>
+<a name="ln1078"> </a>
+<a name="ln1079">    // 2. find the filetype</a>
+<a name="ln1080">    uint64_t number;</a>
+<a name="ln1081">    FileType type;</a>
+<a name="ln1082">    bool ok = ParseFileName(dst, &amp;number, &amp;type);</a>
+<a name="ln1083">    if (!ok) {</a>
+<a name="ln1084">      return STATUS(Corruption, &quot;Backup corrupted&quot;);</a>
+<a name="ln1085">    }</a>
+<a name="ln1086">    // 3. Construct the final path</a>
+<a name="ln1087">    // kLogFile lives in wal_dir and all the rest live in db_dir</a>
+<a name="ln1088">    dst = ((type == kLogFile) ? wal_dir : db_dir) +</a>
+<a name="ln1089">      &quot;/&quot; + dst;</a>
+<a name="ln1090"> </a>
+<a name="ln1091">    RLOG(options_.info_log, &quot;Restoring %s to %s\n&quot;, file.c_str(), dst.c_str());</a>
+<a name="ln1092">    CopyOrCreateWorkItem copy_or_create_work_item(</a>
+<a name="ln1093">        GetAbsolutePath(file), dst, &quot;&quot; /* contents */, backup_env_, db_env_,</a>
+<a name="ln1094">        false, rate_limiter.get(), 0 /* size_limit */);</a>
+<a name="ln1095">    RestoreAfterCopyOrCreateWorkItem after_copy_or_create_work_item(</a>
+<a name="ln1096">        copy_or_create_work_item.result.get_future(),</a>
+<a name="ln1097">        file_info-&gt;checksum_value);</a>
+<a name="ln1098">    files_to_copy_or_create_.write(std::move(copy_or_create_work_item));</a>
+<a name="ln1099">    restore_items_to_finish.push_back(</a>
+<a name="ln1100">        std::move(after_copy_or_create_work_item));</a>
+<a name="ln1101">  }</a>
+<a name="ln1102">  Status item_status;</a>
+<a name="ln1103">  for (auto&amp; item : restore_items_to_finish) {</a>
+<a name="ln1104">    item.result.wait();</a>
+<a name="ln1105">    auto result = item.result.get();</a>
+<a name="ln1106">    item_status = result.status;</a>
+<a name="ln1107">    // Note: It is possible that both of the following bad-status cases occur</a>
+<a name="ln1108">    // during copying. But, we only return one status.</a>
+<a name="ln1109">    if (!item_status.ok()) {</a>
+<a name="ln1110">      s = item_status;</a>
+<a name="ln1111">      break;</a>
+<a name="ln1112">    } else if (item.checksum_value != result.checksum_value) {</a>
+<a name="ln1113">      s = STATUS(Corruption, &quot;Checksum check failed&quot;);</a>
+<a name="ln1114">      break;</a>
+<a name="ln1115">    }</a>
+<a name="ln1116">  }</a>
+<a name="ln1117"> </a>
+<a name="ln1118">  RLOG(options_.info_log, &quot;Restoring done -- %s\n&quot;, s.ToString().c_str());</a>
+<a name="ln1119">  return s;</a>
+<a name="ln1120">}</a>
+<a name="ln1121"> </a>
+<a name="ln1122">Status BackupEngineImpl::VerifyBackup(BackupID backup_id) {</a>
+<a name="ln1123">  assert(initialized_);</a>
+<a name="ln1124">  auto corrupt_itr = corrupt_backups_.find(backup_id);</a>
+<a name="ln1125">  if (corrupt_itr != corrupt_backups_.end()) {</a>
+<a name="ln1126">    return corrupt_itr-&gt;second.first;</a>
+<a name="ln1127">  }</a>
+<a name="ln1128"> </a>
+<a name="ln1129">  auto backup_itr = backups_.find(backup_id);</a>
+<a name="ln1130">  if (backup_itr == backups_.end()) {</a>
+<a name="ln1131">    return STATUS(NotFound, &quot;&quot;);</a>
+<a name="ln1132">  }</a>
+<a name="ln1133"> </a>
+<a name="ln1134">  auto&amp; backup = backup_itr-&gt;second;</a>
+<a name="ln1135">  if (backup-&gt;Empty()) {</a>
+<a name="ln1136">    return STATUS(NotFound, &quot;&quot;);</a>
+<a name="ln1137">  }</a>
+<a name="ln1138"> </a>
+<a name="ln1139">  RLOG(options_.info_log, &quot;Verifying backup id %u\n&quot;, backup_id);</a>
+<a name="ln1140"> </a>
+<a name="ln1141">  std::unordered_map&lt;std::string, uint64_t&gt; curr_abs_path_to_size;</a>
+<a name="ln1142">  for (const auto&amp; rel_dir : {GetPrivateFileRel(backup_id), GetSharedFileRel(),</a>
+<a name="ln1143">                              GetSharedFileWithChecksumRel()}) {</a>
+<a name="ln1144">    const auto abs_dir = GetAbsolutePath(rel_dir);</a>
+<a name="ln1145">    WARN_NOT_OK(InsertPathnameToSizeBytes(abs_dir, &amp;curr_abs_path_to_size),</a>
+<a name="ln1146">                &quot;Failed to insert pathname to size bytes for &quot; + abs_dir);</a>
+<a name="ln1147">  }</a>
+<a name="ln1148"> </a>
+<a name="ln1149">  for (const auto&amp; file_info : backup-&gt;GetFiles()) {</a>
+<a name="ln1150">    const auto abs_path = GetAbsolutePath(file_info-&gt;filename);</a>
+<a name="ln1151">    if (curr_abs_path_to_size.find(abs_path) == curr_abs_path_to_size.end()) {</a>
+<a name="ln1152">      return STATUS(NotFound, &quot;File missing: &quot; + abs_path);</a>
+<a name="ln1153">    }</a>
+<a name="ln1154">    if (file_info-&gt;size != curr_abs_path_to_size[abs_path]) {</a>
+<a name="ln1155">      return STATUS(Corruption, &quot;File corrupted: &quot; + abs_path);</a>
+<a name="ln1156">    }</a>
+<a name="ln1157">  }</a>
+<a name="ln1158">  return Status::OK();</a>
+<a name="ln1159">}</a>
+<a name="ln1160"> </a>
+<a name="ln1161">// this operation HAS to be atomic</a>
+<a name="ln1162">// writing 4 bytes to the file is atomic alright, but we should *never*</a>
+<a name="ln1163">// do something like 1. delete file, 2. write new file</a>
+<a name="ln1164">// We write to a tmp file and then atomically rename</a>
+<a name="ln1165">Status BackupEngineImpl::PutLatestBackupFileContents(uint32_t latest_backup) {</a>
+<a name="ln1166">  assert(!read_only_);</a>
+<a name="ln1167">  Status s;</a>
+<a name="ln1168">  unique_ptr&lt;WritableFile&gt; file;</a>
+<a name="ln1169">  EnvOptions env_options;</a>
+<a name="ln1170">  env_options.use_mmap_writes = false;</a>
+<a name="ln1171">  s = backup_env_-&gt;NewWritableFile(GetLatestBackupFile(true),</a>
+<a name="ln1172">                                   &amp;file,</a>
+<a name="ln1173">                                   env_options);</a>
+<a name="ln1174">  if (!s.ok()) {</a>
+<a name="ln1175">    backup_env_-&gt;CleanupFile(GetLatestBackupFile(true));</a>
+<a name="ln1176">    return s;</a>
+<a name="ln1177">  }</a>
+<a name="ln1178"> </a>
+<a name="ln1179">  unique_ptr&lt;WritableFileWriter&gt; file_writer(</a>
+<a name="ln1180">      new WritableFileWriter(std::move(file), env_options));</a>
+<a name="ln1181">  char file_contents[10];</a>
+<a name="ln1182">  int len =</a>
+<a name="ln1183">      snprintf(file_contents, sizeof(file_contents), &quot;%u\n&quot;, latest_backup);</a>
+<a name="ln1184">  s = file_writer-&gt;Append(Slice(file_contents, len));</a>
+<a name="ln1185">  if (s.ok() &amp;&amp; options_.sync) {</a>
+<a name="ln1186">    RETURN_NOT_OK(file_writer-&gt;Sync(false));</a>
+<a name="ln1187">  }</a>
+<a name="ln1188">  if (s.ok()) {</a>
+<a name="ln1189">    s = file_writer-&gt;Close();</a>
+<a name="ln1190">  }</a>
+<a name="ln1191">  if (s.ok()) {</a>
+<a name="ln1192">    // atomically replace real file with new tmp</a>
+<a name="ln1193">    s = backup_env_-&gt;RenameFile(GetLatestBackupFile(true),</a>
+<a name="ln1194">                                GetLatestBackupFile(false));</a>
+<a name="ln1195">  }</a>
+<a name="ln1196">  return s;</a>
+<a name="ln1197">}</a>
+<a name="ln1198"> </a>
+<a name="ln1199">Status BackupEngineImpl::CopyOrCreateFile(</a>
+<a name="ln1200">    const std::string&amp; src, const std::string&amp; dst, const std::string&amp; contents,</a>
+<a name="ln1201">    Env* src_env, Env* dst_env, bool sync, RateLimiter* rate_limiter,</a>
+<a name="ln1202">    uint64_t* size, uint32_t* checksum_value, uint64_t size_limit,</a>
+<a name="ln1203">    std::function&lt;void()&gt; progress_callback) {</a>
+<a name="ln1204">  assert(src.empty() != contents.empty());</a>
+<a name="ln1205">  Status s;</a>
+<a name="ln1206">  unique_ptr&lt;WritableFile&gt; dst_file;</a>
+<a name="ln1207">  unique_ptr&lt;SequentialFile&gt; src_file;</a>
+<a name="ln1208">  EnvOptions env_options;</a>
+<a name="ln1209">  env_options.use_mmap_writes = false;</a>
+<a name="ln1210">  env_options.use_os_buffer = false;</a>
+<a name="ln1211">  if (size != nullptr) {</a>
+<a name="ln1212">    *size = 0;</a>
+<a name="ln1213">  }</a>
+<a name="ln1214">  if (checksum_value != nullptr) {</a>
+<a name="ln1215">    *checksum_value = 0;</a>
+<a name="ln1216">  }</a>
+<a name="ln1217"> </a>
+<a name="ln1218">  // Check if size limit is set. if not, set it to very big number</a>
+<a name="ln1219">  if (size_limit == 0) {</a>
+<a name="ln1220">    size_limit = std::numeric_limits&lt;uint64_t&gt;::max();</a>
+<a name="ln1221">  }</a>
+<a name="ln1222"> </a>
+<a name="ln1223">  s = dst_env-&gt;NewWritableFile(dst, &amp;dst_file, env_options);</a>
+<a name="ln1224">  if (s.ok() &amp;&amp; !src.empty()) {</a>
+<a name="ln1225">    s = src_env-&gt;NewSequentialFile(src, &amp;src_file, env_options);</a>
+<a name="ln1226">  }</a>
+<a name="ln1227">  if (!s.ok()) {</a>
+<a name="ln1228">    return s;</a>
+<a name="ln1229">  }</a>
+<a name="ln1230"> </a>
+<a name="ln1231">  unique_ptr&lt;WritableFileWriter&gt; dest_writer(</a>
+<a name="ln1232">      new WritableFileWriter(std::move(dst_file), env_options));</a>
+<a name="ln1233">  unique_ptr&lt;SequentialFileReader&gt; src_reader;</a>
+<a name="ln1234">  unique_ptr&lt;uint8_t[]&gt; buf;</a>
+<a name="ln1235">  if (!src.empty()) {</a>
+<a name="ln1236">    src_reader.reset(new SequentialFileReader(std::move(src_file)));</a>
+<a name="ln1237">    buf.reset(new uint8_t[copy_file_buffer_size_]);</a>
+<a name="ln1238">  }</a>
+<a name="ln1239"> </a>
+<a name="ln1240">  Slice data;</a>
+<a name="ln1241">  uint64_t processed_buffer_size = 0;</a>
+<a name="ln1242">  do {</a>
+<a name="ln1243">    if (stop_backup_.load(std::memory_order_acquire)) {</a>
+<a name="ln1244">      return STATUS(Incomplete, &quot;Backup stopped&quot;);</a>
+<a name="ln1245">    }</a>
+<a name="ln1246">    if (!src.empty()) {</a>
+<a name="ln1247">      size_t buffer_to_read = (copy_file_buffer_size_ &lt; size_limit)</a>
+<a name="ln1248">                                  ? copy_file_buffer_size_</a>
+<a name="ln1249">                                  : size_limit;</a>
+<a name="ln1250">      s = src_reader-&gt;Read(buffer_to_read, &amp;data, buf.get());</a>
+<a name="ln1251">      processed_buffer_size += buffer_to_read;</a>
+<a name="ln1252">    } else {</a>
+<a name="ln1253">      data = contents;</a>
+<a name="ln1254">    }</a>
+<a name="ln1255">    size_limit -= data.size();</a>
+<a name="ln1256"> </a>
+<a name="ln1257">    if (!s.ok()) {</a>
+<a name="ln1258">      return s;</a>
+<a name="ln1259">    }</a>
+<a name="ln1260"> </a>
+<a name="ln1261">    if (size != nullptr) {</a>
+<a name="ln1262">      *size += data.size();</a>
+<a name="ln1263">    }</a>
+<a name="ln1264">    if (checksum_value != nullptr) {</a>
+<a name="ln1265">      *checksum_value =</a>
+<a name="ln1266">          crc32c::Extend(*checksum_value, data.data(), data.size());</a>
+<a name="ln1267">    }</a>
+<a name="ln1268">    s = dest_writer-&gt;Append(data);</a>
+<a name="ln1269">    if (rate_limiter != nullptr) {</a>
+<a name="ln1270">      rate_limiter-&gt;Request(data.size(), Env::IO_LOW);</a>
+<a name="ln1271">    }</a>
+<a name="ln1272">    if (processed_buffer_size &gt; options_.callback_trigger_interval_size) {</a>
+<a name="ln1273">      processed_buffer_size -= options_.callback_trigger_interval_size;</a>
+<a name="ln1274">      std::lock_guard&lt;std::mutex&gt; lock(byte_report_mutex_);</a>
+<a name="ln1275">      progress_callback();</a>
+<a name="ln1276">    }</a>
+<a name="ln1277">  } while (s.ok() &amp;&amp; contents.empty() &amp;&amp; data.size() &gt; 0 &amp;&amp; size_limit &gt; 0);</a>
+<a name="ln1278"> </a>
+<a name="ln1279">  if (s.ok() &amp;&amp; sync) {</a>
+<a name="ln1280">    s = dest_writer-&gt;Sync(false);</a>
+<a name="ln1281">  }</a>
+<a name="ln1282">  return s;</a>
+<a name="ln1283">}</a>
+<a name="ln1284"> </a>
+<a name="ln1285">// fname will always start with &quot;/&quot;</a>
+<a name="ln1286">Status BackupEngineImpl::AddBackupFileWorkItem(</a>
+<a name="ln1287">    std::unordered_set&lt;std::string&gt;* live_dst_paths,</a>
+<a name="ln1288">    std::vector&lt;BackupAfterCopyOrCreateWorkItem&gt;* backup_items_to_finish,</a>
+<a name="ln1289">    BackupID backup_id, bool shared,</a>
+<a name="ln1290">    const std::string&amp; src_dir,</a>
+<a name="ln1291">    const std::string&amp; fname, RateLimiter* rate_limiter, uint64_t size_bytes,</a>
+<a name="ln1292">    uint64_t size_limit, bool shared_checksum,</a>
+<a name="ln1293">    std::function&lt;void()&gt; progress_callback, const std::string&amp; contents) {</a>
+<a name="ln1294">  assert(!fname.empty() &amp;&amp; fname[0] == '/');</a>
+<a name="ln1295">  assert(contents.empty() != src_dir.empty());</a>
+<a name="ln1296"> </a>
+<a name="ln1297">  std::string dst_relative = fname.substr(1);</a>
+<a name="ln1298">  std::string dst_relative_tmp;</a>
+<a name="ln1299">  Status s;</a>
+<a name="ln1300">  uint32_t checksum_value = 0;</a>
+<a name="ln1301"> </a>
+<a name="ln1302">  if (shared &amp;&amp; shared_checksum) {</a>
+<a name="ln1303">    // add checksum and file length to the file name</a>
+<a name="ln1304">    s = CalculateChecksum(src_dir + fname, db_env_, size_limit,</a>
+<a name="ln1305">                          &amp;checksum_value);</a>
+<a name="ln1306">    if (!s.ok()) {</a>
+<a name="ln1307">      return s;</a>
+<a name="ln1308">    }</a>
+<a name="ln1309">    if (size_bytes == port::kMaxUint64) {</a>
+<a name="ln1310">      return STATUS(NotFound, &quot;File missing: &quot; + src_dir + fname);</a>
+<a name="ln1311">    }</a>
+<a name="ln1312">    dst_relative =</a>
+<a name="ln1313">        GetSharedFileWithChecksum(dst_relative, checksum_value, size_bytes);</a>
+<a name="ln1314">    dst_relative_tmp = GetSharedFileWithChecksumRel(dst_relative, true);</a>
+<a name="ln1315">    dst_relative = GetSharedFileWithChecksumRel(dst_relative, false);</a>
+<a name="ln1316">  } else if (shared) {</a>
+<a name="ln1317">    dst_relative_tmp = GetSharedFileRel(dst_relative, true);</a>
+<a name="ln1318">    dst_relative = GetSharedFileRel(dst_relative, false);</a>
+<a name="ln1319">  } else {</a>
+<a name="ln1320">    dst_relative_tmp = GetPrivateFileRel(backup_id, true, dst_relative);</a>
+<a name="ln1321">    dst_relative = GetPrivateFileRel(backup_id, false, dst_relative);</a>
+<a name="ln1322">  }</a>
+<a name="ln1323">  std::string dst_path = GetAbsolutePath(dst_relative);</a>
+<a name="ln1324">  std::string dst_path_tmp = GetAbsolutePath(dst_relative_tmp);</a>
+<a name="ln1325"> </a>
+<a name="ln1326">  // if it's shared, we also need to check if it exists -- if it does, no need</a>
+<a name="ln1327">  // to copy it again.</a>
+<a name="ln1328">  bool need_to_copy = true;</a>
+<a name="ln1329">  // true if dst_path is the same path as another live file</a>
+<a name="ln1330">  const bool same_path =</a>
+<a name="ln1331">      live_dst_paths-&gt;find(dst_path) != live_dst_paths-&gt;end();</a>
+<a name="ln1332"> </a>
+<a name="ln1333">  bool file_exists = false;</a>
+<a name="ln1334">  if (shared &amp;&amp; !same_path) {</a>
+<a name="ln1335">    Status exist = backup_env_-&gt;FileExists(dst_path);</a>
+<a name="ln1336">    if (exist.ok()) {</a>
+<a name="ln1337">      file_exists = true;</a>
+<a name="ln1338">    } else if (exist.IsNotFound()) {</a>
+<a name="ln1339">      file_exists = false;</a>
+<a name="ln1340">    } else {</a>
+<a name="ln1341">      assert(s.IsIOError());</a>
+<a name="ln1342">      return exist;</a>
+<a name="ln1343">    }</a>
+<a name="ln1344">  }</a>
+<a name="ln1345"> </a>
+<a name="ln1346">  if (!contents.empty()) {</a>
+<a name="ln1347">    need_to_copy = false;</a>
+<a name="ln1348">  } else if (shared &amp;&amp; (same_path || file_exists)) {</a>
+<a name="ln1349">    need_to_copy = false;</a>
+<a name="ln1350">    if (shared_checksum) {</a>
+<a name="ln1351">      RLOG(options_.info_log,</a>
+<a name="ln1352">          &quot;%s already present, with checksum %u and size %&quot; PRIu64,</a>
+<a name="ln1353">          fname.c_str(), checksum_value, size_bytes);</a>
+<a name="ln1354">    } else if (backuped_file_infos_.find(dst_relative) ==</a>
+<a name="ln1355">               backuped_file_infos_.end() &amp;&amp; !same_path) {</a>
+<a name="ln1356">      // file already exists, but it's not referenced by any backup. overwrite</a>
+<a name="ln1357">      // the file</a>
+<a name="ln1358">      RLOG(options_.info_log,</a>
+<a name="ln1359">          &quot;%s already present, but not referenced by any backup. We will &quot;</a>
+<a name="ln1360">          &quot;overwrite the file.&quot;,</a>
+<a name="ln1361">          fname.c_str());</a>
+<a name="ln1362">      need_to_copy = true;</a>
+<a name="ln1363">      RETURN_NOT_OK(backup_env_-&gt;DeleteFile(dst_path));</a>
+<a name="ln1364">    } else {</a>
+<a name="ln1365">      // the file is present and referenced by a backup</a>
+<a name="ln1366">      RLOG(options_.info_log, &quot;%s already present, calculate checksum&quot;,</a>
+<a name="ln1367">          fname.c_str());</a>
+<a name="ln1368">      s = CalculateChecksum(src_dir + fname, db_env_, size_limit,</a>
+<a name="ln1369">                            &amp;checksum_value);</a>
+<a name="ln1370">    }</a>
+<a name="ln1371">  }</a>
+<a name="ln1372">  live_dst_paths-&gt;insert(dst_path);</a>
+<a name="ln1373"> </a>
+<a name="ln1374">  if (!contents.empty() || need_to_copy) {</a>
+<a name="ln1375">    RLOG(options_.info_log, &quot;Copying %s to %s&quot;, fname.c_str(),</a>
+<a name="ln1376">        dst_path_tmp.c_str());</a>
+<a name="ln1377">    CopyOrCreateWorkItem copy_or_create_work_item(</a>
+<a name="ln1378">        src_dir.empty() ? &quot;&quot; : src_dir + fname, dst_path_tmp, contents, db_env_,</a>
+<a name="ln1379">        backup_env_, options_.sync, rate_limiter, size_limit,</a>
+<a name="ln1380">        progress_callback);</a>
+<a name="ln1381">    BackupAfterCopyOrCreateWorkItem after_copy_or_create_work_item(</a>
+<a name="ln1382">        copy_or_create_work_item.result.get_future(), shared, need_to_copy,</a>
+<a name="ln1383">        backup_env_, dst_path_tmp, dst_path, dst_relative);</a>
+<a name="ln1384">    files_to_copy_or_create_.write(std::move(copy_or_create_work_item));</a>
+<a name="ln1385">    backup_items_to_finish-&gt;push_back(std::move(after_copy_or_create_work_item));</a>
+<a name="ln1386">  } else {</a>
+<a name="ln1387">    std::promise&lt;CopyOrCreateResult&gt; promise_result;</a>
+<a name="ln1388">    BackupAfterCopyOrCreateWorkItem after_copy_or_create_work_item(</a>
+<a name="ln1389">        promise_result.get_future(), shared, need_to_copy, backup_env_,</a>
+<a name="ln1390">        dst_path_tmp, dst_path, dst_relative);</a>
+<a name="ln1391">    backup_items_to_finish-&gt;push_back(std::move(after_copy_or_create_work_item));</a>
+<a name="ln1392">    CopyOrCreateResult result;</a>
+<a name="ln1393">    result.status = s;</a>
+<a name="ln1394">    result.size = size_bytes;</a>
+<a name="ln1395">    result.checksum_value = checksum_value;</a>
+<a name="ln1396">    promise_result.set_value(std::move(result));</a>
+<a name="ln1397">  }</a>
+<a name="ln1398">  return s;</a>
+<a name="ln1399">}</a>
+<a name="ln1400"> </a>
+<a name="ln1401">Status BackupEngineImpl::CalculateChecksum(const std::string&amp; src, Env* src_env,</a>
+<a name="ln1402">                                           uint64_t size_limit,</a>
+<a name="ln1403">                                           uint32_t* checksum_value) {</a>
+<a name="ln1404">  *checksum_value = 0;</a>
+<a name="ln1405">  if (size_limit == 0) {</a>
+<a name="ln1406">    size_limit = std::numeric_limits&lt;uint64_t&gt;::max();</a>
+<a name="ln1407">  }</a>
+<a name="ln1408"> </a>
+<a name="ln1409">  EnvOptions env_options;</a>
+<a name="ln1410">  env_options.use_mmap_writes = false;</a>
+<a name="ln1411">  env_options.use_os_buffer = false;</a>
+<a name="ln1412"> </a>
+<a name="ln1413">  std::unique_ptr&lt;SequentialFile&gt; src_file;</a>
+<a name="ln1414">  Status s = src_env-&gt;NewSequentialFile(src, &amp;src_file, env_options);</a>
+<a name="ln1415">  if (!s.ok()) {</a>
+<a name="ln1416">    return s;</a>
+<a name="ln1417">  }</a>
+<a name="ln1418"> </a>
+<a name="ln1419">  unique_ptr&lt;SequentialFileReader&gt; src_reader(</a>
+<a name="ln1420">      new SequentialFileReader(std::move(src_file)));</a>
+<a name="ln1421">  std::unique_ptr&lt;uint8_t[]&gt; buf(new uint8_t[copy_file_buffer_size_]);</a>
+<a name="ln1422">  Slice data;</a>
+<a name="ln1423"> </a>
+<a name="ln1424">  do {</a>
+<a name="ln1425">    if (stop_backup_.load(std::memory_order_acquire)) {</a>
+<a name="ln1426">      return STATUS(Incomplete, &quot;Backup stopped&quot;);</a>
+<a name="ln1427">    }</a>
+<a name="ln1428">    size_t buffer_to_read = (copy_file_buffer_size_ &lt; size_limit) ?</a>
+<a name="ln1429">      copy_file_buffer_size_ : size_limit;</a>
+<a name="ln1430">    s = src_reader-&gt;Read(buffer_to_read, &amp;data, buf.get());</a>
+<a name="ln1431"> </a>
+<a name="ln1432">    if (!s.ok()) {</a>
+<a name="ln1433">      return s;</a>
+<a name="ln1434">    }</a>
+<a name="ln1435"> </a>
+<a name="ln1436">    size_limit -= data.size();</a>
+<a name="ln1437">    *checksum_value = crc32c::Extend(*checksum_value, data.data(), data.size());</a>
+<a name="ln1438">  } while (data.size() &gt; 0 &amp;&amp; size_limit &gt; 0);</a>
+<a name="ln1439"> </a>
+<a name="ln1440">  return s;</a>
+<a name="ln1441">}</a>
+<a name="ln1442"> </a>
+<a name="ln1443">void BackupEngineImpl::DeleteChildren(const std::string&amp; dir,</a>
+<a name="ln1444">                                      uint32_t file_type_filter) {</a>
+<a name="ln1445">  std::vector&lt;std::string&gt; children;</a>
+<a name="ln1446">  db_env_-&gt;GetChildrenWarnNotOk(dir, &amp;children);</a>
+<a name="ln1447"> </a>
+<a name="ln1448">  for (const auto&amp; f : children) {</a>
+<a name="ln1449">    uint64_t number;</a>
+<a name="ln1450">    FileType type;</a>
+<a name="ln1451">    bool ok = ParseFileName(f, &amp;number, &amp;type);</a>
+<a name="ln1452">    if (ok &amp;&amp; (file_type_filter &amp; (1 &lt;&lt; type))) {</a>
+<a name="ln1453">      // don't delete this file</a>
+<a name="ln1454">      continue;</a>
+<a name="ln1455">    }</a>
+<a name="ln1456">    db_env_-&gt;CleanupFile(dir + &quot;/&quot; + f);</a>
+<a name="ln1457">  }</a>
+<a name="ln1458">}</a>
+<a name="ln1459"> </a>
+<a name="ln1460">Status BackupEngineImpl::InsertPathnameToSizeBytes(</a>
+<a name="ln1461">    const std::string&amp; dir, std::unordered_map&lt;std::string, uint64_t&gt;* result) {</a>
+<a name="ln1462">  assert(result != nullptr);</a>
+<a name="ln1463">  std::vector&lt;Env::FileAttributes&gt; files_attrs;</a>
+<a name="ln1464">  Status status = backup_env_-&gt;GetChildrenFileAttributes(dir, &amp;files_attrs);</a>
+<a name="ln1465">  if (!status.ok()) {</a>
+<a name="ln1466">    return status;</a>
+<a name="ln1467">  }</a>
+<a name="ln1468">  const bool slash_needed = dir.empty() || dir.back() != '/';</a>
+<a name="ln1469">  for (const auto&amp; file_attrs : files_attrs) {</a>
+<a name="ln1470">    result-&gt;emplace(dir + (slash_needed ? &quot;/&quot; : &quot;&quot;) + file_attrs.name,</a>
+<a name="ln1471">                    file_attrs.size_bytes);</a>
+<a name="ln1472">  }</a>
+<a name="ln1473">  return Status::OK();</a>
+<a name="ln1474">}</a>
+<a name="ln1475"> </a>
+<a name="ln1476">Status BackupEngineImpl::GarbageCollect() {</a>
+<a name="ln1477">  assert(!read_only_);</a>
+<a name="ln1478">  RLOG(options_.info_log, &quot;Starting garbage collection&quot;);</a>
+<a name="ln1479"> </a>
+<a name="ln1480">  if (options_.share_table_files) {</a>
+<a name="ln1481">    // delete obsolete shared files</a>
+<a name="ln1482">    std::vector&lt;std::string&gt; shared_children;</a>
+<a name="ln1483">    {</a>
+<a name="ln1484">      auto s = backup_env_-&gt;GetChildren(GetAbsolutePath(GetSharedFileRel()),</a>
+<a name="ln1485">                                        &amp;shared_children);</a>
+<a name="ln1486">      if (!s.ok()) {</a>
+<a name="ln1487">        return s;</a>
+<a name="ln1488">      }</a>
+<a name="ln1489">    }</a>
+<a name="ln1490">    for (auto&amp; child : shared_children) {</a>
+<a name="ln1491">      std::string rel_fname = GetSharedFileRel(child);</a>
+<a name="ln1492">      auto child_itr = backuped_file_infos_.find(rel_fname);</a>
+<a name="ln1493">      // if it's not refcounted, delete it</a>
+<a name="ln1494">      if (child_itr == backuped_file_infos_.end() ||</a>
+<a name="ln1495">          child_itr-&gt;second-&gt;refs == 0) {</a>
+<a name="ln1496">        // this might be a directory, but DeleteFile will just fail in that</a>
+<a name="ln1497">        // case, so we're good</a>
+<a name="ln1498">        Status s = backup_env_-&gt;DeleteFile(GetAbsolutePath(rel_fname));</a>
+<a name="ln1499">        RLOG(options_.info_log, &quot;Deleting %s -- %s&quot;, rel_fname.c_str(),</a>
+<a name="ln1500">            s.ToString().c_str());</a>
+<a name="ln1501">        backuped_file_infos_.erase(rel_fname);</a>
+<a name="ln1502">      }</a>
+<a name="ln1503">    }</a>
+<a name="ln1504">  }</a>
+<a name="ln1505"> </a>
+<a name="ln1506">  // delete obsolete private files</a>
+<a name="ln1507">  std::vector&lt;std::string&gt; private_children;</a>
+<a name="ln1508">  {</a>
+<a name="ln1509">    auto s = backup_env_-&gt;GetChildren(GetAbsolutePath(GetPrivateDirRel()),</a>
+<a name="ln1510">                                      &amp;private_children);</a>
+<a name="ln1511">    if (!s.ok()) {</a>
+<a name="ln1512">      return s;</a>
+<a name="ln1513">    }</a>
+<a name="ln1514">  }</a>
+<a name="ln1515">  for (auto&amp; child : private_children) {</a>
+<a name="ln1516">    BackupID backup_id = 0;</a>
+<a name="ln1517">    bool tmp_dir = child.find(&quot;.tmp&quot;) != std::string::npos;</a>
+<a name="ln1518">    sscanf(child.c_str(), &quot;%u&quot;, &amp;backup_id);</a>
+<a name="ln1519">    if (!tmp_dir &amp;&amp;  // if it's tmp_dir, delete it</a>
+<a name="ln1520">        (backup_id == 0 || backups_.find(backup_id) != backups_.end())) {</a>
+<a name="ln1521">      // it's either not a number or it's still alive. continue</a>
+<a name="ln1522">      continue;</a>
+<a name="ln1523">    }</a>
+<a name="ln1524">    // here we have to delete the dir and all its children</a>
+<a name="ln1525">    std::string full_private_path =</a>
+<a name="ln1526">        GetAbsolutePath(GetPrivateFileRel(backup_id, tmp_dir));</a>
+<a name="ln1527">    std::vector&lt;std::string&gt; subchildren;</a>
+<a name="ln1528">    RETURN_NOT_OK(backup_env_-&gt;GetChildren(full_private_path, &amp;subchildren));</a>
+<a name="ln1529">    for (auto&amp; subchild : subchildren) {</a>
+<a name="ln1530">      Status s = backup_env_-&gt;DeleteFile(full_private_path + subchild);</a>
+<a name="ln1531">      RLOG(options_.info_log, &quot;Deleting %s -- %s&quot;,</a>
+<a name="ln1532">          (full_private_path + subchild).c_str(), s.ToString().c_str());</a>
+<a name="ln1533">    }</a>
+<a name="ln1534">    // finally delete the private dir</a>
+<a name="ln1535">    Status s = backup_env_-&gt;DeleteDir(full_private_path);</a>
+<a name="ln1536">    RLOG(options_.info_log, &quot;Deleting dir %s -- %s&quot;, full_private_path.c_str(),</a>
+<a name="ln1537">        s.ToString().c_str());</a>
+<a name="ln1538">  }</a>
+<a name="ln1539"> </a>
+<a name="ln1540">  return Status::OK();</a>
+<a name="ln1541">}</a>
+<a name="ln1542"> </a>
+<a name="ln1543">// ------- BackupMeta class --------</a>
+<a name="ln1544"> </a>
+<a name="ln1545">Status BackupEngineImpl::BackupMeta::AddFile(</a>
+<a name="ln1546">    std::shared_ptr&lt;FileInfo&gt; file_info) {</a>
+<a name="ln1547">  auto itr = file_infos_-&gt;find(file_info-&gt;filename);</a>
+<a name="ln1548">  if (itr == file_infos_-&gt;end()) {</a>
+<a name="ln1549">    auto ret = file_infos_-&gt;insert({file_info-&gt;filename, file_info});</a>
+<a name="ln1550">    if (ret.second) {</a>
+<a name="ln1551">      itr = ret.first;</a>
+<a name="ln1552">      itr-&gt;second-&gt;refs = 1;</a>
+<a name="ln1553">    } else {</a>
+<a name="ln1554">      // if this happens, something is seriously wrong</a>
+<a name="ln1555">      return STATUS(Corruption, &quot;In memory metadata insertion error&quot;);</a>
+<a name="ln1556">    }</a>
+<a name="ln1557">  } else {</a>
+<a name="ln1558">    if (itr-&gt;second-&gt;checksum_value != file_info-&gt;checksum_value) {</a>
+<a name="ln1559">      return STATUS(Corruption,</a>
+<a name="ln1560">          &quot;Checksum mismatch for existing backup file. Delete old backups and &quot;</a>
+<a name="ln1561">          &quot;try again.&quot;);</a>
+<a name="ln1562">    }</a>
+<a name="ln1563">    ++itr-&gt;second-&gt;refs;  // increase refcount if already present</a>
+<a name="ln1564">  }</a>
+<a name="ln1565"> </a>
+<a name="ln1566">  size_ += file_info-&gt;size;</a>
+<a name="ln1567">  files_.push_back(itr-&gt;second);</a>
+<a name="ln1568"> </a>
+<a name="ln1569">  return Status::OK();</a>
+<a name="ln1570">}</a>
+<a name="ln1571"> </a>
+<a name="ln1572">Status BackupEngineImpl::BackupMeta::Delete(bool delete_meta) {</a>
+<a name="ln1573">  Status s;</a>
+<a name="ln1574">  for (const auto&amp; file : files_) {</a>
+<a name="ln1575">    --file-&gt;refs;  // decrease refcount</a>
+<a name="ln1576">  }</a>
+<a name="ln1577">  files_.clear();</a>
+<a name="ln1578">  // delete meta file</a>
+<a name="ln1579">  if (delete_meta) {</a>
+<a name="ln1580">    s = env_-&gt;FileExists(meta_filename_);</a>
+<a name="ln1581">    if (s.ok()) {</a>
+<a name="ln1582">      s = env_-&gt;DeleteFile(meta_filename_);</a>
+<a name="ln1583">    } else if (s.IsNotFound()) {</a>
+<a name="ln1584">      s = Status::OK();  // nothing to delete</a>
+<a name="ln1585">    }</a>
+<a name="ln1586">  }</a>
+<a name="ln1587">  timestamp_ = 0;</a>
+<a name="ln1588">  return s;</a>
+<a name="ln1589">}</a>
+<a name="ln1590"> </a>
+<a name="ln1591">// each backup meta file is of the format:</a>
+<a name="ln1592">// &lt;timestamp&gt;</a>
+<a name="ln1593">// &lt;seq number&gt;</a>
+<a name="ln1594">// &lt;number of files&gt;</a>
+<a name="ln1595">// &lt;file1&gt; &lt;crc32(literal string)&gt; &lt;crc32_value&gt;</a>
+<a name="ln1596">// &lt;file2&gt; &lt;crc32(literal string)&gt; &lt;crc32_value&gt;</a>
+<a name="ln1597">// ...</a>
+<a name="ln1598">Status BackupEngineImpl::BackupMeta::LoadFromFile(</a>
+<a name="ln1599">    const std::string&amp; backup_dir,</a>
+<a name="ln1600">    const std::unordered_map&lt;std::string, uint64_t&gt;&amp; abs_path_to_size) {</a>
+<a name="ln1601">  assert(Empty());</a>
+<a name="ln1602">  Status s;</a>
+<a name="ln1603">  unique_ptr&lt;SequentialFile&gt; backup_meta_file;</a>
+<a name="ln1604">  s = env_-&gt;NewSequentialFile(meta_filename_, &amp;backup_meta_file, EnvOptions());</a>
+<a name="ln1605">  if (!s.ok()) {</a>
+<a name="ln1606">    return s;</a>
+<a name="ln1607">  }</a>
+<a name="ln1608"> </a>
+<a name="ln1609">  unique_ptr&lt;SequentialFileReader&gt; backup_meta_reader(</a>
+<a name="ln1610">      new SequentialFileReader(std::move(backup_meta_file)));</a>
+<a name="ln1611">  unique_ptr&lt;uint8_t[]&gt; buf(new uint8_t[max_backup_meta_file_size_ + 1]);</a>
+<a name="ln1612">  Slice data;</a>
+<a name="ln1613">  s = backup_meta_reader-&gt;Read(max_backup_meta_file_size_, &amp;data, buf.get());</a>
+<a name="ln1614"> </a>
+<a name="ln1615">  if (!s.ok() || data.size() == max_backup_meta_file_size_) {</a>
+<a name="ln1616">    return s.ok() ? STATUS(Corruption, &quot;File size too big&quot;) : s;</a>
+<a name="ln1617">  }</a>
+<a name="ln1618">  buf[data.size()] = 0;</a>
+<a name="ln1619"> </a>
+<a name="ln1620">  uint32_t num_files = 0;</a>
+<a name="ln1621">  char *next;</a>
+<a name="ln1622">  timestamp_ = strtoull(data.cdata(), &amp;next, 10);</a>
+<a name="ln1623">  data.remove_prefix(next - data.cdata() + 1); // +1 for '\n'</a>
+<a name="ln1624">  sequence_number_ = strtoull(data.cdata(), &amp;next, 10);</a>
+<a name="ln1625">  data.remove_prefix(next - data.cdata() + 1); // +1 for '\n'</a>
+<a name="ln1626">  num_files = static_cast&lt;uint32_t&gt;(strtoul(data.cdata(), &amp;next, 10));</a>
+<a name="ln1627">  data.remove_prefix(next - data.cdata() + 1); // +1 for '\n'</a>
+<a name="ln1628"> </a>
+<a name="ln1629">  std::vector&lt;std::shared_ptr&lt;FileInfo&gt;&gt; files;</a>
+<a name="ln1630"> </a>
+<a name="ln1631">  Slice checksum_prefix(&quot;crc32 &quot;);</a>
+<a name="ln1632"> </a>
+<a name="ln1633">  for (uint32_t i = 0; s.ok() &amp;&amp; i &lt; num_files; ++i) {</a>
+<a name="ln1634">    auto line = GetSliceUntil(&amp;data, '\n');</a>
+<a name="ln1635">    std::string filename = GetSliceUntil(&amp;line, ' ').ToString();</a>
+<a name="ln1636"> </a>
+<a name="ln1637">    uint64_t size;</a>
+<a name="ln1638">    const std::shared_ptr&lt;FileInfo&gt; file_info = GetFile(filename);</a>
+<a name="ln1639">    if (file_info) {</a>
+<a name="ln1640">      size = file_info-&gt;size;</a>
+<a name="ln1641">    } else {</a>
+<a name="ln1642">      std::string abs_path = backup_dir + &quot;/&quot; + filename;</a>
+<a name="ln1643">      try {</a>
+<a name="ln1644">        size = abs_path_to_size.at(abs_path);</a>
+<a name="ln1645">      } catch (std::out_of_range&amp;) {</a>
+<a name="ln1646">        return STATUS(NotFound, &quot;Size missing for pathname: &quot; + abs_path);</a>
+<a name="ln1647">      }</a>
+<a name="ln1648">    }</a>
+<a name="ln1649"> </a>
+<a name="ln1650">    if (line.empty()) {</a>
+<a name="ln1651">      return STATUS(Corruption, &quot;File checksum is missing for &quot; + filename +</a>
+<a name="ln1652">                                &quot; in &quot; + meta_filename_);</a>
+<a name="ln1653">    }</a>
+<a name="ln1654"> </a>
+<a name="ln1655">    uint32_t checksum_value = 0;</a>
+<a name="ln1656">    if (line.starts_with(checksum_prefix)) {</a>
+<a name="ln1657">      line.remove_prefix(checksum_prefix.size());</a>
+<a name="ln1658">      checksum_value = static_cast&lt;uint32_t&gt;(strtoul(line.cdata(), nullptr, 10));</a>
+<a name="ln1659">      if (line != rocksdb::ToString(checksum_value)) {</a>
+<a name="ln1660">        return STATUS(Corruption, &quot;Invalid checksum value for &quot; + filename +</a>
+<a name="ln1661">                                  &quot; in &quot; + meta_filename_);</a>
+<a name="ln1662">      }</a>
+<a name="ln1663">    } else {</a>
+<a name="ln1664">      return STATUS(Corruption, &quot;Unknown checksum type for &quot; + filename +</a>
+<a name="ln1665">                                &quot; in &quot; + meta_filename_);</a>
+<a name="ln1666">    }</a>
+<a name="ln1667"> </a>
+<a name="ln1668">    files.emplace_back(new FileInfo(filename, size, checksum_value));</a>
+<a name="ln1669">  }</a>
+<a name="ln1670"> </a>
+<a name="ln1671">  if (s.ok() &amp;&amp; data.size() &gt; 0) {</a>
+<a name="ln1672">    // file has to be read completely. if not, we count it as corruption</a>
+<a name="ln1673">    s = STATUS(Corruption, &quot;Tailing data in backup meta file in &quot; +</a>
+<a name="ln1674">                           meta_filename_);</a>
+<a name="ln1675">  }</a>
+<a name="ln1676"> </a>
+<a name="ln1677">  if (s.ok()) {</a>
+<a name="ln1678">    files_.reserve(files.size());</a>
+<a name="ln1679">    for (const auto&amp; file_info : files) {</a>
+<a name="ln1680">      s = AddFile(file_info);</a>
+<a name="ln1681">      if (!s.ok()) {</a>
+<a name="ln1682">        break;</a>
+<a name="ln1683">      }</a>
+<a name="ln1684">    }</a>
+<a name="ln1685">  }</a>
+<a name="ln1686"> </a>
+<a name="ln1687">  return s;</a>
+<a name="ln1688">}</a>
+<a name="ln1689"> </a>
+<a name="ln1690">Status BackupEngineImpl::BackupMeta::StoreToFile(bool sync) {</a>
+<a name="ln1691">  Status s;</a>
+<a name="ln1692">  unique_ptr&lt;WritableFile&gt; backup_meta_file;</a>
+<a name="ln1693">  EnvOptions env_options;</a>
+<a name="ln1694">  env_options.use_mmap_writes = false;</a>
+<a name="ln1695">  s = env_-&gt;NewWritableFile(meta_filename_ + &quot;.tmp&quot;, &amp;backup_meta_file,</a>
+<a name="ln1696">                            env_options);</a>
+<a name="ln1697">  if (!s.ok()) {</a>
+<a name="ln1698">    return s;</a>
+<a name="ln1699">  }</a>
+<a name="ln1700"> </a>
+<a name="ln1701">  unique_ptr&lt;char[]&gt; buf(new char[max_backup_meta_file_size_]);</a>
+<a name="ln1702">  int len = 0, buf_size = max_backup_meta_file_size_;</a>
+<a name="ln1703">  len += snprintf(buf.get(), buf_size, &quot;%&quot; PRId64 &quot;\n&quot;, timestamp_);</a>
+<a name="ln1704">  len += snprintf(buf.get() + len, buf_size - len, &quot;%&quot; PRIu64 &quot;\n&quot;,</a>
+<a name="ln1705">                  sequence_number_);</a>
+<a name="ln1706">  len += snprintf(buf.get() + len, buf_size - len, &quot;%&quot; ROCKSDB_PRIszt &quot;\n&quot;,</a>
+<a name="ln1707">                  files_.size());</a>
+<a name="ln1708">  for (const auto&amp; file : files_) {</a>
+<a name="ln1709">    // use crc32 for now, switch to something else if needed</a>
+<a name="ln1710">    len += snprintf(buf.get() + len, buf_size - len, &quot;%s crc32 %u\n&quot;,</a>
+<a name="ln1711">                    file-&gt;filename.c_str(), file-&gt;checksum_value);</a>
+<a name="ln1712">  }</a>
+<a name="ln1713"> </a>
+<a name="ln1714">  s = backup_meta_file-&gt;Append(Slice(buf.get(), (size_t)len));</a>
+<a name="ln1715">  if (s.ok() &amp;&amp; sync) {</a>
+<a name="ln1716">    s = backup_meta_file-&gt;Sync();</a>
+<a name="ln1717">  }</a>
+<a name="ln1718">  if (s.ok()) {</a>
+<a name="ln1719">    s = backup_meta_file-&gt;Close();</a>
+<a name="ln1720">  }</a>
+<a name="ln1721">  if (s.ok()) {</a>
+<a name="ln1722">    s = env_-&gt;RenameFile(meta_filename_ + &quot;.tmp&quot;, meta_filename_);</a>
+<a name="ln1723">  }</a>
+<a name="ln1724">  return s;</a>
+<a name="ln1725">}</a>
+<a name="ln1726"> </a>
+<a name="ln1727">// -------- BackupEngineReadOnlyImpl ---------</a>
+<a name="ln1728">class BackupEngineReadOnlyImpl : public BackupEngineReadOnly {</a>
+<a name="ln1729"> public:</a>
+<a name="ln1730">  BackupEngineReadOnlyImpl(Env* db_env, const BackupableDBOptions&amp; options)</a>
+<a name="ln1731">      : backup_engine_(new BackupEngineImpl(db_env, options, true)) {}</a>
+<a name="ln1732"> </a>
+<a name="ln1733">  virtual ~BackupEngineReadOnlyImpl() {}</a>
+<a name="ln1734"> </a>
+<a name="ln1735">  void GetBackupInfo(std::vector&lt;BackupInfo&gt;* backup_info) override {</a>
+<a name="ln1736">    backup_engine_-&gt;GetBackupInfo(backup_info);</a>
+<a name="ln1737">  }</a>
+<a name="ln1738"> </a>
+<a name="ln1739">  virtual void GetCorruptedBackups(</a>
+<a name="ln1740">      std::vector&lt;BackupID&gt;* corrupt_backup_ids) override {</a>
+<a name="ln1741">    backup_engine_-&gt;GetCorruptedBackups(corrupt_backup_ids);</a>
+<a name="ln1742">  }</a>
+<a name="ln1743"> </a>
+<a name="ln1744">  virtual Status RestoreDBFromBackup(</a>
+<a name="ln1745">      BackupID backup_id, const std::string&amp; db_dir, const std::string&amp; wal_dir,</a>
+<a name="ln1746">      const RestoreOptions&amp; restore_options = RestoreOptions()) override {</a>
+<a name="ln1747">    return backup_engine_-&gt;RestoreDBFromBackup(backup_id, db_dir, wal_dir,</a>
+<a name="ln1748">                                               restore_options);</a>
+<a name="ln1749">  }</a>
+<a name="ln1750"> </a>
+<a name="ln1751">  virtual Status RestoreDBFromLatestBackup(</a>
+<a name="ln1752">      const std::string&amp; db_dir, const std::string&amp; wal_dir,</a>
+<a name="ln1753">      const RestoreOptions&amp; restore_options = RestoreOptions()) override {</a>
+<a name="ln1754">    return backup_engine_-&gt;RestoreDBFromLatestBackup(db_dir, wal_dir,</a>
+<a name="ln1755">                                                     restore_options);</a>
+<a name="ln1756">  }</a>
+<a name="ln1757"> </a>
+<a name="ln1758">  Status VerifyBackup(BackupID backup_id) override {</a>
+<a name="ln1759">    return backup_engine_-&gt;VerifyBackup(backup_id);</a>
+<a name="ln1760">  }</a>
+<a name="ln1761"> </a>
+<a name="ln1762">  Status Initialize() { return backup_engine_-&gt;Initialize(); }</a>
+<a name="ln1763"> </a>
+<a name="ln1764"> private:</a>
+<a name="ln1765">  std::unique_ptr&lt;BackupEngineImpl&gt; backup_engine_;</a>
+<a name="ln1766">};</a>
+<a name="ln1767"> </a>
+<a name="ln1768">Status BackupEngineReadOnly::Open(Env* env, const BackupableDBOptions&amp; options,</a>
+<a name="ln1769">                                  BackupEngineReadOnly** backup_engine_ptr) {</a>
+<a name="ln1770">  if (options.destroy_old_data) {</a>
+<a name="ln1771">    return STATUS(InvalidArgument,</a>
+<a name="ln1772">        &quot;Can't destroy old data with ReadOnly BackupEngine&quot;);</a>
+<a name="ln1773">  }</a>
+<a name="ln1774">  std::unique_ptr&lt;BackupEngineReadOnlyImpl&gt; backup_engine(</a>
+<a name="ln1775">      new BackupEngineReadOnlyImpl(env, options));</a>
+<a name="ln1776">  auto s = backup_engine-&gt;Initialize();</a>
+<a name="ln1777">  if (!s.ok()) {</a>
+<a name="ln1778">    *backup_engine_ptr = nullptr;</a>
+<a name="ln1779">    return s;</a>
+<a name="ln1780">  }</a>
+<a name="ln1781">  *backup_engine_ptr = backup_engine.release();</a>
+<a name="ln1782">  return Status::OK();</a>
+<a name="ln1783">}</a>
+<a name="ln1784"> </a>
+<a name="ln1785">// --- BackupableDB methods --------</a>
+<a name="ln1786"> </a>
+<a name="ln1787">BackupableDB::BackupableDB(DB* db, const BackupableDBOptions&amp; options)</a>
+<a name="ln1788">    : StackableDB(db) {</a>
+<a name="ln1789">  auto backup_engine_impl = new BackupEngineImpl(db-&gt;GetEnv(), options);</a>
+<a name="ln1790">  status_ = backup_engine_impl-&gt;Initialize();</a>
+<a name="ln1791">  backup_engine_ = backup_engine_impl;</a>
+<a name="ln1792">}</a>
+<a name="ln1793"> </a>
+<a name="ln1794">BackupableDB::~BackupableDB() {</a>
+<a name="ln1795">  delete backup_engine_;</a>
+<a name="ln1796">}</a>
+<a name="ln1797"> </a>
+<a name="ln1798">Status BackupableDB::CreateNewBackup(bool flush_before_backup) {</a>
+<a name="ln1799">  if (!status_.ok()) {</a>
+<a name="ln1800">    return status_;</a>
+<a name="ln1801">  }</a>
+<a name="ln1802">  return backup_engine_-&gt;CreateNewBackup(this, flush_before_backup);</a>
+<a name="ln1803">}</a>
+<a name="ln1804"> </a>
+<a name="ln1805">void BackupableDB::GetBackupInfo(std::vector&lt;BackupInfo&gt;* backup_info) {</a>
+<a name="ln1806">  if (!status_.ok()) {</a>
+<a name="ln1807">    return;</a>
+<a name="ln1808">  }</a>
+<a name="ln1809">  backup_engine_-&gt;GetBackupInfo(backup_info);</a>
+<a name="ln1810">}</a>
+<a name="ln1811"> </a>
+<a name="ln1812">void</a>
+<a name="ln1813">BackupableDB::GetCorruptedBackups(std::vector&lt;BackupID&gt;* corrupt_backup_ids) {</a>
+<a name="ln1814">  if (!status_.ok()) {</a>
+<a name="ln1815">    return;</a>
+<a name="ln1816">  }</a>
+<a name="ln1817">  backup_engine_-&gt;GetCorruptedBackups(corrupt_backup_ids);</a>
+<a name="ln1818">}</a>
+<a name="ln1819"> </a>
+<a name="ln1820">Status BackupableDB::PurgeOldBackups(uint32_t num_backups_to_keep) {</a>
+<a name="ln1821">  if (!status_.ok()) {</a>
+<a name="ln1822">    return status_;</a>
+<a name="ln1823">  }</a>
+<a name="ln1824">  return backup_engine_-&gt;PurgeOldBackups(num_backups_to_keep);</a>
+<a name="ln1825">}</a>
+<a name="ln1826"> </a>
+<a name="ln1827">Status BackupableDB::DeleteBackup(BackupID backup_id) {</a>
+<a name="ln1828">  if (!status_.ok()) {</a>
+<a name="ln1829">    return status_;</a>
+<a name="ln1830">  }</a>
+<a name="ln1831">  return backup_engine_-&gt;DeleteBackup(backup_id);</a>
+<a name="ln1832">}</a>
+<a name="ln1833"> </a>
+<a name="ln1834">void BackupableDB::StopBackup() {</a>
+<a name="ln1835">  backup_engine_-&gt;StopBackup();</a>
+<a name="ln1836">}</a>
+<a name="ln1837"> </a>
+<a name="ln1838">Status BackupableDB::GarbageCollect() {</a>
+<a name="ln1839">  if (!status_.ok()) {</a>
+<a name="ln1840">    return status_;</a>
+<a name="ln1841">  }</a>
+<a name="ln1842">  return backup_engine_-&gt;GarbageCollect();</a>
+<a name="ln1843">}</a>
+<a name="ln1844"> </a>
+<a name="ln1845">// --- RestoreBackupableDB methods ------</a>
+<a name="ln1846"> </a>
+<a name="ln1847">RestoreBackupableDB::RestoreBackupableDB(Env* db_env,</a>
+<a name="ln1848">                                         const BackupableDBOptions&amp; options) {</a>
+<a name="ln1849">  auto backup_engine_impl = new BackupEngineImpl(db_env, options);</a>
+<a name="ln1850">  status_ = backup_engine_impl-&gt;Initialize();</a>
+<a name="ln1851">  backup_engine_ = backup_engine_impl;</a>
+<a name="ln1852">}</a>
+<a name="ln1853"> </a>
+<a name="ln1854">RestoreBackupableDB::~RestoreBackupableDB() {</a>
+<a name="ln1855">  delete backup_engine_;</a>
+<a name="ln1856">}</a>
+<a name="ln1857"> </a>
+<a name="ln1858">void</a>
+<a name="ln1859">RestoreBackupableDB::GetBackupInfo(std::vector&lt;BackupInfo&gt;* backup_info) {</a>
+<a name="ln1860">  if (!status_.ok()) {</a>
+<a name="ln1861">    return;</a>
+<a name="ln1862">  }</a>
+<a name="ln1863">  backup_engine_-&gt;GetBackupInfo(backup_info);</a>
+<a name="ln1864">}</a>
+<a name="ln1865"> </a>
+<a name="ln1866">void RestoreBackupableDB::GetCorruptedBackups(</a>
+<a name="ln1867">    std::vector&lt;BackupID&gt;* corrupt_backup_ids) {</a>
+<a name="ln1868">  if (!status_.ok()) {</a>
+<a name="ln1869">    return;</a>
+<a name="ln1870">  }</a>
+<a name="ln1871">  backup_engine_-&gt;GetCorruptedBackups(corrupt_backup_ids);</a>
+<a name="ln1872">}</a>
+<a name="ln1873"> </a>
+<a name="ln1874">Status RestoreBackupableDB::RestoreDBFromBackup(</a>
+<a name="ln1875">    BackupID backup_id, const std::string&amp; db_dir, const std::string&amp; wal_dir,</a>
+<a name="ln1876">    const RestoreOptions&amp; restore_options) {</a>
+<a name="ln1877">  if (!status_.ok()) {</a>
+<a name="ln1878">    return status_;</a>
+<a name="ln1879">  }</a>
+<a name="ln1880">  return backup_engine_-&gt;RestoreDBFromBackup(backup_id, db_dir, wal_dir,</a>
+<a name="ln1881">                                             restore_options);</a>
+<a name="ln1882">}</a>
+<a name="ln1883"> </a>
+<a name="ln1884">Status RestoreBackupableDB::RestoreDBFromLatestBackup(</a>
+<a name="ln1885">    const std::string&amp; db_dir, const std::string&amp; wal_dir,</a>
+<a name="ln1886">    const RestoreOptions&amp; restore_options) {</a>
+<a name="ln1887">  if (!status_.ok()) {</a>
+<a name="ln1888">    return status_;</a>
+<a name="ln1889">  }</a>
+<a name="ln1890">  return backup_engine_-&gt;RestoreDBFromLatestBackup(db_dir, wal_dir,</a>
+<a name="ln1891">                                                   restore_options);</a>
+<a name="ln1892">}</a>
+<a name="ln1893"> </a>
+<a name="ln1894">Status RestoreBackupableDB::PurgeOldBackups(uint32_t num_backups_to_keep) {</a>
+<a name="ln1895">  if (!status_.ok()) {</a>
+<a name="ln1896">    return status_;</a>
+<a name="ln1897">  }</a>
+<a name="ln1898">  return backup_engine_-&gt;PurgeOldBackups(num_backups_to_keep);</a>
+<a name="ln1899">}</a>
+<a name="ln1900"> </a>
+<a name="ln1901">Status RestoreBackupableDB::DeleteBackup(BackupID backup_id) {</a>
+<a name="ln1902">  if (!status_.ok()) {</a>
+<a name="ln1903">    return status_;</a>
+<a name="ln1904">  }</a>
+<a name="ln1905">  return backup_engine_-&gt;DeleteBackup(backup_id);</a>
+<a name="ln1906">}</a>
+<a name="ln1907"> </a>
+<a name="ln1908">Status RestoreBackupableDB::GarbageCollect() {</a>
+<a name="ln1909">  if (!status_.ok()) {</a>
+<a name="ln1910">    return status_;</a>
+<a name="ln1911">  }</a>
+<a name="ln1912">  return backup_engine_-&gt;GarbageCollect();</a>
+<a name="ln1913">}</a>
+<a name="ln1914"> </a>
+<a name="ln1915">}  // namespace rocksdb</a>
+<a name="ln1916"> </a>
+<a name="ln1917">#endif  // ROCKSDB_LITE</a>
+
+</code></pre>
+<div class="balloon" rel="174"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1351"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v576/" target="_blank">V576</a> Incorrect format. Consider checking the seventh actual argument of the 'LogWithContext' function. The memsize type argument is expected.</p></div>
+<div class="balloon" rel="1668"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1023/" target="_blank">V1023</a> A pointer without owner is added to the 'files' container by the 'emplace_back' method. A memory leak will occur in case of an exception.</p></div>
+<div class="balloon" rel="503"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: latest_backup_id_.</p></div>
+<div class="balloon" rel="162"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: sequence_number_.</p></div>
+<div class="balloon" rel="341"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: src_env, dst_env, sync, rate_limiter, size_limit.</p></div>
+<div class="balloon" rel="387"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: shared, needed_to_copy, backup_env.</p></div>
+<div class="balloon" rel="423"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: checksum_value.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

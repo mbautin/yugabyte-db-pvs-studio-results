@@ -1,0 +1,466 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>catalog_loaders.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/master/catalog_loaders.h&quot;</a>
+<a name="ln34">#include &quot;yb/master/master_util.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">namespace yb {</a>
+<a name="ln37">namespace master {</a>
+<a name="ln38"> </a>
+<a name="ln39">////////////////////////////////////////////////////////////</a>
+<a name="ln40">// Table Loader</a>
+<a name="ln41">////////////////////////////////////////////////////////////</a>
+<a name="ln42"> </a>
+<a name="ln43">Status TableLoader::Visit(const TableId&amp; table_id, const SysTablesEntryPB&amp; metadata) {</a>
+<a name="ln44">  CHECK(!ContainsKey(*catalog_manager_-&gt;table_ids_map_, table_id))</a>
+<a name="ln45">        &lt;&lt; &quot;Table already exists: &quot; &lt;&lt; table_id;</a>
+<a name="ln46"> </a>
+<a name="ln47">  // Setup the table info.</a>
+<a name="ln48">  scoped_refptr&lt;TableInfo&gt; table = catalog_manager_-&gt;NewTableInfo(table_id);</a>
+<a name="ln49">  auto l = table-&gt;LockForWrite();</a>
+<a name="ln50">  auto&amp; pb = l-&gt;mutable_data()-&gt;pb;</a>
+<a name="ln51">  pb.CopyFrom(metadata);</a>
+<a name="ln52"> </a>
+<a name="ln53">  if (pb.table_type() == TableType::REDIS_TABLE_TYPE &amp;&amp; pb.name() == kTransactionsTableName) {</a>
+<a name="ln54">    pb.set_table_type(TableType::TRANSACTION_STATUS_TABLE_TYPE);</a>
+<a name="ln55">  }</a>
+<a name="ln56"> </a>
+<a name="ln57">  // Add the table to the IDs map and to the name map (if the table is not deleted). Do not</a>
+<a name="ln58">  // add Postgres tables to the name map as the table name is not unique in a namespace.</a>
+<a name="ln59">  auto table_ids_map_checkout = catalog_manager_-&gt;table_ids_map_.CheckOut();</a>
+<a name="ln60">  (*table_ids_map_checkout)[table-&gt;id()] = table;</a>
+<a name="ln61">  if (l-&gt;data().table_type() != PGSQL_TABLE_TYPE &amp;&amp; !l-&gt;data().started_deleting()) {</a>
+<a name="ln62">    catalog_manager_-&gt;table_names_map_[{l-&gt;data().namespace_id(), l-&gt;data().name()}] = table;</a>
+<a name="ln63">  }</a>
+<a name="ln64"> </a>
+<a name="ln65">  l-&gt;Commit();</a>
+<a name="ln66">  catalog_manager_-&gt;HandleNewTableId(table-&gt;id());</a>
+<a name="ln67"> </a>
+<a name="ln68">  LOG(INFO) &lt;&lt; &quot;Loaded metadata for table &quot; &lt;&lt; table-&gt;ToString();</a>
+<a name="ln69">  VLOG(1) &lt;&lt; &quot;Metadata for table &quot; &lt;&lt; table-&gt;ToString() &lt;&lt; &quot;: &quot; &lt;&lt; metadata.ShortDebugString();</a>
+<a name="ln70"> </a>
+<a name="ln71">  return Status::OK();</a>
+<a name="ln72">}</a>
+<a name="ln73"> </a>
+<a name="ln74">////////////////////////////////////////////////////////////</a>
+<a name="ln75">// Tablet Loader</a>
+<a name="ln76">////////////////////////////////////////////////////////////</a>
+<a name="ln77"> </a>
+<a name="ln78">Status TabletLoader::Visit(const TabletId&amp; tablet_id, const SysTabletsEntryPB&amp; metadata) {</a>
+<a name="ln79">  // Lookup the table.</a>
+<a name="ln80">  scoped_refptr&lt;TableInfo&gt; first_table(FindPtrOrNull(</a>
+<a name="ln81">      *catalog_manager_-&gt;table_ids_map_, metadata.table_id()));</a>
+<a name="ln82"> </a>
+<a name="ln83">  // Setup the tablet info.</a>
+<a name="ln84">  TabletInfo* tablet = new TabletInfo(first_table, tablet_id);</a>
+<a name="ln85">  auto l = tablet-&gt;LockForWrite();</a>
+<a name="ln86">  l-&gt;mutable_data()-&gt;pb.CopyFrom(metadata);</a>
+<a name="ln87"> </a>
+<a name="ln88">  // Add the tablet to the tablet manager.</a>
+<a name="ln89">  auto tablet_map_checkout = catalog_manager_-&gt;tablet_map_.CheckOut();</a>
+<a name="ln90">  auto inserted = tablet_map_checkout-&gt;emplace(tablet-&gt;tablet_id(), tablet).second;</a>
+<a name="ln91">  if (!inserted) {</a>
+<a name="ln92">    return STATUS_FORMAT(</a>
+<a name="ln93">        IllegalState, &quot;Loaded tablet that already in map: $0&quot;, tablet-&gt;tablet_id());</a>
+<a name="ln94">  }</a>
+<a name="ln95"> </a>
+<a name="ln96">  std::vector&lt;TableId&gt; table_ids;</a>
+<a name="ln97">  for (int k = 0; k &lt; metadata.table_ids_size(); ++k) {</a>
+<a name="ln98">    table_ids.push_back(metadata.table_ids(k));</a>
+<a name="ln99">  }</a>
+<a name="ln100"> </a>
+<a name="ln101">  // This is for backwards compatibility: we want to ensure that the table_ids</a>
+<a name="ln102">  // list contains the first table that created the tablet. If the table_ids field</a>
+<a name="ln103">  // was empty, we &quot;upgrade&quot; the master to support this new invariant.</a>
+<a name="ln104">  if (metadata.table_ids_size() == 0) {</a>
+<a name="ln105">    l-&gt;mutable_data()-&gt;pb.add_table_ids(metadata.table_id());</a>
+<a name="ln106">    Status s = catalog_manager_-&gt;sys_catalog_-&gt;UpdateItem(</a>
+<a name="ln107">        tablet, catalog_manager_-&gt;leader_ready_term());</a>
+<a name="ln108">    if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln109">      return STATUS_FORMAT(</a>
+<a name="ln110">          IllegalState, &quot;An error occurred while inserting to sys-tablets: $0&quot;, s);</a>
+<a name="ln111">    }</a>
+<a name="ln112">    table_ids.push_back(metadata.table_id());</a>
+<a name="ln113">  }</a>
+<a name="ln114"> </a>
+<a name="ln115">  bool tablet_deleted = l-&gt;mutable_data()-&gt;is_deleted();</a>
+<a name="ln116"> </a>
+<a name="ln117">  // true if we need to delete this tablet because the tables this tablets belongs to have been</a>
+<a name="ln118">  // marked as DELETING. It will be set to false as soon as we find a table that is not in the</a>
+<a name="ln119">  // DELETING or DELETED state.</a>
+<a name="ln120">  bool should_delete_tablet = true;</a>
+<a name="ln121"> </a>
+<a name="ln122">  // We need to check if this is a tablegroup parent tablet. If so, we need to add this to the</a>
+<a name="ln123">  // catalog manager maps below.</a>
+<a name="ln124">  bool is_tablegroup_tablet = catalog_manager_-&gt;IsTablegroupParentTable(*first_table);</a>
+<a name="ln125"> </a>
+<a name="ln126">  for (auto table_id : table_ids) {</a>
+<a name="ln127">    scoped_refptr&lt;TableInfo&gt; table(FindPtrOrNull(*catalog_manager_-&gt;table_ids_map_, table_id));</a>
+<a name="ln128"> </a>
+<a name="ln129">    if (table == nullptr) {</a>
+<a name="ln130">      // If the table is missing and the tablet is in &quot;preparing&quot; state</a>
+<a name="ln131">      // may mean that the table was not created (maybe due to a failed write</a>
+<a name="ln132">      // for the sys-tablets). The cleaner will remove.</a>
+<a name="ln133">      if (l-&gt;data().pb.state() == SysTabletsEntryPB::PREPARING) {</a>
+<a name="ln134">        LOG(WARNING) &lt;&lt; &quot;Missing table &quot; &lt;&lt; table_id &lt;&lt; &quot; required by tablet &quot; &lt;&lt; tablet_id</a>
+<a name="ln135">                      &lt;&lt; &quot; (probably a failed table creation: the tablet was not assigned)&quot;;</a>
+<a name="ln136">        return Status::OK();</a>
+<a name="ln137">      }</a>
+<a name="ln138"> </a>
+<a name="ln139">      // if the tablet is not in a &quot;preparing&quot; state, something is wrong...</a>
+<a name="ln140">      LOG(ERROR) &lt;&lt; &quot;Missing table &quot; &lt;&lt; table_id &lt;&lt; &quot; required by tablet &quot; &lt;&lt; tablet_id</a>
+<a name="ln141">                  &lt;&lt; &quot;, metadata: &quot; &lt;&lt; metadata.DebugString()</a>
+<a name="ln142">                  &lt;&lt; &quot;, tables: &quot; &lt;&lt; yb::ToString(*catalog_manager_-&gt;table_ids_map_);</a>
+<a name="ln143">      return STATUS(Corruption, &quot;Missing table for tablet: &quot;, tablet_id);</a>
+<a name="ln144">    }</a>
+<a name="ln145"> </a>
+<a name="ln146">    // Add the tablet to the Table.</a>
+<a name="ln147">    if (!tablet_deleted) {</a>
+<a name="ln148">      table-&gt;AddTablet(tablet);</a>
+<a name="ln149">    }</a>
+<a name="ln150"> </a>
+<a name="ln151">    auto tl = table-&gt;LockForRead();</a>
+<a name="ln152">    if (tablet_deleted || !tl-&gt;data().started_deleting()) {</a>
+<a name="ln153">      // The tablet is already deleted or the table hasn't been deleted. So we don't delete</a>
+<a name="ln154">      // this tablet.</a>
+<a name="ln155">      should_delete_tablet = false;</a>
+<a name="ln156">    }</a>
+<a name="ln157"> </a>
+<a name="ln158">  }</a>
+<a name="ln159"> </a>
+<a name="ln160"> </a>
+<a name="ln161">  if (should_delete_tablet) {</a>
+<a name="ln162">    LOG(WARNING) &lt;&lt; &quot;Deleting tablet &quot; &lt;&lt; tablet-&gt;id() &lt;&lt; &quot; for table &quot; &lt;&lt; first_table-&gt;ToString();</a>
+<a name="ln163">    string deletion_msg = &quot;Tablet deleted at &quot; + LocalTimeAsString();</a>
+<a name="ln164">    l-&gt;mutable_data()-&gt;set_state(SysTabletsEntryPB::DELETED, deletion_msg);</a>
+<a name="ln165">    RETURN_NOT_OK_PREPEND(catalog_manager_-&gt;sys_catalog()-&gt;UpdateItem(tablet, term_),</a>
+<a name="ln166">                          strings::Substitute(&quot;Error deleting tablet $0&quot;, tablet-&gt;id()));</a>
+<a name="ln167">  }</a>
+<a name="ln168"> </a>
+<a name="ln169">  l-&gt;Commit();</a>
+<a name="ln170"> </a>
+<a name="ln171">  // Add the tablet to colocated_tablet_ids_map_ if the tablet is colocated.</a>
+<a name="ln172">  if (catalog_manager_-&gt;IsColocatedParentTable(*first_table)) {</a>
+<a name="ln173">    catalog_manager_-&gt;colocated_tablet_ids_map_[first_table-&gt;namespace_id()] =</a>
+<a name="ln174">        catalog_manager_-&gt;tablet_map_-&gt;find(tablet_id)-&gt;second;</a>
+<a name="ln175">  }</a>
+<a name="ln176"> </a>
+<a name="ln177">  // Add the tablet to tablegroup_tablet_ids_map_ if the tablet is a tablegroup parent.</a>
+<a name="ln178">  if (is_tablegroup_tablet) {</a>
+<a name="ln179">    catalog_manager_-&gt;tablegroup_tablet_ids_map_[first_table-&gt;namespace_id()]</a>
+<a name="ln180">        [first_table-&gt;id().substr(0, 32)] = catalog_manager_-&gt;tablet_map_-&gt;find(tablet_id)-&gt;second;</a>
+<a name="ln181"> </a>
+<a name="ln182">    TablegroupInfo *tg = new TablegroupInfo(first_table-&gt;id().substr(0, 32),</a>
+<a name="ln183">                                            first_table-&gt;namespace_id());</a>
+<a name="ln184"> </a>
+<a name="ln185">    // Loop through table_ids again to add them to our tablegroup info.</a>
+<a name="ln186">    for (auto table_id : table_ids) {</a>
+<a name="ln187">      tg-&gt;AddChildTable(table_id);</a>
+<a name="ln188">    }</a>
+<a name="ln189">    catalog_manager_-&gt;tablegroup_ids_map_[first_table-&gt;id().substr(0, 32)] = tg;</a>
+<a name="ln190">  }</a>
+<a name="ln191"> </a>
+<a name="ln192">  LOG(INFO) &lt;&lt; &quot;Loaded metadata for &quot; &lt;&lt; (tablet_deleted ? &quot;deleted &quot; : &quot;&quot;)</a>
+<a name="ln193">            &lt;&lt; &quot;tablet &quot; &lt;&lt; tablet_id</a>
+<a name="ln194">            &lt;&lt; &quot; (first table &quot; &lt;&lt; first_table-&gt;ToString() &lt;&lt; &quot;)&quot;;</a>
+<a name="ln195"> </a>
+<a name="ln196">  VLOG(1) &lt;&lt; &quot;Metadata for tablet &quot; &lt;&lt; tablet_id &lt;&lt; &quot;: &quot; &lt;&lt; metadata.ShortDebugString();</a>
+<a name="ln197"> </a>
+<a name="ln198">  return Status::OK();</a>
+<a name="ln199">}</a>
+<a name="ln200"> </a>
+<a name="ln201">////////////////////////////////////////////////////////////</a>
+<a name="ln202">// Namespace Loader</a>
+<a name="ln203">////////////////////////////////////////////////////////////</a>
+<a name="ln204"> </a>
+<a name="ln205">Status NamespaceLoader::Visit(const NamespaceId&amp; ns_id, const SysNamespaceEntryPB&amp; metadata) {</a>
+<a name="ln206">  CHECK(!ContainsKey(catalog_manager_-&gt;namespace_ids_map_, ns_id))</a>
+<a name="ln207">    &lt;&lt; &quot;Namespace already exists: &quot; &lt;&lt; ns_id;</a>
+<a name="ln208"> </a>
+<a name="ln209">  // Setup the namespace info.</a>
+<a name="ln210">  scoped_refptr&lt;NamespaceInfo&gt; ns = new NamespaceInfo(ns_id);</a>
+<a name="ln211">  auto l = ns-&gt;LockForWrite();</a>
+<a name="ln212">  const auto&amp; pb_data = l-&gt;data().pb;</a>
+<a name="ln213"> </a>
+<a name="ln214">  l-&gt;mutable_data()-&gt;pb.CopyFrom(metadata);</a>
+<a name="ln215"> </a>
+<a name="ln216">  if (!pb_data.has_database_type() || pb_data.database_type() == YQL_DATABASE_UNKNOWN) {</a>
+<a name="ln217">    LOG(INFO) &lt;&lt; &quot;Updating database type of namespace &quot; &lt;&lt; pb_data.name();</a>
+<a name="ln218">    l-&gt;mutable_data()-&gt;pb.set_database_type(GetDefaultDatabaseType(pb_data.name()));</a>
+<a name="ln219">  }</a>
+<a name="ln220"> </a>
+<a name="ln221">  // When upgrading, we won't have persisted this new field.</a>
+<a name="ln222">  // TODO: Persist this change to disk instead of just changing memory.</a>
+<a name="ln223">  auto state = metadata.state();</a>
+<a name="ln224">  if (!metadata.has_state()) {</a>
+<a name="ln225">    state = SysNamespaceEntryPB::RUNNING;</a>
+<a name="ln226">    LOG(INFO) &lt;&lt; &quot;Changing metadata without state to RUNNING: &quot; &lt;&lt; ns-&gt;ToString();</a>
+<a name="ln227">    l-&gt;mutable_data()-&gt;pb.set_state(state);</a>
+<a name="ln228">  }</a>
+<a name="ln229"> </a>
+<a name="ln230">  switch(state) {</a>
+<a name="ln231">    case SysNamespaceEntryPB::RUNNING:</a>
+<a name="ln232">      // Add the namespace to the IDs map and to the name map (if the namespace is not deleted).</a>
+<a name="ln233">      catalog_manager_-&gt;namespace_ids_map_[ns_id] = ns;</a>
+<a name="ln234">      if (!pb_data.name().empty()) {</a>
+<a name="ln235">        catalog_manager_-&gt;namespace_names_mapper_[pb_data.database_type()][pb_data.name()] = ns;</a>
+<a name="ln236">      } else {</a>
+<a name="ln237">        LOG(WARNING) &lt;&lt; &quot;Namespace with id &quot; &lt;&lt; ns_id &lt;&lt; &quot; has empty name&quot;;</a>
+<a name="ln238">      }</a>
+<a name="ln239">      l-&gt;Commit();</a>
+<a name="ln240">      LOG(INFO) &lt;&lt; &quot;Loaded metadata for namespace &quot; &lt;&lt; ns-&gt;ToString();</a>
+<a name="ln241">      break;</a>
+<a name="ln242">    case SysNamespaceEntryPB::PREPARING:</a>
+<a name="ln243">      // PREPARING means the server restarted before completing NS creation.</a>
+<a name="ln244">      // Consider it FAILED &amp; remove any partially-created data.</a>
+<a name="ln245">      FALLTHROUGH_INTENDED;</a>
+<a name="ln246">    case SysNamespaceEntryPB::FAILED:</a>
+<a name="ln247">      LOG(INFO) &lt;&lt; &quot;Transitioning failed namespace (state=&quot;  &lt;&lt; metadata.state()</a>
+<a name="ln248">                &lt;&lt; &quot;) to DELETING: &quot; &lt;&lt; ns-&gt;ToString();</a>
+<a name="ln249">      l-&gt;mutable_data()-&gt;pb.set_state(SysNamespaceEntryPB::DELETING);</a>
+<a name="ln250">      FALLTHROUGH_INTENDED;</a>
+<a name="ln251">    case SysNamespaceEntryPB::DELETING:</a>
+<a name="ln252">      catalog_manager_-&gt;namespace_ids_map_[ns_id] = ns;</a>
+<a name="ln253">      if (!pb_data.name().empty()) {</a>
+<a name="ln254">        catalog_manager_-&gt;namespace_names_mapper_[pb_data.database_type()][pb_data.name()] = ns;</a>
+<a name="ln255">      } else {</a>
+<a name="ln256">        LOG(WARNING) &lt;&lt; &quot;Namespace with id &quot; &lt;&lt; ns_id &lt;&lt; &quot; has empty name&quot;;</a>
+<a name="ln257">      }</a>
+<a name="ln258">      l-&gt;Commit();</a>
+<a name="ln259">      LOG(INFO) &lt;&lt; &quot;Loaded metadata to DELETE namespace &quot; &lt;&lt; ns-&gt;ToString();</a>
+<a name="ln260">      WARN_NOT_OK(catalog_manager_-&gt;background_tasks_thread_pool_-&gt;SubmitFunc(</a>
+<a name="ln261">          std::bind(&amp;CatalogManager::DeleteYsqlDatabaseAsync, catalog_manager_, ns)),</a>
+<a name="ln262">          &quot;Could not submit DeleteYsqlDatabaseAsync to thread pool&quot;);</a>
+<a name="ln263">      break;</a>
+<a name="ln264">    case SysNamespaceEntryPB::DELETED:</a>
+<a name="ln265">      LOG(INFO) &lt;&lt; &quot;Skipping metadata for namespace (state=&quot;  &lt;&lt; metadata.state()</a>
+<a name="ln266">                &lt;&lt; &quot;): &quot; &lt;&lt; ns-&gt;ToString();</a>
+<a name="ln267">      // Garbage collection.  Async remove the Namespace from the SysCatalog.</a>
+<a name="ln268">      // No in-memory state needed since tablet deletes have already been processed.</a>
+<a name="ln269">      WARN_NOT_OK(catalog_manager_-&gt;background_tasks_thread_pool_-&gt;SubmitFunc(</a>
+<a name="ln270">          std::bind(&amp;CatalogManager::DeleteYsqlDatabaseAsync, catalog_manager_, ns)),</a>
+<a name="ln271">          &quot;Could not submit DeleteYsqlDatabaseAsync to thread pool&quot;);</a>
+<a name="ln272">      break;</a>
+<a name="ln273">    default:</a>
+<a name="ln274">      FATAL_INVALID_ENUM_VALUE(SysNamespaceEntryPB_State, state);</a>
+<a name="ln275">  }</a>
+<a name="ln276"> </a>
+<a name="ln277">  VLOG(1) &lt;&lt; &quot;Metadata for namespace &quot; &lt;&lt; ns-&gt;ToString() &lt;&lt; &quot;: &quot; &lt;&lt; metadata.ShortDebugString();</a>
+<a name="ln278"> </a>
+<a name="ln279">  return Status::OK();</a>
+<a name="ln280">}</a>
+<a name="ln281"> </a>
+<a name="ln282">////////////////////////////////////////////////////////////</a>
+<a name="ln283">// User-Defined Type Loader</a>
+<a name="ln284">////////////////////////////////////////////////////////////</a>
+<a name="ln285"> </a>
+<a name="ln286">Status UDTypeLoader::Visit(const UDTypeId&amp; udtype_id, const SysUDTypeEntryPB&amp; metadata) {</a>
+<a name="ln287">  CHECK(!ContainsKey(catalog_manager_-&gt;udtype_ids_map_, udtype_id))</a>
+<a name="ln288">      &lt;&lt; &quot;Type already exists: &quot; &lt;&lt; udtype_id;</a>
+<a name="ln289"> </a>
+<a name="ln290">  // Setup the table info.</a>
+<a name="ln291">  UDTypeInfo *const udtype = new UDTypeInfo(udtype_id);</a>
+<a name="ln292">  auto l = udtype-&gt;LockForWrite();</a>
+<a name="ln293">  l-&gt;mutable_data()-&gt;pb.CopyFrom(metadata);</a>
+<a name="ln294"> </a>
+<a name="ln295">  // Add the used-defined type to the IDs map and to the name map (if the type is not deleted).</a>
+<a name="ln296">  catalog_manager_-&gt;udtype_ids_map_[udtype-&gt;id()] = udtype;</a>
+<a name="ln297">  if (!l-&gt;data().name().empty()) { // If name is set (non-empty) then type is not deleted.</a>
+<a name="ln298">    catalog_manager_-&gt;udtype_names_map_[{l-&gt;data().namespace_id(), l-&gt;data().name()}] = udtype;</a>
+<a name="ln299">  }</a>
+<a name="ln300"> </a>
+<a name="ln301">  l-&gt;Commit();</a>
+<a name="ln302"> </a>
+<a name="ln303">  LOG(INFO) &lt;&lt; &quot;Loaded metadata for type &quot; &lt;&lt; udtype-&gt;ToString();</a>
+<a name="ln304">  VLOG(1) &lt;&lt; &quot;Metadata for type &quot; &lt;&lt; udtype-&gt;ToString() &lt;&lt; &quot;: &quot; &lt;&lt; metadata.ShortDebugString();</a>
+<a name="ln305"> </a>
+<a name="ln306">  return Status::OK();</a>
+<a name="ln307">}</a>
+<a name="ln308"> </a>
+<a name="ln309">////////////////////////////////////////////////////////////</a>
+<a name="ln310">// Config Loader</a>
+<a name="ln311">////////////////////////////////////////////////////////////</a>
+<a name="ln312"> </a>
+<a name="ln313">Status ClusterConfigLoader::Visit(</a>
+<a name="ln314">    const std::string&amp; unused_id, const SysClusterConfigEntryPB&amp; metadata) {</a>
+<a name="ln315">  // Debug confirm that there is no cluster_config_ set. This also ensures that this does not</a>
+<a name="ln316">  // visit multiple rows. Should update this, if we decide to have multiple IDs set as well.</a>
+<a name="ln317">  DCHECK(!catalog_manager_-&gt;cluster_config_) &lt;&lt; &quot;Already have config data!&quot;;</a>
+<a name="ln318"> </a>
+<a name="ln319">  // Prepare the config object.</a>
+<a name="ln320">  ClusterConfigInfo* config = new ClusterConfigInfo();</a>
+<a name="ln321">  auto l = config-&gt;LockForWrite();</a>
+<a name="ln322">  l-&gt;mutable_data()-&gt;pb.CopyFrom(metadata);</a>
+<a name="ln323"> </a>
+<a name="ln324">  {</a>
+<a name="ln325">    std::lock_guard &lt;CatalogManager::LockType&gt; blacklist_lock(catalog_manager_-&gt;blacklist_lock_);</a>
+<a name="ln326"> </a>
+<a name="ln327">    if (metadata.has_server_blacklist()) {</a>
+<a name="ln328">      // Rebuild the blacklist state for load movement completion tracking.</a>
+<a name="ln329">      RETURN_NOT_OK(catalog_manager_-&gt;SetBlackList(metadata.server_blacklist()));</a>
+<a name="ln330">    }</a>
+<a name="ln331"> </a>
+<a name="ln332">    if (metadata.has_leader_blacklist()) {</a>
+<a name="ln333">      // Rebuild the blacklist state for load movement completion tracking.</a>
+<a name="ln334">      RETURN_NOT_OK(catalog_manager_-&gt;SetLeaderBlacklist(metadata.leader_blacklist()));</a>
+<a name="ln335">    }</a>
+<a name="ln336">  }</a>
+<a name="ln337"> </a>
+<a name="ln338">  // Update in memory state.</a>
+<a name="ln339">  catalog_manager_-&gt;cluster_config_ = config;</a>
+<a name="ln340">  l-&gt;Commit();</a>
+<a name="ln341"> </a>
+<a name="ln342">  return Status::OK();</a>
+<a name="ln343">}</a>
+<a name="ln344"> </a>
+<a name="ln345">////////////////////////////////////////////////////////////</a>
+<a name="ln346">// Redis Config Loader</a>
+<a name="ln347">////////////////////////////////////////////////////////////</a>
+<a name="ln348"> </a>
+<a name="ln349">Status RedisConfigLoader::Visit(const std::string&amp; key, const SysRedisConfigEntryPB&amp; metadata) {</a>
+<a name="ln350">  CHECK(!ContainsKey(catalog_manager_-&gt;redis_config_map_, key))</a>
+<a name="ln351">      &lt;&lt; &quot;Redis Config with key already exists: &quot; &lt;&lt; key;</a>
+<a name="ln352">  // Prepare the config object.</a>
+<a name="ln353">  RedisConfigInfo* config = new RedisConfigInfo(key);</a>
+<a name="ln354">  auto l = config-&gt;LockForWrite();</a>
+<a name="ln355">  l-&gt;mutable_data()-&gt;pb.CopyFrom(metadata);</a>
+<a name="ln356">  catalog_manager_-&gt;redis_config_map_[key] = config;</a>
+<a name="ln357">  l-&gt;Commit();</a>
+<a name="ln358">  return Status::OK();</a>
+<a name="ln359">}</a>
+<a name="ln360"> </a>
+<a name="ln361">////////////////////////////////////////////////////////////</a>
+<a name="ln362">// Role Loader</a>
+<a name="ln363">////////////////////////////////////////////////////////////</a>
+<a name="ln364"> </a>
+<a name="ln365">Status RoleLoader::Visit(const RoleName&amp; role_name, const SysRoleEntryPB&amp; metadata) {</a>
+<a name="ln366">  CHECK(!catalog_manager_-&gt;permissions_manager()-&gt;DoesRoleExistUnlocked(role_name))</a>
+<a name="ln367">    &lt;&lt; &quot;Role already exists: &quot; &lt;&lt; role_name;</a>
+<a name="ln368"> </a>
+<a name="ln369">  RoleInfo* const role = new RoleInfo(role_name);</a>
+<a name="ln370">  auto l = role-&gt;LockForWrite();</a>
+<a name="ln371">  l-&gt;mutable_data()-&gt;pb.CopyFrom(metadata);</a>
+<a name="ln372">  catalog_manager_-&gt;permissions_manager()-&gt;AddRoleUnlocked(</a>
+<a name="ln373">      role_name, make_scoped_refptr&lt;RoleInfo&gt;(role));</a>
+<a name="ln374"> </a>
+<a name="ln375">  l-&gt;Commit();</a>
+<a name="ln376"> </a>
+<a name="ln377">  LOG(INFO) &lt;&lt; &quot;Loaded metadata for role &quot; &lt;&lt; role-&gt;id();</a>
+<a name="ln378">  VLOG(1) &lt;&lt; &quot;Metadata for role &quot; &lt;&lt; role-&gt;id() &lt;&lt; &quot;: &quot; &lt;&lt; metadata.ShortDebugString();</a>
+<a name="ln379"> </a>
+<a name="ln380">  return Status::OK();</a>
+<a name="ln381">}</a>
+<a name="ln382"> </a>
+<a name="ln383">////////////////////////////////////////////////////////////</a>
+<a name="ln384">// Sys Config Loader</a>
+<a name="ln385">////////////////////////////////////////////////////////////</a>
+<a name="ln386"> </a>
+<a name="ln387">Status SysConfigLoader::Visit(const string&amp; config_type, const SysConfigEntryPB&amp; metadata) {</a>
+<a name="ln388">  SysConfigInfo* const config = new SysConfigInfo(config_type);</a>
+<a name="ln389">  auto l = config-&gt;LockForWrite();</a>
+<a name="ln390">  l-&gt;mutable_data()-&gt;pb.CopyFrom(metadata);</a>
+<a name="ln391"> </a>
+<a name="ln392">  // For now we are only using this to store (ycql) security config or ysql catalog config.</a>
+<a name="ln393">  if (config_type == kSecurityConfigType) {</a>
+<a name="ln394">    catalog_manager_-&gt;permissions_manager()-&gt;SetSecurityConfigOnLoadUnlocked(config);</a>
+<a name="ln395">  } else if (config_type == kYsqlCatalogConfigType) {</a>
+<a name="ln396">    LOG_IF(WARNING, catalog_manager_-&gt;ysql_catalog_config_ != nullptr)</a>
+<a name="ln397">        &lt;&lt; &quot;Multiple sys config type &quot; &lt;&lt; config_type &lt;&lt; &quot; found&quot;;</a>
+<a name="ln398">    catalog_manager_-&gt;ysql_catalog_config_ = config;</a>
+<a name="ln399">  }</a>
+<a name="ln400"> </a>
+<a name="ln401">  l-&gt;Commit();</a>
+<a name="ln402"> </a>
+<a name="ln403">  LOG(INFO) &lt;&lt; &quot;Loaded sys config type &quot; &lt;&lt; config_type;</a>
+<a name="ln404">  return Status::OK();</a>
+<a name="ln405">}</a>
+<a name="ln406"> </a>
+<a name="ln407">}  // namespace master</a>
+<a name="ln408">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="44"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="69"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="196"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="206"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="277"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="287"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="304"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="317"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="329"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The function was exited without releasing the 'config' pointer. A memory leak is possible.</p></div>
+<div class="balloon" rel="350"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="366"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="378"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="396"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,1269 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>async_rpc_tasks.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13">#include &quot;yb/master/async_rpc_tasks.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &quot;yb/consensus/consensus_meta.h&quot;</a>
+<a name="ln18">#include &quot;yb/consensus/consensus.proxy.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/master/master.h&quot;</a>
+<a name="ln21">#include &quot;yb/master/ts_descriptor.h&quot;</a>
+<a name="ln22">#include &quot;yb/master/catalog_manager.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/tserver/tserver_admin.proxy.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/util/atomic.h&quot;</a>
+<a name="ln29">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln30">#include &quot;yb/util/format.h&quot;</a>
+<a name="ln31">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln32">#include &quot;yb/util/thread_restrictions.h&quot;</a>
+<a name="ln33"> </a>
+<a name="ln34">DEFINE_int32(unresponsive_ts_rpc_timeout_ms, 15 * 60 * 1000,  // 15 minutes</a>
+<a name="ln35">             &quot;After this amount of time (or after we have retried unresponsive_ts_rpc_retry_limit &quot;</a>
+<a name="ln36">             &quot;times, whichever happens first), the master will stop attempting to contact a tablet &quot;</a>
+<a name="ln37">             &quot;server in order to perform operations such as deleting a tablet.&quot;);</a>
+<a name="ln38">TAG_FLAG(unresponsive_ts_rpc_timeout_ms, advanced);</a>
+<a name="ln39"> </a>
+<a name="ln40">DEFINE_int32(unresponsive_ts_rpc_retry_limit, 20,</a>
+<a name="ln41">             &quot;After this number of retries (or unresponsive_ts_rpc_timeout_ms expires, whichever &quot;</a>
+<a name="ln42">             &quot;happens first), the master will stop attempting to contact a tablet server in order &quot;</a>
+<a name="ln43">             &quot;to perform operations such as deleting a tablet.&quot;);</a>
+<a name="ln44">TAG_FLAG(unresponsive_ts_rpc_retry_limit, advanced);</a>
+<a name="ln45"> </a>
+<a name="ln46">DEFINE_int32(retrying_ts_rpc_max_delay_ms, 60 * 1000,</a>
+<a name="ln47">             &quot;Maximum delay between successive attempts to contact an unresponsive tablet server&quot;);</a>
+<a name="ln48">TAG_FLAG(retrying_ts_rpc_max_delay_ms, advanced);</a>
+<a name="ln49"> </a>
+<a name="ln50">DEFINE_test_flag(int32, slowdown_master_async_rpc_tasks_by_ms, 0,</a>
+<a name="ln51">                 &quot;For testing purposes, slow down the run method to take longer.&quot;);</a>
+<a name="ln52"> </a>
+<a name="ln53">// The flags are defined in catalog_manager.cc.</a>
+<a name="ln54">DECLARE_int32(master_ts_rpc_timeout_ms);</a>
+<a name="ln55">DECLARE_int32(tablet_creation_timeout_ms);</a>
+<a name="ln56"> </a>
+<a name="ln57">namespace yb {</a>
+<a name="ln58">namespace master {</a>
+<a name="ln59"> </a>
+<a name="ln60">using namespace std::placeholders;</a>
+<a name="ln61"> </a>
+<a name="ln62">using std::string;</a>
+<a name="ln63">using std::shared_ptr;</a>
+<a name="ln64"> </a>
+<a name="ln65">using strings::Substitute;</a>
+<a name="ln66">using consensus::RaftPeerPB;</a>
+<a name="ln67">using tserver::TabletServerErrorPB;</a>
+<a name="ln68"> </a>
+<a name="ln69">// ============================================================================</a>
+<a name="ln70">//  Class PickSpecificUUID.</a>
+<a name="ln71">// ============================================================================</a>
+<a name="ln72">Status PickSpecificUUID::PickReplica(TSDescriptor** ts_desc) {</a>
+<a name="ln73">  shared_ptr&lt;TSDescriptor&gt; ts;</a>
+<a name="ln74">  if (!master_-&gt;ts_manager()-&gt;LookupTSByUUID(ts_uuid_, &amp;ts)) {</a>
+<a name="ln75">    return STATUS(NotFound, &quot;unknown tablet server id&quot;, ts_uuid_);</a>
+<a name="ln76">  }</a>
+<a name="ln77">  *ts_desc = ts.get();</a>
+<a name="ln78">  return Status::OK();</a>
+<a name="ln79">}</a>
+<a name="ln80"> </a>
+<a name="ln81">string ReplicaMapToString(const TabletInfo::ReplicaMap&amp; replicas) {</a>
+<a name="ln82">  string ret = &quot;&quot;;</a>
+<a name="ln83">  for (const auto&amp; r : replicas) {</a>
+<a name="ln84">    if (!ret.empty()) {</a>
+<a name="ln85">      ret += &quot;, &quot;;</a>
+<a name="ln86">    } else {</a>
+<a name="ln87">      ret += &quot;(&quot;;</a>
+<a name="ln88">    }</a>
+<a name="ln89">    ret += r.second.ts_desc-&gt;permanent_uuid();</a>
+<a name="ln90">  }</a>
+<a name="ln91">  ret += &quot;)&quot;;</a>
+<a name="ln92">  return ret;</a>
+<a name="ln93">}</a>
+<a name="ln94"> </a>
+<a name="ln95">// ============================================================================</a>
+<a name="ln96">//  Class PickLeaderReplica.</a>
+<a name="ln97">// ============================================================================</a>
+<a name="ln98">Status PickLeaderReplica::PickReplica(TSDescriptor** ts_desc) {</a>
+<a name="ln99">  *ts_desc = VERIFY_RESULT(tablet_-&gt;GetLeader());</a>
+<a name="ln100">  return Status::OK();</a>
+<a name="ln101">}</a>
+<a name="ln102"> </a>
+<a name="ln103">// ============================================================================</a>
+<a name="ln104">//  Class RetryingTSRpcTask.</a>
+<a name="ln105">// ============================================================================</a>
+<a name="ln106"> </a>
+<a name="ln107">RetryingTSRpcTask::RetryingTSRpcTask(Master *master,</a>
+<a name="ln108">                                     ThreadPool* callback_pool,</a>
+<a name="ln109">                                     gscoped_ptr&lt;TSPicker&gt; replica_picker,</a>
+<a name="ln110">                                     const scoped_refptr&lt;TableInfo&gt;&amp; table)</a>
+<a name="ln111">  : master_(master),</a>
+<a name="ln112">    callback_pool_(callback_pool),</a>
+<a name="ln113">    replica_picker_(replica_picker.Pass()),</a>
+<a name="ln114">    table_(table),</a>
+<a name="ln115">    start_ts_(MonoTime::Now()),</a>
+<a name="ln116">    attempt_(0),</a>
+<a name="ln117">    state_(MonitoredTaskState::kWaiting) {</a>
+<a name="ln118">  deadline_ = start_ts_;</a>
+<a name="ln119">  deadline_.AddDelta(MonoDelta::FromMilliseconds(FLAGS_unresponsive_ts_rpc_timeout_ms));</a>
+<a name="ln120">}</a>
+<a name="ln121"> </a>
+<a name="ln122">// Send the subclass RPC request.</a>
+<a name="ln123">Status RetryingTSRpcTask::Run() {</a>
+<a name="ln124">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Start Running&quot;;</a>
+<a name="ln125">  ++attempt_;</a>
+<a name="ln126">  auto task_state = state();</a>
+<a name="ln127">  if (task_state == MonitoredTaskState::kAborted) {</a>
+<a name="ln128">    // May delete this.</a>
+<a name="ln129">    return Failed(STATUS(IllegalState, &quot;Unable to run task because it has been aborted&quot;));</a>
+<a name="ln130">  }</a>
+<a name="ln131">  // TODO(bogdan): There is a race between scheduling and running and can cause this to fail.</a>
+<a name="ln132">  // Should look into removing the kScheduling state, if not needed, and simplifying the state</a>
+<a name="ln133">  // transitions!</a>
+<a name="ln134">  DCHECK(task_state == MonitoredTaskState::kWaiting) &lt;&lt; &quot;State: &quot; &lt;&lt; ToString(task_state);</a>
+<a name="ln135"> </a>
+<a name="ln136">  Status s = ResetTSProxy();</a>
+<a name="ln137">  if (!s.ok()) {</a>
+<a name="ln138">    s = s.CloneAndPrepend(&quot;Failed to reset TS proxy&quot;);</a>
+<a name="ln139">    if (s.IsExpired()) {</a>
+<a name="ln140">      TransitionToTerminalState(MonitoredTaskState::kWaiting, MonitoredTaskState::kFailed, s);</a>
+<a name="ln141">      UnregisterAsyncTask();</a>
+<a name="ln142">      return s;</a>
+<a name="ln143">    }</a>
+<a name="ln144">    if (RescheduleWithBackoffDelay()) {</a>
+<a name="ln145">      return Status::OK();</a>
+<a name="ln146">    }</a>
+<a name="ln147"> </a>
+<a name="ln148">    auto state = this-&gt;state();</a>
+<a name="ln149">    UnregisterAsyncTask(); // May delete this.</a>
+<a name="ln150"> </a>
+<a name="ln151">    if (state == MonitoredTaskState::kFailed) {</a>
+<a name="ln152">      return s;</a>
+<a name="ln153">    }</a>
+<a name="ln154">    if (state == MonitoredTaskState::kAborted) {</a>
+<a name="ln155">      return STATUS(IllegalState, &quot;Unable to run task because it has been aborted&quot;);</a>
+<a name="ln156">    }</a>
+<a name="ln157"> </a>
+<a name="ln158">    LOG_WITH_PREFIX(FATAL) &lt;&lt; &quot;Failed to change task to MonitoredTaskState::kFailed state from &quot;</a>
+<a name="ln159">                           &lt;&lt; state;</a>
+<a name="ln160">  } else {</a>
+<a name="ln161">    rpc_.Reset();</a>
+<a name="ln162">  }</a>
+<a name="ln163"> </a>
+<a name="ln164">  // Calculate and set the timeout deadline.</a>
+<a name="ln165">  const MonoTime deadline = ComputeDeadline();</a>
+<a name="ln166">  rpc_.set_deadline(deadline);</a>
+<a name="ln167"> </a>
+<a name="ln168">  if (!PerformStateTransition(MonitoredTaskState::kWaiting, MonitoredTaskState::kRunning)) {</a>
+<a name="ln169">    if (state() == MonitoredTaskState::kAborted) {</a>
+<a name="ln170">      // May delete this.</a>
+<a name="ln171">      return Failed(STATUS(Aborted, &quot;Unable to run task because it has been aborted&quot;));</a>
+<a name="ln172">    }</a>
+<a name="ln173"> </a>
+<a name="ln174">    LOG_WITH_PREFIX(DFATAL) &lt;&lt;</a>
+<a name="ln175">        &quot;Task transition MonitoredTaskState::kWaiting -&gt; MonitoredTaskState::kRunning failed&quot;;</a>
+<a name="ln176">    return Failed(STATUS_FORMAT(IllegalState, &quot;Task in invalid state $0&quot;, state()));</a>
+<a name="ln177">  }</a>
+<a name="ln178"> </a>
+<a name="ln179">  auto slowdown_flag_val = GetAtomicFlag(&amp;FLAGS_TEST_slowdown_master_async_rpc_tasks_by_ms);</a>
+<a name="ln180">  if (PREDICT_FALSE(slowdown_flag_val&gt; 0)) {</a>
+<a name="ln181">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Slowing down by &quot; &lt;&lt; slowdown_flag_val &lt;&lt; &quot; ms.&quot;;</a>
+<a name="ln182">    bool old_thread_restriction = ThreadRestrictions::SetWaitAllowed(true);</a>
+<a name="ln183">    SleepFor(MonoDelta::FromMilliseconds(slowdown_flag_val));</a>
+<a name="ln184">    ThreadRestrictions::SetWaitAllowed(old_thread_restriction);</a>
+<a name="ln185">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Slowing down done. Resuming.&quot;;</a>
+<a name="ln186">  }</a>
+<a name="ln187">  if (!SendRequest(attempt_) &amp;&amp; !RescheduleWithBackoffDelay()) {</a>
+<a name="ln188">    UnregisterAsyncTask();  // May call 'delete this'.</a>
+<a name="ln189">  }</a>
+<a name="ln190">  return Status::OK();</a>
+<a name="ln191">}</a>
+<a name="ln192"> </a>
+<a name="ln193">MonoTime RetryingTSRpcTask::ComputeDeadline() {</a>
+<a name="ln194">  MonoTime timeout = MonoTime::Now();</a>
+<a name="ln195">  timeout.AddDelta(MonoDelta::FromMilliseconds(FLAGS_master_ts_rpc_timeout_ms));</a>
+<a name="ln196">  return MonoTime::Earliest(timeout, deadline_);</a>
+<a name="ln197">}</a>
+<a name="ln198"> </a>
+<a name="ln199">// Abort this task and return its value before it was successfully aborted. If the task entered</a>
+<a name="ln200">// a different terminal state before we were able to abort it, return that state.</a>
+<a name="ln201">MonitoredTaskState RetryingTSRpcTask::AbortAndReturnPrevState(const Status&amp; status) {</a>
+<a name="ln202">  auto prev_state = state();</a>
+<a name="ln203">  while (!IsStateTerminal(prev_state)) {</a>
+<a name="ln204">    auto expected = prev_state;</a>
+<a name="ln205">    if (state_.compare_exchange_weak(expected, MonitoredTaskState::kAborted)) {</a>
+<a name="ln206">      AbortIfScheduled();</a>
+<a name="ln207">      Finished(status);</a>
+<a name="ln208">      UnregisterAsyncTask();</a>
+<a name="ln209">      return prev_state;</a>
+<a name="ln210">    }</a>
+<a name="ln211">    prev_state = state();</a>
+<a name="ln212">  }</a>
+<a name="ln213">  UnregisterAsyncTask();</a>
+<a name="ln214">  return prev_state;</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217">void RetryingTSRpcTask::AbortTask(const Status&amp; status) {</a>
+<a name="ln218">  AbortAndReturnPrevState(status);</a>
+<a name="ln219">}</a>
+<a name="ln220"> </a>
+<a name="ln221">void RetryingTSRpcTask::RpcCallback() {</a>
+<a name="ln222">  // Defer the actual work of the callback off of the reactor thread.</a>
+<a name="ln223">  // This is necessary because our callbacks often do synchronous writes to</a>
+<a name="ln224">  // the catalog table, and we can't do synchronous IO on the reactor.</a>
+<a name="ln225">  CHECK_OK(callback_pool_-&gt;SubmitFunc(</a>
+<a name="ln226">      std::bind(&amp;RetryingTSRpcTask::DoRpcCallback, shared_from(this))));</a>
+<a name="ln227">}</a>
+<a name="ln228"> </a>
+<a name="ln229">// Handle the actual work of the RPC callback. This is run on the master's worker</a>
+<a name="ln230">// pool, rather than a reactor thread, so it may do blocking IO operations.</a>
+<a name="ln231">void RetryingTSRpcTask::DoRpcCallback() {</a>
+<a name="ln232">  if (!rpc_.status().ok()) {</a>
+<a name="ln233">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;TS &quot; &lt;&lt; target_ts_desc_-&gt;permanent_uuid() &lt;&lt; &quot;: &quot;</a>
+<a name="ln234">                             &lt;&lt; type_name() &lt;&lt; &quot; RPC failed for tablet &quot;</a>
+<a name="ln235">                             &lt;&lt; tablet_id() &lt;&lt; &quot;: &quot; &lt;&lt; rpc_.status().ToString();</a>
+<a name="ln236">  } else if (state() != MonitoredTaskState::kAborted) {</a>
+<a name="ln237">    HandleResponse(attempt_);  // Modifies state_.</a>
+<a name="ln238">  }</a>
+<a name="ln239"> </a>
+<a name="ln240">  // Schedule a retry if the RPC call was not successful.</a>
+<a name="ln241">  if (RescheduleWithBackoffDelay()) {</a>
+<a name="ln242">    return;</a>
+<a name="ln243">  }</a>
+<a name="ln244"> </a>
+<a name="ln245">  UnregisterAsyncTask();  // May call 'delete this'.</a>
+<a name="ln246">}</a>
+<a name="ln247"> </a>
+<a name="ln248">int RetryingTSRpcTask::num_max_retries() { return FLAGS_unresponsive_ts_rpc_retry_limit; }</a>
+<a name="ln249"> </a>
+<a name="ln250">int RetryingTSRpcTask::max_delay_ms() {</a>
+<a name="ln251">  return FLAGS_retrying_ts_rpc_max_delay_ms;</a>
+<a name="ln252">}</a>
+<a name="ln253"> </a>
+<a name="ln254">bool RetryingTSRpcTask::RescheduleWithBackoffDelay() {</a>
+<a name="ln255">  auto task_state = state();</a>
+<a name="ln256">  if (task_state != MonitoredTaskState::kRunning &amp;&amp;</a>
+<a name="ln257">      // Allow kWaiting for task(s) that have never successfully ResetTSProxy().</a>
+<a name="ln258">      task_state != MonitoredTaskState::kWaiting) {</a>
+<a name="ln259">    if (task_state != MonitoredTaskState::kComplete) {</a>
+<a name="ln260">      LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;No reschedule for this task&quot;;</a>
+<a name="ln261">    }</a>
+<a name="ln262">    return false;</a>
+<a name="ln263">  }</a>
+<a name="ln264"> </a>
+<a name="ln265">  int attempt_threshold = std::numeric_limits&lt;int&gt;::max();</a>
+<a name="ln266">  if (NoRetryTaskType()) {</a>
+<a name="ln267">    attempt_threshold = 0;</a>
+<a name="ln268">  } else if (RetryLimitTaskType()) {</a>
+<a name="ln269">    attempt_threshold = num_max_retries();</a>
+<a name="ln270">  }</a>
+<a name="ln271"> </a>
+<a name="ln272">  if (attempt_ &gt; attempt_threshold) {</a>
+<a name="ln273">    auto status = STATUS_FORMAT(</a>
+<a name="ln274">        Aborted, &quot;Reached maximum number of retries ($0)&quot;, attempt_threshold);</a>
+<a name="ln275">    LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln276">        &lt;&lt; status &lt;&lt; &quot; for request &quot; &lt;&lt; description()</a>
+<a name="ln277">        &lt;&lt; &quot;, task=&quot; &lt;&lt; this &lt;&lt; &quot; state=&quot; &lt;&lt; state();</a>
+<a name="ln278">    TransitionToFailedState(task_state, status);</a>
+<a name="ln279">    return false;</a>
+<a name="ln280">  }</a>
+<a name="ln281"> </a>
+<a name="ln282">  MonoTime now = MonoTime::Now();</a>
+<a name="ln283">  // We assume it might take 10ms to process the request in the best case,</a>
+<a name="ln284">  // fail if we have less than that amount of time remaining.</a>
+<a name="ln285">  int64_t millis_remaining = deadline_.GetDeltaSince(now).ToMilliseconds() - 10;</a>
+<a name="ln286">  // Exponential backoff with jitter.</a>
+<a name="ln287">  int64_t base_delay_ms;</a>
+<a name="ln288">  if (attempt_ &lt;= 12) {</a>
+<a name="ln289">    base_delay_ms = 1 &lt;&lt; (attempt_ + 3);  // 1st retry delayed 2^4 ms, 2nd 2^5, etc.</a>
+<a name="ln290">  } else {</a>
+<a name="ln291">    base_delay_ms = max_delay_ms();</a>
+<a name="ln292">  }</a>
+<a name="ln293">  // Normal rand is seeded by default with 1. Using the same for rand_r seed.</a>
+<a name="ln294">  unsigned int seed = 1;</a>
+<a name="ln295">  int64_t jitter_ms = rand_r(&amp;seed) % 50;  // Add up to 50ms of additional random delay.</a>
+<a name="ln296">  int64_t delay_millis = std::min&lt;int64_t&gt;(base_delay_ms + jitter_ms, millis_remaining);</a>
+<a name="ln297"> </a>
+<a name="ln298">  if (delay_millis &lt;= 0) {</a>
+<a name="ln299">    auto status = STATUS(TimedOut, &quot;Request timed out&quot;);</a>
+<a name="ln300">    LOG_WITH_PREFIX(WARNING) &lt;&lt; status;</a>
+<a name="ln301">    TransitionToFailedState(task_state, status);</a>
+<a name="ln302">    return false;</a>
+<a name="ln303">  }</a>
+<a name="ln304"> </a>
+<a name="ln305">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Scheduling retry with a delay of &quot; &lt;&lt; delay_millis</a>
+<a name="ln306">                        &lt;&lt; &quot;ms (attempt = &quot; &lt;&lt; attempt_ &lt;&lt; &quot;)...&quot;;</a>
+<a name="ln307"> </a>
+<a name="ln308">  if (!PerformStateTransition(task_state, MonitoredTaskState::kScheduling)) {</a>
+<a name="ln309">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Unable to mark this task as MonitoredTaskState::kScheduling&quot;;</a>
+<a name="ln310">    return false;</a>
+<a name="ln311">  }</a>
+<a name="ln312">  auto task_id = master_-&gt;messenger()-&gt;ScheduleOnReactor(</a>
+<a name="ln313">      std::bind(&amp;RetryingTSRpcTask::RunDelayedTask, shared_from(this), _1),</a>
+<a name="ln314">      MonoDelta::FromMilliseconds(delay_millis), SOURCE_LOCATION(), master_-&gt;messenger());</a>
+<a name="ln315">  reactor_task_id_.store(task_id, std::memory_order_release);</a>
+<a name="ln316"> </a>
+<a name="ln317">  if (task_id == rpc::kInvalidTaskId) {</a>
+<a name="ln318">    AbortTask(STATUS(Aborted, &quot;Messenger closing&quot;));</a>
+<a name="ln319">    UnregisterAsyncTask();</a>
+<a name="ln320">    return false;</a>
+<a name="ln321">  }</a>
+<a name="ln322"> </a>
+<a name="ln323">  return TransitionToWaitingState(MonitoredTaskState::kScheduling);</a>
+<a name="ln324">}</a>
+<a name="ln325"> </a>
+<a name="ln326">void RetryingTSRpcTask::RunDelayedTask(const Status&amp; status) {</a>
+<a name="ln327">  if (state() == MonitoredTaskState::kAborted) {</a>
+<a name="ln328">    UnregisterAsyncTask();  // May delete this.</a>
+<a name="ln329">    return;</a>
+<a name="ln330">  }</a>
+<a name="ln331"> </a>
+<a name="ln332">  if (!status.ok()) {</a>
+<a name="ln333">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Async tablet task failed or was cancelled: &quot; &lt;&lt; status;</a>
+<a name="ln334">    if (status.IsAborted() || status.IsServiceUnavailable()) {</a>
+<a name="ln335">      AbortTask(status);</a>
+<a name="ln336">    }</a>
+<a name="ln337">    UnregisterAsyncTask();  // May delete this.</a>
+<a name="ln338">    return;</a>
+<a name="ln339">  }</a>
+<a name="ln340"> </a>
+<a name="ln341">  string desc = description();  // Save in case we need to log after deletion.</a>
+<a name="ln342">  Status s = Run();  // May delete this.</a>
+<a name="ln343">  if (!s.ok()) {</a>
+<a name="ln344">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Async tablet task failed: &quot; &lt;&lt; s.ToString();</a>
+<a name="ln345">  }</a>
+<a name="ln346">}</a>
+<a name="ln347"> </a>
+<a name="ln348">void RetryingTSRpcTask::UnregisterAsyncTaskCallback() {}</a>
+<a name="ln349"> </a>
+<a name="ln350">Status RetryingTSRpcTask::Failed(const Status&amp; status) {</a>
+<a name="ln351">  LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Async task failed: &quot; &lt;&lt; status;</a>
+<a name="ln352">  Finished(status);</a>
+<a name="ln353">  UnregisterAsyncTask();</a>
+<a name="ln354">  return status;</a>
+<a name="ln355">}</a>
+<a name="ln356"> </a>
+<a name="ln357">void RetryingTSRpcTask::UnregisterAsyncTask() {</a>
+<a name="ln358">  std::unique_lock&lt;decltype(unregister_mutex_)&gt; lock(unregister_mutex_);</a>
+<a name="ln359">  UnregisterAsyncTaskCallback();</a>
+<a name="ln360"> </a>
+<a name="ln361">  auto s = state();</a>
+<a name="ln362">  if (!IsStateTerminal(s)) {</a>
+<a name="ln363">    LOG_WITH_PREFIX(FATAL) &lt;&lt; &quot;Invalid task state &quot; &lt;&lt; s;</a>
+<a name="ln364">  }</a>
+<a name="ln365">  end_ts_ = MonoTime::Now();</a>
+<a name="ln366">  if (table_ != nullptr) {</a>
+<a name="ln367">    table_-&gt;RemoveTask(shared_from_this());</a>
+<a name="ln368">  }</a>
+<a name="ln369">}</a>
+<a name="ln370"> </a>
+<a name="ln371">void RetryingTSRpcTask::AbortIfScheduled() {</a>
+<a name="ln372">  auto reactor_task_id = reactor_task_id_.load(std::memory_order_acquire);</a>
+<a name="ln373">  if (reactor_task_id != rpc::kInvalidTaskId) {</a>
+<a name="ln374">    master_-&gt;messenger()-&gt;AbortOnReactor(reactor_task_id);</a>
+<a name="ln375">  }</a>
+<a name="ln376">}</a>
+<a name="ln377"> </a>
+<a name="ln378">Status RetryingTSRpcTask::ResetTSProxy() {</a>
+<a name="ln379">  // TODO: if there is no replica available, should we still keep the task running?</a>
+<a name="ln380">  RETURN_NOT_OK(replica_picker_-&gt;PickReplica(&amp;target_ts_desc_));</a>
+<a name="ln381"> </a>
+<a name="ln382">  shared_ptr&lt;tserver::TabletServerServiceProxy&gt; ts_proxy;</a>
+<a name="ln383">  shared_ptr&lt;tserver::TabletServerAdminServiceProxy&gt; ts_admin_proxy;</a>
+<a name="ln384">  shared_ptr&lt;consensus::ConsensusServiceProxy&gt; consensus_proxy;</a>
+<a name="ln385">  RETURN_NOT_OK(target_ts_desc_-&gt;GetProxy(&amp;ts_proxy));</a>
+<a name="ln386">  RETURN_NOT_OK(target_ts_desc_-&gt;GetProxy(&amp;ts_admin_proxy));</a>
+<a name="ln387">  RETURN_NOT_OK(target_ts_desc_-&gt;GetProxy(&amp;consensus_proxy));</a>
+<a name="ln388"> </a>
+<a name="ln389">  ts_proxy_.swap(ts_proxy);</a>
+<a name="ln390">  ts_admin_proxy_.swap(ts_admin_proxy);</a>
+<a name="ln391">  consensus_proxy_.swap(consensus_proxy);</a>
+<a name="ln392"> </a>
+<a name="ln393">  return Status::OK();</a>
+<a name="ln394">}</a>
+<a name="ln395"> </a>
+<a name="ln396">void RetryingTSRpcTask::TransitionToTerminalState(MonitoredTaskState expected,</a>
+<a name="ln397">                                                  MonitoredTaskState terminal_state,</a>
+<a name="ln398">                                                  const Status&amp; status) {</a>
+<a name="ln399">  if (!PerformStateTransition(expected, terminal_state)) {</a>
+<a name="ln400">    if (terminal_state != MonitoredTaskState::kAborted &amp;&amp; state() == MonitoredTaskState::kAborted) {</a>
+<a name="ln401">      LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Unable to perform transition &quot; &lt;&lt; expected &lt;&lt; &quot; -&gt; &quot;</a>
+<a name="ln402">                               &lt;&lt; terminal_state &lt;&lt; &quot;. Task has been aborted&quot;;</a>
+<a name="ln403">    } else {</a>
+<a name="ln404">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;State transition &quot; &lt;&lt; expected &lt;&lt; &quot; -&gt; &quot;</a>
+<a name="ln405">                              &lt;&lt; terminal_state &lt;&lt; &quot; failed. Current task is in an invalid state: &quot;</a>
+<a name="ln406">                              &lt;&lt; state();</a>
+<a name="ln407">    }</a>
+<a name="ln408">    return;</a>
+<a name="ln409">  }</a>
+<a name="ln410"> </a>
+<a name="ln411">  Finished(status);</a>
+<a name="ln412">}</a>
+<a name="ln413"> </a>
+<a name="ln414">void RetryingTSRpcTask::TransitionToFailedState(yb::MonitoredTaskState expected,</a>
+<a name="ln415">                                                const yb::Status&amp; status) {</a>
+<a name="ln416">  TransitionToTerminalState(expected, MonitoredTaskState::kFailed, status);</a>
+<a name="ln417">}</a>
+<a name="ln418"> </a>
+<a name="ln419">void RetryingTSRpcTask::TransitionToCompleteState() {</a>
+<a name="ln420">  TransitionToTerminalState(</a>
+<a name="ln421">      MonitoredTaskState::kRunning, MonitoredTaskState::kComplete, Status::OK());</a>
+<a name="ln422">}</a>
+<a name="ln423"> </a>
+<a name="ln424">bool RetryingTSRpcTask::TransitionToWaitingState(MonitoredTaskState expected) {</a>
+<a name="ln425">  if (!PerformStateTransition(expected, MonitoredTaskState::kWaiting)) {</a>
+<a name="ln426">    // The only valid reason for state not being MonitoredTaskState is because the task got</a>
+<a name="ln427">    // aborted.</a>
+<a name="ln428">    if (state() != MonitoredTaskState::kAborted) {</a>
+<a name="ln429">      LOG_WITH_PREFIX(FATAL) &lt;&lt; &quot;Unable to mark task as MonitoredTaskState::kWaiting&quot;;</a>
+<a name="ln430">    }</a>
+<a name="ln431">    AbortIfScheduled();</a>
+<a name="ln432">    return false;</a>
+<a name="ln433">  } else {</a>
+<a name="ln434">    return true;</a>
+<a name="ln435">  }</a>
+<a name="ln436">}</a>
+<a name="ln437"> </a>
+<a name="ln438">// ============================================================================</a>
+<a name="ln439">//  Class AsyncTabletLeaderTask.</a>
+<a name="ln440">// ============================================================================</a>
+<a name="ln441">AsyncTabletLeaderTask::AsyncTabletLeaderTask(</a>
+<a name="ln442">    Master* master, ThreadPool* callback_pool, const scoped_refptr&lt;TabletInfo&gt;&amp; tablet)</a>
+<a name="ln443">    : RetryingTSRpcTask(</a>
+<a name="ln444">          master, callback_pool, gscoped_ptr&lt;TSPicker&gt;(new PickLeaderReplica(tablet)),</a>
+<a name="ln445">          tablet-&gt;table().get()),</a>
+<a name="ln446">      tablet_(tablet) {</a>
+<a name="ln447">}</a>
+<a name="ln448"> </a>
+<a name="ln449">AsyncTabletLeaderTask::AsyncTabletLeaderTask(</a>
+<a name="ln450">    Master* master, ThreadPool* callback_pool, const scoped_refptr&lt;TabletInfo&gt;&amp; tablet,</a>
+<a name="ln451">    const scoped_refptr&lt;TableInfo&gt;&amp; table)</a>
+<a name="ln452">    : RetryingTSRpcTask(</a>
+<a name="ln453">          master, callback_pool, gscoped_ptr&lt;TSPicker&gt;(new PickLeaderReplica(tablet)), table),</a>
+<a name="ln454">      tablet_(tablet) {</a>
+<a name="ln455">}</a>
+<a name="ln456"> </a>
+<a name="ln457">std::string AsyncTabletLeaderTask::description() const {</a>
+<a name="ln458">  return type_name() + &quot; RPC for &quot; + tablet_-&gt;ToString();</a>
+<a name="ln459">}</a>
+<a name="ln460"> </a>
+<a name="ln461">TabletId AsyncTabletLeaderTask::tablet_id() const {</a>
+<a name="ln462">  return tablet_-&gt;tablet_id();</a>
+<a name="ln463">}</a>
+<a name="ln464"> </a>
+<a name="ln465">TabletServerId AsyncTabletLeaderTask::permanent_uuid() const {</a>
+<a name="ln466">  return target_ts_desc_ != nullptr ? target_ts_desc_-&gt;permanent_uuid() : &quot;&quot;;</a>
+<a name="ln467">}</a>
+<a name="ln468"> </a>
+<a name="ln469">// ============================================================================</a>
+<a name="ln470">//  Class AsyncCreateReplica.</a>
+<a name="ln471">// ============================================================================</a>
+<a name="ln472">AsyncCreateReplica::AsyncCreateReplica(Master *master,</a>
+<a name="ln473">                                       ThreadPool *callback_pool,</a>
+<a name="ln474">                                       const string&amp; permanent_uuid,</a>
+<a name="ln475">                                       const scoped_refptr&lt;TabletInfo&gt;&amp; tablet)</a>
+<a name="ln476">  : RetrySpecificTSRpcTask(master, callback_pool, permanent_uuid, tablet-&gt;table().get()),</a>
+<a name="ln477">    tablet_id_(tablet-&gt;tablet_id()) {</a>
+<a name="ln478">  deadline_ = start_ts_;</a>
+<a name="ln479">  deadline_.AddDelta(MonoDelta::FromMilliseconds(FLAGS_tablet_creation_timeout_ms));</a>
+<a name="ln480"> </a>
+<a name="ln481">  auto table_lock = tablet-&gt;table()-&gt;LockForRead();</a>
+<a name="ln482">  const SysTabletsEntryPB&amp; tablet_pb = tablet-&gt;metadata().dirty().pb;</a>
+<a name="ln483"> </a>
+<a name="ln484">  req_.set_dest_uuid(permanent_uuid);</a>
+<a name="ln485">  req_.set_table_id(tablet-&gt;table()-&gt;id());</a>
+<a name="ln486">  req_.set_tablet_id(tablet-&gt;tablet_id());</a>
+<a name="ln487">  req_.set_table_type(tablet-&gt;table()-&gt;metadata().state().pb.table_type());</a>
+<a name="ln488">  req_.mutable_partition()-&gt;CopyFrom(tablet_pb.partition());</a>
+<a name="ln489">  req_.set_namespace_id(table_lock-&gt;data().pb.namespace_id());</a>
+<a name="ln490">  req_.set_namespace_name(table_lock-&gt;data().pb.namespace_name());</a>
+<a name="ln491">  req_.set_table_name(table_lock-&gt;data().pb.name());</a>
+<a name="ln492">  req_.mutable_schema()-&gt;CopyFrom(table_lock-&gt;data().pb.schema());</a>
+<a name="ln493">  req_.mutable_partition_schema()-&gt;CopyFrom(table_lock-&gt;data().pb.partition_schema());</a>
+<a name="ln494">  req_.mutable_config()-&gt;CopyFrom(tablet_pb.committed_consensus_state().config());</a>
+<a name="ln495">  req_.set_colocated(tablet_pb.colocated());</a>
+<a name="ln496">  if (table_lock-&gt;data().pb.has_index_info()) {</a>
+<a name="ln497">    req_.mutable_index_info()-&gt;CopyFrom(table_lock-&gt;data().pb.index_info());</a>
+<a name="ln498">  }</a>
+<a name="ln499">}</a>
+<a name="ln500"> </a>
+<a name="ln501">void AsyncCreateReplica::HandleResponse(int attempt) {</a>
+<a name="ln502">  if (resp_.has_error()) {</a>
+<a name="ln503">    Status s = StatusFromPB(resp_.error().status());</a>
+<a name="ln504">    if (s.IsAlreadyPresent()) {</a>
+<a name="ln505">      LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;CreateTablet RPC for tablet &quot; &lt;&lt; tablet_id_</a>
+<a name="ln506">                            &lt;&lt; &quot; on TS &quot; &lt;&lt; permanent_uuid_ &lt;&lt; &quot; returned already present: &quot;</a>
+<a name="ln507">                            &lt;&lt; s;</a>
+<a name="ln508">      TransitionToCompleteState();</a>
+<a name="ln509">    } else {</a>
+<a name="ln510">      LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;CreateTablet RPC for tablet &quot; &lt;&lt; tablet_id_</a>
+<a name="ln511">                               &lt;&lt; &quot; on TS &quot; &lt;&lt; permanent_uuid_ &lt;&lt; &quot; failed: &quot; &lt;&lt; s;</a>
+<a name="ln512">    }</a>
+<a name="ln513"> </a>
+<a name="ln514">    return;</a>
+<a name="ln515">  }</a>
+<a name="ln516"> </a>
+<a name="ln517">  TransitionToCompleteState();</a>
+<a name="ln518">}</a>
+<a name="ln519"> </a>
+<a name="ln520">bool AsyncCreateReplica::SendRequest(int attempt) {</a>
+<a name="ln521">  ts_admin_proxy_-&gt;CreateTabletAsync(req_, &amp;resp_, &amp;rpc_, BindRpcCallback());</a>
+<a name="ln522">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Send create tablet request to &quot; &lt;&lt; permanent_uuid_ &lt;&lt; &quot;:\n&quot;</a>
+<a name="ln523">                      &lt;&lt; &quot; (attempt &quot; &lt;&lt; attempt &lt;&lt; &quot;):\n&quot;</a>
+<a name="ln524">                      &lt;&lt; req_.DebugString();</a>
+<a name="ln525">  return true;</a>
+<a name="ln526">}</a>
+<a name="ln527"> </a>
+<a name="ln528">// ============================================================================</a>
+<a name="ln529">//  Class AsyncDeleteReplica.</a>
+<a name="ln530">// ============================================================================</a>
+<a name="ln531">void AsyncDeleteReplica::HandleResponse(int attempt) {</a>
+<a name="ln532">  bool delete_done = false;</a>
+<a name="ln533">  if (resp_.has_error()) {</a>
+<a name="ln534">    Status status = StatusFromPB(resp_.error().status());</a>
+<a name="ln535"> </a>
+<a name="ln536">    // Do not retry on a fatal error</a>
+<a name="ln537">    TabletServerErrorPB::Code code = resp_.error().code();</a>
+<a name="ln538">    switch (code) {</a>
+<a name="ln539">      case TabletServerErrorPB::TABLET_NOT_FOUND:</a>
+<a name="ln540">        LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln541">            &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid_ &lt;&lt; &quot;: delete failed for tablet &quot; &lt;&lt; tablet_id_</a>
+<a name="ln542">            &lt;&lt; &quot; because the tablet was not found. No further retry: &quot;</a>
+<a name="ln543">            &lt;&lt; status.ToString();</a>
+<a name="ln544">        TransitionToCompleteState();</a>
+<a name="ln545">        delete_done = true;</a>
+<a name="ln546">        break;</a>
+<a name="ln547">      case TabletServerErrorPB::CAS_FAILED:</a>
+<a name="ln548">        LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln549">            &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid_ &lt;&lt; &quot;: delete failed for tablet &quot; &lt;&lt; tablet_id_</a>
+<a name="ln550">            &lt;&lt; &quot; due to a CAS failure. No further retry: &quot; &lt;&lt; status.ToString();</a>
+<a name="ln551">        TransitionToCompleteState();</a>
+<a name="ln552">        delete_done = true;</a>
+<a name="ln553">        break;</a>
+<a name="ln554">      case TabletServerErrorPB::WRONG_SERVER_UUID:</a>
+<a name="ln555">        LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln556">            &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid_ &lt;&lt; &quot;: delete failed for tablet &quot; &lt;&lt; tablet_id_</a>
+<a name="ln557">            &lt;&lt; &quot; due to an incorrect UUID. No further retry: &quot; &lt;&lt; status.ToString();</a>
+<a name="ln558">        TransitionToCompleteState();</a>
+<a name="ln559">        delete_done = true;</a>
+<a name="ln560">        break;</a>
+<a name="ln561">      default:</a>
+<a name="ln562">        LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln563">            &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid_ &lt;&lt; &quot;: delete failed for tablet &quot; &lt;&lt; tablet_id_</a>
+<a name="ln564">            &lt;&lt; &quot; with error code &quot; &lt;&lt; TabletServerErrorPB::Code_Name(code)</a>
+<a name="ln565">            &lt;&lt; &quot;: &quot; &lt;&lt; status.ToString();</a>
+<a name="ln566">        break;</a>
+<a name="ln567">    }</a>
+<a name="ln568">  } else {</a>
+<a name="ln569">    if (table_) {</a>
+<a name="ln570">      LOG_WITH_PREFIX(INFO)</a>
+<a name="ln571">          &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid_ &lt;&lt; &quot;: tablet &quot; &lt;&lt; tablet_id_</a>
+<a name="ln572">          &lt;&lt; &quot; (table &quot; &lt;&lt; table_-&gt;ToString() &lt;&lt; &quot;) successfully deleted&quot;;</a>
+<a name="ln573">    } else {</a>
+<a name="ln574">      LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln575">          &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid_ &lt;&lt; &quot;: tablet &quot; &lt;&lt; tablet_id_</a>
+<a name="ln576">          &lt;&lt; &quot; did not belong to a known table, but was successfully deleted&quot;;</a>
+<a name="ln577">    }</a>
+<a name="ln578">    TransitionToCompleteState();</a>
+<a name="ln579">    delete_done = true;</a>
+<a name="ln580">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid_ &lt;&lt; &quot;: delete complete on tablet &quot; &lt;&lt; tablet_id_;</a>
+<a name="ln581">  }</a>
+<a name="ln582">  if (delete_done) {</a>
+<a name="ln583">    UnregisterAsyncTaskCallback();</a>
+<a name="ln584">  }</a>
+<a name="ln585">}</a>
+<a name="ln586"> </a>
+<a name="ln587">bool AsyncDeleteReplica::SendRequest(int attempt) {</a>
+<a name="ln588">  tserver::DeleteTabletRequestPB req;</a>
+<a name="ln589">  req.set_dest_uuid(permanent_uuid_);</a>
+<a name="ln590">  req.set_tablet_id(tablet_id_);</a>
+<a name="ln591">  req.set_reason(reason_);</a>
+<a name="ln592">  req.set_delete_type(delete_type_);</a>
+<a name="ln593">  if (cas_config_opid_index_less_or_equal_) {</a>
+<a name="ln594">    req.set_cas_config_opid_index_less_or_equal(*cas_config_opid_index_less_or_equal_);</a>
+<a name="ln595">  }</a>
+<a name="ln596"> </a>
+<a name="ln597">  ts_admin_proxy_-&gt;DeleteTabletAsync(req, &amp;resp_, &amp;rpc_, BindRpcCallback());</a>
+<a name="ln598">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Send delete tablet request to &quot; &lt;&lt; permanent_uuid_</a>
+<a name="ln599">                      &lt;&lt; &quot; (attempt &quot; &lt;&lt; attempt &lt;&lt; &quot;):\n&quot;</a>
+<a name="ln600">                      &lt;&lt; req.DebugString();</a>
+<a name="ln601">  return true;</a>
+<a name="ln602">}</a>
+<a name="ln603"> </a>
+<a name="ln604">void AsyncDeleteReplica::UnregisterAsyncTaskCallback() {</a>
+<a name="ln605">  master_-&gt;catalog_manager()-&gt;NotifyTabletDeleteFinished(permanent_uuid_, tablet_id_);</a>
+<a name="ln606">}</a>
+<a name="ln607"> </a>
+<a name="ln608">// ============================================================================</a>
+<a name="ln609">//  Class AsyncAlterTable.</a>
+<a name="ln610">// ============================================================================</a>
+<a name="ln611">void AsyncAlterTable::HandleResponse(int attempt) {</a>
+<a name="ln612">  if (resp_.has_error()) {</a>
+<a name="ln613">    Status status = StatusFromPB(resp_.error().status());</a>
+<a name="ln614"> </a>
+<a name="ln615">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot; failed: &quot;</a>
+<a name="ln616">                             &lt;&lt; status &lt;&lt; &quot; for version &quot; &lt;&lt; schema_version_;</a>
+<a name="ln617"> </a>
+<a name="ln618">    // Do not retry on a fatal error</a>
+<a name="ln619">    switch (resp_.error().code()) {</a>
+<a name="ln620">      case TabletServerErrorPB::TABLET_NOT_FOUND:</a>
+<a name="ln621">      case TabletServerErrorPB::MISMATCHED_SCHEMA:</a>
+<a name="ln622">      case TabletServerErrorPB::TABLET_HAS_A_NEWER_SCHEMA:</a>
+<a name="ln623">        TransitionToCompleteState();</a>
+<a name="ln624">        break;</a>
+<a name="ln625">      default:</a>
+<a name="ln626">        break;</a>
+<a name="ln627">    }</a>
+<a name="ln628">  } else {</a>
+<a name="ln629">    TransitionToCompleteState();</a>
+<a name="ln630">    VLOG_WITH_PREFIX(1)</a>
+<a name="ln631">        &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot; completed: for version &quot; &lt;&lt; schema_version_;</a>
+<a name="ln632">  }</a>
+<a name="ln633"> </a>
+<a name="ln634">  server::UpdateClock(resp_, master_-&gt;clock());</a>
+<a name="ln635"> </a>
+<a name="ln636">  if (state() == MonitoredTaskState::kComplete) {</a>
+<a name="ln637">    // TODO: proper error handling here. Not critical, since TSHeartbeat will retry on failure.</a>
+<a name="ln638">    WARN_NOT_OK(master_-&gt;catalog_manager()-&gt;HandleTabletSchemaVersionReport(</a>
+<a name="ln639">        tablet_.get(), schema_version_, table()),</a>
+<a name="ln640">        yb::Format(</a>
+<a name="ln641">            &quot;$0 for $1 failed while running AsyncAlterTable::HandleResponse. response $2&quot;,</a>
+<a name="ln642">            description(), tablet_-&gt;ToString(), resp_.DebugString()));</a>
+<a name="ln643">  } else {</a>
+<a name="ln644">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Task is not completed&quot; &lt;&lt; tablet_-&gt;ToString() &lt;&lt; &quot; for version &quot;</a>
+<a name="ln645">                        &lt;&lt; schema_version_;</a>
+<a name="ln646">  }</a>
+<a name="ln647">}</a>
+<a name="ln648"> </a>
+<a name="ln649">bool AsyncAlterTable::SendRequest(int attempt) {</a>
+<a name="ln650">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Send alter table request to &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot; for &quot;</a>
+<a name="ln651">                      &lt;&lt; tablet_-&gt;tablet_id() &lt;&lt; &quot; waiting for a read lock.&quot;;</a>
+<a name="ln652">  auto l = table_-&gt;LockForRead();</a>
+<a name="ln653">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Send alter table request to &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot; for &quot;</a>
+<a name="ln654">                      &lt;&lt; tablet_-&gt;tablet_id() &lt;&lt; &quot; obtained the read lock.&quot;;</a>
+<a name="ln655"> </a>
+<a name="ln656">  tserver::ChangeMetadataRequestPB req;</a>
+<a name="ln657">  req.set_schema_version(l-&gt;data().pb.version());</a>
+<a name="ln658">  req.set_dest_uuid(permanent_uuid());</a>
+<a name="ln659">  req.set_tablet_id(tablet_-&gt;tablet_id());</a>
+<a name="ln660">  req.set_alter_table_id(table_-&gt;id());</a>
+<a name="ln661"> </a>
+<a name="ln662">  if (l-&gt;data().pb.has_wal_retention_secs()) {</a>
+<a name="ln663">    req.set_wal_retention_secs(l-&gt;data().pb.wal_retention_secs());</a>
+<a name="ln664">  }</a>
+<a name="ln665"> </a>
+<a name="ln666">  req.mutable_schema()-&gt;CopyFrom(l-&gt;data().pb.schema());</a>
+<a name="ln667">  req.set_new_table_name(l-&gt;data().pb.name());</a>
+<a name="ln668">  req.mutable_indexes()-&gt;CopyFrom(l-&gt;data().pb.indexes());</a>
+<a name="ln669">  req.set_propagated_hybrid_time(master_-&gt;clock()-&gt;Now().ToUint64());</a>
+<a name="ln670"> </a>
+<a name="ln671">  schema_version_ = l-&gt;data().pb.version();</a>
+<a name="ln672"> </a>
+<a name="ln673">  l-&gt;Unlock();</a>
+<a name="ln674"> </a>
+<a name="ln675">  ts_admin_proxy_-&gt;AlterSchemaAsync(req, &amp;resp_, &amp;rpc_, BindRpcCallback());</a>
+<a name="ln676">  VLOG_WITH_PREFIX(1)</a>
+<a name="ln677">      &lt;&lt; &quot;Send alter table request to &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot; for &quot; &lt;&lt; tablet_-&gt;tablet_id()</a>
+<a name="ln678">      &lt;&lt; &quot; (attempt &quot; &lt;&lt; attempt &lt;&lt; &quot;):\n&quot; &lt;&lt; req.DebugString();</a>
+<a name="ln679">  return true;</a>
+<a name="ln680">}</a>
+<a name="ln681"> </a>
+<a name="ln682">bool AsyncBackfillDone::SendRequest(int attempt) {</a>
+<a name="ln683">  VLOG_WITH_PREFIX(1)</a>
+<a name="ln684">      &lt;&lt; &quot;Send alter table request to &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot; for &quot; &lt;&lt; tablet_-&gt;tablet_id()</a>
+<a name="ln685">      &lt;&lt; &quot;version &quot; &lt;&lt; schema_version_ &lt;&lt; &quot; waiting for a read lock.&quot;;</a>
+<a name="ln686">  auto l = table_-&gt;LockForRead();</a>
+<a name="ln687">  VLOG_WITH_PREFIX(1)</a>
+<a name="ln688">      &lt;&lt; &quot;Send alter table request to &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot; for &quot; &lt;&lt; tablet_-&gt;tablet_id()</a>
+<a name="ln689">      &lt;&lt; &quot;version &quot; &lt;&lt; schema_version_ &lt;&lt; &quot; obtained the read lock.&quot;;</a>
+<a name="ln690"> </a>
+<a name="ln691">  tserver::ChangeMetadataRequestPB req;</a>
+<a name="ln692">  req.set_dest_uuid(permanent_uuid());</a>
+<a name="ln693">  req.set_tablet_id(tablet_-&gt;tablet_id());</a>
+<a name="ln694">  req.set_propagated_hybrid_time(master_-&gt;clock()-&gt;Now().ToUint64());</a>
+<a name="ln695">  req.set_is_backfilling(false);</a>
+<a name="ln696">  schema_version_ = l-&gt;data().pb.version();</a>
+<a name="ln697">  l-&gt;Unlock();</a>
+<a name="ln698"> </a>
+<a name="ln699">  ts_admin_proxy_-&gt;BackfillDoneAsync(req, &amp;resp_, &amp;rpc_, BindRpcCallback());</a>
+<a name="ln700">  VLOG_WITH_PREFIX(1)</a>
+<a name="ln701">      &lt;&lt; &quot;Send backfill done request to &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot; for &quot; &lt;&lt; tablet_-&gt;tablet_id()</a>
+<a name="ln702">      &lt;&lt; &quot; (attempt &quot; &lt;&lt; attempt &lt;&lt; &quot;):\n&quot; &lt;&lt; req.DebugString();</a>
+<a name="ln703">  return true;</a>
+<a name="ln704">}</a>
+<a name="ln705"> </a>
+<a name="ln706">// ============================================================================</a>
+<a name="ln707">//  Class AsyncCopartitionTable.</a>
+<a name="ln708">// ============================================================================</a>
+<a name="ln709">AsyncCopartitionTable::AsyncCopartitionTable(Master *master,</a>
+<a name="ln710">                                             ThreadPool* callback_pool,</a>
+<a name="ln711">                                             const scoped_refptr&lt;TabletInfo&gt;&amp; tablet,</a>
+<a name="ln712">                                             const scoped_refptr&lt;TableInfo&gt;&amp; table)</a>
+<a name="ln713">    : RetryingTSRpcTask(master,</a>
+<a name="ln714">                        callback_pool,</a>
+<a name="ln715">                        gscoped_ptr&lt;TSPicker&gt;(new PickLeaderReplica(tablet)),</a>
+<a name="ln716">                        table.get()),</a>
+<a name="ln717">      tablet_(tablet), table_(table) {</a>
+<a name="ln718">}</a>
+<a name="ln719"> </a>
+<a name="ln720">string AsyncCopartitionTable::description() const {</a>
+<a name="ln721">  return &quot;Copartition Table RPC for tablet &quot; + tablet_-&gt;ToString()</a>
+<a name="ln722">          + &quot; for &quot; + table_-&gt;ToString();</a>
+<a name="ln723">}</a>
+<a name="ln724"> </a>
+<a name="ln725">TabletId AsyncCopartitionTable::tablet_id() const {</a>
+<a name="ln726">  return tablet_-&gt;tablet_id();</a>
+<a name="ln727">}</a>
+<a name="ln728"> </a>
+<a name="ln729">TabletServerId AsyncCopartitionTable::permanent_uuid() const {</a>
+<a name="ln730">  return target_ts_desc_ != nullptr ? target_ts_desc_-&gt;permanent_uuid() : &quot;&quot;;</a>
+<a name="ln731">}</a>
+<a name="ln732"> </a>
+<a name="ln733">// TODO(sagnik): modify this to fill all relevant fields for the AsyncCopartition request.</a>
+<a name="ln734">bool AsyncCopartitionTable::SendRequest(int attempt) {</a>
+<a name="ln735"> </a>
+<a name="ln736">  tserver::CopartitionTableRequestPB req;</a>
+<a name="ln737">  req.set_dest_uuid(permanent_uuid());</a>
+<a name="ln738">  req.set_tablet_id(tablet_-&gt;tablet_id());</a>
+<a name="ln739">  req.set_table_id(table_-&gt;id());</a>
+<a name="ln740">  req.set_table_name(table_-&gt;name());</a>
+<a name="ln741"> </a>
+<a name="ln742">  ts_admin_proxy_-&gt;CopartitionTableAsync(req, &amp;resp_, &amp;rpc_, BindRpcCallback());</a>
+<a name="ln743">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Send copartition table request to &quot; &lt;&lt; permanent_uuid()</a>
+<a name="ln744">                      &lt;&lt; &quot; (attempt &quot; &lt;&lt; attempt &lt;&lt; &quot;):\n&quot; &lt;&lt; req.DebugString();</a>
+<a name="ln745">  return true;</a>
+<a name="ln746">}</a>
+<a name="ln747"> </a>
+<a name="ln748">// TODO(sagnik): modify this to handle the AsyncCopartition Response and retry fail as necessary.</a>
+<a name="ln749">void AsyncCopartitionTable::HandleResponse(int attempt) {</a>
+<a name="ln750">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;master can't handle server responses yet&quot;;</a>
+<a name="ln751">}</a>
+<a name="ln752"> </a>
+<a name="ln753">// ============================================================================</a>
+<a name="ln754">//  Class AsyncTruncate.</a>
+<a name="ln755">// ============================================================================</a>
+<a name="ln756">void AsyncTruncate::HandleResponse(int attempt) {</a>
+<a name="ln757">  if (resp_.has_error()) {</a>
+<a name="ln758">    const Status s = StatusFromPB(resp_.error().status());</a>
+<a name="ln759">    const TabletServerErrorPB::Code code = resp_.error().code();</a>
+<a name="ln760">    LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln761">        &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot;: truncate failed for tablet &quot; &lt;&lt; tablet_id()</a>
+<a name="ln762">        &lt;&lt; &quot; with error code &quot; &lt;&lt; TabletServerErrorPB::Code_Name(code) &lt;&lt; &quot;: &quot; &lt;&lt; s;</a>
+<a name="ln763">  } else {</a>
+<a name="ln764">    VLOG_WITH_PREFIX(1)</a>
+<a name="ln765">        &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot;: truncate complete on tablet &quot; &lt;&lt; tablet_id();</a>
+<a name="ln766">    TransitionToCompleteState();</a>
+<a name="ln767">  }</a>
+<a name="ln768"> </a>
+<a name="ln769">  server::UpdateClock(resp_, master_-&gt;clock());</a>
+<a name="ln770">}</a>
+<a name="ln771"> </a>
+<a name="ln772">bool AsyncTruncate::SendRequest(int attempt) {</a>
+<a name="ln773">  tserver::TruncateRequestPB req;</a>
+<a name="ln774">  req.set_tablet_id(tablet_id());</a>
+<a name="ln775">  req.set_propagated_hybrid_time(master_-&gt;clock()-&gt;Now().ToUint64());</a>
+<a name="ln776">  ts_proxy_-&gt;TruncateAsync(req, &amp;resp_, &amp;rpc_, BindRpcCallback());</a>
+<a name="ln777">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Send truncate tablet request to &quot; &lt;&lt; permanent_uuid()</a>
+<a name="ln778">                      &lt;&lt; &quot; (attempt &quot; &lt;&lt; attempt &lt;&lt; &quot;):\n&quot; &lt;&lt; req.DebugString();</a>
+<a name="ln779">  return true;</a>
+<a name="ln780">}</a>
+<a name="ln781"> </a>
+<a name="ln782">// ============================================================================</a>
+<a name="ln783">//  Class CommonInfoForRaftTask.</a>
+<a name="ln784">// ============================================================================</a>
+<a name="ln785">CommonInfoForRaftTask::CommonInfoForRaftTask(</a>
+<a name="ln786">    Master* master, ThreadPool* callback_pool, const scoped_refptr&lt;TabletInfo&gt;&amp; tablet,</a>
+<a name="ln787">    const consensus::ConsensusStatePB&amp; cstate, const string&amp; change_config_ts_uuid)</a>
+<a name="ln788">    : RetryingTSRpcTask(</a>
+<a name="ln789">          master, callback_pool, gscoped_ptr&lt;TSPicker&gt;(new PickLeaderReplica(tablet)),</a>
+<a name="ln790">          tablet-&gt;table()),</a>
+<a name="ln791">      tablet_(tablet),</a>
+<a name="ln792">      cstate_(cstate),</a>
+<a name="ln793">      change_config_ts_uuid_(change_config_ts_uuid) {</a>
+<a name="ln794">  deadline_ = MonoTime::Max();  // Never time out.</a>
+<a name="ln795">}</a>
+<a name="ln796"> </a>
+<a name="ln797">TabletId CommonInfoForRaftTask::tablet_id() const {</a>
+<a name="ln798">  return tablet_-&gt;tablet_id();</a>
+<a name="ln799">}</a>
+<a name="ln800"> </a>
+<a name="ln801">TabletServerId CommonInfoForRaftTask::permanent_uuid() const {</a>
+<a name="ln802">  return target_ts_desc_ != nullptr ? target_ts_desc_-&gt;permanent_uuid() : &quot;&quot;;</a>
+<a name="ln803">}</a>
+<a name="ln804"> </a>
+<a name="ln805">// ============================================================================</a>
+<a name="ln806">//  Class AsyncChangeConfigTask.</a>
+<a name="ln807">// ============================================================================</a>
+<a name="ln808">string AsyncChangeConfigTask::description() const {</a>
+<a name="ln809">  return strings::Substitute(</a>
+<a name="ln810">      &quot;$0 RPC for tablet $1 on peer $2 with cas_config_opid_index $3&quot;, type_name(),</a>
+<a name="ln811">      tablet_-&gt;tablet_id(), permanent_uuid(), cstate_.config().opid_index());</a>
+<a name="ln812">}</a>
+<a name="ln813"> </a>
+<a name="ln814">bool AsyncChangeConfigTask::SendRequest(int attempt) {</a>
+<a name="ln815">  // Bail if we're retrying in vain.</a>
+<a name="ln816">  int64_t latest_index;</a>
+<a name="ln817">  {</a>
+<a name="ln818">    auto tablet_lock = tablet_-&gt;LockForRead();</a>
+<a name="ln819">    latest_index = tablet_lock-&gt;data().pb.committed_consensus_state().config().opid_index();</a>
+<a name="ln820">    // Adding this logic for a race condition that occurs in this scenario:</a>
+<a name="ln821">    // 1. CatalogManager receives a DeleteTable request and sends DeleteTablet requests to the</a>
+<a name="ln822">    // tservers, but doesn't yet update the tablet in memory state to not running.</a>
+<a name="ln823">    // 2. The CB runs and sees that this tablet is still running, sees that it is over-replicated</a>
+<a name="ln824">    // (since the placement now dictates it should have 0 replicas),</a>
+<a name="ln825">    // but before it can send the ChangeConfig RPC to a tserver.</a>
+<a name="ln826">    // 3. That tserver processes the DeleteTablet request.</a>
+<a name="ln827">    // 4. The ChangeConfig RPC now returns tablet not found,</a>
+<a name="ln828">    // which prompts an infinite retry of the RPC.</a>
+<a name="ln829">    bool tablet_running = tablet_lock-&gt;data().is_running();</a>
+<a name="ln830">    if (!tablet_running) {</a>
+<a name="ln831">      AbortTask(STATUS(Aborted, &quot;Tablet is not running&quot;));</a>
+<a name="ln832">      return false;</a>
+<a name="ln833">    }</a>
+<a name="ln834">  }</a>
+<a name="ln835">  if (latest_index &gt; cstate_.config().opid_index()) {</a>
+<a name="ln836">    auto status = STATUS_FORMAT(</a>
+<a name="ln837">        Aborted,</a>
+<a name="ln838">        &quot;Latest config for has opid_index of $0 while this task has opid_index of $1&quot;,</a>
+<a name="ln839">        latest_index, cstate_.config().opid_index());</a>
+<a name="ln840">    LOG_WITH_PREFIX(INFO) &lt;&lt; status;</a>
+<a name="ln841">    AbortTask(status);</a>
+<a name="ln842">    return false;</a>
+<a name="ln843">  }</a>
+<a name="ln844"> </a>
+<a name="ln845">  // Logging should be covered inside based on failure reasons.</a>
+<a name="ln846">  auto prepare_status = PrepareRequest(attempt);</a>
+<a name="ln847">  if (!prepare_status.ok()) {</a>
+<a name="ln848">    AbortTask(prepare_status);</a>
+<a name="ln849">    return false;</a>
+<a name="ln850">  }</a>
+<a name="ln851"> </a>
+<a name="ln852">  consensus_proxy_-&gt;ChangeConfigAsync(req_, &amp;resp_, &amp;rpc_, BindRpcCallback());</a>
+<a name="ln853">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Task &quot; &lt;&lt; description() &lt;&lt; &quot; sent request:\n&quot; &lt;&lt; req_.DebugString();</a>
+<a name="ln854">  return true;</a>
+<a name="ln855">}</a>
+<a name="ln856"> </a>
+<a name="ln857">void AsyncChangeConfigTask::HandleResponse(int attempt) {</a>
+<a name="ln858">  if (!resp_.has_error()) {</a>
+<a name="ln859">    TransitionToCompleteState();</a>
+<a name="ln860">    LOG_WITH_PREFIX(INFO) &lt;&lt; Substitute(</a>
+<a name="ln861">        &quot;Change config succeeded on leader TS $0 for tablet $1 with type $2 for replica $3&quot;,</a>
+<a name="ln862">        permanent_uuid(), tablet_-&gt;tablet_id(), type_name(), change_config_ts_uuid_);</a>
+<a name="ln863">    return;</a>
+<a name="ln864">  }</a>
+<a name="ln865"> </a>
+<a name="ln866">  Status status = StatusFromPB(resp_.error().status());</a>
+<a name="ln867"> </a>
+<a name="ln868">  // Do not retry on some known errors, otherwise retry forever or until cancelled.</a>
+<a name="ln869">  switch (resp_.error().code()) {</a>
+<a name="ln870">    case TabletServerErrorPB::CAS_FAILED:</a>
+<a name="ln871">    case TabletServerErrorPB::ADD_CHANGE_CONFIG_ALREADY_PRESENT:</a>
+<a name="ln872">    case TabletServerErrorPB::REMOVE_CHANGE_CONFIG_NOT_PRESENT:</a>
+<a name="ln873">    case TabletServerErrorPB::NOT_THE_LEADER:</a>
+<a name="ln874">      LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;ChangeConfig() failed on leader &quot; &lt;&lt; permanent_uuid()</a>
+<a name="ln875">                               &lt;&lt; &quot;. No further retry: &quot; &lt;&lt; status.ToString();</a>
+<a name="ln876">      TransitionToCompleteState();</a>
+<a name="ln877">      break;</a>
+<a name="ln878">    default:</a>
+<a name="ln879">      LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;ChangeConfig() failed on leader &quot; &lt;&lt; permanent_uuid()</a>
+<a name="ln880">                            &lt;&lt; &quot; due to error &quot;</a>
+<a name="ln881">                            &lt;&lt; TabletServerErrorPB::Code_Name(resp_.error().code())</a>
+<a name="ln882">                            &lt;&lt; &quot;. This operation will be retried. Error detail: &quot;</a>
+<a name="ln883">                            &lt;&lt; status.ToString();</a>
+<a name="ln884">      break;</a>
+<a name="ln885">  }</a>
+<a name="ln886">}</a>
+<a name="ln887"> </a>
+<a name="ln888">// ============================================================================</a>
+<a name="ln889">//  Class AsyncAddServerTask.</a>
+<a name="ln890">// ============================================================================</a>
+<a name="ln891">Status AsyncAddServerTask::PrepareRequest(int attempt) {</a>
+<a name="ln892">  // Select the replica we wish to add to the config.</a>
+<a name="ln893">  // Do not include current members of the config.</a>
+<a name="ln894">  unordered_set&lt;string&gt; replica_uuids;</a>
+<a name="ln895">  for (const RaftPeerPB&amp; peer : cstate_.config().peers()) {</a>
+<a name="ln896">    InsertOrDie(&amp;replica_uuids, peer.permanent_uuid());</a>
+<a name="ln897">  }</a>
+<a name="ln898">  TSDescriptorVector ts_descs;</a>
+<a name="ln899">  master_-&gt;ts_manager()-&gt;GetAllLiveDescriptors(&amp;ts_descs);</a>
+<a name="ln900">  shared_ptr&lt;TSDescriptor&gt; replacement_replica;</a>
+<a name="ln901">  for (auto ts_desc : ts_descs) {</a>
+<a name="ln902">    if (ts_desc-&gt;permanent_uuid() == change_config_ts_uuid_) {</a>
+<a name="ln903">      // This is given by the client, so we assume it is a well chosen uuid.</a>
+<a name="ln904">      replacement_replica = ts_desc;</a>
+<a name="ln905">      break;</a>
+<a name="ln906">    }</a>
+<a name="ln907">  }</a>
+<a name="ln908">  if (PREDICT_FALSE(!replacement_replica)) {</a>
+<a name="ln909">    auto status = STATUS_FORMAT(</a>
+<a name="ln910">        TimedOut, &quot;Could not find desired replica $0 in live set&quot;, change_config_ts_uuid_);</a>
+<a name="ln911">    LOG_WITH_PREFIX(WARNING) &lt;&lt; status;</a>
+<a name="ln912">    return status;</a>
+<a name="ln913">  }</a>
+<a name="ln914"> </a>
+<a name="ln915">  req_.set_dest_uuid(permanent_uuid());</a>
+<a name="ln916">  req_.set_tablet_id(tablet_-&gt;tablet_id());</a>
+<a name="ln917">  req_.set_type(consensus::ADD_SERVER);</a>
+<a name="ln918">  req_.set_cas_config_opid_index(cstate_.config().opid_index());</a>
+<a name="ln919">  RaftPeerPB* peer = req_.mutable_server();</a>
+<a name="ln920">  peer-&gt;set_permanent_uuid(replacement_replica-&gt;permanent_uuid());</a>
+<a name="ln921">  peer-&gt;set_member_type(member_type_);</a>
+<a name="ln922">  TSRegistrationPB peer_reg = replacement_replica-&gt;GetRegistration();</a>
+<a name="ln923"> </a>
+<a name="ln924">  if (peer_reg.common().private_rpc_addresses().empty()) {</a>
+<a name="ln925">    auto status = STATUS_FORMAT(</a>
+<a name="ln926">        IllegalState, &quot;Candidate replacement $0 has no registered rpc address: $1&quot;,</a>
+<a name="ln927">        replacement_replica-&gt;permanent_uuid(), peer_reg);</a>
+<a name="ln928">    YB_LOG_EVERY_N(WARNING, 100) &lt;&lt; LogPrefix() &lt;&lt; status;</a>
+<a name="ln929">    return status;</a>
+<a name="ln930">  }</a>
+<a name="ln931"> </a>
+<a name="ln932">  TakeRegistration(peer_reg.mutable_common(), peer);</a>
+<a name="ln933"> </a>
+<a name="ln934">  return Status::OK();</a>
+<a name="ln935">}</a>
+<a name="ln936"> </a>
+<a name="ln937">// ============================================================================</a>
+<a name="ln938">//  Class AsyncRemoveServerTask.</a>
+<a name="ln939">// ============================================================================</a>
+<a name="ln940">Status AsyncRemoveServerTask::PrepareRequest(int attempt) {</a>
+<a name="ln941">  bool found = false;</a>
+<a name="ln942">  for (const RaftPeerPB&amp; peer : cstate_.config().peers()) {</a>
+<a name="ln943">    if (change_config_ts_uuid_ == peer.permanent_uuid()) {</a>
+<a name="ln944">      found = true;</a>
+<a name="ln945">    }</a>
+<a name="ln946">  }</a>
+<a name="ln947"> </a>
+<a name="ln948">  if (!found) {</a>
+<a name="ln949">    auto status = STATUS_FORMAT(</a>
+<a name="ln950">        NotFound, &quot;Asked to remove TS with uuid $0 but could not find it in config peers!&quot;,</a>
+<a name="ln951">        change_config_ts_uuid_);</a>
+<a name="ln952">    LOG_WITH_PREFIX(WARNING) &lt;&lt; status;</a>
+<a name="ln953">    return status;</a>
+<a name="ln954">  }</a>
+<a name="ln955"> </a>
+<a name="ln956">  req_.set_dest_uuid(permanent_uuid());</a>
+<a name="ln957">  req_.set_tablet_id(tablet_-&gt;tablet_id());</a>
+<a name="ln958">  req_.set_type(consensus::REMOVE_SERVER);</a>
+<a name="ln959">  req_.set_cas_config_opid_index(cstate_.config().opid_index());</a>
+<a name="ln960">  RaftPeerPB* peer = req_.mutable_server();</a>
+<a name="ln961">  peer-&gt;set_permanent_uuid(change_config_ts_uuid_);</a>
+<a name="ln962"> </a>
+<a name="ln963">  return Status::OK();</a>
+<a name="ln964">}</a>
+<a name="ln965"> </a>
+<a name="ln966">// ============================================================================</a>
+<a name="ln967">//  Class AsyncTryStepDown.</a>
+<a name="ln968">// ============================================================================</a>
+<a name="ln969">Status AsyncTryStepDown::PrepareRequest(int attempt) {</a>
+<a name="ln970">  LOG_WITH_PREFIX(INFO) &lt;&lt; Substitute(&quot;Prep Leader step down $0, leader_uuid=$1, change_ts_uuid=$2&quot;,</a>
+<a name="ln971">                                      attempt, permanent_uuid(), change_config_ts_uuid_);</a>
+<a name="ln972">  if (attempt &gt; 1) {</a>
+<a name="ln973">    return STATUS(RuntimeError, &quot;Retry is not allowed&quot;);</a>
+<a name="ln974">  }</a>
+<a name="ln975"> </a>
+<a name="ln976">  // If we were asked to remove the server even if it is the leader, we have to call StepDown, but</a>
+<a name="ln977">  // only if our current leader is the server we are asked to remove.</a>
+<a name="ln978">  if (permanent_uuid() != change_config_ts_uuid_) {</a>
+<a name="ln979">    auto status = STATUS_FORMAT(</a>
+<a name="ln980">        IllegalState,</a>
+<a name="ln981">        &quot;Incorrect state config leader $0 does not match target uuid $1 for a leader step down op&quot;,</a>
+<a name="ln982">        permanent_uuid(), change_config_ts_uuid_);</a>
+<a name="ln983">    LOG_WITH_PREFIX(WARNING) &lt;&lt; status;</a>
+<a name="ln984">    return status;</a>
+<a name="ln985">  }</a>
+<a name="ln986"> </a>
+<a name="ln987">  stepdown_req_.set_dest_uuid(change_config_ts_uuid_);</a>
+<a name="ln988">  stepdown_req_.set_tablet_id(tablet_-&gt;tablet_id());</a>
+<a name="ln989">  if (!new_leader_uuid_.empty()) {</a>
+<a name="ln990">    stepdown_req_.set_new_leader_uuid(new_leader_uuid_);</a>
+<a name="ln991">  }</a>
+<a name="ln992"> </a>
+<a name="ln993">  return Status::OK();</a>
+<a name="ln994">}</a>
+<a name="ln995"> </a>
+<a name="ln996">bool AsyncTryStepDown::SendRequest(int attempt) {</a>
+<a name="ln997">  auto prepare_status = PrepareRequest(attempt);</a>
+<a name="ln998">  if (!prepare_status.ok()) {</a>
+<a name="ln999">    AbortTask(prepare_status);</a>
+<a name="ln1000">    return false;</a>
+<a name="ln1001">  }</a>
+<a name="ln1002"> </a>
+<a name="ln1003">  LOG_WITH_PREFIX(INFO) &lt;&lt; Substitute(&quot;Stepping down leader $0 for tablet $1&quot;,</a>
+<a name="ln1004">                                      change_config_ts_uuid_, tablet_-&gt;tablet_id());</a>
+<a name="ln1005">  consensus_proxy_-&gt;LeaderStepDownAsync(</a>
+<a name="ln1006">      stepdown_req_, &amp;stepdown_resp_, &amp;rpc_, BindRpcCallback());</a>
+<a name="ln1007"> </a>
+<a name="ln1008">  return true;</a>
+<a name="ln1009">}</a>
+<a name="ln1010"> </a>
+<a name="ln1011">void AsyncTryStepDown::HandleResponse(int attempt) {</a>
+<a name="ln1012">  if (!rpc_.status().ok()) {</a>
+<a name="ln1013">    AbortTask(rpc_.status());</a>
+<a name="ln1014">    LOG_WITH_PREFIX(WARNING) &lt;&lt; Substitute(</a>
+<a name="ln1015">        &quot;Got error on stepdown for tablet $0 with leader $1, attempt $2 and error $3&quot;,</a>
+<a name="ln1016">        tablet_-&gt;tablet_id(), permanent_uuid(), attempt, rpc_.status().ToString());</a>
+<a name="ln1017"> </a>
+<a name="ln1018">    return;</a>
+<a name="ln1019">  }</a>
+<a name="ln1020"> </a>
+<a name="ln1021">  TransitionToCompleteState();</a>
+<a name="ln1022">  const bool stepdown_failed = stepdown_resp_.error().status().code() != AppStatusPB::OK;</a>
+<a name="ln1023">  LOG_WITH_PREFIX(INFO) &lt;&lt; Format(</a>
+<a name="ln1024">      &quot;Leader step down done attempt=$0, leader_uuid=$1, change_uuid=$2, &quot;</a>
+<a name="ln1025">      &quot;error=$3, failed=$4, should_remove=$5 for tablet $6.&quot;,</a>
+<a name="ln1026">      attempt, permanent_uuid(), change_config_ts_uuid_, stepdown_resp_.error(),</a>
+<a name="ln1027">      stepdown_failed, should_remove_, tablet_-&gt;tablet_id());</a>
+<a name="ln1028"> </a>
+<a name="ln1029">  if (stepdown_failed) {</a>
+<a name="ln1030">    tablet_-&gt;RegisterLeaderStepDownFailure(change_config_ts_uuid_,</a>
+<a name="ln1031">        MonoDelta::FromMilliseconds(stepdown_resp_.has_time_since_election_failure_ms() ?</a>
+<a name="ln1032">                                    stepdown_resp_.time_since_election_failure_ms() : 0));</a>
+<a name="ln1033">  }</a>
+<a name="ln1034"> </a>
+<a name="ln1035">  if (should_remove_) {</a>
+<a name="ln1036">    auto task = std::make_shared&lt;AsyncRemoveServerTask&gt;(</a>
+<a name="ln1037">        master_, callback_pool_, tablet_, cstate_, change_config_ts_uuid_);</a>
+<a name="ln1038"> </a>
+<a name="ln1039">    tablet_-&gt;table()-&gt;AddTask(task);</a>
+<a name="ln1040">    Status status = task-&gt;Run();</a>
+<a name="ln1041">    WARN_NOT_OK(status, &quot;Failed to send new RemoveServer request&quot;);</a>
+<a name="ln1042">  }</a>
+<a name="ln1043">}</a>
+<a name="ln1044"> </a>
+<a name="ln1045">// ============================================================================</a>
+<a name="ln1046">//  Class AsyncAddTableToTablet.</a>
+<a name="ln1047">// ============================================================================</a>
+<a name="ln1048">AsyncAddTableToTablet::AsyncAddTableToTablet(</a>
+<a name="ln1049">    Master* master, ThreadPool* callback_pool, const scoped_refptr&lt;TabletInfo&gt;&amp; tablet,</a>
+<a name="ln1050">    const scoped_refptr&lt;TableInfo&gt;&amp; table)</a>
+<a name="ln1051">    : RetryingTSRpcTask(</a>
+<a name="ln1052">          master, callback_pool, gscoped_ptr&lt;TSPicker&gt;(new PickLeaderReplica(tablet)), table.get()),</a>
+<a name="ln1053">      tablet_(tablet),</a>
+<a name="ln1054">      table_(table),</a>
+<a name="ln1055">      tablet_id_(tablet-&gt;tablet_id()) {</a>
+<a name="ln1056">  req_.set_tablet_id(tablet-&gt;id());</a>
+<a name="ln1057">  auto&amp; add_table = *req_.mutable_add_table();</a>
+<a name="ln1058">  add_table.set_table_id(table_-&gt;id());</a>
+<a name="ln1059">  add_table.set_table_name(table_-&gt;name());</a>
+<a name="ln1060">  add_table.set_table_type(table_-&gt;GetTableType());</a>
+<a name="ln1061">  {</a>
+<a name="ln1062">    auto l = table-&gt;LockForRead();</a>
+<a name="ln1063">    add_table.set_schema_version(l-&gt;data().pb.version());</a>
+<a name="ln1064">    *add_table.mutable_schema() = l-&gt;data().pb.schema();</a>
+<a name="ln1065">    *add_table.mutable_partition_schema() = l-&gt;data().pb.partition_schema();</a>
+<a name="ln1066">  }</a>
+<a name="ln1067">}</a>
+<a name="ln1068"> </a>
+<a name="ln1069">string AsyncAddTableToTablet::description() const {</a>
+<a name="ln1070">  return Substitute(&quot;AddTableToTablet RPC ($0) ($1)&quot;, table_-&gt;ToString(), tablet_-&gt;ToString());</a>
+<a name="ln1071">}</a>
+<a name="ln1072"> </a>
+<a name="ln1073">void AsyncAddTableToTablet::HandleResponse(int attempt) {</a>
+<a name="ln1074">  if (!rpc_.status().ok()) {</a>
+<a name="ln1075">    AbortTask(rpc_.status());</a>
+<a name="ln1076">    LOG_WITH_PREFIX(WARNING) &lt;&lt; Substitute(</a>
+<a name="ln1077">        &quot;Got error when adding table $0 to tablet $1, attempt $2 and error $3&quot;,</a>
+<a name="ln1078">        table_-&gt;ToString(), tablet_-&gt;ToString(), attempt, rpc_.status().ToString());</a>
+<a name="ln1079">    return;</a>
+<a name="ln1080">  }</a>
+<a name="ln1081">  if (resp_.has_error()) {</a>
+<a name="ln1082">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;AddTableToTablet() responded with error code &quot;</a>
+<a name="ln1083">                             &lt;&lt; TabletServerErrorPB_Code_Name(resp_.error().code());</a>
+<a name="ln1084">    switch (resp_.error().code()) {</a>
+<a name="ln1085">      case TabletServerErrorPB::LEADER_NOT_READY_TO_SERVE: FALLTHROUGH_INTENDED;</a>
+<a name="ln1086">      case TabletServerErrorPB::NOT_THE_LEADER:</a>
+<a name="ln1087">        TransitionToWaitingState(MonitoredTaskState::kRunning);</a>
+<a name="ln1088">        break;</a>
+<a name="ln1089">      default:</a>
+<a name="ln1090">        TransitionToCompleteState();</a>
+<a name="ln1091">        break;</a>
+<a name="ln1092">    }</a>
+<a name="ln1093"> </a>
+<a name="ln1094">    return;</a>
+<a name="ln1095">  }</a>
+<a name="ln1096"> </a>
+<a name="ln1097">  TransitionToCompleteState();</a>
+<a name="ln1098">}</a>
+<a name="ln1099"> </a>
+<a name="ln1100">bool AsyncAddTableToTablet::SendRequest(int attempt) {</a>
+<a name="ln1101">  ts_admin_proxy_-&gt;AddTableToTabletAsync(req_, &amp;resp_, &amp;rpc_, BindRpcCallback());</a>
+<a name="ln1102">  VLOG_WITH_PREFIX(1)</a>
+<a name="ln1103">      &lt;&lt; &quot;Send AddTableToTablet request (attempt &quot; &lt;&lt; attempt &lt;&lt; &quot;):\n&quot; &lt;&lt; req_.DebugString();</a>
+<a name="ln1104">  return true;</a>
+<a name="ln1105">}</a>
+<a name="ln1106"> </a>
+<a name="ln1107">// ============================================================================</a>
+<a name="ln1108">//  Class AsyncRemoveTableFromTablet.</a>
+<a name="ln1109">// ============================================================================</a>
+<a name="ln1110">AsyncRemoveTableFromTablet::AsyncRemoveTableFromTablet(</a>
+<a name="ln1111">    Master* master, ThreadPool* callback_pool, const scoped_refptr&lt;TabletInfo&gt;&amp; tablet,</a>
+<a name="ln1112">    const scoped_refptr&lt;TableInfo&gt;&amp; table)</a>
+<a name="ln1113">    : RetryingTSRpcTask(</a>
+<a name="ln1114">          master, callback_pool, gscoped_ptr&lt;TSPicker&gt;(new PickLeaderReplica(tablet)), table.get()),</a>
+<a name="ln1115">      table_(table),</a>
+<a name="ln1116">      tablet_(tablet),</a>
+<a name="ln1117">      tablet_id_(tablet-&gt;tablet_id()) {</a>
+<a name="ln1118">  req_.set_tablet_id(tablet-&gt;id());</a>
+<a name="ln1119">  req_.set_remove_table_id(table-&gt;id());</a>
+<a name="ln1120">}</a>
+<a name="ln1121"> </a>
+<a name="ln1122">string AsyncRemoveTableFromTablet::description() const {</a>
+<a name="ln1123">  return Substitute(&quot;RemoveTableFromTablet RPC ($0) ($1)&quot;, table_-&gt;ToString(), tablet_-&gt;ToString());</a>
+<a name="ln1124">}</a>
+<a name="ln1125"> </a>
+<a name="ln1126">void AsyncRemoveTableFromTablet::HandleResponse(int attempt) {</a>
+<a name="ln1127">  if (!rpc_.status().ok()) {</a>
+<a name="ln1128">    AbortTask(rpc_.status());</a>
+<a name="ln1129">    LOG_WITH_PREFIX(WARNING) &lt;&lt; Substitute(</a>
+<a name="ln1130">        &quot;Got error when removing table $0 from tablet $1, attempt $2 and error $3&quot;,</a>
+<a name="ln1131">        table_-&gt;ToString(), tablet_-&gt;ToString(), attempt, rpc_.status().ToString());</a>
+<a name="ln1132">    return;</a>
+<a name="ln1133">  }</a>
+<a name="ln1134">  if (resp_.has_error()) {</a>
+<a name="ln1135">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;RemoveTableFromTablet() responded with error code &quot;</a>
+<a name="ln1136">                             &lt;&lt; TabletServerErrorPB_Code_Name(resp_.error().code());</a>
+<a name="ln1137">    switch (resp_.error().code()) {</a>
+<a name="ln1138">      case TabletServerErrorPB::LEADER_NOT_READY_TO_SERVE: FALLTHROUGH_INTENDED;</a>
+<a name="ln1139">      case TabletServerErrorPB::NOT_THE_LEADER:</a>
+<a name="ln1140">        TransitionToWaitingState(MonitoredTaskState::kRunning);</a>
+<a name="ln1141">        break;</a>
+<a name="ln1142">      default:</a>
+<a name="ln1143">        TransitionToCompleteState();</a>
+<a name="ln1144">        break;</a>
+<a name="ln1145">    }</a>
+<a name="ln1146">  } else {</a>
+<a name="ln1147">    TransitionToCompleteState();</a>
+<a name="ln1148">  }</a>
+<a name="ln1149">}</a>
+<a name="ln1150"> </a>
+<a name="ln1151">bool AsyncRemoveTableFromTablet::SendRequest(int attempt) {</a>
+<a name="ln1152">  ts_admin_proxy_-&gt;RemoveTableFromTabletAsync(req_, &amp;resp_, &amp;rpc_, BindRpcCallback());</a>
+<a name="ln1153">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Send RemoveTableFromTablet request (attempt &quot; &lt;&lt; attempt &lt;&lt; &quot;):\n&quot;</a>
+<a name="ln1154">                      &lt;&lt; req_.DebugString();</a>
+<a name="ln1155">  return true;</a>
+<a name="ln1156">}</a>
+<a name="ln1157"> </a>
+<a name="ln1158">// ============================================================================</a>
+<a name="ln1159">//  Class AsyncSplitTablet.</a>
+<a name="ln1160">// ============================================================================</a>
+<a name="ln1161">AsyncSplitTablet::AsyncSplitTablet(</a>
+<a name="ln1162">    Master* master, ThreadPool* callback_pool, const scoped_refptr&lt;TabletInfo&gt;&amp; tablet,</a>
+<a name="ln1163">    const std::array&lt;TabletId, 2&gt;&amp; new_tablet_ids, const std::string&amp; split_encoded_key,</a>
+<a name="ln1164">    const std::string&amp; split_partition_key)</a>
+<a name="ln1165">    : AsyncTabletLeaderTask(master, callback_pool, tablet) {</a>
+<a name="ln1166">  req_.set_tablet_id(tablet_id());</a>
+<a name="ln1167">  req_.set_new_tablet1_id(new_tablet_ids[0]);</a>
+<a name="ln1168">  req_.set_new_tablet2_id(new_tablet_ids[1]);</a>
+<a name="ln1169">  req_.set_split_encoded_key(split_encoded_key);</a>
+<a name="ln1170">  req_.set_split_partition_key(split_partition_key);</a>
+<a name="ln1171">}</a>
+<a name="ln1172"> </a>
+<a name="ln1173">void AsyncSplitTablet::HandleResponse(int attempt) {</a>
+<a name="ln1174">  if (resp_.has_error()) {</a>
+<a name="ln1175">    const Status s = StatusFromPB(resp_.error().status());</a>
+<a name="ln1176">    const TabletServerErrorPB::Code code = resp_.error().code();</a>
+<a name="ln1177">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot;: split (attempt &quot; &lt;&lt; attempt</a>
+<a name="ln1178">                             &lt;&lt; &quot;) failed for tablet &quot; &lt;&lt; tablet_id() &lt;&lt; &quot; with error code &quot;</a>
+<a name="ln1179">                             &lt;&lt; TabletServerErrorPB::Code_Name(code) &lt;&lt; &quot;: &quot; &lt;&lt; s;</a>
+<a name="ln1180">  } else {</a>
+<a name="ln1181">    VLOG_WITH_PREFIX(1)</a>
+<a name="ln1182">        &lt;&lt; &quot;TS &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot;: split complete on tablet &quot; &lt;&lt; tablet_id();</a>
+<a name="ln1183">    TransitionToCompleteState();</a>
+<a name="ln1184">  }</a>
+<a name="ln1185"> </a>
+<a name="ln1186">  server::UpdateClock(resp_, master_-&gt;clock());</a>
+<a name="ln1187">}</a>
+<a name="ln1188"> </a>
+<a name="ln1189">bool AsyncSplitTablet::SendRequest(int attempt) {</a>
+<a name="ln1190">  req_.set_dest_uuid(permanent_uuid());</a>
+<a name="ln1191">  req_.set_propagated_hybrid_time(master_-&gt;clock()-&gt;Now().ToUint64());</a>
+<a name="ln1192">  ts_admin_proxy_-&gt;SplitTabletAsync(req_, &amp;resp_, &amp;rpc_, BindRpcCallback());</a>
+<a name="ln1193">  VLOG_WITH_PREFIX(1)</a>
+<a name="ln1194">      &lt;&lt; &quot;Sent split tablet request to &quot; &lt;&lt; permanent_uuid() &lt;&lt; &quot; (attempt &quot; &lt;&lt; attempt &lt;&lt; &quot;):\n&quot;</a>
+<a name="ln1195">      &lt;&lt; req_.DebugString();</a>
+<a name="ln1196">  return true;</a>
+<a name="ln1197">}</a>
+<a name="ln1198"> </a>
+<a name="ln1199">}  // namespace master</a>
+<a name="ln1200">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="124"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="134"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="181"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="185"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="225"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="522"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="580"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="598"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="630"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="644"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="650"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="653"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="676"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="683"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="687"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="700"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="743"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="764"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="777"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="853"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1102"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1153"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1181"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1193"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,599 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>hdr_histogram.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32">#include &quot;yb/util/hdr_histogram.h&quot;</a>
+<a name="ln33"> </a>
+<a name="ln34">#include &lt;algorithm&gt;</a>
+<a name="ln35">#include &lt;cmath&gt;</a>
+<a name="ln36">#include &lt;limits&gt;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &quot;yb/gutil/atomicops.h&quot;</a>
+<a name="ln39">#include &quot;yb/gutil/bits.h&quot;</a>
+<a name="ln40">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln41">#include &quot;yb/util/status.h&quot;</a>
+<a name="ln42"> </a>
+<a name="ln43">using base::subtle::Atomic64;</a>
+<a name="ln44">using base::subtle::NoBarrier_AtomicIncrement;</a>
+<a name="ln45">using base::subtle::NoBarrier_Store;</a>
+<a name="ln46">using base::subtle::NoBarrier_Load;</a>
+<a name="ln47">using base::subtle::NoBarrier_CompareAndSwap;</a>
+<a name="ln48">using strings::Substitute;</a>
+<a name="ln49">using std::endl;</a>
+<a name="ln50"> </a>
+<a name="ln51">namespace yb {</a>
+<a name="ln52"> </a>
+<a name="ln53">HdrHistogram::HdrHistogram(uint64_t highest_trackable_value, int num_significant_digits)</a>
+<a name="ln54">  : highest_trackable_value_(highest_trackable_value),</a>
+<a name="ln55">    num_significant_digits_(num_significant_digits),</a>
+<a name="ln56">    counts_array_length_(0),</a>
+<a name="ln57">    bucket_count_(0),</a>
+<a name="ln58">    sub_bucket_count_(0),</a>
+<a name="ln59">    sub_bucket_half_count_magnitude_(0),</a>
+<a name="ln60">    sub_bucket_half_count_(0),</a>
+<a name="ln61">    sub_bucket_mask_(0),</a>
+<a name="ln62">    total_count_(0),</a>
+<a name="ln63">    total_sum_(0),</a>
+<a name="ln64">    current_count_(0),</a>
+<a name="ln65">    current_sum_(0),</a>
+<a name="ln66">    min_value_(std::numeric_limits&lt;Atomic64&gt;::max()),</a>
+<a name="ln67">    max_value_(0),</a>
+<a name="ln68">    counts_(nullptr) {</a>
+<a name="ln69">  Init();</a>
+<a name="ln70">}</a>
+<a name="ln71"> </a>
+<a name="ln72">HdrHistogram::HdrHistogram(const HdrHistogram&amp; other)</a>
+<a name="ln73">  : highest_trackable_value_(other.highest_trackable_value_),</a>
+<a name="ln74">    num_significant_digits_(other.num_significant_digits_),</a>
+<a name="ln75">    counts_array_length_(0),</a>
+<a name="ln76">    bucket_count_(0),</a>
+<a name="ln77">    sub_bucket_count_(0),</a>
+<a name="ln78">    sub_bucket_half_count_magnitude_(0),</a>
+<a name="ln79">    sub_bucket_half_count_(0),</a>
+<a name="ln80">    sub_bucket_mask_(0),</a>
+<a name="ln81">    total_count_(0),</a>
+<a name="ln82">    total_sum_(0),</a>
+<a name="ln83">    current_count_(0),</a>
+<a name="ln84">    current_sum_(0),</a>
+<a name="ln85">    min_value_(std::numeric_limits&lt;Atomic64&gt;::max()),</a>
+<a name="ln86">    max_value_(0),</a>
+<a name="ln87">    counts_(nullptr) {</a>
+<a name="ln88">  Init();</a>
+<a name="ln89"> </a>
+<a name="ln90">  // Not a consistent snapshot but we try to roughly keep it close.</a>
+<a name="ln91">  // Copy the sum and min first.</a>
+<a name="ln92">  NoBarrier_Store(&amp;total_sum_, NoBarrier_Load(&amp;other.total_sum_));</a>
+<a name="ln93">  NoBarrier_Store(&amp;current_sum_, NoBarrier_Load(&amp;other.current_sum_));</a>
+<a name="ln94">  NoBarrier_Store(&amp;min_value_, NoBarrier_Load(&amp;other.min_value_));</a>
+<a name="ln95"> </a>
+<a name="ln96">  uint64_t total_copied_count = 0;</a>
+<a name="ln97">  // Copy the counts in order of ascending magnitude.</a>
+<a name="ln98">  for (int i = 0; i &lt; counts_array_length_; i++) {</a>
+<a name="ln99">    uint64_t count = NoBarrier_Load(&amp;other.counts_[i]);</a>
+<a name="ln100">    NoBarrier_Store(&amp;counts_[i], count);</a>
+<a name="ln101">    total_copied_count += count;</a>
+<a name="ln102">  }</a>
+<a name="ln103">  // Copy the max observed value last.</a>
+<a name="ln104">  NoBarrier_Store(&amp;max_value_, NoBarrier_Load(&amp;other.max_value_));</a>
+<a name="ln105">  // We must ensure the total is consistent with the copied counts.</a>
+<a name="ln106">  NoBarrier_Store(&amp;total_count_, NoBarrier_Load(&amp;other.total_count_));</a>
+<a name="ln107">  NoBarrier_Store(&amp;current_count_, total_copied_count);</a>
+<a name="ln108">}</a>
+<a name="ln109"> </a>
+<a name="ln110">void HdrHistogram::ResetPercentiles() {</a>
+<a name="ln111">  for (int i = 0; i &lt; counts_array_length_; i++) {</a>
+<a name="ln112">    NoBarrier_Store(&amp;counts_[i], 0);</a>
+<a name="ln113">  }</a>
+<a name="ln114">  NoBarrier_Store(&amp;current_count_, 0);</a>
+<a name="ln115">  NoBarrier_Store(&amp;current_sum_, 0);</a>
+<a name="ln116"> </a>
+<a name="ln117">  NoBarrier_Store(&amp;min_value_, std::numeric_limits&lt;Atomic64&gt;::max());</a>
+<a name="ln118">  NoBarrier_Store(&amp;max_value_, 0);</a>
+<a name="ln119">}</a>
+<a name="ln120"> </a>
+<a name="ln121">bool HdrHistogram::IsValidHighestTrackableValue(uint64_t highest_trackable_value) {</a>
+<a name="ln122">  return highest_trackable_value &gt;= kMinHighestTrackableValue;</a>
+<a name="ln123">}</a>
+<a name="ln124"> </a>
+<a name="ln125">bool HdrHistogram::IsValidNumSignificantDigits(int num_significant_digits) {</a>
+<a name="ln126">  return num_significant_digits &gt;= kMinValidNumSignificantDigits &amp;&amp;</a>
+<a name="ln127">         num_significant_digits &lt;= kMaxValidNumSignificantDigits;</a>
+<a name="ln128">}</a>
+<a name="ln129"> </a>
+<a name="ln130">void HdrHistogram::Init() {</a>
+<a name="ln131">  // Verify parameter validity</a>
+<a name="ln132">  CHECK(IsValidHighestTrackableValue(highest_trackable_value_)) &lt;&lt;</a>
+<a name="ln133">      Substitute(&quot;highest_trackable_value must be &gt;= $0&quot;, kMinHighestTrackableValue);</a>
+<a name="ln134">  CHECK(IsValidNumSignificantDigits(num_significant_digits_)) &lt;&lt;</a>
+<a name="ln135">      Substitute(&quot;num_significant_digits must be between $0 and $1&quot;,</a>
+<a name="ln136">          kMinValidNumSignificantDigits, kMaxValidNumSignificantDigits);</a>
+<a name="ln137"> </a>
+<a name="ln138">  uint32_t largest_value_with_single_unit_resolution =</a>
+<a name="ln139">      2 * static_cast&lt;uint32_t&gt;(pow(10.0, num_significant_digits_));</a>
+<a name="ln140"> </a>
+<a name="ln141">  // We need to maintain power-of-two sub_bucket_count_ (for clean direct</a>
+<a name="ln142">  // indexing) that is large enough to provide unit resolution to at least</a>
+<a name="ln143">  // largest_value_with_single_unit_resolution. So figure out</a>
+<a name="ln144">  // largest_value_with_single_unit_resolution's nearest power-of-two</a>
+<a name="ln145">  // (rounded up), and use that:</a>
+<a name="ln146"> </a>
+<a name="ln147">  // The sub-buckets take care of the precision.</a>
+<a name="ln148">  // Each sub-bucket is sized to have enough bits for the requested</a>
+<a name="ln149">  // 10^precision accuracy.</a>
+<a name="ln150">  int sub_bucket_count_magnitude =</a>
+<a name="ln151">      Bits::Log2Ceiling(largest_value_with_single_unit_resolution);</a>
+<a name="ln152">  sub_bucket_half_count_magnitude_ =</a>
+<a name="ln153">      (sub_bucket_count_magnitude &gt;= 1) ? sub_bucket_count_magnitude - 1 : 0;</a>
+<a name="ln154"> </a>
+<a name="ln155">  // sub_bucket_count_ is approx. 10^num_sig_digits (as a power of 2)</a>
+<a name="ln156">  sub_bucket_count_ = pow(2.0, sub_bucket_half_count_magnitude_ + 1);</a>
+<a name="ln157">  sub_bucket_mask_ = sub_bucket_count_ - 1;</a>
+<a name="ln158">  sub_bucket_half_count_ = sub_bucket_count_ / 2;</a>
+<a name="ln159"> </a>
+<a name="ln160">  // The buckets take care of the magnitude.</a>
+<a name="ln161">  // Determine exponent range needed to support the trackable value with no</a>
+<a name="ln162">  // overflow:</a>
+<a name="ln163">  uint64_t trackable_value = sub_bucket_count_ - 1;</a>
+<a name="ln164">  int buckets_needed = 1;</a>
+<a name="ln165">  while (trackable_value &lt; highest_trackable_value_) {</a>
+<a name="ln166">    trackable_value &lt;&lt;= 1;</a>
+<a name="ln167">    buckets_needed++;</a>
+<a name="ln168">  }</a>
+<a name="ln169">  bucket_count_ = buckets_needed;</a>
+<a name="ln170"> </a>
+<a name="ln171">  counts_array_length_ = (bucket_count_ + 1) * sub_bucket_half_count_;</a>
+<a name="ln172">  counts_.reset(new Atomic64[counts_array_length_]());  // value-initialized</a>
+<a name="ln173">}</a>
+<a name="ln174"> </a>
+<a name="ln175">void HdrHistogram::Increment(int64_t value) {</a>
+<a name="ln176">  IncrementBy(value, 1);</a>
+<a name="ln177">}</a>
+<a name="ln178"> </a>
+<a name="ln179">void HdrHistogram::IncrementBy(int64_t value, int64_t count) {</a>
+<a name="ln180">  DCHECK_GE(value, 0);</a>
+<a name="ln181">  DCHECK_GE(count, 0);</a>
+<a name="ln182"> </a>
+<a name="ln183">  // Dissect the value into bucket and sub-bucket parts, and derive index into</a>
+<a name="ln184">  // counts array:</a>
+<a name="ln185">  int bucket_index = BucketIndex(value);</a>
+<a name="ln186">  int sub_bucket_index = SubBucketIndex(value, bucket_index);</a>
+<a name="ln187">  int counts_index = CountsArrayIndex(bucket_index, sub_bucket_index);</a>
+<a name="ln188"> </a>
+<a name="ln189">  // Increment bucket, total, and sum.</a>
+<a name="ln190">  NoBarrier_AtomicIncrement(&amp;counts_[counts_index], count);</a>
+<a name="ln191">  NoBarrier_AtomicIncrement(&amp;total_count_, count);</a>
+<a name="ln192">  NoBarrier_AtomicIncrement(&amp;current_count_, count);</a>
+<a name="ln193">  NoBarrier_AtomicIncrement(&amp;total_sum_, value * count);</a>
+<a name="ln194">  NoBarrier_AtomicIncrement(&amp;current_sum_, value * count);</a>
+<a name="ln195"> </a>
+<a name="ln196">  // Update min, if needed.</a>
+<a name="ln197">  {</a>
+<a name="ln198">    Atomic64 min_val;</a>
+<a name="ln199">    while (PREDICT_FALSE(value &lt; (min_val = MinValue()))) {</a>
+<a name="ln200">      Atomic64 old_val = NoBarrier_CompareAndSwap(&amp;min_value_, min_val, value);</a>
+<a name="ln201">      if (PREDICT_TRUE(old_val == min_val)) break; // CAS success.</a>
+<a name="ln202">    }</a>
+<a name="ln203">  }</a>
+<a name="ln204"> </a>
+<a name="ln205">  // Update max, if needed.</a>
+<a name="ln206">  {</a>
+<a name="ln207">    Atomic64 max_val;</a>
+<a name="ln208">    while (PREDICT_FALSE(value &gt; (max_val = MaxValue()))) {</a>
+<a name="ln209">      Atomic64 old_val = NoBarrier_CompareAndSwap(&amp;max_value_, max_val, value);</a>
+<a name="ln210">      if (PREDICT_TRUE(old_val == max_val)) break; // CAS success.</a>
+<a name="ln211">    }</a>
+<a name="ln212">  }</a>
+<a name="ln213">}</a>
+<a name="ln214"> </a>
+<a name="ln215">void HdrHistogram::IncrementWithExpectedInterval(int64_t value,</a>
+<a name="ln216">                                                 int64_t expected_interval_between_samples) {</a>
+<a name="ln217">  Increment(value);</a>
+<a name="ln218">  if (expected_interval_between_samples &lt;= 0) {</a>
+<a name="ln219">    return;</a>
+<a name="ln220">  }</a>
+<a name="ln221">  for (int64_t missing_value = value - expected_interval_between_samples;</a>
+<a name="ln222">      missing_value &gt;= expected_interval_between_samples;</a>
+<a name="ln223">      missing_value -= expected_interval_between_samples) {</a>
+<a name="ln224">    Increment(missing_value);</a>
+<a name="ln225">  }</a>
+<a name="ln226">}</a>
+<a name="ln227"> </a>
+<a name="ln228">////////////////////////////////////</a>
+<a name="ln229"> </a>
+<a name="ln230">int HdrHistogram::BucketIndex(uint64_t value) const {</a>
+<a name="ln231">  if (PREDICT_FALSE(value &gt; highest_trackable_value_)) {</a>
+<a name="ln232">    value = highest_trackable_value_;</a>
+<a name="ln233">  }</a>
+<a name="ln234">  // Here we are calculating the power-of-2 magnitude of the value with a</a>
+<a name="ln235">  // correction for precision in the first bucket.</a>
+<a name="ln236">  // Smallest power of 2 containing value.</a>
+<a name="ln237">  int pow2ceiling = Bits::Log2Ceiling64(value | sub_bucket_mask_);</a>
+<a name="ln238">  return pow2ceiling - (sub_bucket_half_count_magnitude_ + 1);</a>
+<a name="ln239">}</a>
+<a name="ln240"> </a>
+<a name="ln241">int HdrHistogram::SubBucketIndex(uint64_t value, int bucket_index) const {</a>
+<a name="ln242">  if (PREDICT_FALSE(value &gt; highest_trackable_value_)) {</a>
+<a name="ln243">    value = highest_trackable_value_;</a>
+<a name="ln244">  }</a>
+<a name="ln245">  // We hack off the magnitude and are left with only the relevant precision</a>
+<a name="ln246">  // portion, which gives us a direct index into the sub-bucket. TODO: Right??</a>
+<a name="ln247">  return static_cast&lt;int&gt;(value &gt;&gt; bucket_index);</a>
+<a name="ln248">}</a>
+<a name="ln249"> </a>
+<a name="ln250">int HdrHistogram::CountsArrayIndex(int bucket_index, int sub_bucket_index) const {</a>
+<a name="ln251">  DCHECK(sub_bucket_index &lt; sub_bucket_count_);</a>
+<a name="ln252">  DCHECK(bucket_index &lt; bucket_count_);</a>
+<a name="ln253">  DCHECK(bucket_index == 0 || (sub_bucket_index &gt;= sub_bucket_half_count_));</a>
+<a name="ln254">  // Calculate the index for the first entry in the bucket:</a>
+<a name="ln255">  // (The following is the equivalent of ((bucket_index + 1) * sub_bucket_half_count_) ):</a>
+<a name="ln256">  int bucket_base_index = (bucket_index + 1) &lt;&lt; sub_bucket_half_count_magnitude_;</a>
+<a name="ln257">  // Calculate the offset in the bucket:</a>
+<a name="ln258">  int offset_in_bucket = sub_bucket_index - sub_bucket_half_count_;</a>
+<a name="ln259">  return bucket_base_index + offset_in_bucket;</a>
+<a name="ln260">}</a>
+<a name="ln261"> </a>
+<a name="ln262">uint64_t HdrHistogram::CountAt(int bucket_index, int sub_bucket_index) const {</a>
+<a name="ln263">  return counts_[CountsArrayIndex(bucket_index, sub_bucket_index)];</a>
+<a name="ln264">}</a>
+<a name="ln265"> </a>
+<a name="ln266">uint64_t HdrHistogram::CountInBucketForValue(uint64_t value) const {</a>
+<a name="ln267">  int bucket_index = BucketIndex(value);</a>
+<a name="ln268">  int sub_bucket_index = SubBucketIndex(value, bucket_index);</a>
+<a name="ln269">  return CountAt(bucket_index, sub_bucket_index);</a>
+<a name="ln270">}</a>
+<a name="ln271"> </a>
+<a name="ln272">uint64_t HdrHistogram::ValueFromIndex(int bucket_index, int sub_bucket_index) {</a>
+<a name="ln273">  return static_cast&lt;uint64_t&gt;(sub_bucket_index) &lt;&lt; bucket_index;</a>
+<a name="ln274">}</a>
+<a name="ln275"> </a>
+<a name="ln276">////////////////////////////////////</a>
+<a name="ln277"> </a>
+<a name="ln278">uint64_t HdrHistogram::SizeOfEquivalentValueRange(uint64_t value) const {</a>
+<a name="ln279">  int bucket_index = BucketIndex(value);</a>
+<a name="ln280">  int sub_bucket_index = SubBucketIndex(value, bucket_index);</a>
+<a name="ln281">  uint64_t distance_to_next_value =</a>
+<a name="ln282">    (1 &lt;&lt; ((sub_bucket_index &gt;= sub_bucket_count_) ? (bucket_index + 1) : bucket_index));</a>
+<a name="ln283">  return distance_to_next_value;</a>
+<a name="ln284">}</a>
+<a name="ln285"> </a>
+<a name="ln286">uint64_t HdrHistogram::LowestEquivalentValue(uint64_t value) const {</a>
+<a name="ln287">  int bucket_index = BucketIndex(value);</a>
+<a name="ln288">  int sub_bucket_index = SubBucketIndex(value, bucket_index);</a>
+<a name="ln289">  uint64_t this_value_base_level = ValueFromIndex(bucket_index, sub_bucket_index);</a>
+<a name="ln290">  return this_value_base_level;</a>
+<a name="ln291">}</a>
+<a name="ln292"> </a>
+<a name="ln293">uint64_t HdrHistogram::HighestEquivalentValue(uint64_t value) const {</a>
+<a name="ln294">  return NextNonEquivalentValue(value) - 1;</a>
+<a name="ln295">}</a>
+<a name="ln296"> </a>
+<a name="ln297">uint64_t HdrHistogram::MedianEquivalentValue(uint64_t value) const {</a>
+<a name="ln298">  return (LowestEquivalentValue(value) + (SizeOfEquivalentValueRange(value) &gt;&gt; 1));</a>
+<a name="ln299">}</a>
+<a name="ln300"> </a>
+<a name="ln301">uint64_t HdrHistogram::NextNonEquivalentValue(uint64_t value) const {</a>
+<a name="ln302">  return LowestEquivalentValue(value) + SizeOfEquivalentValueRange(value);</a>
+<a name="ln303">}</a>
+<a name="ln304"> </a>
+<a name="ln305">bool HdrHistogram::ValuesAreEquivalent(uint64_t value1, uint64_t value2) const {</a>
+<a name="ln306">  return (LowestEquivalentValue(value1) == LowestEquivalentValue(value2));</a>
+<a name="ln307">}</a>
+<a name="ln308"> </a>
+<a name="ln309">uint64_t HdrHistogram::MinValue() const {</a>
+<a name="ln310">  if (PREDICT_FALSE(CurrentCount() == 0)) {</a>
+<a name="ln311">    return 0;</a>
+<a name="ln312">  }</a>
+<a name="ln313">  return NoBarrier_Load(&amp;min_value_);</a>
+<a name="ln314">}</a>
+<a name="ln315"> </a>
+<a name="ln316">uint64_t HdrHistogram::MaxValue() const {</a>
+<a name="ln317">  if (PREDICT_FALSE(CurrentCount() == 0)) {</a>
+<a name="ln318">    return 0;</a>
+<a name="ln319">  }</a>
+<a name="ln320">  return NoBarrier_Load(&amp;max_value_);</a>
+<a name="ln321">}</a>
+<a name="ln322"> </a>
+<a name="ln323">double HdrHistogram::MeanValue() const {</a>
+<a name="ln324">  uint64_t count = CurrentCount();</a>
+<a name="ln325">  if (PREDICT_FALSE(count == 0)) return 0.0;</a>
+<a name="ln326">  return static_cast&lt;double&gt;(CurrentSum()) / count;</a>
+<a name="ln327">}</a>
+<a name="ln328"> </a>
+<a name="ln329">uint64_t HdrHistogram::ValueAtPercentile(double percentile) const {</a>
+<a name="ln330">  uint64_t count = CurrentCount();</a>
+<a name="ln331">  if (PREDICT_FALSE(count == 0)) return 0;</a>
+<a name="ln332"> </a>
+<a name="ln333">  double requested_percentile = std::min(percentile, 100.0); // Truncate down to 100%</a>
+<a name="ln334">  uint64_t count_at_percentile =</a>
+<a name="ln335">    static_cast&lt;uint64_t&gt;(((requested_percentile / 100.0) * count) + 0.5); // Round</a>
+<a name="ln336">  // Make sure we at least reach the first recorded entry</a>
+<a name="ln337">  count_at_percentile = std::max(count_at_percentile, static_cast&lt;uint64_t&gt;(1));</a>
+<a name="ln338"> </a>
+<a name="ln339">  uint64_t total_to_current_iJ = 0;</a>
+<a name="ln340">  for (int i = 0; i &lt; bucket_count_; i++) {</a>
+<a name="ln341">    int j = (i == 0) ? 0 : (sub_bucket_count_ / 2);</a>
+<a name="ln342">    for (; j &lt; sub_bucket_count_; j++) {</a>
+<a name="ln343">      total_to_current_iJ += CountAt(i, j);</a>
+<a name="ln344">      if (total_to_current_iJ &gt;= count_at_percentile) {</a>
+<a name="ln345">        uint64_t valueAtIndex = ValueFromIndex(i, j);</a>
+<a name="ln346">        return valueAtIndex;</a>
+<a name="ln347">      }</a>
+<a name="ln348">    }</a>
+<a name="ln349">  }</a>
+<a name="ln350"> </a>
+<a name="ln351">  LOG(DFATAL) &lt;&lt; &quot;Fell through while iterating, likely concurrent modification of histogram&quot;;</a>
+<a name="ln352">  return 0;</a>
+<a name="ln353">}</a>
+<a name="ln354"> </a>
+<a name="ln355">void HdrHistogram::DumpHumanReadable(std::ostream* out) const {</a>
+<a name="ln356">  *out &lt;&lt; &quot;Total Count: &quot; &lt;&lt; TotalCount() &lt;&lt; endl;</a>
+<a name="ln357">  *out &lt;&lt; &quot;Mean: &quot; &lt;&lt; MeanValue() &lt;&lt; endl;</a>
+<a name="ln358">  *out &lt;&lt; &quot;Percentiles:&quot; &lt;&lt; endl;</a>
+<a name="ln359">  *out &lt;&lt; &quot;CountInBuckets: &quot; &lt;&lt; CurrentCount() &lt;&lt; endl;</a>
+<a name="ln360">  *out &lt;&lt; &quot;   0%  (min) = &quot; &lt;&lt; MinValue() &lt;&lt; endl;</a>
+<a name="ln361">  *out &lt;&lt; &quot;  25%        = &quot; &lt;&lt; ValueAtPercentile(25) &lt;&lt; endl;</a>
+<a name="ln362">  *out &lt;&lt; &quot;  50%  (med) = &quot; &lt;&lt; ValueAtPercentile(50) &lt;&lt; endl;</a>
+<a name="ln363">  *out &lt;&lt; &quot;  75%        = &quot; &lt;&lt; ValueAtPercentile(75) &lt;&lt; endl;</a>
+<a name="ln364">  *out &lt;&lt; &quot;  95%        = &quot; &lt;&lt; ValueAtPercentile(95) &lt;&lt; endl;</a>
+<a name="ln365">  *out &lt;&lt; &quot;  99%        = &quot; &lt;&lt; ValueAtPercentile(99) &lt;&lt; endl;</a>
+<a name="ln366">  *out &lt;&lt; &quot;  99.9%      = &quot; &lt;&lt; ValueAtPercentile(99.9) &lt;&lt; endl;</a>
+<a name="ln367">  *out &lt;&lt; &quot;  99.99%     = &quot; &lt;&lt; ValueAtPercentile(99.99) &lt;&lt; endl;</a>
+<a name="ln368">  *out &lt;&lt; &quot;  100% (max) = &quot; &lt;&lt; MaxValue() &lt;&lt; endl;</a>
+<a name="ln369">  if (MaxValue() &gt;= highest_trackable_value()) {</a>
+<a name="ln370">    *out &lt;&lt; &quot;*NOTE: some values were greater than highest trackable value&quot; &lt;&lt; endl;</a>
+<a name="ln371">  }</a>
+<a name="ln372">}</a>
+<a name="ln373"> </a>
+<a name="ln374">///////////////////////////////////////////////////////////////////////</a>
+<a name="ln375">// AbstractHistogramIterator</a>
+<a name="ln376">///////////////////////////////////////////////////////////////////////</a>
+<a name="ln377"> </a>
+<a name="ln378">AbstractHistogramIterator::AbstractHistogramIterator(const HdrHistogram* histogram)</a>
+<a name="ln379">  : histogram_(CHECK_NOTNULL(histogram)),</a>
+<a name="ln380">    cur_iter_val_(),</a>
+<a name="ln381">    histogram_total_count_(histogram_-&gt;CurrentCount()),</a>
+<a name="ln382">    current_bucket_index_(0),</a>
+<a name="ln383">    current_sub_bucket_index_(0),</a>
+<a name="ln384">    current_value_at_index_(0),</a>
+<a name="ln385">    next_bucket_index_(0),</a>
+<a name="ln386">    next_sub_bucket_index_(1),</a>
+<a name="ln387">    next_value_at_index_(1),</a>
+<a name="ln388">    prev_value_iterated_to_(0),</a>
+<a name="ln389">    total_count_to_prev_index_(0),</a>
+<a name="ln390">    total_count_to_current_index_(0),</a>
+<a name="ln391">    total_value_to_current_index_(0),</a>
+<a name="ln392">    count_at_this_value_(0),</a>
+<a name="ln393">    fresh_sub_bucket_(true) {</a>
+<a name="ln394">}</a>
+<a name="ln395"> </a>
+<a name="ln396">bool AbstractHistogramIterator::HasNext() const {</a>
+<a name="ln397">  return total_count_to_current_index_ &lt; histogram_total_count_;</a>
+<a name="ln398">}</a>
+<a name="ln399"> </a>
+<a name="ln400">Status AbstractHistogramIterator::Next(HistogramIterationValue* value) {</a>
+<a name="ln401">  if (histogram_-&gt;CurrentCount() != histogram_total_count_) {</a>
+<a name="ln402">    return STATUS(IllegalState, &quot;Concurrently modified histogram while traversing it&quot;);</a>
+<a name="ln403">  }</a>
+<a name="ln404"> </a>
+<a name="ln405">  // Move through the sub buckets and buckets until we hit the next reporting level:</a>
+<a name="ln406">  while (!ExhaustedSubBuckets()) {</a>
+<a name="ln407">    count_at_this_value_ =</a>
+<a name="ln408">        histogram_-&gt;CountAt(current_bucket_index_, current_sub_bucket_index_);</a>
+<a name="ln409">    if (fresh_sub_bucket_) { // Don't add unless we've incremented since last bucket...</a>
+<a name="ln410">      total_count_to_current_index_ += count_at_this_value_;</a>
+<a name="ln411">      total_value_to_current_index_ +=</a>
+<a name="ln412">        count_at_this_value_ * histogram_-&gt;MedianEquivalentValue(current_value_at_index_);</a>
+<a name="ln413">      fresh_sub_bucket_ = false;</a>
+<a name="ln414">    }</a>
+<a name="ln415">    if (ReachedIterationLevel()) {</a>
+<a name="ln416">      uint64_t value_iterated_to = ValueIteratedTo();</a>
+<a name="ln417"> </a>
+<a name="ln418">      // Update iterator value.</a>
+<a name="ln419">      cur_iter_val_.value_iterated_to = value_iterated_to;</a>
+<a name="ln420">      cur_iter_val_.value_iterated_from = prev_value_iterated_to_;</a>
+<a name="ln421">      cur_iter_val_.count_at_value_iterated_to = count_at_this_value_;</a>
+<a name="ln422">      cur_iter_val_.count_added_in_this_iteration_step =</a>
+<a name="ln423">          (total_count_to_current_index_ - total_count_to_prev_index_);</a>
+<a name="ln424">      cur_iter_val_.total_count_to_this_value = total_count_to_current_index_;</a>
+<a name="ln425">      cur_iter_val_.total_value_to_this_value = total_value_to_current_index_;</a>
+<a name="ln426">      cur_iter_val_.percentile =</a>
+<a name="ln427">          ((100.0 * total_count_to_current_index_) / histogram_total_count_);</a>
+<a name="ln428">      cur_iter_val_.percentile_level_iterated_to = PercentileIteratedTo();</a>
+<a name="ln429"> </a>
+<a name="ln430">      prev_value_iterated_to_ = value_iterated_to;</a>
+<a name="ln431">      total_count_to_prev_index_ = total_count_to_current_index_;</a>
+<a name="ln432">      // Move the next percentile reporting level forward.</a>
+<a name="ln433">      IncrementIterationLevel();</a>
+<a name="ln434"> </a>
+<a name="ln435">      *value = cur_iter_val_;</a>
+<a name="ln436">      return Status::OK();</a>
+<a name="ln437">    }</a>
+<a name="ln438">    IncrementSubBucket();</a>
+<a name="ln439">  }</a>
+<a name="ln440">  return STATUS(IllegalState, &quot;Histogram array index out of bounds while traversing&quot;);</a>
+<a name="ln441">}</a>
+<a name="ln442"> </a>
+<a name="ln443">double AbstractHistogramIterator::PercentileIteratedTo() const {</a>
+<a name="ln444">  return (100.0 * static_cast&lt;double&gt;(total_count_to_current_index_)) / histogram_total_count_;</a>
+<a name="ln445">}</a>
+<a name="ln446"> </a>
+<a name="ln447">double AbstractHistogramIterator::PercentileIteratedFrom() const {</a>
+<a name="ln448">  return (100.0 * static_cast&lt;double&gt;(total_count_to_prev_index_)) / histogram_total_count_;</a>
+<a name="ln449">}</a>
+<a name="ln450"> </a>
+<a name="ln451">uint64_t AbstractHistogramIterator::ValueIteratedTo() const {</a>
+<a name="ln452">  return histogram_-&gt;HighestEquivalentValue(current_value_at_index_);</a>
+<a name="ln453">}</a>
+<a name="ln454"> </a>
+<a name="ln455">bool AbstractHistogramIterator::ExhaustedSubBuckets() const {</a>
+<a name="ln456">  return (current_bucket_index_ &gt;= histogram_-&gt;bucket_count_);</a>
+<a name="ln457">}</a>
+<a name="ln458"> </a>
+<a name="ln459">void AbstractHistogramIterator::IncrementSubBucket() {</a>
+<a name="ln460">  fresh_sub_bucket_ = true;</a>
+<a name="ln461">  // Take on the next index:</a>
+<a name="ln462">  current_bucket_index_ = next_bucket_index_;</a>
+<a name="ln463">  current_sub_bucket_index_ = next_sub_bucket_index_;</a>
+<a name="ln464">  current_value_at_index_ = next_value_at_index_;</a>
+<a name="ln465">  // Figure out the next next index:</a>
+<a name="ln466">  next_sub_bucket_index_++;</a>
+<a name="ln467">  if (next_sub_bucket_index_ &gt;= histogram_-&gt;sub_bucket_count_) {</a>
+<a name="ln468">    next_sub_bucket_index_ = histogram_-&gt;sub_bucket_half_count_;</a>
+<a name="ln469">    next_bucket_index_++;</a>
+<a name="ln470">  }</a>
+<a name="ln471">  next_value_at_index_ = HdrHistogram::ValueFromIndex(next_bucket_index_, next_sub_bucket_index_);</a>
+<a name="ln472">}</a>
+<a name="ln473"> </a>
+<a name="ln474">///////////////////////////////////////////////////////////////////////</a>
+<a name="ln475">// RecordedValuesIterator</a>
+<a name="ln476">///////////////////////////////////////////////////////////////////////</a>
+<a name="ln477"> </a>
+<a name="ln478">RecordedValuesIterator::RecordedValuesIterator(const HdrHistogram* histogram)</a>
+<a name="ln479">  : AbstractHistogramIterator(histogram),</a>
+<a name="ln480">    visited_sub_bucket_index_(-1),</a>
+<a name="ln481">    visited_bucket_index_(-1) {</a>
+<a name="ln482">}</a>
+<a name="ln483"> </a>
+<a name="ln484">void RecordedValuesIterator::IncrementIterationLevel() {</a>
+<a name="ln485">  visited_sub_bucket_index_ = current_sub_bucket_index_;</a>
+<a name="ln486">  visited_bucket_index_ = current_bucket_index_;</a>
+<a name="ln487">}</a>
+<a name="ln488"> </a>
+<a name="ln489">bool RecordedValuesIterator::ReachedIterationLevel() const {</a>
+<a name="ln490">  uint64_t current_ij_count =</a>
+<a name="ln491">      histogram_-&gt;CountAt(current_bucket_index_, current_sub_bucket_index_);</a>
+<a name="ln492">  return current_ij_count != 0 &amp;&amp;</a>
+<a name="ln493">      ((visited_sub_bucket_index_ != current_sub_bucket_index_) ||</a>
+<a name="ln494">       (visited_bucket_index_ != current_bucket_index_));</a>
+<a name="ln495">}</a>
+<a name="ln496"> </a>
+<a name="ln497">///////////////////////////////////////////////////////////////////////</a>
+<a name="ln498">// PercentileIterator</a>
+<a name="ln499">///////////////////////////////////////////////////////////////////////</a>
+<a name="ln500"> </a>
+<a name="ln501">PercentileIterator::PercentileIterator(const HdrHistogram* histogram,</a>
+<a name="ln502">                                       int percentile_ticks_per_half_distance)</a>
+<a name="ln503">  : AbstractHistogramIterator(histogram),</a>
+<a name="ln504">    percentile_ticks_per_half_distance_(percentile_ticks_per_half_distance),</a>
+<a name="ln505">    percentile_level_to_iterate_to_(0.0),</a>
+<a name="ln506">    percentile_level_to_iterate_from_(0.0),</a>
+<a name="ln507">    reached_last_recorded_value_(false) {</a>
+<a name="ln508">}</a>
+<a name="ln509"> </a>
+<a name="ln510">bool PercentileIterator::HasNext() const {</a>
+<a name="ln511">  if (AbstractHistogramIterator::HasNext()) {</a>
+<a name="ln512">    return true;</a>
+<a name="ln513">  }</a>
+<a name="ln514">  // We want one additional last step to 100%</a>
+<a name="ln515">  if (!reached_last_recorded_value_ &amp;&amp; (histogram_total_count_ &gt; 0)) {</a>
+<a name="ln516">    const_cast&lt;PercentileIterator*&gt;(this)-&gt;percentile_level_to_iterate_to_ = 100.0;</a>
+<a name="ln517">    const_cast&lt;PercentileIterator*&gt;(this)-&gt;reached_last_recorded_value_ = true;</a>
+<a name="ln518">    return true;</a>
+<a name="ln519">  }</a>
+<a name="ln520">  return false;</a>
+<a name="ln521">}</a>
+<a name="ln522"> </a>
+<a name="ln523">double PercentileIterator::PercentileIteratedTo() const {</a>
+<a name="ln524">  return percentile_level_to_iterate_to_;</a>
+<a name="ln525">}</a>
+<a name="ln526"> </a>
+<a name="ln527"> </a>
+<a name="ln528">double PercentileIterator::PercentileIteratedFrom() const {</a>
+<a name="ln529">  return percentile_level_to_iterate_from_;</a>
+<a name="ln530">}</a>
+<a name="ln531"> </a>
+<a name="ln532">void PercentileIterator::IncrementIterationLevel() {</a>
+<a name="ln533">  percentile_level_to_iterate_from_ = percentile_level_to_iterate_to_;</a>
+<a name="ln534">  // TODO: Can this expression be simplified?</a>
+<a name="ln535">  uint64_t percentile_reporting_ticks = percentile_ticks_per_half_distance_ *</a>
+<a name="ln536">    static_cast&lt;uint64_t&gt;(pow(2.0,</a>
+<a name="ln537">          static_cast&lt;int&gt;(log(100.0 / (100.0 - (percentile_level_to_iterate_to_))) / log(2)) + 1));</a>
+<a name="ln538">  percentile_level_to_iterate_to_ += 100.0 / percentile_reporting_ticks;</a>
+<a name="ln539">}</a>
+<a name="ln540"> </a>
+<a name="ln541">bool PercentileIterator::ReachedIterationLevel() const {</a>
+<a name="ln542">  if (count_at_this_value_ == 0) return false;</a>
+<a name="ln543">  double current_percentile =</a>
+<a name="ln544">      (100.0 * static_cast&lt;double&gt;(total_count_to_current_index_)) / histogram_total_count_;</a>
+<a name="ln545">  return (current_percentile &gt;= percentile_level_to_iterate_to_);</a>
+<a name="ln546">}</a>
+<a name="ln547"> </a>
+<a name="ln548">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="132"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="134"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="251"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="252"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="253"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="282"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v629/" target="_blank">V629</a> Consider inspecting the expression. Bit shifting of the 32-bit value with a subsequent expansion to the 64-bit type.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

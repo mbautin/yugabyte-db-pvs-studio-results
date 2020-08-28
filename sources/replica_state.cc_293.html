@@ -1,0 +1,1471 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>replica_state.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &lt;algorithm&gt;</a>
+<a name="ln34">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln35"> </a>
+<a name="ln36">#include &quot;yb/consensus/consensus.h&quot;</a>
+<a name="ln37">#include &quot;yb/consensus/consensus_context.h&quot;</a>
+<a name="ln38">#include &quot;yb/consensus/consensus_error.h&quot;</a>
+<a name="ln39">#include &quot;yb/consensus/log_util.h&quot;</a>
+<a name="ln40">#include &quot;yb/consensus/quorum_util.h&quot;</a>
+<a name="ln41">#include &quot;yb/consensus/replica_state.h&quot;</a>
+<a name="ln42">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln43">#include &quot;yb/gutil/strings/join.h&quot;</a>
+<a name="ln44">#include &quot;yb/gutil/strings/strcat.h&quot;</a>
+<a name="ln45">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln46">#include &quot;yb/util/debug/trace_event.h&quot;</a>
+<a name="ln47">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln48">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln49">#include &quot;yb/util/opid.h&quot;</a>
+<a name="ln50">#include &quot;yb/util/status.h&quot;</a>
+<a name="ln51">#include &quot;yb/util/tostring.h&quot;</a>
+<a name="ln52">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln53">#include &quot;yb/util/thread_restrictions.h&quot;</a>
+<a name="ln54">#include &quot;yb/util/enums.h&quot;</a>
+<a name="ln55"> </a>
+<a name="ln56">using namespace std::literals;</a>
+<a name="ln57"> </a>
+<a name="ln58">DEFINE_int32(inject_delay_commit_pre_voter_to_voter_secs, 0,</a>
+<a name="ln59">             &quot;Amount of time to delay commit of a PRE_VOTER to VOTER transition. To be used for &quot;</a>
+<a name="ln60">             &quot;unit testing purposes only.&quot;);</a>
+<a name="ln61">TAG_FLAG(inject_delay_commit_pre_voter_to_voter_secs, unsafe);</a>
+<a name="ln62">TAG_FLAG(inject_delay_commit_pre_voter_to_voter_secs, hidden);</a>
+<a name="ln63"> </a>
+<a name="ln64">namespace yb {</a>
+<a name="ln65">namespace consensus {</a>
+<a name="ln66"> </a>
+<a name="ln67">using std::string;</a>
+<a name="ln68">using strings::Substitute;</a>
+<a name="ln69">using strings::SubstituteAndAppend;</a>
+<a name="ln70"> </a>
+<a name="ln71">//////////////////////////////////////////////////</a>
+<a name="ln72">// ReplicaState</a>
+<a name="ln73">//////////////////////////////////////////////////</a>
+<a name="ln74"> </a>
+<a name="ln75">ReplicaState::ReplicaState(</a>
+<a name="ln76">    ConsensusOptions options, string peer_uuid, std::unique_ptr&lt;ConsensusMetadata&gt; cmeta,</a>
+<a name="ln77">    ConsensusContext* consensus_context, SafeOpIdWaiter* safe_op_id_waiter,</a>
+<a name="ln78">    RetryableRequests* retryable_requests, const yb::OpId&amp; split_op_id,</a>
+<a name="ln79">    std::function&lt;void(const OpIds&amp;)&gt; applied_ops_tracker)</a>
+<a name="ln80">    : options_(std::move(options)),</a>
+<a name="ln81">      peer_uuid_(std::move(peer_uuid)),</a>
+<a name="ln82">      cmeta_(std::move(cmeta)),</a>
+<a name="ln83">      context_(consensus_context),</a>
+<a name="ln84">      safe_op_id_waiter_(safe_op_id_waiter),</a>
+<a name="ln85">      split_op_id_(split_op_id),</a>
+<a name="ln86">      applied_ops_tracker_(std::move(applied_ops_tracker)) {</a>
+<a name="ln87">  CHECK(cmeta_) &lt;&lt; &quot;ConsensusMeta passed as NULL&quot;;</a>
+<a name="ln88">  if (retryable_requests) {</a>
+<a name="ln89">    retryable_requests_ = std::move(*retryable_requests);</a>
+<a name="ln90">  }</a>
+<a name="ln91"> </a>
+<a name="ln92">  CHECK(leader_state_cache_.is_lock_free());</a>
+<a name="ln93"> </a>
+<a name="ln94">  // Actually we don't need this lock, but GetActiveRoleUnlocked checks that we are holding the</a>
+<a name="ln95">  // lock.</a>
+<a name="ln96">  auto lock = LockForRead();</a>
+<a name="ln97">  CoarseTimePoint now;</a>
+<a name="ln98">  RefreshLeaderStateCacheUnlocked(&amp;now);</a>
+<a name="ln99">}</a>
+<a name="ln100"> </a>
+<a name="ln101">ReplicaState::~ReplicaState() {</a>
+<a name="ln102">}</a>
+<a name="ln103"> </a>
+<a name="ln104">Status ReplicaState::StartUnlocked(const OpIdPB&amp; last_id_in_wal) {</a>
+<a name="ln105">  DCHECK(IsLocked());</a>
+<a name="ln106"> </a>
+<a name="ln107">  // Our last persisted term can be higher than the last persisted operation</a>
+<a name="ln108">  // (i.e. if we called an election) but reverse should never happen.</a>
+<a name="ln109">  CHECK_LE(last_id_in_wal.term(), GetCurrentTermUnlocked()) &lt;&lt; LogPrefix()</a>
+<a name="ln110">      &lt;&lt; &quot;The last op in the WAL with id &quot; &lt;&lt; OpIdToString(last_id_in_wal)</a>
+<a name="ln111">      &lt;&lt; &quot; has a term (&quot; &lt;&lt; last_id_in_wal.term() &lt;&lt; &quot;) that is greater &quot;</a>
+<a name="ln112">      &lt;&lt; &quot;than the latest recorded term, which is &quot; &lt;&lt; GetCurrentTermUnlocked();</a>
+<a name="ln113"> </a>
+<a name="ln114">  next_index_ = last_id_in_wal.index() + 1;</a>
+<a name="ln115"> </a>
+<a name="ln116">  last_received_op_id_ = yb::OpId::FromPB(last_id_in_wal);</a>
+<a name="ln117"> </a>
+<a name="ln118">  state_ = kRunning;</a>
+<a name="ln119">  return Status::OK();</a>
+<a name="ln120">}</a>
+<a name="ln121"> </a>
+<a name="ln122">Status ReplicaState::LockForStart(UniqueLock* lock) const {</a>
+<a name="ln123">  ThreadRestrictions::AssertWaitAllowed();</a>
+<a name="ln124">  UniqueLock l(update_lock_);</a>
+<a name="ln125">  CHECK_EQ(state_, kInitialized) &lt;&lt; &quot;Illegal state for Start().&quot;</a>
+<a name="ln126">      &lt;&lt; &quot; Replica is not in kInitialized state&quot;;</a>
+<a name="ln127">  lock-&gt;swap(l);</a>
+<a name="ln128">  return Status::OK();</a>
+<a name="ln129">}</a>
+<a name="ln130"> </a>
+<a name="ln131">bool ReplicaState::IsLocked() const {</a>
+<a name="ln132">  std::unique_lock&lt;std::mutex&gt; lock(update_lock_, std::try_to_lock);</a>
+<a name="ln133">  return !lock.owns_lock();</a>
+<a name="ln134">}</a>
+<a name="ln135"> </a>
+<a name="ln136">ReplicaState::UniqueLock ReplicaState::LockForRead() const {</a>
+<a name="ln137">  ThreadRestrictions::AssertWaitAllowed();</a>
+<a name="ln138">  return UniqueLock(update_lock_);</a>
+<a name="ln139">}</a>
+<a name="ln140"> </a>
+<a name="ln141">Status ReplicaState::LockForReplicate(UniqueLock* lock, const ReplicateMsg&amp; msg) const {</a>
+<a name="ln142">  DCHECK(!msg.has_id()) &lt;&lt; &quot;Should not have an ID yet: &quot; &lt;&lt; msg.ShortDebugString();</a>
+<a name="ln143">  CHECK(msg.has_op_type());  // TODO: better checking?</a>
+<a name="ln144">  return LockForReplicate(lock);</a>
+<a name="ln145">}</a>
+<a name="ln146"> </a>
+<a name="ln147">Status ReplicaState::LockForReplicate(UniqueLock* lock) const {</a>
+<a name="ln148">  ThreadRestrictions::AssertWaitAllowed();</a>
+<a name="ln149">  UniqueLock l(update_lock_);</a>
+<a name="ln150">  if (PREDICT_FALSE(state_ != kRunning)) {</a>
+<a name="ln151">    return STATUS(IllegalState, &quot;Replica not in running state&quot;);</a>
+<a name="ln152">  }</a>
+<a name="ln153"> </a>
+<a name="ln154">  lock-&gt;swap(l);</a>
+<a name="ln155">  return Status::OK();</a>
+<a name="ln156">}</a>
+<a name="ln157"> </a>
+<a name="ln158">Status ReplicaState::CheckIsActiveLeaderAndHasLease() const {</a>
+<a name="ln159">  UniqueLock l(update_lock_);</a>
+<a name="ln160">  if (PREDICT_FALSE(state_ != kRunning)) {</a>
+<a name="ln161">    return STATUS(IllegalState, &quot;Replica not in running state&quot;);</a>
+<a name="ln162">  }</a>
+<a name="ln163">  return CheckActiveLeaderUnlocked(LeaderLeaseCheckMode::NEED_LEASE);</a>
+<a name="ln164">}</a>
+<a name="ln165"> </a>
+<a name="ln166">Status ReplicaState::LockForMajorityReplicatedIndexUpdate(UniqueLock* lock) const {</a>
+<a name="ln167">  TRACE_EVENT0(&quot;consensus&quot;, &quot;ReplicaState::LockForMajorityReplicatedIndexUpdate&quot;);</a>
+<a name="ln168">  ThreadRestrictions::AssertWaitAllowed();</a>
+<a name="ln169">  UniqueLock l(update_lock_);</a>
+<a name="ln170"> </a>
+<a name="ln171">  if (PREDICT_FALSE(state_ != kRunning)) {</a>
+<a name="ln172">    return STATUS(IllegalState, &quot;Replica not in running state&quot;);</a>
+<a name="ln173">  }</a>
+<a name="ln174"> </a>
+<a name="ln175">  if (PREDICT_FALSE(GetActiveRoleUnlocked() != RaftPeerPB::LEADER)) {</a>
+<a name="ln176">    return STATUS(IllegalState, &quot;Replica not LEADER&quot;);</a>
+<a name="ln177">  }</a>
+<a name="ln178">  lock-&gt;swap(l);</a>
+<a name="ln179">  return Status::OK();</a>
+<a name="ln180">}</a>
+<a name="ln181"> </a>
+<a name="ln182">LeaderState ReplicaState::GetLeaderState(bool allow_stale) const {</a>
+<a name="ln183">  auto cache = leader_state_cache_.load(boost::memory_order_acquire);</a>
+<a name="ln184"> </a>
+<a name="ln185">  if (!allow_stale) {</a>
+<a name="ln186">    CoarseTimePoint now = CoarseMonoClock::Now();</a>
+<a name="ln187">    if (now &gt;= cache.expire_at) {</a>
+<a name="ln188">      auto lock = LockForRead();</a>
+<a name="ln189">      return RefreshLeaderStateCacheUnlocked(&amp;now);</a>
+<a name="ln190">    }</a>
+<a name="ln191">  }</a>
+<a name="ln192"> </a>
+<a name="ln193">  LeaderState result = {cache.status()};</a>
+<a name="ln194">  if (result.status == LeaderStatus::LEADER_AND_READY) {</a>
+<a name="ln195">    result.term = cache.extra_value();</a>
+<a name="ln196">  } else {</a>
+<a name="ln197">    if (result.status == LeaderStatus::LEADER_BUT_OLD_LEADER_MAY_HAVE_LEASE) {</a>
+<a name="ln198">      result.remaining_old_leader_lease = MonoDelta::FromMicroseconds(cache.extra_value());</a>
+<a name="ln199">    }</a>
+<a name="ln200">    result.MakeNotReadyLeader(result.status);</a>
+<a name="ln201">  }</a>
+<a name="ln202"> </a>
+<a name="ln203">  return result;</a>
+<a name="ln204">}</a>
+<a name="ln205"> </a>
+<a name="ln206">LeaderState ReplicaState::GetLeaderStateUnlocked(</a>
+<a name="ln207">    LeaderLeaseCheckMode lease_check_mode, CoarseTimePoint* now) const {</a>
+<a name="ln208">  LeaderState result;</a>
+<a name="ln209"> </a>
+<a name="ln210">  if (GetActiveRoleUnlocked() != RaftPeerPB::LEADER) {</a>
+<a name="ln211">    return result.MakeNotReadyLeader(LeaderStatus::NOT_LEADER);</a>
+<a name="ln212">  }</a>
+<a name="ln213"> </a>
+<a name="ln214">  if (!leader_no_op_committed_) {</a>
+<a name="ln215">    // This will cause the client to retry on the same server (won't try to find the new leader).</a>
+<a name="ln216">    return result.MakeNotReadyLeader(LeaderStatus::LEADER_BUT_NO_OP_NOT_COMMITTED);</a>
+<a name="ln217">  }</a>
+<a name="ln218"> </a>
+<a name="ln219">  const auto lease_status = lease_check_mode != LeaderLeaseCheckMode::DONT_NEED_LEASE</a>
+<a name="ln220">      ? GetLeaderLeaseStatusUnlocked(&amp;result.remaining_old_leader_lease, now)</a>
+<a name="ln221">      : LeaderLeaseStatus::HAS_LEASE;</a>
+<a name="ln222">  switch (lease_status) {</a>
+<a name="ln223">    case LeaderLeaseStatus::OLD_LEADER_MAY_HAVE_LEASE:</a>
+<a name="ln224">      // Will retry on the same server.</a>
+<a name="ln225">      VLOG(1) &lt;&lt; &quot;Old leader lease might still be active for &quot;</a>
+<a name="ln226">              &lt;&lt; result.remaining_old_leader_lease.ToString();</a>
+<a name="ln227">      return result.MakeNotReadyLeader(</a>
+<a name="ln228">          LeaderStatus::LEADER_BUT_OLD_LEADER_MAY_HAVE_LEASE);</a>
+<a name="ln229"> </a>
+<a name="ln230">    case LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE:</a>
+<a name="ln231">      // Will retry to look up the leader, because it might have changed.</a>
+<a name="ln232">      return result.MakeNotReadyLeader(</a>
+<a name="ln233">          LeaderStatus::LEADER_BUT_NO_MAJORITY_REPLICATED_LEASE);</a>
+<a name="ln234"> </a>
+<a name="ln235">    case LeaderLeaseStatus::HAS_LEASE:</a>
+<a name="ln236">      result.status = LeaderStatus::LEADER_AND_READY;</a>
+<a name="ln237">      result.term = GetCurrentTermUnlocked();</a>
+<a name="ln238">      return result;</a>
+<a name="ln239">  }</a>
+<a name="ln240"> </a>
+<a name="ln241">  FATAL_INVALID_ENUM_VALUE(LeaderLeaseStatus, lease_status);</a>
+<a name="ln242">}</a>
+<a name="ln243"> </a>
+<a name="ln244">Status ReplicaState::CheckActiveLeaderUnlocked(LeaderLeaseCheckMode lease_check_mode) const {</a>
+<a name="ln245">  auto state = GetLeaderStateUnlocked(lease_check_mode);</a>
+<a name="ln246">  if (state.status == LeaderStatus::NOT_LEADER) {</a>
+<a name="ln247">    ConsensusStatePB cstate = ConsensusStateUnlocked(CONSENSUS_CONFIG_ACTIVE);</a>
+<a name="ln248">    return STATUS_FORMAT(IllegalState,</a>
+<a name="ln249">                         &quot;Replica $0 is not leader of this config. Role: $1. Consensus state: $2&quot;,</a>
+<a name="ln250">                         peer_uuid_, RaftPeerPB::Role_Name(GetActiveRoleUnlocked()), cstate);</a>
+<a name="ln251">  }</a>
+<a name="ln252"> </a>
+<a name="ln253">  return state.CreateStatus();</a>
+<a name="ln254">}</a>
+<a name="ln255"> </a>
+<a name="ln256">Status ReplicaState::LockForConfigChange(UniqueLock* lock) const {</a>
+<a name="ln257">  TRACE_EVENT0(&quot;consensus&quot;, &quot;ReplicaState::LockForConfigChange&quot;);</a>
+<a name="ln258"> </a>
+<a name="ln259">  ThreadRestrictions::AssertWaitAllowed();</a>
+<a name="ln260">  UniqueLock l(update_lock_);</a>
+<a name="ln261">  // Can only change the config on running replicas.</a>
+<a name="ln262">  if (PREDICT_FALSE(state_ != kRunning)) {</a>
+<a name="ln263">    return STATUS(IllegalState, &quot;Unable to lock ReplicaState for config change&quot;,</a>
+<a name="ln264">                                Substitute(&quot;State = $0&quot;, state_));</a>
+<a name="ln265">  }</a>
+<a name="ln266">  lock-&gt;swap(l);</a>
+<a name="ln267">  return Status::OK();</a>
+<a name="ln268">}</a>
+<a name="ln269"> </a>
+<a name="ln270">Status ReplicaState::LockForUpdate(UniqueLock* lock) const {</a>
+<a name="ln271">  TRACE_EVENT0(&quot;consensus&quot;, &quot;ReplicaState::LockForUpdate&quot;);</a>
+<a name="ln272">  ThreadRestrictions::AssertWaitAllowed();</a>
+<a name="ln273">  UniqueLock l(update_lock_);</a>
+<a name="ln274">  if (PREDICT_FALSE(state_ != kRunning)) {</a>
+<a name="ln275">    return STATUS(IllegalState, &quot;Replica not in running state&quot;);</a>
+<a name="ln276">  }</a>
+<a name="ln277">  lock-&gt;swap(l);</a>
+<a name="ln278">  return Status::OK();</a>
+<a name="ln279">}</a>
+<a name="ln280"> </a>
+<a name="ln281">Status ReplicaState::LockForShutdown(UniqueLock* lock) {</a>
+<a name="ln282">  TRACE_EVENT0(&quot;consensus&quot;, &quot;ReplicaState::LockForShutdown&quot;);</a>
+<a name="ln283">  ThreadRestrictions::AssertWaitAllowed();</a>
+<a name="ln284">  UniqueLock l(update_lock_);</a>
+<a name="ln285">  if (state_ != kShuttingDown &amp;&amp; state_ != kShutDown) {</a>
+<a name="ln286">    state_ = kShuttingDown;</a>
+<a name="ln287">  }</a>
+<a name="ln288">  lock-&gt;swap(l);</a>
+<a name="ln289">  return Status::OK();</a>
+<a name="ln290">}</a>
+<a name="ln291"> </a>
+<a name="ln292">Status ReplicaState::ShutdownUnlocked() {</a>
+<a name="ln293">  DCHECK(IsLocked());</a>
+<a name="ln294">  CHECK_EQ(state_, kShuttingDown);</a>
+<a name="ln295">  state_ = kShutDown;</a>
+<a name="ln296">  return Status::OK();</a>
+<a name="ln297">}</a>
+<a name="ln298"> </a>
+<a name="ln299">ConsensusStatePB ReplicaState::ConsensusStateUnlocked(ConsensusConfigType type) const {</a>
+<a name="ln300">  return cmeta_-&gt;ToConsensusStatePB(type);</a>
+<a name="ln301">}</a>
+<a name="ln302"> </a>
+<a name="ln303">RaftPeerPB::Role ReplicaState::GetActiveRoleUnlocked() const {</a>
+<a name="ln304">  DCHECK(IsLocked());</a>
+<a name="ln305">  return cmeta_-&gt;active_role();</a>
+<a name="ln306">}</a>
+<a name="ln307"> </a>
+<a name="ln308">bool ReplicaState::IsConfigChangePendingUnlocked() const {</a>
+<a name="ln309">  DCHECK(IsLocked());</a>
+<a name="ln310">  return cmeta_-&gt;has_pending_config();</a>
+<a name="ln311">}</a>
+<a name="ln312"> </a>
+<a name="ln313">Status ReplicaState::CheckNoConfigChangePendingUnlocked() const {</a>
+<a name="ln314">  DCHECK(IsLocked());</a>
+<a name="ln315">  if (IsConfigChangePendingUnlocked()) {</a>
+<a name="ln316">    return STATUS(IllegalState,</a>
+<a name="ln317">        Substitute(&quot;RaftConfig change currently pending. Only one is allowed at a time.\n&quot;</a>
+<a name="ln318">                   &quot;  Committed config: $0.\n  Pending config: $1&quot;,</a>
+<a name="ln319">                   GetCommittedConfigUnlocked().ShortDebugString(),</a>
+<a name="ln320">                   GetPendingConfigUnlocked().ShortDebugString()));</a>
+<a name="ln321">  }</a>
+<a name="ln322">  return Status::OK();</a>
+<a name="ln323">}</a>
+<a name="ln324"> </a>
+<a name="ln325">Status ReplicaState::SetPendingConfigUnlocked(const RaftConfigPB&amp; new_config) {</a>
+<a name="ln326">  DCHECK(IsLocked());</a>
+<a name="ln327">  RETURN_NOT_OK_PREPEND(VerifyRaftConfig(new_config, UNCOMMITTED_QUORUM),</a>
+<a name="ln328">                        &quot;Invalid config to set as pending&quot;);</a>
+<a name="ln329">  CHECK(!cmeta_-&gt;has_pending_config())</a>
+<a name="ln330">      &lt;&lt; &quot;Attempt to set pending config while another is already pending! &quot;</a>
+<a name="ln331">      &lt;&lt; &quot;Existing pending config: &quot; &lt;&lt; cmeta_-&gt;pending_config().ShortDebugString() &lt;&lt; &quot;; &quot;</a>
+<a name="ln332">      &lt;&lt; &quot;Attempted new pending config: &quot; &lt;&lt; new_config.ShortDebugString();</a>
+<a name="ln333">  cmeta_-&gt;set_pending_config(new_config);</a>
+<a name="ln334">  CoarseTimePoint now;</a>
+<a name="ln335">  RefreshLeaderStateCacheUnlocked(&amp;now);</a>
+<a name="ln336">  return Status::OK();</a>
+<a name="ln337">}</a>
+<a name="ln338"> </a>
+<a name="ln339">Status ReplicaState::ClearPendingConfigUnlocked() {</a>
+<a name="ln340">  DCHECK(IsLocked());</a>
+<a name="ln341">  if (!cmeta_-&gt;has_pending_config()) {</a>
+<a name="ln342">    LOG(WARNING) &lt;&lt; &quot;Attempt to clear a non-existent pending config.&quot;</a>
+<a name="ln343">                 &lt;&lt; &quot;Existing committed config: &quot; &lt;&lt; cmeta_-&gt;committed_config().ShortDebugString();</a>
+<a name="ln344">    return STATUS(IllegalState, &quot;Attempt to clear a non-existent pending config.&quot;);</a>
+<a name="ln345">  }</a>
+<a name="ln346">  cmeta_-&gt;clear_pending_config();</a>
+<a name="ln347">  CoarseTimePoint now;</a>
+<a name="ln348">  RefreshLeaderStateCacheUnlocked(&amp;now);</a>
+<a name="ln349">  return Status::OK();</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352">const RaftConfigPB&amp; ReplicaState::GetPendingConfigUnlocked() const {</a>
+<a name="ln353">  DCHECK(IsLocked());</a>
+<a name="ln354">  CHECK(IsConfigChangePendingUnlocked()) &lt;&lt; &quot;No pending config&quot;;</a>
+<a name="ln355">  return cmeta_-&gt;pending_config();</a>
+<a name="ln356">}</a>
+<a name="ln357"> </a>
+<a name="ln358">Status ReplicaState::SetCommittedConfigUnlocked(const RaftConfigPB&amp; committed_config) {</a>
+<a name="ln359">  TRACE_EVENT0(&quot;consensus&quot;, &quot;ReplicaState::SetCommittedConfigUnlocked&quot;);</a>
+<a name="ln360">  DCHECK(IsLocked());</a>
+<a name="ln361">  DCHECK(committed_config.IsInitialized());</a>
+<a name="ln362">  RETURN_NOT_OK_PREPEND(VerifyRaftConfig(committed_config, COMMITTED_QUORUM),</a>
+<a name="ln363">                        &quot;Invalid config to set as committed&quot;);</a>
+<a name="ln364"> </a>
+<a name="ln365">  // Compare committed with pending configuration, ensure they are the same.</a>
+<a name="ln366">  // Pending will not have an opid_index, so ignore that field.</a>
+<a name="ln367">  DCHECK(cmeta_-&gt;has_pending_config());</a>
+<a name="ln368">  RaftConfigPB config_no_opid = committed_config;</a>
+<a name="ln369">  config_no_opid.clear_opid_index();</a>
+<a name="ln370">  const RaftConfigPB&amp; pending_config = GetPendingConfigUnlocked();</a>
+<a name="ln371">  // Quorums must be exactly equal, even w.r.t. peer ordering.</a>
+<a name="ln372">  CHECK_EQ(GetPendingConfigUnlocked().SerializeAsString(), config_no_opid.SerializeAsString())</a>
+<a name="ln373">      &lt;&lt; Substitute(&quot;New committed config must equal pending config, but does not. &quot;</a>
+<a name="ln374">                    &quot;Pending config: $0, committed config: $1&quot;,</a>
+<a name="ln375">                    pending_config.ShortDebugString(), committed_config.ShortDebugString());</a>
+<a name="ln376"> </a>
+<a name="ln377">  cmeta_-&gt;set_committed_config(committed_config);</a>
+<a name="ln378">  cmeta_-&gt;clear_pending_config();</a>
+<a name="ln379">  CoarseTimePoint now;</a>
+<a name="ln380">  RefreshLeaderStateCacheUnlocked(&amp;now);</a>
+<a name="ln381">  CHECK_OK(cmeta_-&gt;Flush());</a>
+<a name="ln382">  return Status::OK();</a>
+<a name="ln383">}</a>
+<a name="ln384"> </a>
+<a name="ln385">const RaftConfigPB&amp; ReplicaState::GetCommittedConfigUnlocked() const {</a>
+<a name="ln386">  DCHECK(IsLocked());</a>
+<a name="ln387">  return cmeta_-&gt;committed_config();</a>
+<a name="ln388">}</a>
+<a name="ln389"> </a>
+<a name="ln390">const RaftConfigPB&amp; ReplicaState::GetActiveConfigUnlocked() const {</a>
+<a name="ln391">  DCHECK(IsLocked());</a>
+<a name="ln392">  return cmeta_-&gt;active_config();</a>
+<a name="ln393">}</a>
+<a name="ln394"> </a>
+<a name="ln395">bool ReplicaState::IsOpCommittedOrPending(const yb::OpId&amp; op_id, bool* term_mismatch) {</a>
+<a name="ln396">  DCHECK(IsLocked());</a>
+<a name="ln397"> </a>
+<a name="ln398">  *term_mismatch = false;</a>
+<a name="ln399"> </a>
+<a name="ln400">  if (cmeta_ == nullptr) {</a>
+<a name="ln401">    LOG(FATAL) &lt;&lt; &quot;cmeta_ cannot be NULL&quot;;</a>
+<a name="ln402">  }</a>
+<a name="ln403"> </a>
+<a name="ln404">  int64_t committed_index = GetCommittedOpIdUnlocked().index;</a>
+<a name="ln405">  if (op_id.index &lt;= committed_index) {</a>
+<a name="ln406">    return true;</a>
+<a name="ln407">  }</a>
+<a name="ln408"> </a>
+<a name="ln409">  int64_t last_received_index = GetLastReceivedOpIdUnlocked().index;</a>
+<a name="ln410">  if (op_id.index &gt; last_received_index) {</a>
+<a name="ln411">    return false;</a>
+<a name="ln412">  }</a>
+<a name="ln413"> </a>
+<a name="ln414">  scoped_refptr&lt;ConsensusRound&gt; round = GetPendingOpByIndexOrNullUnlocked(op_id.index);</a>
+<a name="ln415">  if (round == nullptr) {</a>
+<a name="ln416">    LOG_WITH_PREFIX(ERROR)</a>
+<a name="ln417">        &lt;&lt; &quot;Consensus round not found for op id &quot; &lt;&lt; op_id &lt;&lt; &quot;: &quot;</a>
+<a name="ln418">        &lt;&lt; &quot;committed_index=&quot; &lt;&lt; committed_index &lt;&lt; &quot;, &quot;</a>
+<a name="ln419">        &lt;&lt; &quot;last_received_index=&quot; &lt;&lt; last_received_index &lt;&lt; &quot;, &quot;</a>
+<a name="ln420">        &lt;&lt; &quot;tablet: &quot; &lt;&lt; options_.tablet_id &lt;&lt; &quot;, current state: &quot;</a>
+<a name="ln421">        &lt;&lt; ToStringUnlocked();</a>
+<a name="ln422">    DumpPendingOperationsUnlocked();</a>
+<a name="ln423">    CHECK(false);</a>
+<a name="ln424">  }</a>
+<a name="ln425"> </a>
+<a name="ln426">  if (round-&gt;id().term() != op_id.term) {</a>
+<a name="ln427">    *term_mismatch = true;</a>
+<a name="ln428">    return false;</a>
+<a name="ln429">  }</a>
+<a name="ln430">  return true;</a>
+<a name="ln431">}</a>
+<a name="ln432"> </a>
+<a name="ln433">Status ReplicaState::SetCurrentTermUnlocked(int64_t new_term) {</a>
+<a name="ln434">  TRACE_EVENT1(&quot;consensus&quot;, &quot;ReplicaState::SetCurrentTermUnlocked&quot;,</a>
+<a name="ln435">               &quot;term&quot;, new_term);</a>
+<a name="ln436">  DCHECK(IsLocked());</a>
+<a name="ln437">  if (PREDICT_FALSE(new_term &lt;= GetCurrentTermUnlocked())) {</a>
+<a name="ln438">    return STATUS(IllegalState,</a>
+<a name="ln439">        Substitute(&quot;Cannot change term to a term that is lower than or equal to the current one. &quot;</a>
+<a name="ln440">                   &quot;Current: $0, Proposed: $1&quot;, GetCurrentTermUnlocked(), new_term));</a>
+<a name="ln441">  }</a>
+<a name="ln442">  cmeta_-&gt;set_current_term(new_term);</a>
+<a name="ln443">  cmeta_-&gt;clear_voted_for();</a>
+<a name="ln444">  // OK to flush before clearing the leader, because the leader UUID is not part of</a>
+<a name="ln445">  // ConsensusMetadataPB.</a>
+<a name="ln446">  RETURN_NOT_OK(cmeta_-&gt;Flush());</a>
+<a name="ln447">  ClearLeaderUnlocked();</a>
+<a name="ln448">  last_received_op_id_current_leader_ = yb::OpId();</a>
+<a name="ln449">  return Status::OK();</a>
+<a name="ln450">}</a>
+<a name="ln451"> </a>
+<a name="ln452">const int64_t ReplicaState::GetCurrentTermUnlocked() const {</a>
+<a name="ln453">  DCHECK(IsLocked());</a>
+<a name="ln454">  return cmeta_-&gt;current_term();</a>
+<a name="ln455">}</a>
+<a name="ln456"> </a>
+<a name="ln457">void ReplicaState::SetLeaderUuidUnlocked(const std::string&amp; uuid) {</a>
+<a name="ln458">  DCHECK(IsLocked());</a>
+<a name="ln459">  cmeta_-&gt;set_leader_uuid(uuid);</a>
+<a name="ln460">  CoarseTimePoint now;</a>
+<a name="ln461">  RefreshLeaderStateCacheUnlocked(&amp;now);</a>
+<a name="ln462">}</a>
+<a name="ln463"> </a>
+<a name="ln464">const string&amp; ReplicaState::GetLeaderUuidUnlocked() const {</a>
+<a name="ln465">  DCHECK(IsLocked());</a>
+<a name="ln466">  return cmeta_-&gt;leader_uuid();</a>
+<a name="ln467">}</a>
+<a name="ln468"> </a>
+<a name="ln469">const bool ReplicaState::HasVotedCurrentTermUnlocked() const {</a>
+<a name="ln470">  DCHECK(IsLocked());</a>
+<a name="ln471">  return cmeta_-&gt;has_voted_for();</a>
+<a name="ln472">}</a>
+<a name="ln473"> </a>
+<a name="ln474">Status ReplicaState::SetVotedForCurrentTermUnlocked(const std::string&amp; uuid) {</a>
+<a name="ln475">  TRACE_EVENT1(&quot;consensus&quot;, &quot;ReplicaState::SetVotedForCurrentTermUnlocked&quot;,</a>
+<a name="ln476">               &quot;uuid&quot;, uuid);</a>
+<a name="ln477">  DCHECK(IsLocked());</a>
+<a name="ln478">  cmeta_-&gt;set_voted_for(uuid);</a>
+<a name="ln479">  CHECK_OK(cmeta_-&gt;Flush());</a>
+<a name="ln480">  return Status::OK();</a>
+<a name="ln481">}</a>
+<a name="ln482"> </a>
+<a name="ln483">const std::string&amp; ReplicaState::GetVotedForCurrentTermUnlocked() const {</a>
+<a name="ln484">  DCHECK(IsLocked());</a>
+<a name="ln485">  DCHECK(cmeta_-&gt;has_voted_for());</a>
+<a name="ln486">  return cmeta_-&gt;voted_for();</a>
+<a name="ln487">}</a>
+<a name="ln488"> </a>
+<a name="ln489">const string&amp; ReplicaState::GetPeerUuid() const {</a>
+<a name="ln490">  return peer_uuid_;</a>
+<a name="ln491">}</a>
+<a name="ln492"> </a>
+<a name="ln493">const ConsensusOptions&amp; ReplicaState::GetOptions() const {</a>
+<a name="ln494">  return options_;</a>
+<a name="ln495">}</a>
+<a name="ln496"> </a>
+<a name="ln497">void ReplicaState::DumpPendingOperationsUnlocked() {</a>
+<a name="ln498">  DCHECK(IsLocked());</a>
+<a name="ln499">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Dumping &quot; &lt;&lt; pending_operations_.size()</a>
+<a name="ln500">                                 &lt;&lt; &quot; pending operations.&quot;;</a>
+<a name="ln501">  for (const auto &amp;round : pending_operations_) {</a>
+<a name="ln502">    LOG_WITH_PREFIX(INFO) &lt;&lt; round-&gt;replicate_msg()-&gt;ShortDebugString();</a>
+<a name="ln503">  }</a>
+<a name="ln504">}</a>
+<a name="ln505"> </a>
+<a name="ln506">Status ReplicaState::CancelPendingOperations() {</a>
+<a name="ln507">  {</a>
+<a name="ln508">    ThreadRestrictions::AssertWaitAllowed();</a>
+<a name="ln509">    UniqueLock lock(update_lock_);</a>
+<a name="ln510">    if (state_ != kShuttingDown) {</a>
+<a name="ln511">      return STATUS(IllegalState, &quot;Can only wait for pending commits on kShuttingDown state.&quot;);</a>
+<a name="ln512">    }</a>
+<a name="ln513">    if (pending_operations_.empty()) {</a>
+<a name="ln514">      return Status::OK();</a>
+<a name="ln515">    }</a>
+<a name="ln516"> </a>
+<a name="ln517">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Trying to abort &quot; &lt;&lt; pending_operations_.size()</a>
+<a name="ln518">                          &lt;&lt; &quot; pending operations because of shutdown.&quot;;</a>
+<a name="ln519">    auto abort_status = STATUS(Aborted, &quot;Operation aborted&quot;);</a>
+<a name="ln520">    int i = 0;</a>
+<a name="ln521">    for (const auto&amp; round : pending_operations_) {</a>
+<a name="ln522">      // We cancel only operations whose applies have not yet been triggered.</a>
+<a name="ln523">      constexpr auto kLogAbortedOperationsNum = 10;</a>
+<a name="ln524">      if (++i &lt;= kLogAbortedOperationsNum) {</a>
+<a name="ln525">        LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Aborting operation because of shutdown: &quot;</a>
+<a name="ln526">                              &lt;&lt; round-&gt;replicate_msg()-&gt;ShortDebugString();</a>
+<a name="ln527">      }</a>
+<a name="ln528">      NotifyReplicationFinishedUnlocked(round, abort_status, yb::OpId::kUnknownTerm,</a>
+<a name="ln529">                                        nullptr /* applied_op_ids */);</a>
+<a name="ln530">    }</a>
+<a name="ln531">  }</a>
+<a name="ln532">  return Status::OK();</a>
+<a name="ln533">}</a>
+<a name="ln534"> </a>
+<a name="ln535">struct PendingOperationsComparator {</a>
+<a name="ln536">  bool operator()(const ConsensusRoundPtr&amp; lhs, int64_t rhs) const {</a>
+<a name="ln537">    return lhs-&gt;id().index() &lt; rhs;</a>
+<a name="ln538">  }</a>
+<a name="ln539"> </a>
+<a name="ln540">  bool operator()(int64_t lhs, const ConsensusRoundPtr&amp; rhs) const {</a>
+<a name="ln541">    return lhs &lt; rhs-&gt;id().index();</a>
+<a name="ln542">  }</a>
+<a name="ln543">};</a>
+<a name="ln544"> </a>
+<a name="ln545">ReplicaState::PendingOperations::iterator ReplicaState::FindPendingOperation(int64_t index) {</a>
+<a name="ln546">  if (pending_operations_.empty()) {</a>
+<a name="ln547">    return pending_operations_.end();</a>
+<a name="ln548">  }</a>
+<a name="ln549"> </a>
+<a name="ln550">  size_t offset = index - pending_operations_.front()-&gt;id().index();</a>
+<a name="ln551">  // If index &lt; pending_operations_.front()-&gt;id().index() then offset will be very big positive</a>
+<a name="ln552">  // number, so could check both bounds in one comparison.</a>
+<a name="ln553">  if (offset &gt;= pending_operations_.size()) {</a>
+<a name="ln554">    return pending_operations_.end();</a>
+<a name="ln555">  }</a>
+<a name="ln556"> </a>
+<a name="ln557">  auto result = pending_operations_.begin() + offset;</a>
+<a name="ln558">  DCHECK_EQ((**result).id().index(), index);</a>
+<a name="ln559">  return result;</a>
+<a name="ln560">}</a>
+<a name="ln561"> </a>
+<a name="ln562">Status ReplicaState::AbortOpsAfterUnlocked(int64_t new_preceding_idx) {</a>
+<a name="ln563">  DCHECK(IsLocked());</a>
+<a name="ln564">  LOG_WITH_PREFIX(INFO)</a>
+<a name="ln565">      &lt;&lt; &quot;Aborting all operations after (but not including): &quot;</a>
+<a name="ln566">      &lt;&lt; new_preceding_idx &lt;&lt; &quot;. Current State: &quot; &lt;&lt; ToStringUnlocked();</a>
+<a name="ln567"> </a>
+<a name="ln568">  DCHECK_GE(new_preceding_idx, 0);</a>
+<a name="ln569">  yb::OpId new_preceding;</a>
+<a name="ln570"> </a>
+<a name="ln571">  auto preceding_op_iter = FindPendingOperation(new_preceding_idx);</a>
+<a name="ln572"> </a>
+<a name="ln573">  // Either the new preceding id is in the pendings set or it must be equal to the</a>
+<a name="ln574">  // committed index since we can't truncate already committed operations.</a>
+<a name="ln575">  if (preceding_op_iter != pending_operations_.end()) {</a>
+<a name="ln576">    new_preceding = yb::OpId::FromPB((**preceding_op_iter).id());</a>
+<a name="ln577">    ++preceding_op_iter;</a>
+<a name="ln578">  } else {</a>
+<a name="ln579">    CHECK_EQ(new_preceding_idx, last_committed_op_id_.index);</a>
+<a name="ln580">    new_preceding = last_committed_op_id_;</a>
+<a name="ln581">    if (!pending_operations_.empty() &amp;&amp;</a>
+<a name="ln582">        pending_operations_.front()-&gt;id().index() &gt; new_preceding_idx) {</a>
+<a name="ln583">      preceding_op_iter = pending_operations_.begin();</a>
+<a name="ln584">    }</a>
+<a name="ln585">  }</a>
+<a name="ln586"> </a>
+<a name="ln587">  // This is the same as UpdateLastReceivedOpIdUnlocked() but we do it</a>
+<a name="ln588">  // here to avoid the bounds check, since we're breaking monotonicity.</a>
+<a name="ln589">  last_received_op_id_ = new_preceding;</a>
+<a name="ln590">  last_received_op_id_current_leader_ = last_received_op_id_;</a>
+<a name="ln591">  next_index_ = new_preceding.index + 1;</a>
+<a name="ln592"> </a>
+<a name="ln593">  auto abort_status = STATUS(Aborted, &quot;Operation aborted by new leader&quot;);</a>
+<a name="ln594">  for (auto it = preceding_op_iter; it != pending_operations_.end(); ++it) {</a>
+<a name="ln595">    const scoped_refptr&lt;ConsensusRound&gt;&amp; round = *it;</a>
+<a name="ln596">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Aborting uncommitted operation due to leader change: &quot;</a>
+<a name="ln597">                          &lt;&lt; round-&gt;replicate_msg()-&gt;id();</a>
+<a name="ln598">    NotifyReplicationFinishedUnlocked(round, abort_status, yb::OpId::kUnknownTerm,</a>
+<a name="ln599">                                      nullptr /* applied_op_ids */);</a>
+<a name="ln600">  }</a>
+<a name="ln601">  // Clear entries from pending operations.</a>
+<a name="ln602">  pending_operations_.erase(preceding_op_iter, pending_operations_.end());</a>
+<a name="ln603"> </a>
+<a name="ln604">  return Status::OK();</a>
+<a name="ln605">}</a>
+<a name="ln606"> </a>
+<a name="ln607">namespace {</a>
+<a name="ln608"> </a>
+<a name="ln609">// Returns whether Raft operation of op_type is allowed to be added to Raft log of the tablet</a>
+<a name="ln610">// for which split tablet Raft operation has been already added to Raft log.</a>
+<a name="ln611">bool ShouldAllowOpAfterSplitTablet(const OperationType&amp; op_type) {</a>
+<a name="ln612">  // Old tablet remains running for remote bootstrap purposes for some time and could receive</a>
+<a name="ln613">  // Raft operations.</a>
+<a name="ln614"> </a>
+<a name="ln615">  // If new OperationType is added, make an explicit deliberate decision whether new op type</a>
+<a name="ln616">  // should be allowed to be added into Raft log for old (pre-split) tablet.</a>
+<a name="ln617">  switch (op_type) {</a>
+<a name="ln618">    case NO_OP:</a>
+<a name="ln619">      // We allow NO_OP, so old tablet can have leader changes in case of re-elections.</a>
+<a name="ln620">      return true;</a>
+<a name="ln621">    case UNKNOWN_OP: FALLTHROUGH_INTENDED;</a>
+<a name="ln622">    case WRITE_OP: FALLTHROUGH_INTENDED;</a>
+<a name="ln623">    case CHANGE_METADATA_OP: FALLTHROUGH_INTENDED;</a>
+<a name="ln624">    case CHANGE_CONFIG_OP: FALLTHROUGH_INTENDED;</a>
+<a name="ln625">    case HISTORY_CUTOFF_OP: FALLTHROUGH_INTENDED;</a>
+<a name="ln626">    case UPDATE_TRANSACTION_OP: FALLTHROUGH_INTENDED;</a>
+<a name="ln627">    case SNAPSHOT_OP: FALLTHROUGH_INTENDED;</a>
+<a name="ln628">    case TRUNCATE_OP: FALLTHROUGH_INTENDED;</a>
+<a name="ln629">    case SPLIT_OP:</a>
+<a name="ln630">      return false;</a>
+<a name="ln631">  }</a>
+<a name="ln632">  FATAL_INVALID_ENUM_VALUE(OperationType, op_type);</a>
+<a name="ln633">}</a>
+<a name="ln634"> </a>
+<a name="ln635">}  // namespace</a>
+<a name="ln636"> </a>
+<a name="ln637">Status ReplicaState::AddPendingOperation(const scoped_refptr&lt;ConsensusRound&gt;&amp; round) {</a>
+<a name="ln638">  DCHECK(IsLocked());</a>
+<a name="ln639"> </a>
+<a name="ln640">  SCHECK_GT(</a>
+<a name="ln641">      yb::OpId::FromPB(round-&gt;replicate_msg()-&gt;id()), split_op_id_, InvalidArgument,</a>
+<a name="ln642">      &quot;Received op id should be grater than split_op_id.&quot;);</a>
+<a name="ln643"> </a>
+<a name="ln644">  auto op_type = round-&gt;replicate_msg()-&gt;op_type();</a>
+<a name="ln645">  if (PREDICT_FALSE(state_ != kRunning)) {</a>
+<a name="ln646">    // Special case when we're configuring and this is a config change, refuse</a>
+<a name="ln647">    // everything else.</a>
+<a name="ln648">    // TODO: Don't require a NO_OP to get to kRunning state</a>
+<a name="ln649">    if (op_type != NO_OP) {</a>
+<a name="ln650">      return STATUS(IllegalState, &quot;Cannot trigger prepare. Replica is not in kRunning state.&quot;);</a>
+<a name="ln651">    }</a>
+<a name="ln652">  }</a>
+<a name="ln653"> </a>
+<a name="ln654">  if (PREDICT_FALSE(!split_op_id_.empty() &amp;&amp; !ShouldAllowOpAfterSplitTablet(op_type))) {</a>
+<a name="ln655">    // TODO(tsplit): for optimization - include new tablet IDs into response, so client knows</a>
+<a name="ln656">    // earlier where to retry.</a>
+<a name="ln657">    // TODO(tsplit): test - check that split_op_id_ is correctly aborted.</a>
+<a name="ln658">    // TODO(tsplit): test - check that split_op_id_ is correctly restored during bootstrap.</a>
+<a name="ln659">    return STATUS_EC_FORMAT(</a>
+<a name="ln660">        IllegalState, ConsensusError(ConsensusErrorPB::TABLET_SPLIT),</a>
+<a name="ln661">        &quot;Tablet split has been added to Raft log, operation $0 $1 should be retried to new &quot;</a>
+<a name="ln662">        &quot;tablets.&quot;,</a>
+<a name="ln663">        op_type, round-&gt;replicate_msg()-&gt;id());</a>
+<a name="ln664">  }</a>
+<a name="ln665"> </a>
+<a name="ln666">  // When we do not have a hybrid time leader lease we allow 2 operation types to be added to RAFT.</a>
+<a name="ln667">  // NO_OP - because even empty heartbeat messages could be used to obtain the lease.</a>
+<a name="ln668">  // CHANGE_CONFIG_OP - because we should be able to update consensus even w/o lease.</a>
+<a name="ln669">  // Both of them are safe, since they don't affect user reads or writes.</a>
+<a name="ln670">  if (GetActiveRoleUnlocked() == RaftPeerPB::LEADER &amp;&amp;</a>
+<a name="ln671">      op_type != NO_OP &amp;&amp;</a>
+<a name="ln672">      op_type != CHANGE_CONFIG_OP) {</a>
+<a name="ln673">    auto lease_status = GetHybridTimeLeaseStatusAtUnlocked(</a>
+<a name="ln674">        HybridTime(round-&gt;replicate_msg()-&gt;hybrid_time()).GetPhysicalValueMicros());</a>
+<a name="ln675">    static_assert(LeaderLeaseStatus_ARRAYSIZE == 3, &quot;Please update logic below to adapt new state&quot;);</a>
+<a name="ln676">    if (lease_status == LeaderLeaseStatus::OLD_LEADER_MAY_HAVE_LEASE) {</a>
+<a name="ln677">      return STATUS_FORMAT(LeaderHasNoLease,</a>
+<a name="ln678">                           &quot;Old leader may have hybrid time lease, while adding: $0&quot;,</a>
+<a name="ln679">                           OperationType_Name(op_type));</a>
+<a name="ln680">    }</a>
+<a name="ln681">    lease_status = GetLeaderLeaseStatusUnlocked(nullptr);</a>
+<a name="ln682">    if (lease_status == LeaderLeaseStatus::OLD_LEADER_MAY_HAVE_LEASE) {</a>
+<a name="ln683">      return STATUS_FORMAT(LeaderHasNoLease,</a>
+<a name="ln684">                           &quot;Old leader may have lease, while adding: $0&quot;,</a>
+<a name="ln685">                           OperationType_Name(op_type));</a>
+<a name="ln686">    }</a>
+<a name="ln687">  }</a>
+<a name="ln688"> </a>
+<a name="ln689">  // Mark pending configuration.</a>
+<a name="ln690">  if (PREDICT_FALSE(op_type == CHANGE_CONFIG_OP)) {</a>
+<a name="ln691">    DCHECK(round-&gt;replicate_msg()-&gt;change_config_record().has_old_config());</a>
+<a name="ln692">    DCHECK(round-&gt;replicate_msg()-&gt;change_config_record().old_config().has_opid_index());</a>
+<a name="ln693">    DCHECK(round-&gt;replicate_msg()-&gt;change_config_record().has_new_config());</a>
+<a name="ln694">    DCHECK(!round-&gt;replicate_msg()-&gt;change_config_record().new_config().has_opid_index());</a>
+<a name="ln695">    if (GetActiveRoleUnlocked() != RaftPeerPB::LEADER) {</a>
+<a name="ln696">      const RaftConfigPB&amp; old_config = round-&gt;replicate_msg()-&gt;change_config_record().old_config();</a>
+<a name="ln697">      const RaftConfigPB&amp; new_config = round-&gt;replicate_msg()-&gt;change_config_record().new_config();</a>
+<a name="ln698">      // The leader has to mark the configuration as pending before it gets here</a>
+<a name="ln699">      // because the active configuration affects the replication queue.</a>
+<a name="ln700">      // Do one last sanity check.</a>
+<a name="ln701">      Status s = CheckNoConfigChangePendingUnlocked();</a>
+<a name="ln702">      if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln703">        s = s.CloneAndAppend(Format(&quot;New config: $0&quot;, new_config));</a>
+<a name="ln704">        LOG_WITH_PREFIX(INFO) &lt;&lt; s;</a>
+<a name="ln705">        return s;</a>
+<a name="ln706">      }</a>
+<a name="ln707">      // Check if the pending Raft config has an OpId less than the committed</a>
+<a name="ln708">      // config. If so, this is a replay at startup in which the COMMIT</a>
+<a name="ln709">      // messages were delayed.</a>
+<a name="ln710">      const RaftConfigPB&amp; committed_config = GetCommittedConfigUnlocked();</a>
+<a name="ln711">      if (round-&gt;replicate_msg()-&gt;id().index() &gt; committed_config.opid_index()) {</a>
+<a name="ln712">        CHECK_OK(SetPendingConfigUnlocked(new_config));</a>
+<a name="ln713">      } else {</a>
+<a name="ln714">        LOG_WITH_PREFIX(INFO)</a>
+<a name="ln715">            &lt;&lt; &quot;Ignoring setting pending config change with OpId &quot;</a>
+<a name="ln716">            &lt;&lt; round-&gt;replicate_msg()-&gt;id() &lt;&lt; &quot; because the committed config has OpId index &quot;</a>
+<a name="ln717">            &lt;&lt; committed_config.opid_index() &lt;&lt; &quot;. The config change we are ignoring is: &quot;</a>
+<a name="ln718">            &lt;&lt; &quot;Old config: { &quot; &lt;&lt; old_config.ShortDebugString() &lt;&lt; &quot; }. &quot;</a>
+<a name="ln719">            &lt;&lt; &quot;New config: { &quot; &lt;&lt; new_config.ShortDebugString() &lt;&lt; &quot; }&quot;;</a>
+<a name="ln720">      }</a>
+<a name="ln721">    }</a>
+<a name="ln722">  } else if (op_type == WRITE_OP) {</a>
+<a name="ln723">    if (!retryable_requests_.Register(round)) {</a>
+<a name="ln724">      return STATUS(AlreadyPresent, &quot;Duplicate request&quot;);</a>
+<a name="ln725">    }</a>
+<a name="ln726">  } else if (op_type == SPLIT_OP) {</a>
+<a name="ln727">    SCHECK_EQ(</a>
+<a name="ln728">        round-&gt;replicate_msg()-&gt;split_request().tablet_id(), cmeta_-&gt;tablet_id(), InvalidArgument,</a>
+<a name="ln729">        &quot;Received split op for a different tablet.&quot;);</a>
+<a name="ln730">    split_op_id_ = yb::OpId::FromPB(round-&gt;replicate_msg()-&gt;id());</a>
+<a name="ln731">    // TODO(tsplit): if we get failures past this point we can't undo the tablet state.</a>
+<a name="ln732">    // Might be need some tool to be able to remove SPLIT_OP from Raft log.</a>
+<a name="ln733">  }</a>
+<a name="ln734"> </a>
+<a name="ln735">  pending_operations_.push_back(round);</a>
+<a name="ln736">  return Status::OK();</a>
+<a name="ln737">}</a>
+<a name="ln738"> </a>
+<a name="ln739">scoped_refptr&lt;ConsensusRound&gt; ReplicaState::GetPendingOpByIndexOrNullUnlocked(int64_t index) {</a>
+<a name="ln740">  DCHECK(IsLocked());</a>
+<a name="ln741">  auto it = FindPendingOperation(index);</a>
+<a name="ln742">  if (it == pending_operations_.end()) {</a>
+<a name="ln743">    return nullptr;</a>
+<a name="ln744">  }</a>
+<a name="ln745">  return *it;</a>
+<a name="ln746">}</a>
+<a name="ln747"> </a>
+<a name="ln748">Status ReplicaState::UpdateMajorityReplicatedUnlocked(</a>
+<a name="ln749">    const OpIdPB&amp; majority_replicated, OpIdPB* committed_op_id, bool* committed_op_id_changed) {</a>
+<a name="ln750">  DCHECK(IsLocked());</a>
+<a name="ln751">  DCHECK(majority_replicated.IsInitialized());</a>
+<a name="ln752">  if (PREDICT_FALSE(state_ == kShuttingDown || state_ == kShutDown)) {</a>
+<a name="ln753">    return STATUS(ServiceUnavailable, &quot;Cannot trigger apply. Replica is shutting down.&quot;);</a>
+<a name="ln754">  }</a>
+<a name="ln755">  if (PREDICT_FALSE(state_ != kRunning)) {</a>
+<a name="ln756">    return STATUS(IllegalState, &quot;Cannot trigger apply. Replica is not in kRunning state.&quot;);</a>
+<a name="ln757">  }</a>
+<a name="ln758"> </a>
+<a name="ln759">  // If the last committed operation was in the current term (the normal case)</a>
+<a name="ln760">  // then 'committed_op_id' is simply equal to majority replicated.</a>
+<a name="ln761">  if (last_committed_op_id_.term == GetCurrentTermUnlocked()) {</a>
+<a name="ln762">    *committed_op_id_changed = VERIFY_RESULT(AdvanceCommittedOpIdUnlocked(</a>
+<a name="ln763">        yb::OpId::FromPB(majority_replicated), CouldStop::kFalse));</a>
+<a name="ln764">    last_committed_op_id_.ToPB(committed_op_id);</a>
+<a name="ln765">    return Status::OK();</a>
+<a name="ln766">  }</a>
+<a name="ln767"> </a>
+<a name="ln768">  // If the last committed operation is not in the current term (such as when</a>
+<a name="ln769">  // we change leaders) but 'majority_replicated' is then we can advance the</a>
+<a name="ln770">  // 'committed_op_id' too.</a>
+<a name="ln771">  if (majority_replicated.term() == GetCurrentTermUnlocked()) {</a>
+<a name="ln772">    auto previous = last_committed_op_id_;</a>
+<a name="ln773">    *committed_op_id_changed = VERIFY_RESULT(AdvanceCommittedOpIdUnlocked(</a>
+<a name="ln774">        yb::OpId::FromPB(majority_replicated), CouldStop::kFalse));</a>
+<a name="ln775">    last_committed_op_id_.ToPB(committed_op_id);</a>
+<a name="ln776">    LOG_WITH_PREFIX(INFO)</a>
+<a name="ln777">        &lt;&lt; &quot;Advanced the committed_op_id across terms.&quot;</a>
+<a name="ln778">        &lt;&lt; &quot; Last committed operation was: &quot; &lt;&lt; previous</a>
+<a name="ln779">        &lt;&lt; &quot; New committed index is: &quot; &lt;&lt; last_committed_op_id_;</a>
+<a name="ln780">    return Status::OK();</a>
+<a name="ln781">  }</a>
+<a name="ln782"> </a>
+<a name="ln783">  last_committed_op_id_.ToPB(committed_op_id);</a>
+<a name="ln784">  YB_LOG_EVERY_N_SECS(WARNING, 1) &lt;&lt; LogPrefix()</a>
+<a name="ln785">          &lt;&lt; &quot;Can't advance the committed index across term boundaries&quot;</a>
+<a name="ln786">          &lt;&lt; &quot; until operations from the current term are replicated.&quot;</a>
+<a name="ln787">          &lt;&lt; &quot; Last committed operation was: &quot; &lt;&lt; last_committed_op_id_ &lt;&lt; &quot;,&quot;</a>
+<a name="ln788">          &lt;&lt; &quot; New majority replicated is: &quot; &lt;&lt; majority_replicated.ShortDebugString() &lt;&lt; &quot;,&quot;</a>
+<a name="ln789">          &lt;&lt; &quot; Current term is: &quot; &lt;&lt; GetCurrentTermUnlocked();</a>
+<a name="ln790"> </a>
+<a name="ln791">  return Status::OK();</a>
+<a name="ln792">}</a>
+<a name="ln793"> </a>
+<a name="ln794">void ReplicaState::SetLastCommittedIndexUnlocked(const yb::OpId&amp; committed_op_id) {</a>
+<a name="ln795">  DCHECK(IsLocked());</a>
+<a name="ln796">  CHECK_GE(last_received_op_id_.index, committed_op_id.index);</a>
+<a name="ln797">  last_committed_op_id_ = committed_op_id;</a>
+<a name="ln798">}</a>
+<a name="ln799"> </a>
+<a name="ln800">Status ReplicaState::InitCommittedOpIdUnlocked(const yb::OpId&amp; committed_op_id) {</a>
+<a name="ln801">  if (last_committed_op_id_) {</a>
+<a name="ln802">    return STATUS_FORMAT(</a>
+<a name="ln803">        IllegalState,</a>
+<a name="ln804">        &quot;Committed index already initialized to: $0, tried to set $1&quot;,</a>
+<a name="ln805">        last_committed_op_id_,</a>
+<a name="ln806">        committed_op_id);</a>
+<a name="ln807">  }</a>
+<a name="ln808"> </a>
+<a name="ln809">  if (!pending_operations_.empty() &amp;&amp;</a>
+<a name="ln810">      committed_op_id.index &gt;= pending_operations_.front()-&gt;id().index()) {</a>
+<a name="ln811">    RETURN_NOT_OK(ApplyPendingOperationsUnlocked(committed_op_id, CouldStop::kFalse));</a>
+<a name="ln812">  }</a>
+<a name="ln813"> </a>
+<a name="ln814">  SetLastCommittedIndexUnlocked(committed_op_id);</a>
+<a name="ln815"> </a>
+<a name="ln816">  return Status::OK();</a>
+<a name="ln817">}</a>
+<a name="ln818"> </a>
+<a name="ln819">Result&lt;bool&gt; ReplicaState::AdvanceCommittedOpIdUnlocked(</a>
+<a name="ln820">    const yb::OpId&amp; committed_op_id, CouldStop could_stop) {</a>
+<a name="ln821">  DCHECK(IsLocked());</a>
+<a name="ln822">  // If we already committed up to (or past) 'id' return.</a>
+<a name="ln823">  // This can happen in the case that multiple UpdateConsensus() calls end</a>
+<a name="ln824">  // up in the RPC queue at the same time, and then might get interleaved out</a>
+<a name="ln825">  // of order.</a>
+<a name="ln826">  if (last_committed_op_id_.index &gt;= committed_op_id.index) {</a>
+<a name="ln827">    VLOG_WITH_PREFIX(1)</a>
+<a name="ln828">        &lt;&lt; &quot;Already marked ops through &quot; &lt;&lt; last_committed_op_id_ &lt;&lt; &quot; as committed. &quot;</a>
+<a name="ln829">        &lt;&lt; &quot;Now trying to mark &quot; &lt;&lt; committed_op_id &lt;&lt; &quot; which would be a no-op.&quot;;</a>
+<a name="ln830">    return false;</a>
+<a name="ln831">  }</a>
+<a name="ln832"> </a>
+<a name="ln833">  if (pending_operations_.empty()) {</a>
+<a name="ln834">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;No operations to mark as committed up to: &quot;</a>
+<a name="ln835">                        &lt;&lt; committed_op_id;</a>
+<a name="ln836">    return STATUS_FORMAT(</a>
+<a name="ln837">        NotFound,</a>
+<a name="ln838">        &quot;No pending entries, requested to advance last committed OpId from $0 to $1, &quot;</a>
+<a name="ln839">            &quot;last received: $2&quot;,</a>
+<a name="ln840">        last_committed_op_id_, committed_op_id, last_received_op_id_);</a>
+<a name="ln841">  }</a>
+<a name="ln842"> </a>
+<a name="ln843">  // Start at the operation after the last committed one.</a>
+<a name="ln844">  CHECK_EQ(pending_operations_.front()-&gt;id().index(), last_committed_op_id_.index + 1);</a>
+<a name="ln845"> </a>
+<a name="ln846">  auto old_index = last_committed_op_id_.index;</a>
+<a name="ln847"> </a>
+<a name="ln848">  auto status = ApplyPendingOperationsUnlocked(committed_op_id, could_stop);</a>
+<a name="ln849">  if (!status.ok()) {</a>
+<a name="ln850">    return status;</a>
+<a name="ln851">  }</a>
+<a name="ln852"> </a>
+<a name="ln853">  return last_committed_op_id_.index != old_index;</a>
+<a name="ln854">}</a>
+<a name="ln855"> </a>
+<a name="ln856">Status ReplicaState::ApplyPendingOperationsUnlocked(</a>
+<a name="ln857">    const yb::OpId&amp; committed_op_id, CouldStop could_stop) {</a>
+<a name="ln858">  DCHECK(IsLocked());</a>
+<a name="ln859">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Last triggered apply was: &quot; &lt;&lt;  last_committed_op_id_;</a>
+<a name="ln860"> </a>
+<a name="ln861">  // Stop at the operation after the last one we must commit. This iterator by definition points to</a>
+<a name="ln862">  // the first entry greater than the committed index, so the entry preceding that must have the</a>
+<a name="ln863">  // OpId equal to committed_op_id.</a>
+<a name="ln864"> </a>
+<a name="ln865">  auto prev_id = last_committed_op_id_;</a>
+<a name="ln866">  yb::OpId max_allowed_op_id;</a>
+<a name="ln867">  if (!safe_op_id_waiter_) {</a>
+<a name="ln868">    max_allowed_op_id.index = std::numeric_limits&lt;int64_t&gt;::max();</a>
+<a name="ln869">  }</a>
+<a name="ln870">  auto leader_term = GetLeaderStateUnlocked().term;</a>
+<a name="ln871"> </a>
+<a name="ln872">  OpIds applied_op_ids;</a>
+<a name="ln873">  applied_op_ids.reserve(committed_op_id.index - prev_id.index);</a>
+<a name="ln874"> </a>
+<a name="ln875">  while (!pending_operations_.empty()) {</a>
+<a name="ln876">    auto round = pending_operations_.front();</a>
+<a name="ln877">    auto current_id = yb::OpId::FromPB(round-&gt;id());</a>
+<a name="ln878">    if (current_id.index &gt; committed_op_id.index) {</a>
+<a name="ln879">      break;</a>
+<a name="ln880">    }</a>
+<a name="ln881"> </a>
+<a name="ln882">    if (PREDICT_TRUE(prev_id)) {</a>
+<a name="ln883">      CHECK_OK(CheckOpInSequence(prev_id, current_id));</a>
+<a name="ln884">    }</a>
+<a name="ln885"> </a>
+<a name="ln886">    auto type = round-&gt;replicate_msg()-&gt;op_type();</a>
+<a name="ln887"> </a>
+<a name="ln888">    // For write operations we block rocksdb flush, until appropriate records are written to the</a>
+<a name="ln889">    // log file. So we could apply them before adding to log.</a>
+<a name="ln890">    if (type == OperationType::WRITE_OP) {</a>
+<a name="ln891">      if (could_stop &amp;&amp; !context_-&gt;ShouldApplyWrite()) {</a>
+<a name="ln892">        YB_LOG_EVERY_N_SECS(WARNING, 5) &lt;&lt; LogPrefix()</a>
+<a name="ln893">            &lt;&lt; &quot;Stop apply pending operations, because of write delay required, last applied: &quot;</a>
+<a name="ln894">            &lt;&lt; prev_id &lt;&lt; &quot; of &quot; &lt;&lt; committed_op_id;</a>
+<a name="ln895">        break;</a>
+<a name="ln896">      }</a>
+<a name="ln897">    } else if (current_id.index &gt; max_allowed_op_id.index ||</a>
+<a name="ln898">               current_id.term &gt; max_allowed_op_id.term) {</a>
+<a name="ln899">      max_allowed_op_id = safe_op_id_waiter_-&gt;WaitForSafeOpIdToApply(current_id);</a>
+<a name="ln900">      SCHECK(max_allowed_op_id.index &gt;= current_id.index &amp;&amp;</a>
+<a name="ln901">                 max_allowed_op_id.term &gt;= current_id.term,</a>
+<a name="ln902">             RuntimeError,</a>
+<a name="ln903">             Format(&quot;Bad max allowed: $0, while current: $1&quot;, max_allowed_op_id, current_id));</a>
+<a name="ln904">    }</a>
+<a name="ln905"> </a>
+<a name="ln906">    pending_operations_.pop_front();</a>
+<a name="ln907">    // Set committed configuration.</a>
+<a name="ln908">    if (PREDICT_FALSE(type == OperationType::CHANGE_CONFIG_OP)) {</a>
+<a name="ln909">      ApplyConfigChangeUnlocked(round);</a>
+<a name="ln910">    }</a>
+<a name="ln911"> </a>
+<a name="ln912">    prev_id = current_id;</a>
+<a name="ln913">    NotifyReplicationFinishedUnlocked(round, Status::OK(), leader_term, &amp;applied_op_ids);</a>
+<a name="ln914">  }</a>
+<a name="ln915"> </a>
+<a name="ln916">  SetLastCommittedIndexUnlocked(prev_id);</a>
+<a name="ln917"> </a>
+<a name="ln918">  applied_ops_tracker_(applied_op_ids);</a>
+<a name="ln919"> </a>
+<a name="ln920">  return Status::OK();</a>
+<a name="ln921">}</a>
+<a name="ln922"> </a>
+<a name="ln923">void ReplicaState::ApplyConfigChangeUnlocked(const ConsensusRoundPtr&amp; round) {</a>
+<a name="ln924">  DCHECK(round-&gt;replicate_msg()-&gt;change_config_record().has_old_config());</a>
+<a name="ln925">  DCHECK(round-&gt;replicate_msg()-&gt;change_config_record().has_new_config());</a>
+<a name="ln926">  RaftConfigPB old_config = round-&gt;replicate_msg()-&gt;change_config_record().old_config();</a>
+<a name="ln927">  RaftConfigPB new_config = round-&gt;replicate_msg()-&gt;change_config_record().new_config();</a>
+<a name="ln928">  DCHECK(old_config.has_opid_index());</a>
+<a name="ln929">  DCHECK(!new_config.has_opid_index());</a>
+<a name="ln930"> </a>
+<a name="ln931">  const OpIdPB&amp; current_id = round-&gt;id();</a>
+<a name="ln932"> </a>
+<a name="ln933">  if (PREDICT_FALSE(FLAGS_inject_delay_commit_pre_voter_to_voter_secs)) {</a>
+<a name="ln934">    bool is_transit_to_voter =</a>
+<a name="ln935">      CountVotersInTransition(old_config) &gt; CountVotersInTransition(new_config);</a>
+<a name="ln936">    if (is_transit_to_voter) {</a>
+<a name="ln937">      LOG_WITH_PREFIX(INFO)</a>
+<a name="ln938">          &lt;&lt; &quot;Commit skipped as inject_delay_commit_pre_voter_to_voter_secs flag is set to true.\n&quot;</a>
+<a name="ln939">          &lt;&lt; &quot;  Old config: { &quot; &lt;&lt; old_config.ShortDebugString() &lt;&lt; &quot; }.\n&quot;</a>
+<a name="ln940">          &lt;&lt; &quot;  New config: { &quot; &lt;&lt; new_config.ShortDebugString() &lt;&lt; &quot; }&quot;;</a>
+<a name="ln941">      SleepFor(MonoDelta::FromSeconds(FLAGS_inject_delay_commit_pre_voter_to_voter_secs));</a>
+<a name="ln942">    }</a>
+<a name="ln943">  }</a>
+<a name="ln944"> </a>
+<a name="ln945">  new_config.set_opid_index(current_id.index());</a>
+<a name="ln946">  // Check if the pending Raft config has an OpId less than the committed</a>
+<a name="ln947">  // config. If so, this is a replay at startup in which the COMMIT</a>
+<a name="ln948">  // messages were delayed.</a>
+<a name="ln949">  const RaftConfigPB&amp; committed_config = GetCommittedConfigUnlocked();</a>
+<a name="ln950">  if (new_config.opid_index() &gt; committed_config.opid_index()) {</a>
+<a name="ln951">    LOG_WITH_PREFIX(INFO)</a>
+<a name="ln952">        &lt;&lt; &quot;Committing config change with OpId &quot;</a>
+<a name="ln953">        &lt;&lt; current_id &lt;&lt; &quot;. Old config: { &quot; &lt;&lt; old_config.ShortDebugString() &lt;&lt; &quot; }. &quot;</a>
+<a name="ln954">        &lt;&lt; &quot;New config: { &quot; &lt;&lt; new_config.ShortDebugString() &lt;&lt; &quot; }&quot;;</a>
+<a name="ln955">    CHECK_OK(SetCommittedConfigUnlocked(new_config));</a>
+<a name="ln956">  } else {</a>
+<a name="ln957">    LOG_WITH_PREFIX(INFO)</a>
+<a name="ln958">        &lt;&lt; &quot;Ignoring commit of config change with OpId &quot;</a>
+<a name="ln959">        &lt;&lt; current_id &lt;&lt; &quot; because the committed config has OpId index &quot;</a>
+<a name="ln960">        &lt;&lt; committed_config.opid_index() &lt;&lt; &quot;. The config change we are ignoring is: &quot;</a>
+<a name="ln961">        &lt;&lt; &quot;Old config: { &quot; &lt;&lt; old_config.ShortDebugString() &lt;&lt; &quot; }. &quot;</a>
+<a name="ln962">        &lt;&lt; &quot;New config: { &quot; &lt;&lt; new_config.ShortDebugString() &lt;&lt; &quot; }&quot;;</a>
+<a name="ln963">  }</a>
+<a name="ln964">}</a>
+<a name="ln965"> </a>
+<a name="ln966">const yb::OpId&amp; ReplicaState::GetCommittedOpIdUnlocked() const {</a>
+<a name="ln967">  DCHECK(IsLocked());</a>
+<a name="ln968">  return last_committed_op_id_;</a>
+<a name="ln969">}</a>
+<a name="ln970"> </a>
+<a name="ln971">const yb::OpId&amp; ReplicaState::GetSplitOpIdUnlocked() const {</a>
+<a name="ln972">  DCHECK(IsLocked());</a>
+<a name="ln973">  return split_op_id_;</a>
+<a name="ln974">}</a>
+<a name="ln975"> </a>
+<a name="ln976">void ReplicaState::ResetSplitOpIdUnlocked() {</a>
+<a name="ln977">  DCHECK(IsLocked());</a>
+<a name="ln978">  split_op_id_ = yb::OpId();</a>
+<a name="ln979">}</a>
+<a name="ln980"> </a>
+<a name="ln981">RestartSafeCoarseMonoClock&amp; ReplicaState::Clock() {</a>
+<a name="ln982">  return retryable_requests_.Clock();</a>
+<a name="ln983">}</a>
+<a name="ln984"> </a>
+<a name="ln985">RetryableRequestsCounts ReplicaState::TEST_CountRetryableRequests() {</a>
+<a name="ln986">  auto lock = LockForRead();</a>
+<a name="ln987">  return retryable_requests_.TEST_Counts();</a>
+<a name="ln988">}</a>
+<a name="ln989"> </a>
+<a name="ln990">bool ReplicaState::AreCommittedAndCurrentTermsSameUnlocked() const {</a>
+<a name="ln991">  int64_t term = GetCurrentTermUnlocked();</a>
+<a name="ln992">  const auto&amp; opid = GetCommittedOpIdUnlocked();</a>
+<a name="ln993">  if (opid.term != term) {</a>
+<a name="ln994">    LOG(INFO) &lt;&lt; &quot;committed term=&quot; &lt;&lt; opid.term &lt;&lt; &quot;, current term=&quot; &lt;&lt; term;</a>
+<a name="ln995">    return false;</a>
+<a name="ln996">  }</a>
+<a name="ln997">  return true;</a>
+<a name="ln998">}</a>
+<a name="ln999"> </a>
+<a name="ln1000">void ReplicaState::UpdateLastReceivedOpIdUnlocked(const OpIdPB&amp; op_id) {</a>
+<a name="ln1001">  DCHECK(IsLocked());</a>
+<a name="ln1002">  auto* trace = Trace::CurrentTrace();</a>
+<a name="ln1003">  DCHECK(last_received_op_id_.term &lt;= op_id.term() &amp;&amp; last_received_op_id_.index &lt;= op_id.index())</a>
+<a name="ln1004">      &lt;&lt; LogPrefix() &lt;&lt; &quot;: &quot;</a>
+<a name="ln1005">      &lt;&lt; &quot;Previously received OpId: &quot; &lt;&lt; last_received_op_id_</a>
+<a name="ln1006">      &lt;&lt; &quot;, updated OpId: &quot; &lt;&lt; op_id.ShortDebugString()</a>
+<a name="ln1007">      &lt;&lt; &quot;, Trace:&quot; &lt;&lt; std::endl &lt;&lt; (trace ? trace-&gt;DumpToString(true) : &quot;No trace found&quot;);</a>
+<a name="ln1008"> </a>
+<a name="ln1009">  last_received_op_id_ = yb::OpId::FromPB(op_id);</a>
+<a name="ln1010">  last_received_op_id_current_leader_ = last_received_op_id_;</a>
+<a name="ln1011">  next_index_ = op_id.index() + 1;</a>
+<a name="ln1012">}</a>
+<a name="ln1013"> </a>
+<a name="ln1014">const yb::OpId&amp; ReplicaState::GetLastReceivedOpIdUnlocked() const {</a>
+<a name="ln1015">  DCHECK(IsLocked());</a>
+<a name="ln1016">  return last_received_op_id_;</a>
+<a name="ln1017">}</a>
+<a name="ln1018"> </a>
+<a name="ln1019">const yb::OpId&amp; ReplicaState::GetLastReceivedOpIdCurLeaderUnlocked() const {</a>
+<a name="ln1020">  DCHECK(IsLocked());</a>
+<a name="ln1021">  return last_received_op_id_current_leader_;</a>
+<a name="ln1022">}</a>
+<a name="ln1023"> </a>
+<a name="ln1024">OpIdPB ReplicaState::GetLastPendingOperationOpIdUnlocked() const {</a>
+<a name="ln1025">  DCHECK(IsLocked());</a>
+<a name="ln1026">  return pending_operations_.empty()</a>
+<a name="ln1027">      ? MinimumOpId() : pending_operations_.back()-&gt;id();</a>
+<a name="ln1028">}</a>
+<a name="ln1029"> </a>
+<a name="ln1030">yb::OpId ReplicaState::NewIdUnlocked() {</a>
+<a name="ln1031">  DCHECK(IsLocked());</a>
+<a name="ln1032">  return yb::OpId(GetCurrentTermUnlocked(), next_index_++);</a>
+<a name="ln1033">}</a>
+<a name="ln1034"> </a>
+<a name="ln1035">void ReplicaState::CancelPendingOperation(const OpIdPB&amp; id, bool should_exist) {</a>
+<a name="ln1036">  yb::OpId previous(id.term(), id.index() - 1);</a>
+<a name="ln1037">  DCHECK(IsLocked());</a>
+<a name="ln1038">  CHECK_EQ(GetCurrentTermUnlocked(), id.term());</a>
+<a name="ln1039">  CHECK_EQ(next_index_, id.index() + 1);</a>
+<a name="ln1040">  next_index_ = id.index();</a>
+<a name="ln1041"> </a>
+<a name="ln1042">  // We don't use UpdateLastReceivedOpIdUnlocked because we're actually</a>
+<a name="ln1043">  // updating it back to a lower value and we need to avoid the checks</a>
+<a name="ln1044">  // that method has.</a>
+<a name="ln1045"> </a>
+<a name="ln1046">  // This is only ok if we do _not_ release the lock after calling</a>
+<a name="ln1047">  // NewIdUnlocked() (which we don't in RaftConsensus::Replicate()).</a>
+<a name="ln1048">  last_received_op_id_ = previous;</a>
+<a name="ln1049">  if (should_exist) {</a>
+<a name="ln1050">    DCHECK(!pending_operations_.empty() &amp;&amp; OpIdEquals(pending_operations_.back()-&gt;id(), id));</a>
+<a name="ln1051">    pending_operations_.pop_back();</a>
+<a name="ln1052">  } else {</a>
+<a name="ln1053">    DCHECK(pending_operations_.empty() || !OpIdEquals(pending_operations_.back()-&gt;id(), id));</a>
+<a name="ln1054">  }</a>
+<a name="ln1055">}</a>
+<a name="ln1056"> </a>
+<a name="ln1057">string ReplicaState::LogPrefix() const {</a>
+<a name="ln1058">  auto role_and_term = cmeta_-&gt;GetRoleAndTerm();</a>
+<a name="ln1059">  return Substitute(&quot;T $0 P $1 [term $2 $3]: &quot;,</a>
+<a name="ln1060">                    options_.tablet_id,</a>
+<a name="ln1061">                    peer_uuid_,</a>
+<a name="ln1062">                    role_and_term.second,</a>
+<a name="ln1063">                    RaftPeerPB::Role_Name(role_and_term.first));</a>
+<a name="ln1064">}</a>
+<a name="ln1065"> </a>
+<a name="ln1066">ReplicaState::State ReplicaState::state() const {</a>
+<a name="ln1067">  DCHECK(IsLocked());</a>
+<a name="ln1068">  return state_;</a>
+<a name="ln1069">}</a>
+<a name="ln1070"> </a>
+<a name="ln1071">string ReplicaState::ToString() const {</a>
+<a name="ln1072">  ThreadRestrictions::AssertWaitAllowed();</a>
+<a name="ln1073">  ReplicaState::UniqueLock lock(update_lock_);</a>
+<a name="ln1074">  return ToStringUnlocked();</a>
+<a name="ln1075">}</a>
+<a name="ln1076"> </a>
+<a name="ln1077">string ReplicaState::ToStringUnlocked() const {</a>
+<a name="ln1078">  DCHECK(IsLocked());</a>
+<a name="ln1079">  return Format(</a>
+<a name="ln1080">      &quot;Replica: $0, State: $1, Role: $2, Watermarks: {Received: $3 Committed: $4} Leader: $5&quot;,</a>
+<a name="ln1081">      peer_uuid_, state_, RaftPeerPB::Role_Name(GetActiveRoleUnlocked()),</a>
+<a name="ln1082">      last_received_op_id_, last_committed_op_id_, last_received_op_id_current_leader_);</a>
+<a name="ln1083">}</a>
+<a name="ln1084"> </a>
+<a name="ln1085">Status ReplicaState::CheckOpInSequence(const yb::OpId&amp; previous, const yb::OpId&amp; current) {</a>
+<a name="ln1086">  if (current.term &lt; previous.term) {</a>
+<a name="ln1087">    return STATUS_FORMAT(</a>
+<a name="ln1088">        Corruption,</a>
+<a name="ln1089">        &quot;New operation's term is not &gt;= than the previous op's term. Current: $0. Previous: $1&quot;,</a>
+<a name="ln1090">        current, previous);</a>
+<a name="ln1091">  }</a>
+<a name="ln1092"> </a>
+<a name="ln1093">  if (current.index != previous.index + 1) {</a>
+<a name="ln1094">    return STATUS_FORMAT(</a>
+<a name="ln1095">        Corruption,</a>
+<a name="ln1096">        &quot;New operation's index does not follow the previous op's index. Current: $0. Previous: $1&quot;,</a>
+<a name="ln1097">        current, previous);</a>
+<a name="ln1098">  }</a>
+<a name="ln1099">  return Status::OK();</a>
+<a name="ln1100">}</a>
+<a name="ln1101"> </a>
+<a name="ln1102">void ReplicaState::UpdateOldLeaderLeaseExpirationOnNonLeaderUnlocked(</a>
+<a name="ln1103">    const CoarseTimeLease&amp; lease, const PhysicalComponentLease&amp; ht_lease) {</a>
+<a name="ln1104">  old_leader_lease_.TryUpdate(lease);</a>
+<a name="ln1105">  old_leader_ht_lease_.TryUpdate(ht_lease);</a>
+<a name="ln1106"> </a>
+<a name="ln1107">  // Reset our lease, since we are non leader now. I.e. follower or candidate.</a>
+<a name="ln1108">  auto existing_lease = majority_replicated_lease_expiration_;</a>
+<a name="ln1109">  if (existing_lease != CoarseTimeLease::NoneValue()) {</a>
+<a name="ln1110">    LOG_WITH_PREFIX(INFO)</a>
+<a name="ln1111">        &lt;&lt; &quot;Reset our lease: &quot; &lt;&lt; MonoDelta(CoarseMonoClock::now() - existing_lease);</a>
+<a name="ln1112">    majority_replicated_lease_expiration_ = CoarseTimeLease::NoneValue();</a>
+<a name="ln1113">  }</a>
+<a name="ln1114"> </a>
+<a name="ln1115">  auto existing_ht_lease = majority_replicated_ht_lease_expiration_.load(std::memory_order_acquire);</a>
+<a name="ln1116">  if (existing_ht_lease != PhysicalComponentLease::NoneValue()) {</a>
+<a name="ln1117">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Reset our ht lease: &quot; &lt;&lt; HybridTime::FromMicros(existing_ht_lease);</a>
+<a name="ln1118">    majority_replicated_ht_lease_expiration_.store(PhysicalComponentLease::NoneValue(),</a>
+<a name="ln1119">                                                   std::memory_order_release);</a>
+<a name="ln1120">  }</a>
+<a name="ln1121">}</a>
+<a name="ln1122"> </a>
+<a name="ln1123">template &lt;class Policy&gt;</a>
+<a name="ln1124">LeaderLeaseStatus ReplicaState::GetLeaseStatusUnlocked(Policy policy) const {</a>
+<a name="ln1125">  DCHECK_EQ(GetActiveRoleUnlocked(), RaftPeerPB_Role_LEADER);</a>
+<a name="ln1126"> </a>
+<a name="ln1127">  if (!policy.Enabled()) {</a>
+<a name="ln1128">    return LeaderLeaseStatus::HAS_LEASE;</a>
+<a name="ln1129">  }</a>
+<a name="ln1130"> </a>
+<a name="ln1131">  if (GetActiveConfigUnlocked().peers_size() == 1) {</a>
+<a name="ln1132">    // It is OK that majority_replicated_lease_expiration_ might be undefined in this case, because</a>
+<a name="ln1133">    // we are only reading it in this function (as of 08/09/2017).</a>
+<a name="ln1134">    return LeaderLeaseStatus::HAS_LEASE;</a>
+<a name="ln1135">  }</a>
+<a name="ln1136"> </a>
+<a name="ln1137">  if (!policy.OldLeaderLeaseExpired()) {</a>
+<a name="ln1138">    return LeaderLeaseStatus::OLD_LEADER_MAY_HAVE_LEASE;</a>
+<a name="ln1139">  }</a>
+<a name="ln1140"> </a>
+<a name="ln1141">  if (policy.MajorityReplicatedLeaseExpired()) {</a>
+<a name="ln1142">    return LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE;</a>
+<a name="ln1143">  }</a>
+<a name="ln1144"> </a>
+<a name="ln1145">  return LeaderLeaseStatus::HAS_LEASE;</a>
+<a name="ln1146">}</a>
+<a name="ln1147"> </a>
+<a name="ln1148">// Policy that is used during leader lease calculation.</a>
+<a name="ln1149">struct GetLeaderLeaseStatusPolicy {</a>
+<a name="ln1150">  const ReplicaState* replica_state;</a>
+<a name="ln1151">  MonoDelta* remaining_old_leader_lease;</a>
+<a name="ln1152">  CoarseTimePoint* now;</a>
+<a name="ln1153"> </a>
+<a name="ln1154">  GetLeaderLeaseStatusPolicy(</a>
+<a name="ln1155">      const ReplicaState* replica_state_, MonoDelta* remaining_old_leader_lease_,</a>
+<a name="ln1156">      CoarseTimePoint* now_)</a>
+<a name="ln1157">      : replica_state(replica_state_), remaining_old_leader_lease(remaining_old_leader_lease_),</a>
+<a name="ln1158">        now(now_) {</a>
+<a name="ln1159">    if (remaining_old_leader_lease) {</a>
+<a name="ln1160">      *remaining_old_leader_lease = 0s;</a>
+<a name="ln1161">    }</a>
+<a name="ln1162">  }</a>
+<a name="ln1163"> </a>
+<a name="ln1164">  bool OldLeaderLeaseExpired() {</a>
+<a name="ln1165">    const auto remaining_old_leader_lease_duration =</a>
+<a name="ln1166">        replica_state-&gt;RemainingOldLeaderLeaseDuration(now);</a>
+<a name="ln1167">    if (remaining_old_leader_lease_duration) {</a>
+<a name="ln1168">      if (remaining_old_leader_lease) {</a>
+<a name="ln1169">        *remaining_old_leader_lease = remaining_old_leader_lease_duration;</a>
+<a name="ln1170">      }</a>
+<a name="ln1171">      return false;</a>
+<a name="ln1172">    }</a>
+<a name="ln1173">    return true;</a>
+<a name="ln1174">  }</a>
+<a name="ln1175"> </a>
+<a name="ln1176">  bool MajorityReplicatedLeaseExpired() {</a>
+<a name="ln1177">    return replica_state-&gt;MajorityReplicatedLeaderLeaseExpired(now);</a>
+<a name="ln1178">  }</a>
+<a name="ln1179"> </a>
+<a name="ln1180">  bool Enabled() {</a>
+<a name="ln1181">    return true;</a>
+<a name="ln1182">  }</a>
+<a name="ln1183">};</a>
+<a name="ln1184"> </a>
+<a name="ln1185">bool ReplicaState::MajorityReplicatedLeaderLeaseExpired(CoarseTimePoint* now) const {</a>
+<a name="ln1186">  if (majority_replicated_lease_expiration_ == CoarseTimePoint()) {</a>
+<a name="ln1187">    return true;</a>
+<a name="ln1188">  }</a>
+<a name="ln1189"> </a>
+<a name="ln1190">  if (*now == CoarseTimePoint()) {</a>
+<a name="ln1191">    *now = CoarseMonoClock::Now();</a>
+<a name="ln1192">  }</a>
+<a name="ln1193"> </a>
+<a name="ln1194">  return *now &gt;= majority_replicated_lease_expiration_;</a>
+<a name="ln1195">}</a>
+<a name="ln1196"> </a>
+<a name="ln1197">LeaderLeaseStatus ReplicaState::GetLeaderLeaseStatusUnlocked(</a>
+<a name="ln1198">    MonoDelta* remaining_old_leader_lease, CoarseTimePoint* now) const {</a>
+<a name="ln1199">  if (now == nullptr) {</a>
+<a name="ln1200">    CoarseTimePoint local_now;</a>
+<a name="ln1201">    return GetLeaseStatusUnlocked(GetLeaderLeaseStatusPolicy(</a>
+<a name="ln1202">        this, remaining_old_leader_lease, &amp;local_now));</a>
+<a name="ln1203">  }</a>
+<a name="ln1204">  return GetLeaseStatusUnlocked(GetLeaderLeaseStatusPolicy(this, remaining_old_leader_lease, now));</a>
+<a name="ln1205">}</a>
+<a name="ln1206"> </a>
+<a name="ln1207">bool ReplicaState::MajorityReplicatedHybridTimeLeaseExpiredAt(MicrosTime hybrid_time) const {</a>
+<a name="ln1208">  return hybrid_time &gt;= majority_replicated_ht_lease_expiration_;</a>
+<a name="ln1209">}</a>
+<a name="ln1210"> </a>
+<a name="ln1211">struct GetHybridTimeLeaseStatusAtPolicy {</a>
+<a name="ln1212">  const ReplicaState* replica_state;</a>
+<a name="ln1213">  MicrosTime micros_time;</a>
+<a name="ln1214"> </a>
+<a name="ln1215">  GetHybridTimeLeaseStatusAtPolicy(const ReplicaState* rs, MicrosTime ht)</a>
+<a name="ln1216">      : replica_state(rs), micros_time(ht) {}</a>
+<a name="ln1217"> </a>
+<a name="ln1218">  bool OldLeaderLeaseExpired() {</a>
+<a name="ln1219">    return micros_time &gt; replica_state-&gt;old_leader_ht_lease().expiration;</a>
+<a name="ln1220">  }</a>
+<a name="ln1221"> </a>
+<a name="ln1222">  bool MajorityReplicatedLeaseExpired() {</a>
+<a name="ln1223">    return replica_state-&gt;MajorityReplicatedHybridTimeLeaseExpiredAt(micros_time);</a>
+<a name="ln1224">  }</a>
+<a name="ln1225"> </a>
+<a name="ln1226">  bool Enabled() {</a>
+<a name="ln1227">    return FLAGS_ht_lease_duration_ms != 0;</a>
+<a name="ln1228">  }</a>
+<a name="ln1229">};</a>
+<a name="ln1230"> </a>
+<a name="ln1231">LeaderLeaseStatus ReplicaState::GetHybridTimeLeaseStatusAtUnlocked(</a>
+<a name="ln1232">    MicrosTime micros_time) const {</a>
+<a name="ln1233">  return GetLeaseStatusUnlocked(GetHybridTimeLeaseStatusAtPolicy(this, micros_time));</a>
+<a name="ln1234">}</a>
+<a name="ln1235"> </a>
+<a name="ln1236">MonoDelta ReplicaState::RemainingOldLeaderLeaseDuration(CoarseTimePoint* now) const {</a>
+<a name="ln1237">  MonoDelta result;</a>
+<a name="ln1238">  if (old_leader_lease_) {</a>
+<a name="ln1239">    CoarseTimePoint now_local;</a>
+<a name="ln1240">    if (!now) {</a>
+<a name="ln1241">      now = &amp;now_local;</a>
+<a name="ln1242">    }</a>
+<a name="ln1243">    *now = CoarseMonoClock::Now();</a>
+<a name="ln1244"> </a>
+<a name="ln1245">    if (*now &gt; old_leader_lease_.expiration) {</a>
+<a name="ln1246">      // Reset the old leader lease expiration time so that we don't have to check it anymore.</a>
+<a name="ln1247">      old_leader_lease_.Reset();</a>
+<a name="ln1248">    } else {</a>
+<a name="ln1249">      result = old_leader_lease_.expiration - *now;</a>
+<a name="ln1250">    }</a>
+<a name="ln1251">  }</a>
+<a name="ln1252"> </a>
+<a name="ln1253">  return result;</a>
+<a name="ln1254">}</a>
+<a name="ln1255"> </a>
+<a name="ln1256">MicrosTime ReplicaState::MajorityReplicatedHtLeaseExpiration(</a>
+<a name="ln1257">    MicrosTime min_allowed, CoarseTimePoint deadline) const {</a>
+<a name="ln1258">  if (FLAGS_ht_lease_duration_ms == 0) {</a>
+<a name="ln1259">    return kMaxHybridTimePhysicalMicros;</a>
+<a name="ln1260">  }</a>
+<a name="ln1261"> </a>
+<a name="ln1262">  auto result = majority_replicated_ht_lease_expiration_.load(std::memory_order_acquire);</a>
+<a name="ln1263">  if (result &gt;= min_allowed) { // Fast path</a>
+<a name="ln1264">    return result;</a>
+<a name="ln1265">  }</a>
+<a name="ln1266"> </a>
+<a name="ln1267">  // Slow path</a>
+<a name="ln1268">  UniqueLock l(update_lock_);</a>
+<a name="ln1269">  auto predicate = [this, &amp;result, min_allowed] {</a>
+<a name="ln1270">    result = majority_replicated_ht_lease_expiration_.load(std::memory_order_acquire);</a>
+<a name="ln1271">    return result &gt;= min_allowed;</a>
+<a name="ln1272">  };</a>
+<a name="ln1273">  if (deadline == CoarseTimePoint::max()) {</a>
+<a name="ln1274">    cond_.wait(l, predicate);</a>
+<a name="ln1275">  } else if (!cond_.wait_until(l, deadline, predicate)) {</a>
+<a name="ln1276">    return 0;</a>
+<a name="ln1277">  }</a>
+<a name="ln1278">  return result;</a>
+<a name="ln1279">}</a>
+<a name="ln1280"> </a>
+<a name="ln1281">void ReplicaState::SetMajorityReplicatedLeaseExpirationUnlocked(</a>
+<a name="ln1282">    const MajorityReplicatedData&amp; majority_replicated_data,</a>
+<a name="ln1283">    EnumBitSet&lt;SetMajorityReplicatedLeaseExpirationFlag&gt; flags) {</a>
+<a name="ln1284">  majority_replicated_lease_expiration_ = majority_replicated_data.leader_lease_expiration;</a>
+<a name="ln1285">  majority_replicated_ht_lease_expiration_.store(majority_replicated_data.ht_lease_expiration,</a>
+<a name="ln1286">                                                 std::memory_order_release);</a>
+<a name="ln1287"> </a>
+<a name="ln1288">  if (flags.Test(SetMajorityReplicatedLeaseExpirationFlag::kResetOldLeaderLease)) {</a>
+<a name="ln1289">    LOG_WITH_PREFIX(INFO)</a>
+<a name="ln1290">        &lt;&lt; &quot;Revoked old leader &quot; &lt;&lt; old_leader_lease_.holder_uuid &lt;&lt; &quot; lease: &quot;</a>
+<a name="ln1291">        &lt;&lt; MonoDelta(old_leader_lease_.expiration - CoarseMonoClock::now());</a>
+<a name="ln1292">    old_leader_lease_.Reset();</a>
+<a name="ln1293">  }</a>
+<a name="ln1294"> </a>
+<a name="ln1295">  if (flags.Test(SetMajorityReplicatedLeaseExpirationFlag::kResetOldLeaderHtLease)) {</a>
+<a name="ln1296">    LOG_WITH_PREFIX(INFO)</a>
+<a name="ln1297">        &lt;&lt; &quot;Revoked old leader &quot; &lt;&lt; old_leader_ht_lease_.holder_uuid &lt;&lt; &quot; ht lease: &quot;</a>
+<a name="ln1298">        &lt;&lt; HybridTime::FromMicros(old_leader_ht_lease_.expiration);</a>
+<a name="ln1299">    old_leader_ht_lease_.Reset();</a>
+<a name="ln1300">  }</a>
+<a name="ln1301"> </a>
+<a name="ln1302">  CoarseTimePoint now;</a>
+<a name="ln1303">  RefreshLeaderStateCacheUnlocked(&amp;now);</a>
+<a name="ln1304">  cond_.notify_all();</a>
+<a name="ln1305">}</a>
+<a name="ln1306"> </a>
+<a name="ln1307">uint64_t ReplicaState::OnDiskSize() const {</a>
+<a name="ln1308">  return cmeta_-&gt;on_disk_size();</a>
+<a name="ln1309">}</a>
+<a name="ln1310"> </a>
+<a name="ln1311">yb::OpId ReplicaState::MinRetryableRequestOpId() {</a>
+<a name="ln1312">  UniqueLock lock;</a>
+<a name="ln1313">  auto status = LockForUpdate(&amp;lock);</a>
+<a name="ln1314">  if (!status.ok()) {</a>
+<a name="ln1315">    return yb::OpId(); // return minimal op id, that prevents log from cleaning</a>
+<a name="ln1316">  }</a>
+<a name="ln1317">  return retryable_requests_.CleanExpiredReplicatedAndGetMinOpId();</a>
+<a name="ln1318">}</a>
+<a name="ln1319"> </a>
+<a name="ln1320">void ReplicaState::NotifyReplicationFinishedUnlocked(</a>
+<a name="ln1321">    const ConsensusRoundPtr&amp; round, const Status&amp; status, int64_t leader_term,</a>
+<a name="ln1322">    OpIds* applied_op_ids) {</a>
+<a name="ln1323">  round-&gt;NotifyReplicationFinished(status, leader_term, applied_op_ids);</a>
+<a name="ln1324"> </a>
+<a name="ln1325">  retryable_requests_.ReplicationFinished(*round-&gt;replicate_msg(), status, leader_term);</a>
+<a name="ln1326">}</a>
+<a name="ln1327"> </a>
+<a name="ln1328">consensus::LeaderState ReplicaState::RefreshLeaderStateCacheUnlocked(CoarseTimePoint* now) const {</a>
+<a name="ln1329">  auto result = GetLeaderStateUnlocked(LeaderLeaseCheckMode::NEED_LEASE, now);</a>
+<a name="ln1330">  LeaderStateCache cache;</a>
+<a name="ln1331">  if (result.status == LeaderStatus::LEADER_AND_READY) {</a>
+<a name="ln1332">    cache.Set(result.status, result.term, majority_replicated_lease_expiration_);</a>
+<a name="ln1333">  } else if (result.status == LeaderStatus::LEADER_BUT_OLD_LEADER_MAY_HAVE_LEASE) {</a>
+<a name="ln1334">    cache.Set(result.status, result.remaining_old_leader_lease.ToMicroseconds(),</a>
+<a name="ln1335">              *now + result.remaining_old_leader_lease);</a>
+<a name="ln1336">  } else {</a>
+<a name="ln1337">    cache.Set(result.status, 0 /* extra_value */, CoarseTimePoint::max());</a>
+<a name="ln1338">  }</a>
+<a name="ln1339"> </a>
+<a name="ln1340">  leader_state_cache_.store(cache, boost::memory_order_release);</a>
+<a name="ln1341"> </a>
+<a name="ln1342">  return result;</a>
+<a name="ln1343">}</a>
+<a name="ln1344"> </a>
+<a name="ln1345">void ReplicaState::SetLeaderNoOpCommittedUnlocked(bool value) {</a>
+<a name="ln1346">  LOG_WITH_PREFIX(INFO)</a>
+<a name="ln1347">      &lt;&lt; __func__ &lt;&lt; &quot;(&quot; &lt;&lt; value &lt;&lt; &quot;), committed: &quot; &lt;&lt; GetCommittedOpIdUnlocked()</a>
+<a name="ln1348">      &lt;&lt; &quot;, received: &quot; &lt;&lt; GetLastReceivedOpIdUnlocked();</a>
+<a name="ln1349"> </a>
+<a name="ln1350">  leader_no_op_committed_ = value;</a>
+<a name="ln1351">  CoarseTimePoint now;</a>
+<a name="ln1352">  RefreshLeaderStateCacheUnlocked(&amp;now);</a>
+<a name="ln1353">}</a>
+<a name="ln1354"> </a>
+<a name="ln1355">}  // namespace consensus</a>
+<a name="ln1356">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="87"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="92"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="105"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="142"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="143"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="225"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="293"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="304"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="309"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="314"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="326"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="329"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="340"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="353"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="354"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="360"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="361"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="367"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="381"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="386"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="391"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="396"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="423"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="436"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="453"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="458"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="465"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="470"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="477"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="479"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="484"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="485"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="498"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="563"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="638"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="691"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="692"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="693"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="694"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="712"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="740"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="750"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="751"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="795"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="821"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="827"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="834"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="858"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="859"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="883"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="924"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="925"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="928"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="929"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="955"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="967"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="972"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="977"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1001"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1003"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1015"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1020"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1025"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1031"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1037"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1050"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1053"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1067"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1078"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1241"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v506/" target="_blank">V506</a> Pointer to local variable 'now_local' is stored outside the scope of this variable. Such a pointer will become invalid.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,247 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>cluster_balance.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &quot;yb/master/cluster_balance.h&quot;</a>
+<a name="ln14">#include &quot;yb/master/cluster_balance_util.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">using std::set;</a>
+<a name="ln17"> </a>
+<a name="ln18">namespace yb {</a>
+<a name="ln19">namespace master {</a>
+<a name="ln20">namespace enterprise {</a>
+<a name="ln21"> </a>
+<a name="ln22">Result&lt;bool&gt; ClusterLoadBalancer::HandleLeaderMoves(TabletId* out_tablet_id,</a>
+<a name="ln23">                                                    TabletServerId* out_from_ts,</a>
+<a name="ln24">                                                    TabletServerId* out_to_ts) {</a>
+<a name="ln25"> </a>
+<a name="ln26">  // If the user sets 'transaction_tables_use_preferred_zones' gflag to 0 and the tablet</a>
+<a name="ln27">  // being balanced is a transaction tablet, then logical flow will be changed to ignore</a>
+<a name="ln28">  // preferred zones and instead proceed to normal leader balancing.</a>
+<a name="ln29">  PerTableLoadState* ent_state = GetEntState();</a>
+<a name="ln30">  if (ent_state-&gt;use_preferred_zones_ &amp;&amp;</a>
+<a name="ln31">    VERIFY_RESULT(HandleLeaderLoadIfNonAffinitized(out_tablet_id, out_from_ts, out_to_ts))) {</a>
+<a name="ln32">    RETURN_NOT_OK(MoveLeader(*out_tablet_id, *out_from_ts, *out_to_ts));</a>
+<a name="ln33">    return true;</a>
+<a name="ln34">  }</a>
+<a name="ln35"> </a>
+<a name="ln36">  return super::HandleLeaderMoves(out_tablet_id, out_from_ts, out_to_ts);</a>
+<a name="ln37">}</a>
+<a name="ln38"> </a>
+<a name="ln39">Status ClusterLoadBalancer::AnalyzeTabletsUnlocked(const TableId&amp; table_uuid) {</a>
+<a name="ln40">  PerTableLoadState* ent_state = GetEntState();</a>
+<a name="ln41">  if (ent_state-&gt;use_preferred_zones_) {</a>
+<a name="ln42">    GetAllAffinitizedZones(&amp;ent_state-&gt;affinitized_zones_);</a>
+<a name="ln43">  }</a>
+<a name="ln44">  return super::AnalyzeTabletsUnlocked(table_uuid);</a>
+<a name="ln45">}</a>
+<a name="ln46"> </a>
+<a name="ln47">void ClusterLoadBalancer::GetAllAffinitizedZones(AffinitizedZonesSet* affinitized_zones) const {</a>
+<a name="ln48">  SysClusterConfigEntryPB config;</a>
+<a name="ln49">  CHECK_OK(catalog_manager_-&gt;GetClusterConfig(&amp;config));</a>
+<a name="ln50">  const int num_zones = config.replication_info().affinitized_leaders_size();</a>
+<a name="ln51">  for (int i = 0; i &lt; num_zones; i++) {</a>
+<a name="ln52">    CloudInfoPB ci = config.replication_info().affinitized_leaders(i);</a>
+<a name="ln53">    affinitized_zones-&gt;insert(ci);</a>
+<a name="ln54">  }</a>
+<a name="ln55">}</a>
+<a name="ln56"> </a>
+<a name="ln57">Result&lt;bool&gt; ClusterLoadBalancer::HandleLeaderLoadIfNonAffinitized(TabletId* moving_tablet_id,</a>
+<a name="ln58">                                                                   TabletServerId* from_ts,</a>
+<a name="ln59">                                                                   TabletServerId* to_ts) {</a>
+<a name="ln60">  // Similar to normal leader balancing, we double iterate from most loaded to least loaded</a>
+<a name="ln61">  // non-affinitized nodes and least to most affinitized nodes. For each pair, we check whether</a>
+<a name="ln62">  // there is any tablet intersection and if so, there is a match and we return true.</a>
+<a name="ln63">  //</a>
+<a name="ln64">  // If we go through all the node pairs or we see that the current non-affinitized</a>
+<a name="ln65">  // leader load is 0, we know that there is no match from non-affinitized to affinitized nodes</a>
+<a name="ln66">  // and we return false.</a>
+<a name="ln67">  PerTableLoadState* ent_state = GetEntState();</a>
+<a name="ln68">  const int non_affinitized_last_pos = ent_state-&gt;sorted_non_affinitized_leader_load_.size() - 1;</a>
+<a name="ln69"> </a>
+<a name="ln70">  for (int non_affinitized_idx = non_affinitized_last_pos;</a>
+<a name="ln71">      non_affinitized_idx &gt;= 0;</a>
+<a name="ln72">      non_affinitized_idx--) {</a>
+<a name="ln73">    for (const auto&amp; affinitized_uuid : state_-&gt;sorted_leader_load_) {</a>
+<a name="ln74">      const TabletServerId&amp; non_affinitized_uuid =</a>
+<a name="ln75">          ent_state-&gt;sorted_non_affinitized_leader_load_[non_affinitized_idx];</a>
+<a name="ln76">      if (state_-&gt;GetLeaderLoad(non_affinitized_uuid) == 0) {</a>
+<a name="ln77">        // All subsequent non-affinitized nodes have no leaders, no match found.</a>
+<a name="ln78">        return false;</a>
+<a name="ln79">      }</a>
+<a name="ln80"> </a>
+<a name="ln81">      const set&lt;TabletId&gt;&amp; leaders = state_-&gt;per_ts_meta_[non_affinitized_uuid].leaders;</a>
+<a name="ln82">      const set&lt;TabletId&gt;&amp; peers = state_-&gt;per_ts_meta_[affinitized_uuid].running_tablets;</a>
+<a name="ln83">      set&lt;TabletId&gt; intersection;</a>
+<a name="ln84">      const auto&amp; itr = std::inserter(intersection, intersection.begin());</a>
+<a name="ln85">      std::set_intersection(leaders.begin(), leaders.end(), peers.begin(), peers.end(), itr);</a>
+<a name="ln86">      if (!intersection.empty()) {</a>
+<a name="ln87">        *moving_tablet_id = *intersection.begin();</a>
+<a name="ln88">        *from_ts = non_affinitized_uuid;</a>
+<a name="ln89">        *to_ts = affinitized_uuid;</a>
+<a name="ln90">        return true;</a>
+<a name="ln91">      }</a>
+<a name="ln92">    }</a>
+<a name="ln93">  }</a>
+<a name="ln94">  return false;</a>
+<a name="ln95">}</a>
+<a name="ln96"> </a>
+<a name="ln97">void ClusterLoadBalancer::PopulatePlacementInfo(TabletInfo* tablet, PlacementInfoPB* pb) {</a>
+<a name="ln98">  auto l = tablet-&gt;table()-&gt;LockForRead();</a>
+<a name="ln99">  const Options* options_ent = GetEntState()-&gt;GetEntOptions();</a>
+<a name="ln100">  if (options_ent-&gt;type == LIVE &amp;&amp;</a>
+<a name="ln101">      l-&gt;data().pb.has_replication_info() &amp;&amp;</a>
+<a name="ln102">      l-&gt;data().pb.replication_info().has_live_replicas()) {</a>
+<a name="ln103">    pb-&gt;CopyFrom(l-&gt;data().pb.replication_info().live_replicas());</a>
+<a name="ln104">  } else if (options_ent-&gt;type == READ_ONLY &amp;&amp;</a>
+<a name="ln105">      l-&gt;data().pb.has_replication_info() &amp;&amp;</a>
+<a name="ln106">      !l-&gt;data().pb.replication_info().read_replicas().empty()) {</a>
+<a name="ln107">    pb-&gt;CopyFrom(GetReadOnlyPlacementFromUuid(l-&gt;data().pb.replication_info()));</a>
+<a name="ln108">  } else {</a>
+<a name="ln109">    pb-&gt;CopyFrom(GetClusterPlacementInfo());</a>
+<a name="ln110">  }</a>
+<a name="ln111">}</a>
+<a name="ln112"> </a>
+<a name="ln113">Status ClusterLoadBalancer::UpdateTabletInfo(TabletInfo* tablet) {</a>
+<a name="ln114">  const auto&amp; table_id = tablet-&gt;table()-&gt;id();</a>
+<a name="ln115">  // Set the placement information on a per-table basis, only once.</a>
+<a name="ln116">  if (!state_-&gt;placement_by_table_.count(table_id)) {</a>
+<a name="ln117">    PlacementInfoPB pb;</a>
+<a name="ln118">    {</a>
+<a name="ln119">      PopulatePlacementInfo(tablet, &amp;pb);</a>
+<a name="ln120">    }</a>
+<a name="ln121">    state_-&gt;placement_by_table_[table_id] = std::move(pb);</a>
+<a name="ln122">  }</a>
+<a name="ln123"> </a>
+<a name="ln124">  return state_-&gt;UpdateTablet(tablet);</a>
+<a name="ln125">}</a>
+<a name="ln126"> </a>
+<a name="ln127">const PlacementInfoPB&amp; ClusterLoadBalancer::GetLiveClusterPlacementInfo() const {</a>
+<a name="ln128">  auto l = down_cast&lt;CatalogManager*&gt;(catalog_manager_)-&gt;GetClusterConfigInfo()-&gt;LockForRead();</a>
+<a name="ln129">  return l-&gt;data().pb.replication_info().live_replicas();</a>
+<a name="ln130">}</a>
+<a name="ln131"> </a>
+<a name="ln132"> </a>
+<a name="ln133">const PlacementInfoPB&amp; ClusterLoadBalancer::GetClusterPlacementInfo() const {</a>
+<a name="ln134">  auto l = down_cast&lt;CatalogManager*&gt;(catalog_manager_)-&gt;GetClusterConfigInfo()-&gt;LockForRead();</a>
+<a name="ln135">  if (GetEntState()-&gt;GetEntOptions()-&gt;type == LIVE) {</a>
+<a name="ln136">    return l-&gt;data().pb.replication_info().live_replicas();</a>
+<a name="ln137">  } else {</a>
+<a name="ln138">    return GetReadOnlyPlacementFromUuid(l-&gt;data().pb.replication_info());</a>
+<a name="ln139">  }</a>
+<a name="ln140">}</a>
+<a name="ln141"> </a>
+<a name="ln142"> </a>
+<a name="ln143">void ClusterLoadBalancer::RunLoadBalancer(yb::master::Options* options) {</a>
+<a name="ln144">  SysClusterConfigEntryPB config;</a>
+<a name="ln145">  CHECK_OK(catalog_manager_-&gt;GetClusterConfig(&amp;config));</a>
+<a name="ln146"> </a>
+<a name="ln147">  std::unique_ptr&lt;enterprise::Options&gt; options_unique_ptr =</a>
+<a name="ln148">      std::make_unique&lt;enterprise::Options&gt;();</a>
+<a name="ln149">  Options* options_ent = options_unique_ptr.get();</a>
+<a name="ln150">  // First, we load balance the live cluster.</a>
+<a name="ln151">  options_ent-&gt;type = LIVE;</a>
+<a name="ln152">  if (config.replication_info().live_replicas().has_placement_uuid()) {</a>
+<a name="ln153">    options_ent-&gt;placement_uuid = config.replication_info().live_replicas().placement_uuid();</a>
+<a name="ln154">    options_ent-&gt;live_placement_uuid = options_ent-&gt;placement_uuid;</a>
+<a name="ln155">  } else {</a>
+<a name="ln156">    options_ent-&gt;placement_uuid = &quot;&quot;;</a>
+<a name="ln157">    options_ent-&gt;live_placement_uuid = &quot;&quot;;</a>
+<a name="ln158">  }</a>
+<a name="ln159">  super::RunLoadBalancer(options_ent);</a>
+<a name="ln160"> </a>
+<a name="ln161">  // Then, we balance all read-only clusters.</a>
+<a name="ln162">  options_ent-&gt;type = READ_ONLY;</a>
+<a name="ln163">  for (int i = 0; i &lt; config.replication_info().read_replicas_size(); i++) {</a>
+<a name="ln164">    const PlacementInfoPB&amp; read_only_cluster = config.replication_info().read_replicas(i);</a>
+<a name="ln165">    options_ent-&gt;placement_uuid = read_only_cluster.placement_uuid();</a>
+<a name="ln166">    super::RunLoadBalancer(options_ent);</a>
+<a name="ln167">  }</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170">const PlacementInfoPB&amp; ClusterLoadBalancer::GetReadOnlyPlacementFromUuid(</a>
+<a name="ln171">    const ReplicationInfoPB&amp; replication_info) const {</a>
+<a name="ln172">  const Options* options_ent = GetEntState()-&gt;GetEntOptions();</a>
+<a name="ln173">  // We assume we have an read replicas field in our replication info.</a>
+<a name="ln174">  for (int i = 0; i &lt; replication_info.read_replicas_size(); i++) {</a>
+<a name="ln175">    const PlacementInfoPB&amp; read_only_placement = replication_info.read_replicas(i);</a>
+<a name="ln176">    if (read_only_placement.placement_uuid() == options_ent-&gt;placement_uuid) {</a>
+<a name="ln177">      return read_only_placement;</a>
+<a name="ln178">    }</a>
+<a name="ln179">  }</a>
+<a name="ln180">  // Should never get here.</a>
+<a name="ln181">  LOG(ERROR) &lt;&lt; &quot;Could not find read only cluster with placement uuid: &quot;</a>
+<a name="ln182">             &lt;&lt; options_ent-&gt;placement_uuid;</a>
+<a name="ln183">  return replication_info.read_replicas(0);</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186">consensus::RaftPeerPB::MemberType ClusterLoadBalancer::GetDefaultMemberType() {</a>
+<a name="ln187">  if (GetEntState()-&gt;GetEntOptions()-&gt;type == LIVE) {</a>
+<a name="ln188">    return consensus::RaftPeerPB::PRE_VOTER;</a>
+<a name="ln189">  } else {</a>
+<a name="ln190">    return consensus::RaftPeerPB::PRE_OBSERVER;</a>
+<a name="ln191">  }</a>
+<a name="ln192">}</a>
+<a name="ln193"> </a>
+<a name="ln194">PerTableLoadState* ClusterLoadBalancer::GetEntState() const {</a>
+<a name="ln195">  return down_cast&lt;enterprise::PerTableLoadState*&gt;(state_);</a>
+<a name="ln196">}</a>
+<a name="ln197"> </a>
+<a name="ln198">} // namespace enterprise</a>
+<a name="ln199">} // namespace master</a>
+<a name="ln200">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="49"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="145"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

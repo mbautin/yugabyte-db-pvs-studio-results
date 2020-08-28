@@ -1,0 +1,765 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>catalog_entity_info.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &lt;string&gt;</a>
+<a name="ln34">#include &lt;mutex&gt;</a>
+<a name="ln35"> </a>
+<a name="ln36">#include &quot;yb/master/catalog_entity_info.h&quot;</a>
+<a name="ln37">#include &quot;yb/util/format.h&quot;</a>
+<a name="ln38">#include &quot;yb/util/locks.h&quot;</a>
+<a name="ln39">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln40">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln41"> </a>
+<a name="ln42">using std::string;</a>
+<a name="ln43"> </a>
+<a name="ln44">using strings::Substitute;</a>
+<a name="ln45"> </a>
+<a name="ln46">DECLARE_int32(tserver_unresponsive_timeout_ms);</a>
+<a name="ln47"> </a>
+<a name="ln48">namespace yb {</a>
+<a name="ln49">namespace master {</a>
+<a name="ln50"> </a>
+<a name="ln51">// ================================================================================================</a>
+<a name="ln52">// TabletReplica</a>
+<a name="ln53">// ================================================================================================</a>
+<a name="ln54"> </a>
+<a name="ln55">string TabletReplica::ToString() const {</a>
+<a name="ln56">  return Format(&quot;{ ts_desc: $0 state: $1 role: $2 member_type: $3 time since update: $4ms}&quot;,</a>
+<a name="ln57">                ts_desc-&gt;permanent_uuid(),</a>
+<a name="ln58">                tablet::RaftGroupStatePB_Name(state),</a>
+<a name="ln59">                consensus::RaftPeerPB_Role_Name(role),</a>
+<a name="ln60">                consensus::RaftPeerPB::MemberType_Name(member_type),</a>
+<a name="ln61">                MonoTime::Now().GetDeltaSince(time_updated).ToMilliseconds());</a>
+<a name="ln62">}</a>
+<a name="ln63"> </a>
+<a name="ln64">void TabletReplica::UpdateFrom(const TabletReplica&amp; source) {</a>
+<a name="ln65">  state = source.state;</a>
+<a name="ln66">  role = source.role;</a>
+<a name="ln67">  member_type = source.member_type;</a>
+<a name="ln68">  time_updated = MonoTime::Now();</a>
+<a name="ln69">}</a>
+<a name="ln70"> </a>
+<a name="ln71">bool TabletReplica::IsStale() const {</a>
+<a name="ln72">  MonoTime now(MonoTime::Now());</a>
+<a name="ln73">  if (now.GetDeltaSince(time_updated).ToMilliseconds() &gt;=</a>
+<a name="ln74">      GetAtomicFlag(&amp;FLAGS_tserver_unresponsive_timeout_ms)) {</a>
+<a name="ln75">    return true;</a>
+<a name="ln76">  }</a>
+<a name="ln77">  return false;</a>
+<a name="ln78">}</a>
+<a name="ln79"> </a>
+<a name="ln80">bool TabletReplica::IsStarting() const {</a>
+<a name="ln81">  return (state == tablet::NOT_STARTED || state == tablet::BOOTSTRAPPING);</a>
+<a name="ln82">}</a>
+<a name="ln83"> </a>
+<a name="ln84">// ================================================================================================</a>
+<a name="ln85">// TabletInfo</a>
+<a name="ln86">// ================================================================================================</a>
+<a name="ln87"> </a>
+<a name="ln88">class TabletInfo::LeaderChangeReporter {</a>
+<a name="ln89"> public:</a>
+<a name="ln90">  explicit LeaderChangeReporter(TabletInfo* info)</a>
+<a name="ln91">      : info_(info), old_leader_(info-&gt;GetLeaderUnlocked()) {</a>
+<a name="ln92">  }</a>
+<a name="ln93"> </a>
+<a name="ln94">  ~LeaderChangeReporter() {</a>
+<a name="ln95">    auto new_leader = info_-&gt;GetLeaderUnlocked();</a>
+<a name="ln96">    if (old_leader_ != new_leader) {</a>
+<a name="ln97">      LOG(INFO) &lt;&lt; &quot;T &quot; &lt;&lt; info_-&gt;tablet_id() &lt;&lt; &quot;: Leader changed from &quot;</a>
+<a name="ln98">                &lt;&lt; yb::ToString(old_leader_) &lt;&lt; &quot; to &quot; &lt;&lt; yb::ToString(new_leader);</a>
+<a name="ln99">    }</a>
+<a name="ln100">  }</a>
+<a name="ln101"> private:</a>
+<a name="ln102">  TabletInfo* info_;</a>
+<a name="ln103">  TSDescriptor* old_leader_;</a>
+<a name="ln104">};</a>
+<a name="ln105"> </a>
+<a name="ln106"> </a>
+<a name="ln107">TabletInfo::TabletInfo(const scoped_refptr&lt;TableInfo&gt;&amp; table, TabletId tablet_id)</a>
+<a name="ln108">    : tablet_id_(std::move(tablet_id)),</a>
+<a name="ln109">      table_(table),</a>
+<a name="ln110">      last_update_time_(MonoTime::Now()),</a>
+<a name="ln111">      reported_schema_version_({}) {}</a>
+<a name="ln112"> </a>
+<a name="ln113">TabletInfo::~TabletInfo() {</a>
+<a name="ln114">}</a>
+<a name="ln115"> </a>
+<a name="ln116">void TabletInfo::SetReplicaLocations(ReplicaMap replica_locations) {</a>
+<a name="ln117">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln118">  LeaderChangeReporter leader_change_reporter(this);</a>
+<a name="ln119">  last_update_time_ = MonoTime::Now();</a>
+<a name="ln120">  replica_locations_ = std::move(replica_locations);</a>
+<a name="ln121">}</a>
+<a name="ln122"> </a>
+<a name="ln123">CHECKED_STATUS TabletInfo::CheckRunning() const {</a>
+<a name="ln124">  if (!table()-&gt;is_running()) {</a>
+<a name="ln125">    return STATUS_FORMAT(Expired, &quot;Table is not running: $0&quot;, table()-&gt;ToStringWithState());</a>
+<a name="ln126">  }</a>
+<a name="ln127"> </a>
+<a name="ln128">  return Status::OK();</a>
+<a name="ln129">}</a>
+<a name="ln130"> </a>
+<a name="ln131">Result&lt;TSDescriptor*&gt; TabletInfo::GetLeader() const {</a>
+<a name="ln132">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln133">  auto result = GetLeaderUnlocked();</a>
+<a name="ln134">  if (result) {</a>
+<a name="ln135">    return result;</a>
+<a name="ln136">  }</a>
+<a name="ln137"> </a>
+<a name="ln138">  RETURN_NOT_OK(CheckRunning());</a>
+<a name="ln139"> </a>
+<a name="ln140">  return STATUS_FORMAT(</a>
+<a name="ln141">      NotFound,</a>
+<a name="ln142">      &quot;No leader found for tablet $0 with $1 replicas: $2.&quot;,</a>
+<a name="ln143">      ToString(), replica_locations_.size(), replica_locations_);</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146">TSDescriptor* TabletInfo::GetLeaderUnlocked() const {</a>
+<a name="ln147">  for (const auto&amp; pair : replica_locations_) {</a>
+<a name="ln148">    if (pair.second.role == consensus::RaftPeerPB::LEADER) {</a>
+<a name="ln149">      return pair.second.ts_desc;</a>
+<a name="ln150">    }</a>
+<a name="ln151">  }</a>
+<a name="ln152">  return nullptr;</a>
+<a name="ln153">}</a>
+<a name="ln154"> </a>
+<a name="ln155">void TabletInfo::GetReplicaLocations(ReplicaMap* replica_locations) const {</a>
+<a name="ln156">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln157">  *replica_locations = replica_locations_;</a>
+<a name="ln158">}</a>
+<a name="ln159"> </a>
+<a name="ln160">void TabletInfo::UpdateReplicaLocations(const TabletReplica&amp; replica) {</a>
+<a name="ln161">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln162">  LeaderChangeReporter leader_change_reporter(this);</a>
+<a name="ln163">  auto it = replica_locations_.find(replica.ts_desc-&gt;permanent_uuid());</a>
+<a name="ln164">  if (it == replica_locations_.end()) {</a>
+<a name="ln165">    replica_locations_.emplace(replica.ts_desc-&gt;permanent_uuid(), replica);</a>
+<a name="ln166">    return;</a>
+<a name="ln167">  }</a>
+<a name="ln168">  it-&gt;second.UpdateFrom(replica);</a>
+<a name="ln169">}</a>
+<a name="ln170"> </a>
+<a name="ln171">void TabletInfo::set_last_update_time(const MonoTime&amp; ts) {</a>
+<a name="ln172">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln173">  last_update_time_ = ts;</a>
+<a name="ln174">}</a>
+<a name="ln175"> </a>
+<a name="ln176">MonoTime TabletInfo::last_update_time() const {</a>
+<a name="ln177">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln178">  return last_update_time_;</a>
+<a name="ln179">}</a>
+<a name="ln180"> </a>
+<a name="ln181">bool TabletInfo::set_reported_schema_version(const TableId&amp; table_id, uint32_t version) {</a>
+<a name="ln182">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln183">  if (reported_schema_version_.count(table_id) == 0 ||</a>
+<a name="ln184">      version &gt; reported_schema_version_[table_id]) {</a>
+<a name="ln185">    reported_schema_version_[table_id] = version;</a>
+<a name="ln186">    return true;</a>
+<a name="ln187">  }</a>
+<a name="ln188">  return false;</a>
+<a name="ln189">}</a>
+<a name="ln190"> </a>
+<a name="ln191">uint32_t TabletInfo::reported_schema_version(const TableId&amp; table_id) {</a>
+<a name="ln192">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln193">  if (reported_schema_version_.count(table_id) == 0) {</a>
+<a name="ln194">    return 0;</a>
+<a name="ln195">  }</a>
+<a name="ln196">  return reported_schema_version_[table_id];</a>
+<a name="ln197">}</a>
+<a name="ln198"> </a>
+<a name="ln199">bool TabletInfo::colocated() const {</a>
+<a name="ln200">  auto l = LockForRead();</a>
+<a name="ln201">  return l-&gt;data().pb.colocated();</a>
+<a name="ln202">}</a>
+<a name="ln203"> </a>
+<a name="ln204">string TabletInfo::ToString() const {</a>
+<a name="ln205">  return Substitute(&quot;$0 (table $1)&quot;, tablet_id_,</a>
+<a name="ln206">                    (table_ != nullptr ? table_-&gt;ToString() : &quot;MISSING&quot;));</a>
+<a name="ln207">}</a>
+<a name="ln208"> </a>
+<a name="ln209">void TabletInfo::RegisterLeaderStepDownFailure(const TabletServerId&amp; dest_leader,</a>
+<a name="ln210">                                               MonoDelta time_since_stepdown_failure) {</a>
+<a name="ln211">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln212">  leader_stepdown_failure_times_[dest_leader] = MonoTime::Now() - time_since_stepdown_failure;</a>
+<a name="ln213">}</a>
+<a name="ln214"> </a>
+<a name="ln215">void TabletInfo::GetLeaderStepDownFailureTimes(MonoTime forget_failures_before,</a>
+<a name="ln216">                                               LeaderStepDownFailureTimes* dest) {</a>
+<a name="ln217">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln218">  for (auto iter = leader_stepdown_failure_times_.begin();</a>
+<a name="ln219">       iter != leader_stepdown_failure_times_.end(); ) {</a>
+<a name="ln220">    if (iter-&gt;second &lt; forget_failures_before) {</a>
+<a name="ln221">      iter = leader_stepdown_failure_times_.erase(iter);</a>
+<a name="ln222">    } else {</a>
+<a name="ln223">      iter++;</a>
+<a name="ln224">    }</a>
+<a name="ln225">  }</a>
+<a name="ln226">  *dest = leader_stepdown_failure_times_;</a>
+<a name="ln227">}</a>
+<a name="ln228"> </a>
+<a name="ln229">void PersistentTabletInfo::set_state(SysTabletsEntryPB::State state, const string&amp; msg) {</a>
+<a name="ln230">  pb.set_state(state);</a>
+<a name="ln231">  pb.set_state_msg(msg);</a>
+<a name="ln232">}</a>
+<a name="ln233"> </a>
+<a name="ln234">// ================================================================================================</a>
+<a name="ln235">// TableInfo</a>
+<a name="ln236">// ================================================================================================</a>
+<a name="ln237"> </a>
+<a name="ln238">TableInfo::TableInfo(TableId table_id, scoped_refptr&lt;TasksTracker&gt; tasks_tracker)</a>
+<a name="ln239">    : table_id_(std::move(table_id)),</a>
+<a name="ln240">      tasks_tracker_(tasks_tracker) {</a>
+<a name="ln241">}</a>
+<a name="ln242"> </a>
+<a name="ln243">TableInfo::~TableInfo() {</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246">const TableName TableInfo::name() const {</a>
+<a name="ln247">  auto l = LockForRead();</a>
+<a name="ln248">  return l-&gt;data().pb.name();</a>
+<a name="ln249">}</a>
+<a name="ln250"> </a>
+<a name="ln251">bool TableInfo::is_running() const {</a>
+<a name="ln252">  auto l = LockForRead();</a>
+<a name="ln253">  return l-&gt;data().is_running();</a>
+<a name="ln254">}</a>
+<a name="ln255"> </a>
+<a name="ln256">string TableInfo::ToString() const {</a>
+<a name="ln257">  auto l = LockForRead();</a>
+<a name="ln258">  return Substitute(&quot;$0 [id=$1]&quot;, l-&gt;data().pb.name(), table_id_);</a>
+<a name="ln259">}</a>
+<a name="ln260"> </a>
+<a name="ln261">string TableInfo::ToStringWithState() const {</a>
+<a name="ln262">  auto l = LockForRead();</a>
+<a name="ln263">  return Substitute(&quot;$0 [id=$1, state=$2]&quot;,</a>
+<a name="ln264">      l-&gt;data().pb.name(), table_id_, SysTablesEntryPB::State_Name(l-&gt;data().pb.state()));</a>
+<a name="ln265">}</a>
+<a name="ln266"> </a>
+<a name="ln267">const NamespaceId TableInfo::namespace_id() const {</a>
+<a name="ln268">  auto l = LockForRead();</a>
+<a name="ln269">  return l-&gt;data().namespace_id();</a>
+<a name="ln270">}</a>
+<a name="ln271"> </a>
+<a name="ln272">const NamespaceName TableInfo::namespace_name() const {</a>
+<a name="ln273">  auto l = LockForRead();</a>
+<a name="ln274">  return l-&gt;data().namespace_name();</a>
+<a name="ln275">}</a>
+<a name="ln276"> </a>
+<a name="ln277">const Status TableInfo::GetSchema(Schema* schema) const {</a>
+<a name="ln278">  auto l = LockForRead();</a>
+<a name="ln279">  return SchemaFromPB(l-&gt;data().schema(), schema);</a>
+<a name="ln280">}</a>
+<a name="ln281"> </a>
+<a name="ln282">bool TableInfo::colocated() const {</a>
+<a name="ln283">  auto l = LockForRead();</a>
+<a name="ln284">  return l-&gt;data().pb.colocated();</a>
+<a name="ln285">}</a>
+<a name="ln286"> </a>
+<a name="ln287">const string TableInfo::indexed_table_id() const {</a>
+<a name="ln288">  auto l = LockForRead();</a>
+<a name="ln289">  return l-&gt;data().pb.has_index_info()</a>
+<a name="ln290">             ? l-&gt;data().pb.index_info().indexed_table_id()</a>
+<a name="ln291">             : l-&gt;data().pb.has_indexed_table_id() ? l-&gt;data().pb.indexed_table_id() : &quot;&quot;;</a>
+<a name="ln292">}</a>
+<a name="ln293"> </a>
+<a name="ln294">bool TableInfo::is_local_index() const {</a>
+<a name="ln295">  auto l = LockForRead();</a>
+<a name="ln296">  return l-&gt;data().pb.has_index_info() ? l-&gt;data().pb.index_info().is_local()</a>
+<a name="ln297">                                       : l-&gt;data().pb.is_local_index();</a>
+<a name="ln298">}</a>
+<a name="ln299"> </a>
+<a name="ln300">bool TableInfo::is_unique_index() const {</a>
+<a name="ln301">  auto l = LockForRead();</a>
+<a name="ln302">  return l-&gt;data().pb.has_index_info() ? l-&gt;data().pb.index_info().is_unique()</a>
+<a name="ln303">                                       : l-&gt;data().pb.is_unique_index();</a>
+<a name="ln304">}</a>
+<a name="ln305"> </a>
+<a name="ln306">TableType TableInfo::GetTableType() const {</a>
+<a name="ln307">  auto l = LockForRead();</a>
+<a name="ln308">  return l-&gt;data().pb.table_type();</a>
+<a name="ln309">}</a>
+<a name="ln310"> </a>
+<a name="ln311">bool TableInfo::RemoveTablet(const string&amp; partition_key_start) {</a>
+<a name="ln312">  std::lock_guard&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln313">  return EraseKeyReturnValuePtr(&amp;tablet_map_, partition_key_start) != NULL;</a>
+<a name="ln314">}</a>
+<a name="ln315"> </a>
+<a name="ln316">void TableInfo::AddTablet(TabletInfo *tablet) {</a>
+<a name="ln317">  std::lock_guard&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln318">  AddTabletUnlocked(tablet);</a>
+<a name="ln319">}</a>
+<a name="ln320"> </a>
+<a name="ln321">void TableInfo::AddTablets(const vector&lt;TabletInfo*&gt;&amp; tablets) {</a>
+<a name="ln322">  std::lock_guard&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln323">  for (TabletInfo *tablet : tablets) {</a>
+<a name="ln324">    AddTabletUnlocked(tablet);</a>
+<a name="ln325">  }</a>
+<a name="ln326">}</a>
+<a name="ln327"> </a>
+<a name="ln328">void TableInfo::AddTabletUnlocked(TabletInfo* tablet) {</a>
+<a name="ln329">  const auto&amp; tablet_meta = tablet-&gt;metadata().dirty().pb;</a>
+<a name="ln330">  const auto&amp; partition_key_start = tablet_meta.partition().partition_key_start();</a>
+<a name="ln331">  auto it = tablet_map_.find(partition_key_start);</a>
+<a name="ln332">  if (it == tablet_map_.end()) {</a>
+<a name="ln333">    tablet_map_.emplace(partition_key_start, tablet);</a>
+<a name="ln334">  } else {</a>
+<a name="ln335">    const auto old_split_depth = it-&gt;second-&gt;LockForRead()-&gt;data().pb.split_depth();</a>
+<a name="ln336">    if (tablet_meta.split_depth() &lt; old_split_depth) {</a>
+<a name="ln337">      return;</a>
+<a name="ln338">    }</a>
+<a name="ln339">    VLOG(1) &lt;&lt; &quot;Replacing tablet &quot; &lt;&lt; it-&gt;second-&gt;tablet_id()</a>
+<a name="ln340">            &lt;&lt; &quot; (split_depth = &quot; &lt;&lt; old_split_depth &lt;&lt; &quot;)&quot;</a>
+<a name="ln341">            &lt;&lt; &quot; with tablet &quot; &lt;&lt; tablet-&gt;tablet_id()</a>
+<a name="ln342">            &lt;&lt; &quot; (split_depth = &quot; &lt;&lt; tablet_meta.split_depth() &lt;&lt; &quot;)&quot;;</a>
+<a name="ln343">    it-&gt;second = tablet;</a>
+<a name="ln344">    // TODO: can we assert that the replaced tablet is not in Running state?</a>
+<a name="ln345">    // May be a little tricky since we don't know whether to look at its committed or</a>
+<a name="ln346">    // uncommitted state.</a>
+<a name="ln347">  }</a>
+<a name="ln348">}</a>
+<a name="ln349"> </a>
+<a name="ln350">void TableInfo::GetTabletsInRange(const GetTableLocationsRequestPB* req, TabletInfos* ret) const {</a>
+<a name="ln351">  shared_lock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln352">  int32_t max_returned_locations = req-&gt;max_returned_locations();</a>
+<a name="ln353"> </a>
+<a name="ln354">  TableInfo::TabletInfoMap::const_iterator it, it_end;</a>
+<a name="ln355">  if (req-&gt;has_partition_key_start()) {</a>
+<a name="ln356">    it = tablet_map_.upper_bound(req-&gt;partition_key_start());</a>
+<a name="ln357">    if (it != tablet_map_.begin()) {</a>
+<a name="ln358">      --it;</a>
+<a name="ln359">    }</a>
+<a name="ln360">  } else {</a>
+<a name="ln361">    it = tablet_map_.begin();</a>
+<a name="ln362">  }</a>
+<a name="ln363">  if (req-&gt;has_partition_key_end()) {</a>
+<a name="ln364">    it_end = tablet_map_.upper_bound(req-&gt;partition_key_end());</a>
+<a name="ln365">  } else {</a>
+<a name="ln366">    it_end = tablet_map_.end();</a>
+<a name="ln367">  }</a>
+<a name="ln368"> </a>
+<a name="ln369">  int32_t count = 0;</a>
+<a name="ln370">  for (; it != it_end &amp;&amp; count &lt; max_returned_locations; ++it) {</a>
+<a name="ln371">    ret-&gt;push_back(make_scoped_refptr(it-&gt;second));</a>
+<a name="ln372">    count++;</a>
+<a name="ln373">  }</a>
+<a name="ln374">}</a>
+<a name="ln375"> </a>
+<a name="ln376">bool TableInfo::IsAlterInProgress(uint32_t version) const {</a>
+<a name="ln377">  shared_lock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln378">  for (const TableInfo::TabletInfoMap::value_type&amp; e : tablet_map_) {</a>
+<a name="ln379">    if (e.second-&gt;reported_schema_version(table_id_) &lt; version) {</a>
+<a name="ln380">      VLOG(3) &lt;&lt; &quot;Table &quot; &lt;&lt; table_id_ &lt;&lt; &quot; ALTER in progress due to tablet &quot;</a>
+<a name="ln381">              &lt;&lt; e.second-&gt;ToString() &lt;&lt; &quot; because reported schema &quot;</a>
+<a name="ln382">              &lt;&lt; e.second-&gt;reported_schema_version(table_id_) &lt;&lt; &quot; &lt; expected &quot; &lt;&lt; version;</a>
+<a name="ln383">      return true;</a>
+<a name="ln384">    }</a>
+<a name="ln385">  }</a>
+<a name="ln386">  return false;</a>
+<a name="ln387">}</a>
+<a name="ln388">bool TableInfo::AreAllTabletsDeleted() const {</a>
+<a name="ln389">  shared_lock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln390">  for (const TableInfo::TabletInfoMap::value_type&amp; e : tablet_map_) {</a>
+<a name="ln391">    auto tablet_lock = e.second-&gt;LockForRead();</a>
+<a name="ln392">    if (!tablet_lock-&gt;data().is_deleted()) {</a>
+<a name="ln393">      return false;</a>
+<a name="ln394">    }</a>
+<a name="ln395">  }</a>
+<a name="ln396">  return true;</a>
+<a name="ln397">}</a>
+<a name="ln398"> </a>
+<a name="ln399">bool TableInfo::IsCreateInProgress() const {</a>
+<a name="ln400">  shared_lock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln401">  for (const TableInfo::TabletInfoMap::value_type&amp; e : tablet_map_) {</a>
+<a name="ln402">    auto tablet_lock = e.second-&gt;LockForRead();</a>
+<a name="ln403">    if (!tablet_lock-&gt;data().is_running()) {</a>
+<a name="ln404">      return true;</a>
+<a name="ln405">    }</a>
+<a name="ln406">  }</a>
+<a name="ln407">  return false;</a>
+<a name="ln408">}</a>
+<a name="ln409"> </a>
+<a name="ln410">void TableInfo::SetCreateTableErrorStatus(const Status&amp; status) {</a>
+<a name="ln411">  std::lock_guard&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln412">  create_table_error_ = status;</a>
+<a name="ln413">}</a>
+<a name="ln414"> </a>
+<a name="ln415">Status TableInfo::GetCreateTableErrorStatus() const {</a>
+<a name="ln416">  shared_lock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln417">  return create_table_error_;</a>
+<a name="ln418">}</a>
+<a name="ln419"> </a>
+<a name="ln420">std::size_t TableInfo::NumLBTasks() const {</a>
+<a name="ln421">  shared_lock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln422">  return std::count_if(pending_tasks_.begin(),</a>
+<a name="ln423">                       pending_tasks_.end(),</a>
+<a name="ln424">                       [](auto task) { return task-&gt;started_by_lb(); });</a>
+<a name="ln425">}</a>
+<a name="ln426"> </a>
+<a name="ln427">std::size_t TableInfo::NumTasks() const {</a>
+<a name="ln428">  shared_lock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln429">  return pending_tasks_.size();</a>
+<a name="ln430">}</a>
+<a name="ln431"> </a>
+<a name="ln432">bool TableInfo::HasTasks() const {</a>
+<a name="ln433">  shared_lock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln434">  return !pending_tasks_.empty();</a>
+<a name="ln435">}</a>
+<a name="ln436"> </a>
+<a name="ln437">bool TableInfo::HasTasks(MonitoredTask::Type type) const {</a>
+<a name="ln438">  shared_lock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln439">  for (auto task : pending_tasks_) {</a>
+<a name="ln440">    if (task-&gt;type() == type) {</a>
+<a name="ln441">      return true;</a>
+<a name="ln442">    }</a>
+<a name="ln443">  }</a>
+<a name="ln444">  return false;</a>
+<a name="ln445">}</a>
+<a name="ln446"> </a>
+<a name="ln447">void TableInfo::AddTask(std::shared_ptr&lt;MonitoredTask&gt; task) {</a>
+<a name="ln448">  bool abort_task = false;</a>
+<a name="ln449">  {</a>
+<a name="ln450">    std::lock_guard&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln451">    if (!closing_) {</a>
+<a name="ln452">      pending_tasks_.insert(task);</a>
+<a name="ln453">      if (tasks_tracker_) {</a>
+<a name="ln454">        tasks_tracker_-&gt;AddTask(task);</a>
+<a name="ln455">      }</a>
+<a name="ln456">    } else {</a>
+<a name="ln457">      abort_task = true;</a>
+<a name="ln458">    }</a>
+<a name="ln459">  }</a>
+<a name="ln460">  // We need to abort these tasks without holding the lock because when a task is destroyed it tries</a>
+<a name="ln461">  // to acquire the same lock to remove itself from pending_tasks_.</a>
+<a name="ln462">  if (abort_task) {</a>
+<a name="ln463">    task-&gt;AbortAndReturnPrevState(STATUS(Aborted, &quot;Table closing&quot;));</a>
+<a name="ln464">  }</a>
+<a name="ln465">}</a>
+<a name="ln466"> </a>
+<a name="ln467">void TableInfo::RemoveTask(const std::shared_ptr&lt;MonitoredTask&gt;&amp; task) {</a>
+<a name="ln468">  {</a>
+<a name="ln469">    std::lock_guard&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln470">    pending_tasks_.erase(task);</a>
+<a name="ln471">  }</a>
+<a name="ln472">  VLOG(1) &lt;&lt; __func__ &lt;&lt; &quot; Removed task &quot; &lt;&lt; task.get() &lt;&lt; &quot; &quot; &lt;&lt; task-&gt;description();</a>
+<a name="ln473">}</a>
+<a name="ln474"> </a>
+<a name="ln475">// Aborts tasks which have their rpc in progress, rest of them are aborted and also erased</a>
+<a name="ln476">// from the pending list.</a>
+<a name="ln477">void TableInfo::AbortTasks() {</a>
+<a name="ln478">  AbortTasksAndCloseIfRequested( /* close */ false);</a>
+<a name="ln479">}</a>
+<a name="ln480"> </a>
+<a name="ln481">void TableInfo::AbortTasksAndClose() {</a>
+<a name="ln482">  AbortTasksAndCloseIfRequested( /* close */ true);</a>
+<a name="ln483">}</a>
+<a name="ln484"> </a>
+<a name="ln485">void TableInfo::AbortTasksAndCloseIfRequested(bool close) {</a>
+<a name="ln486">  std::vector&lt;std::shared_ptr&lt;MonitoredTask&gt;&gt; abort_tasks;</a>
+<a name="ln487">  {</a>
+<a name="ln488">    std::lock_guard&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln489">    if (close) {</a>
+<a name="ln490">      closing_ = true;</a>
+<a name="ln491">    }</a>
+<a name="ln492">    abort_tasks.reserve(pending_tasks_.size());</a>
+<a name="ln493">    abort_tasks.assign(pending_tasks_.cbegin(), pending_tasks_.cend());</a>
+<a name="ln494">  }</a>
+<a name="ln495">  // We need to abort these tasks without holding the lock because when a task is destroyed it tries</a>
+<a name="ln496">  // to acquire the same lock to remove itself from pending_tasks_.</a>
+<a name="ln497">  for (const auto&amp; task : abort_tasks) {</a>
+<a name="ln498">    VLOG(1) &lt;&lt; __func__ &lt;&lt; &quot; Aborting task &quot; &lt;&lt; task.get() &lt;&lt; &quot; &quot; &lt;&lt; task-&gt;description();</a>
+<a name="ln499">    task-&gt;AbortAndReturnPrevState(STATUS(Aborted, &quot;Table closing&quot;));</a>
+<a name="ln500">  }</a>
+<a name="ln501">}</a>
+<a name="ln502"> </a>
+<a name="ln503">void TableInfo::WaitTasksCompletion() {</a>
+<a name="ln504">  int wait_time = 5;</a>
+<a name="ln505">  while (1) {</a>
+<a name="ln506">    std::vector&lt;std::shared_ptr&lt;MonitoredTask&gt;&gt; waiting_on_for_debug;</a>
+<a name="ln507">    {</a>
+<a name="ln508">      shared_lock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln509">      if (pending_tasks_.empty()) {</a>
+<a name="ln510">        break;</a>
+<a name="ln511">      } else if (VLOG_IS_ON(1)) {</a>
+<a name="ln512">        waiting_on_for_debug.reserve(pending_tasks_.size());</a>
+<a name="ln513">        waiting_on_for_debug.assign(pending_tasks_.cbegin(), pending_tasks_.cend());</a>
+<a name="ln514">      }</a>
+<a name="ln515">    }</a>
+<a name="ln516">    for (const auto&amp; task : waiting_on_for_debug) {</a>
+<a name="ln517">      VLOG(1) &lt;&lt; &quot;Waiting for Aborting task &quot; &lt;&lt; task.get() &lt;&lt; &quot; &quot; &lt;&lt; task-&gt;description();</a>
+<a name="ln518">    }</a>
+<a name="ln519">    base::SleepForMilliseconds(wait_time);</a>
+<a name="ln520">    wait_time = std::min(wait_time * 5 / 4, 10000);</a>
+<a name="ln521">  }</a>
+<a name="ln522">}</a>
+<a name="ln523"> </a>
+<a name="ln524">std::unordered_set&lt;std::shared_ptr&lt;MonitoredTask&gt;&gt; TableInfo::GetTasks() {</a>
+<a name="ln525">  shared_lock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln526">  return pending_tasks_;</a>
+<a name="ln527">}</a>
+<a name="ln528"> </a>
+<a name="ln529">void TableInfo::GetAllTablets(TabletInfos *ret) const {</a>
+<a name="ln530">  ret-&gt;clear();</a>
+<a name="ln531">  shared_lock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln532">  for (const TableInfo::TabletInfoMap::value_type&amp; e : tablet_map_) {</a>
+<a name="ln533">    ret-&gt;push_back(make_scoped_refptr(e.second));</a>
+<a name="ln534">  }</a>
+<a name="ln535">}</a>
+<a name="ln536"> </a>
+<a name="ln537">TabletInfoPtr TableInfo::GetColocatedTablet() const {</a>
+<a name="ln538">  shared_lock&lt;decltype(lock_)&gt; l(lock_);</a>
+<a name="ln539">  if (colocated()) {</a>
+<a name="ln540">    for (const TableInfo::TabletInfoMap::value_type&amp; e : tablet_map_) {</a>
+<a name="ln541">      return make_scoped_refptr(e.second);</a>
+<a name="ln542">    }</a>
+<a name="ln543">  }</a>
+<a name="ln544">  return nullptr;</a>
+<a name="ln545">}</a>
+<a name="ln546"> </a>
+<a name="ln547">IndexInfo TableInfo::GetIndexInfo(const TableId&amp; index_id) const {</a>
+<a name="ln548">  auto l = LockForRead();</a>
+<a name="ln549">  for (const auto&amp; index_info_pb : l-&gt;data().pb.indexes()) {</a>
+<a name="ln550">    if (index_info_pb.table_id() == index_id) {</a>
+<a name="ln551">      return IndexInfo(index_info_pb);</a>
+<a name="ln552">    }</a>
+<a name="ln553">  }</a>
+<a name="ln554">  return IndexInfo();</a>
+<a name="ln555">}</a>
+<a name="ln556"> </a>
+<a name="ln557">void PersistentTableInfo::set_state(SysTablesEntryPB::State state, const string&amp; msg) {</a>
+<a name="ln558">  VLOG(2) &lt;&lt; __PRETTY_FUNCTION__ &lt;&lt; &quot; setting state for &quot; &lt;&lt; name() &lt;&lt; &quot; to &quot;</a>
+<a name="ln559">          &lt;&lt; SysTablesEntryPB::State_Name(state) &lt;&lt; &quot; reason: &quot; &lt;&lt; msg;</a>
+<a name="ln560">  pb.set_state(state);</a>
+<a name="ln561">  pb.set_state_msg(msg);</a>
+<a name="ln562">}</a>
+<a name="ln563"> </a>
+<a name="ln564">// ================================================================================================</a>
+<a name="ln565">// DeletedTableInfo</a>
+<a name="ln566">// ================================================================================================</a>
+<a name="ln567"> </a>
+<a name="ln568">DeletedTableInfo::DeletedTableInfo(const TableInfo* table) : table_id_(table-&gt;id()) {</a>
+<a name="ln569">  vector&lt;scoped_refptr&lt;TabletInfo&gt;&gt; tablets;</a>
+<a name="ln570">  table-&gt;GetAllTablets(&amp;tablets);</a>
+<a name="ln571"> </a>
+<a name="ln572">  for (const scoped_refptr&lt;TabletInfo&gt;&amp; tablet : tablets) {</a>
+<a name="ln573">    auto tablet_lock = tablet-&gt;LockForRead();</a>
+<a name="ln574">    TabletInfo::ReplicaMap replica_locations;</a>
+<a name="ln575">    tablet-&gt;GetReplicaLocations(&amp;replica_locations);</a>
+<a name="ln576"> </a>
+<a name="ln577">    for (const TabletInfo::ReplicaMap::value_type&amp; r : replica_locations) {</a>
+<a name="ln578">      tablet_set_.insert(TabletSet::value_type(</a>
+<a name="ln579">          r.second.ts_desc-&gt;permanent_uuid(), tablet-&gt;id()));</a>
+<a name="ln580">    }</a>
+<a name="ln581">  }</a>
+<a name="ln582">}</a>
+<a name="ln583"> </a>
+<a name="ln584">std::size_t DeletedTableInfo::NumTablets() const {</a>
+<a name="ln585">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln586">  return tablet_set_.size();</a>
+<a name="ln587">}</a>
+<a name="ln588"> </a>
+<a name="ln589">bool DeletedTableInfo::HasTablets() const {</a>
+<a name="ln590">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln591">  return !tablet_set_.empty();</a>
+<a name="ln592">}</a>
+<a name="ln593"> </a>
+<a name="ln594">void DeletedTableInfo::DeleteTablet(const TabletKey&amp; key) {</a>
+<a name="ln595">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln596">  tablet_set_.erase(key);</a>
+<a name="ln597">}</a>
+<a name="ln598"> </a>
+<a name="ln599">void DeletedTableInfo::AddTabletsToMap(DeletedTabletMap* tablet_map) {</a>
+<a name="ln600">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln601">  for (const TabletKey&amp; key : tablet_set_) {</a>
+<a name="ln602">    tablet_map-&gt;insert(DeletedTabletMap::value_type(key, this));</a>
+<a name="ln603">  }</a>
+<a name="ln604">}</a>
+<a name="ln605"> </a>
+<a name="ln606">// ================================================================================================</a>
+<a name="ln607">// NamespaceInfo</a>
+<a name="ln608">// ================================================================================================</a>
+<a name="ln609"> </a>
+<a name="ln610">NamespaceInfo::NamespaceInfo(NamespaceId ns_id) : namespace_id_(std::move(ns_id)) {}</a>
+<a name="ln611"> </a>
+<a name="ln612">const NamespaceName&amp; NamespaceInfo::name() const {</a>
+<a name="ln613">  auto l = LockForRead();</a>
+<a name="ln614">  return l-&gt;data().pb.name();</a>
+<a name="ln615">}</a>
+<a name="ln616"> </a>
+<a name="ln617">YQLDatabase NamespaceInfo::database_type() const {</a>
+<a name="ln618">  auto l = LockForRead();</a>
+<a name="ln619">  return l-&gt;data().pb.database_type();</a>
+<a name="ln620">}</a>
+<a name="ln621"> </a>
+<a name="ln622">bool NamespaceInfo::colocated() const {</a>
+<a name="ln623">  auto l = LockForRead();</a>
+<a name="ln624">  return l-&gt;data().pb.colocated();</a>
+<a name="ln625">}</a>
+<a name="ln626"> </a>
+<a name="ln627">::yb::master::SysNamespaceEntryPB_State NamespaceInfo::state() const {</a>
+<a name="ln628">  auto l = LockForRead();</a>
+<a name="ln629">  return l-&gt;data().pb.state();</a>
+<a name="ln630">}</a>
+<a name="ln631"> </a>
+<a name="ln632">string NamespaceInfo::ToString() const {</a>
+<a name="ln633">  return Substitute(&quot;$0 [id=$1]&quot;, name(), namespace_id_);</a>
+<a name="ln634">}</a>
+<a name="ln635"> </a>
+<a name="ln636">// ================================================================================================</a>
+<a name="ln637">// TablegroupInfo</a>
+<a name="ln638">// ================================================================================================</a>
+<a name="ln639"> </a>
+<a name="ln640">TablegroupInfo::TablegroupInfo(TablegroupId tablegroup_id, NamespaceId namespace_id) :</a>
+<a name="ln641">                               tablegroup_id_(tablegroup_id), namespace_id_(namespace_id) {}</a>
+<a name="ln642"> </a>
+<a name="ln643">void TablegroupInfo::AddChildTable(const TableId&amp; table_id) {</a>
+<a name="ln644">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln645">  if (table_set_.find(table_id) != table_set_.end()) {</a>
+<a name="ln646">    LOG(WARNING) &lt;&lt; &quot;Table ID &quot; &lt;&lt; table_id &lt;&lt; &quot; already in Tablegroup &quot; &lt;&lt; tablegroup_id_;</a>
+<a name="ln647">  } else {</a>
+<a name="ln648">    table_set_.insert(table_id);</a>
+<a name="ln649">  }</a>
+<a name="ln650">}</a>
+<a name="ln651"> </a>
+<a name="ln652">void TablegroupInfo::DeleteChildTable(const TableId&amp; table_id) {</a>
+<a name="ln653">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln654">  if (table_set_.find(table_id) != table_set_.end()) {</a>
+<a name="ln655">    table_set_.erase(table_id);</a>
+<a name="ln656">  } else {</a>
+<a name="ln657">    LOG(WARNING) &lt;&lt; &quot;Table ID &quot; &lt;&lt; table_id &lt;&lt; &quot; not found in Tablegroup &quot; &lt;&lt; tablegroup_id_;</a>
+<a name="ln658">  }</a>
+<a name="ln659">}</a>
+<a name="ln660"> </a>
+<a name="ln661">bool TablegroupInfo::HasChildTables() const {</a>
+<a name="ln662">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln663">  return !table_set_.empty();</a>
+<a name="ln664">}</a>
+<a name="ln665"> </a>
+<a name="ln666"> </a>
+<a name="ln667">std::size_t TablegroupInfo::NumChildTables() const {</a>
+<a name="ln668">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln669">  return table_set_.size();</a>
+<a name="ln670">}</a>
+<a name="ln671"> </a>
+<a name="ln672">// ================================================================================================</a>
+<a name="ln673">// UDTypeInfo</a>
+<a name="ln674">// ================================================================================================</a>
+<a name="ln675"> </a>
+<a name="ln676">UDTypeInfo::UDTypeInfo(UDTypeId udtype_id) : udtype_id_(std::move(udtype_id)) { }</a>
+<a name="ln677"> </a>
+<a name="ln678">const UDTypeName&amp; UDTypeInfo::name() const {</a>
+<a name="ln679">  auto l = LockForRead();</a>
+<a name="ln680">  return l-&gt;data().pb.name();</a>
+<a name="ln681">}</a>
+<a name="ln682"> </a>
+<a name="ln683">const NamespaceName&amp; UDTypeInfo::namespace_id() const {</a>
+<a name="ln684">  auto l = LockForRead();</a>
+<a name="ln685">  return l-&gt;data().pb.namespace_id();</a>
+<a name="ln686">}</a>
+<a name="ln687"> </a>
+<a name="ln688">int UDTypeInfo::field_names_size() const {</a>
+<a name="ln689">  auto l = LockForRead();</a>
+<a name="ln690">  return l-&gt;data().pb.field_names_size();</a>
+<a name="ln691">}</a>
+<a name="ln692"> </a>
+<a name="ln693">const string&amp; UDTypeInfo::field_names(int index) const {</a>
+<a name="ln694">  auto l = LockForRead();</a>
+<a name="ln695">  return l-&gt;data().pb.field_names(index);</a>
+<a name="ln696">}</a>
+<a name="ln697"> </a>
+<a name="ln698">int UDTypeInfo::field_types_size() const {</a>
+<a name="ln699">  auto l = LockForRead();</a>
+<a name="ln700">  return l-&gt;data().pb.field_types_size();</a>
+<a name="ln701">}</a>
+<a name="ln702"> </a>
+<a name="ln703">const QLTypePB&amp; UDTypeInfo::field_types(int index) const {</a>
+<a name="ln704">  auto l = LockForRead();</a>
+<a name="ln705">  return l-&gt;data().pb.field_types(index);</a>
+<a name="ln706">}</a>
+<a name="ln707"> </a>
+<a name="ln708">string UDTypeInfo::ToString() const {</a>
+<a name="ln709">  auto l = LockForRead();</a>
+<a name="ln710">  return Substitute(&quot;$0 [id=$1] {metadata=$2} &quot;, name(), udtype_id_, l-&gt;data().pb.DebugString());</a>
+<a name="ln711">}</a>
+<a name="ln712"> </a>
+<a name="ln713">}  // namespace master</a>
+<a name="ln714">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="339"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="380"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="472"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="498"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="517"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="558"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

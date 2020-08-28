@@ -1,0 +1,288 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>statement_result.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15">// Different results of processing a statement.</a>
+<a name="ln16">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/yql/cql/ql/util/statement_result.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln21">#include &quot;yb/client/schema-internal.h&quot;</a>
+<a name="ln22">#include &quot;yb/client/table.h&quot;</a>
+<a name="ln23">#include &quot;yb/client/yb_op.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;yb/common/ql_protocol_util.h&quot;</a>
+<a name="ln26">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln27">#include &quot;yb/util/pb_util.h&quot;</a>
+<a name="ln28">#include &quot;yb/yql/cql/ql/ptree/pt_select.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">namespace yb {</a>
+<a name="ln31">namespace ql {</a>
+<a name="ln32"> </a>
+<a name="ln33">using std::string;</a>
+<a name="ln34">using std::vector;</a>
+<a name="ln35">using std::unique_ptr;</a>
+<a name="ln36">using std::shared_ptr;</a>
+<a name="ln37">using std::make_shared;</a>
+<a name="ln38">using strings::Substitute;</a>
+<a name="ln39"> </a>
+<a name="ln40">using client::YBOperation;</a>
+<a name="ln41">using client::YBqlOp;</a>
+<a name="ln42">using client::YBqlReadOp;</a>
+<a name="ln43">using client::YBqlWriteOp;</a>
+<a name="ln44">using client::YBTableName;</a>
+<a name="ln45"> </a>
+<a name="ln46">//------------------------------------------------------------------------------------------------</a>
+<a name="ln47">namespace {</a>
+<a name="ln48"> </a>
+<a name="ln49">// Get bind column schemas for DML.</a>
+<a name="ln50">void GetBindVariableSchemasFromDmlStmt(const PTDmlStmt&amp; stmt,</a>
+<a name="ln51">                                       vector&lt;ColumnSchema&gt;* schemas,</a>
+<a name="ln52">                                       vector&lt;YBTableName&gt;* table_names = nullptr) {</a>
+<a name="ln53">  schemas-&gt;reserve(schemas-&gt;size() + stmt.bind_variables().size());</a>
+<a name="ln54">  if (table_names != nullptr) {</a>
+<a name="ln55">    table_names-&gt;reserve(table_names-&gt;size() + stmt.bind_variables().size());</a>
+<a name="ln56">  }</a>
+<a name="ln57">  for (const PTBindVar *var : stmt.bind_variables()) {</a>
+<a name="ln58">    DCHECK_NOTNULL(var-&gt;name().get());</a>
+<a name="ln59">    schemas-&gt;emplace_back(var-&gt;name() ? string(var-&gt;name()-&gt;c_str()) : string(), var-&gt;ql_type());</a>
+<a name="ln60">    if (table_names != nullptr &amp;&amp; stmt.bind_table()) {</a>
+<a name="ln61">      table_names-&gt;emplace_back(stmt.bind_table()-&gt;name());</a>
+<a name="ln62">    }</a>
+<a name="ln63">  }</a>
+<a name="ln64">}</a>
+<a name="ln65"> </a>
+<a name="ln66">shared_ptr&lt;vector&lt;ColumnSchema&gt;&gt; GetColumnSchemasFromOp(const YBqlOp&amp; op, const PTDmlStmt *tnode) {</a>
+<a name="ln67">  switch (op.type()) {</a>
+<a name="ln68">    case YBOperation::Type::QL_READ: {</a>
+<a name="ln69">      // For actual execution &quot;tnode&quot; is always not null.</a>
+<a name="ln70">      if (tnode != nullptr) {</a>
+<a name="ln71">        return tnode-&gt;selected_schemas();</a>
+<a name="ln72">      }</a>
+<a name="ln73"> </a>
+<a name="ln74">      return std::make_shared&lt;vector&lt;ColumnSchema&gt;&gt;(</a>
+<a name="ln75">          static_cast&lt;const YBqlReadOp&amp;&gt;(op).MakeColumnSchemasFromRequest());</a>
+<a name="ln76">    }</a>
+<a name="ln77"> </a>
+<a name="ln78">    case YBOperation::Type::QL_WRITE: {</a>
+<a name="ln79">      shared_ptr&lt;vector&lt;ColumnSchema&gt;&gt; column_schemas = make_shared&lt;vector&lt;ColumnSchema&gt;&gt;();</a>
+<a name="ln80">      const auto&amp; write_op = static_cast&lt;const YBqlWriteOp&amp;&gt;(op);</a>
+<a name="ln81">      column_schemas-&gt;reserve(write_op.response().column_schemas_size());</a>
+<a name="ln82">      for (const auto&amp; column_schema : write_op.response().column_schemas()) {</a>
+<a name="ln83">        column_schemas-&gt;emplace_back(ColumnSchemaFromPB(column_schema));</a>
+<a name="ln84">      }</a>
+<a name="ln85">      return column_schemas;</a>
+<a name="ln86">    }</a>
+<a name="ln87"> </a>
+<a name="ln88">    case YBOperation::Type::PGSQL_READ: FALLTHROUGH_INTENDED;</a>
+<a name="ln89">    case YBOperation::Type::PGSQL_WRITE: FALLTHROUGH_INTENDED;</a>
+<a name="ln90">    case YBOperation::Type::REDIS_READ: FALLTHROUGH_INTENDED;</a>
+<a name="ln91">    case YBOperation::Type::REDIS_WRITE:</a>
+<a name="ln92">      break;</a>
+<a name="ln93">    // default: fallthrough</a>
+<a name="ln94">  }</a>
+<a name="ln95"> </a>
+<a name="ln96">  LOG(FATAL) &lt;&lt; &quot;Internal error: invalid or unknown QL operation: &quot; &lt;&lt; op.type();</a>
+<a name="ln97">  return nullptr;</a>
+<a name="ln98">}</a>
+<a name="ln99"> </a>
+<a name="ln100">QLClient GetClientFromOp(const YBqlOp&amp; op) {</a>
+<a name="ln101">  switch (op.type()) {</a>
+<a name="ln102">    case YBOperation::Type::QL_READ:</a>
+<a name="ln103">      return static_cast&lt;const YBqlReadOp&amp;&gt;(op).request().client();</a>
+<a name="ln104">    case YBOperation::Type::QL_WRITE:</a>
+<a name="ln105">      return static_cast&lt;const YBqlWriteOp&amp;&gt;(op).request().client();</a>
+<a name="ln106">    case YBOperation::Type::PGSQL_READ: FALLTHROUGH_INTENDED;</a>
+<a name="ln107">    case YBOperation::Type::PGSQL_WRITE: FALLTHROUGH_INTENDED;</a>
+<a name="ln108">    case YBOperation::Type::REDIS_READ: FALLTHROUGH_INTENDED;</a>
+<a name="ln109">    case YBOperation::Type::REDIS_WRITE:</a>
+<a name="ln110">      break;</a>
+<a name="ln111">    // default: fallthrough</a>
+<a name="ln112">  }</a>
+<a name="ln113">  LOG(FATAL) &lt;&lt; &quot;Internal error: invalid or unknown QL operation: &quot; &lt;&lt; op.type();</a>
+<a name="ln114"> </a>
+<a name="ln115">  // Inactive code: It's only meant to avoid compilation warning.</a>
+<a name="ln116">  return QLClient();</a>
+<a name="ln117">}</a>
+<a name="ln118"> </a>
+<a name="ln119">} // namespace</a>
+<a name="ln120"> </a>
+<a name="ln121">//------------------------------------------------------------------------------------------------</a>
+<a name="ln122">PreparedResult::PreparedResult(const PTDmlStmt&amp; stmt)</a>
+<a name="ln123">    : table_name_(stmt.bind_table() ? stmt.bind_table()-&gt;name() : YBTableName()),</a>
+<a name="ln124">      hash_col_indices_(stmt.hash_col_indices()),</a>
+<a name="ln125">      column_schemas_(stmt.selected_schemas()) {</a>
+<a name="ln126">  GetBindVariableSchemasFromDmlStmt(stmt, &amp;bind_variable_schemas_);</a>
+<a name="ln127">  if (column_schemas_ == nullptr) {</a>
+<a name="ln128">    column_schemas_ = make_shared&lt;vector&lt;ColumnSchema&gt;&gt;();</a>
+<a name="ln129">  }</a>
+<a name="ln130">}</a>
+<a name="ln131"> </a>
+<a name="ln132">PreparedResult::PreparedResult(const PTListNode&amp; stmt)</a>
+<a name="ln133">    : column_schemas_(make_shared&lt;vector&lt;ColumnSchema&gt;&gt;()) {</a>
+<a name="ln134">  for (TreeNode::SharedPtr tnode : stmt.node_list()) {</a>
+<a name="ln135">    switch (tnode-&gt;opcode()) {</a>
+<a name="ln136">      case TreeNodeOpcode::kPTInsertStmt: FALLTHROUGH_INTENDED;</a>
+<a name="ln137">      case TreeNodeOpcode::kPTUpdateStmt: FALLTHROUGH_INTENDED;</a>
+<a name="ln138">      case TreeNodeOpcode::kPTDeleteStmt: {</a>
+<a name="ln139">        const auto&amp; dml = static_cast&lt;const PTDmlStmt&amp;&gt;(*tnode);</a>
+<a name="ln140">        GetBindVariableSchemasFromDmlStmt(dml, &amp;bind_variable_schemas_, &amp;bind_table_names_);</a>
+<a name="ln141">        if (hash_col_indices_.empty()) {</a>
+<a name="ln142">          hash_col_indices_ = dml.hash_col_indices();</a>
+<a name="ln143">        }</a>
+<a name="ln144">        break;</a>
+<a name="ln145">      }</a>
+<a name="ln146">      default:</a>
+<a name="ln147">        break;</a>
+<a name="ln148">    }</a>
+<a name="ln149">  }</a>
+<a name="ln150">}</a>
+<a name="ln151"> </a>
+<a name="ln152">PreparedResult::~PreparedResult() {</a>
+<a name="ln153">}</a>
+<a name="ln154"> </a>
+<a name="ln155">//------------------------------------------------------------------------------------------------</a>
+<a name="ln156">RowsResult::RowsResult(const PTDmlStmt *tnode)</a>
+<a name="ln157">    : table_name_(tnode-&gt;table()-&gt;name()),</a>
+<a name="ln158">      column_schemas_(tnode-&gt;selected_schemas()),</a>
+<a name="ln159">      client_(YQL_CLIENT_CQL),</a>
+<a name="ln160">      rows_data_(QLRowBlock::ZeroRowsData(YQL_CLIENT_CQL)) {</a>
+<a name="ln161">  if (column_schemas_ == nullptr) {</a>
+<a name="ln162">    column_schemas_ = make_shared&lt;vector&lt;ColumnSchema&gt;&gt;();</a>
+<a name="ln163">  }</a>
+<a name="ln164">}</a>
+<a name="ln165"> </a>
+<a name="ln166">RowsResult::RowsResult(YBqlOp *op, const PTDmlStmt *tnode)</a>
+<a name="ln167">    : table_name_(op-&gt;table()-&gt;name()),</a>
+<a name="ln168">      column_schemas_(GetColumnSchemasFromOp(*op, tnode)),</a>
+<a name="ln169">      client_(GetClientFromOp(*op)),</a>
+<a name="ln170">      rows_data_(std::move(*op-&gt;mutable_rows_data())) {</a>
+<a name="ln171">  if (column_schemas_ == nullptr) {</a>
+<a name="ln172">    column_schemas_ = make_shared&lt;vector&lt;ColumnSchema&gt;&gt;();</a>
+<a name="ln173">  }</a>
+<a name="ln174">  SetPagingState(op);</a>
+<a name="ln175">}</a>
+<a name="ln176"> </a>
+<a name="ln177">RowsResult::RowsResult(const YBTableName&amp; table_name,</a>
+<a name="ln178">                       const shared_ptr&lt;vector&lt;ColumnSchema&gt;&gt;&amp; column_schemas,</a>
+<a name="ln179">                       const std::string&amp; rows_data)</a>
+<a name="ln180">    : table_name_(table_name),</a>
+<a name="ln181">      column_schemas_(column_schemas),</a>
+<a name="ln182">      client_(QLClient::YQL_CLIENT_CQL),</a>
+<a name="ln183">      rows_data_(rows_data) {</a>
+<a name="ln184">}</a>
+<a name="ln185"> </a>
+<a name="ln186">RowsResult::~RowsResult() {</a>
+<a name="ln187">}</a>
+<a name="ln188"> </a>
+<a name="ln189">Status RowsResult::Append(RowsResult&amp;&amp; other) {</a>
+<a name="ln190">  column_schemas_ = std::move(other.column_schemas_);</a>
+<a name="ln191">  if (rows_data_.empty()) {</a>
+<a name="ln192">    rows_data_ = std::move(other.rows_data_);</a>
+<a name="ln193">  } else {</a>
+<a name="ln194">    RETURN_NOT_OK(QLRowBlock::AppendRowsData(other.client_, other.rows_data_, &amp;rows_data_));</a>
+<a name="ln195">  }</a>
+<a name="ln196">  paging_state_ = std::move(other.paging_state_);</a>
+<a name="ln197">  return Status::OK();</a>
+<a name="ln198">}</a>
+<a name="ln199"> </a>
+<a name="ln200">void RowsResult::SetPagingState(YBqlOp *op) {</a>
+<a name="ln201">  // If there is a paging state in the response, fill in the table ID also and serialize the</a>
+<a name="ln202">  // paging state as bytes.</a>
+<a name="ln203">  if (op-&gt;response().has_paging_state()) {</a>
+<a name="ln204">    QLPagingStatePB *paging_state = op-&gt;mutable_response()-&gt;mutable_paging_state();</a>
+<a name="ln205">    paging_state-&gt;set_table_id(op-&gt;table()-&gt;id());</a>
+<a name="ln206">    SetPagingState(*paging_state);</a>
+<a name="ln207">  }</a>
+<a name="ln208">}</a>
+<a name="ln209"> </a>
+<a name="ln210">void RowsResult::SetPagingState(const QLPagingStatePB&amp; paging_state) {</a>
+<a name="ln211">  paging_state_.clear();</a>
+<a name="ln212">  CHECK(paging_state.SerializeToString(&amp;paging_state_));</a>
+<a name="ln213">}</a>
+<a name="ln214"> </a>
+<a name="ln215">void RowsResult::SetPagingState(RowsResult&amp;&amp; other) {</a>
+<a name="ln216">  paging_state_ = std::move(other.paging_state_);</a>
+<a name="ln217">}</a>
+<a name="ln218"> </a>
+<a name="ln219">void RowsResult::ClearPagingState() {</a>
+<a name="ln220">  VLOG(3) &lt;&lt; &quot;Clear paging state &quot; &lt;&lt; GetStackTrace();</a>
+<a name="ln221">  paging_state_.clear();</a>
+<a name="ln222">}</a>
+<a name="ln223"> </a>
+<a name="ln224">std::unique_ptr&lt;QLRowBlock&gt; RowsResult::GetRowBlock() const {</a>
+<a name="ln225">  return CreateRowBlock(client_, Schema(*column_schemas_, 0), rows_data_);</a>
+<a name="ln226">}</a>
+<a name="ln227"> </a>
+<a name="ln228">//------------------------------------------------------------------------------------------------</a>
+<a name="ln229">SchemaChangeResult::SchemaChangeResult(</a>
+<a name="ln230">    const string&amp; change_type, const string&amp; object_type,</a>
+<a name="ln231">    const string&amp; keyspace_name, const string&amp; object_name)</a>
+<a name="ln232">    : change_type_(change_type), object_type_(object_type),</a>
+<a name="ln233">      keyspace_name_(keyspace_name), object_name_(object_name) {</a>
+<a name="ln234">}</a>
+<a name="ln235"> </a>
+<a name="ln236">SchemaChangeResult::~SchemaChangeResult() {</a>
+<a name="ln237">}</a>
+<a name="ln238"> </a>
+<a name="ln239"> </a>
+<a name="ln240">} // namespace ql</a>
+<a name="ln241">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="212"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="220"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

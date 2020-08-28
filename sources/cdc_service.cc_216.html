@@ -1,0 +1,1503 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>cdc_service.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12"> </a>
+<a name="ln13">#include &quot;yb/cdc/cdc_service.h&quot;</a>
+<a name="ln14"> </a>
+<a name="ln15">#include &lt;shared_mutex&gt;</a>
+<a name="ln16">#include &lt;chrono&gt;</a>
+<a name="ln17">#include &lt;memory&gt;</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &lt;boost/algorithm/string.hpp&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/cdc/cdc_producer.h&quot;</a>
+<a name="ln22">#include &quot;yb/cdc/cdc_service.proxy.h&quot;</a>
+<a name="ln23">#include &quot;yb/cdc/cdc_rpc.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;yb/common/entity_ids.h&quot;</a>
+<a name="ln26">#include &quot;yb/common/ql_expr.h&quot;</a>
+<a name="ln27">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln28">#include &quot;yb/common/pg_system_attr.h&quot;</a>
+<a name="ln29">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &quot;yb/consensus/raft_consensus.h&quot;</a>
+<a name="ln32">#include &quot;yb/consensus/replicate_msgs_holder.h&quot;</a>
+<a name="ln33"> </a>
+<a name="ln34">#include &quot;yb/client/meta_cache.h&quot;</a>
+<a name="ln35">#include &quot;yb/client/table.h&quot;</a>
+<a name="ln36">#include &quot;yb/client/table_alterer.h&quot;</a>
+<a name="ln37">#include &quot;yb/client/table_handle.h&quot;</a>
+<a name="ln38">#include &quot;yb/client/session.h&quot;</a>
+<a name="ln39">#include &quot;yb/client/yb_table_name.h&quot;</a>
+<a name="ln40">#include &quot;yb/client/yb_op.h&quot;</a>
+<a name="ln41">#include &quot;yb/gutil/strings/join.h&quot;</a>
+<a name="ln42">#include &quot;yb/tablet/tablet.h&quot;</a>
+<a name="ln43">#include &quot;yb/tablet/tablet_peer.h&quot;</a>
+<a name="ln44">#include &quot;yb/tserver/tablet_server.h&quot;</a>
+<a name="ln45">#include &quot;yb/tserver/ts_tablet_manager.h&quot;</a>
+<a name="ln46">#include &quot;yb/tserver/service_util.h&quot;</a>
+<a name="ln47">#include &quot;yb/util/debug/trace_event.h&quot;</a>
+<a name="ln48">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln49">#include &quot;yb/util/scope_exit.h&quot;</a>
+<a name="ln50">#include &quot;yb/util/shared_lock.h&quot;</a>
+<a name="ln51">#include &quot;yb/yql/cql/ql/util/statement_result.h&quot;</a>
+<a name="ln52"> </a>
+<a name="ln53">DEFINE_int32(cdc_read_rpc_timeout_ms, 30 * 1000,</a>
+<a name="ln54">             &quot;Timeout used for CDC read rpc calls.  Reads normally occur cross-cluster.&quot;);</a>
+<a name="ln55">TAG_FLAG(cdc_read_rpc_timeout_ms, advanced);</a>
+<a name="ln56"> </a>
+<a name="ln57">DEFINE_int32(cdc_write_rpc_timeout_ms, 30 * 1000,</a>
+<a name="ln58">             &quot;Timeout used for CDC write rpc calls.  Writes normally occur intra-cluster.&quot;);</a>
+<a name="ln59">TAG_FLAG(cdc_write_rpc_timeout_ms, advanced);</a>
+<a name="ln60"> </a>
+<a name="ln61">DEFINE_int32(cdc_ybclient_reactor_threads, 50,</a>
+<a name="ln62">             &quot;The number of reactor threads to be used for processing ybclient &quot;</a>
+<a name="ln63">             &quot;requests for CDC.&quot;);</a>
+<a name="ln64">TAG_FLAG(cdc_ybclient_reactor_threads, advanced);</a>
+<a name="ln65"> </a>
+<a name="ln66">DEFINE_int32(cdc_state_checkpoint_update_interval_ms, 15 * 1000,</a>
+<a name="ln67">             &quot;Rate at which CDC state's checkpoint is updated.&quot;);</a>
+<a name="ln68"> </a>
+<a name="ln69">DEFINE_string(certs_for_cdc_dir, &quot;&quot;,</a>
+<a name="ln70">              &quot;Directory that contains certificate authorities for CDC producer universes.&quot;);</a>
+<a name="ln71"> </a>
+<a name="ln72">DEFINE_int32(update_min_cdc_indices_interval_secs, 60,</a>
+<a name="ln73">             &quot;How often to read cdc_state table to get the minimum applied index for each tablet &quot;</a>
+<a name="ln74">             &quot;across all streams. This information is used to correctly keep log files that &quot;</a>
+<a name="ln75">             &quot;contain unapplied entries. This is also the rate at which a tablet's minimum &quot;</a>
+<a name="ln76">             &quot;replicated index across all streams is sent to the other peers in the configuration. &quot;</a>
+<a name="ln77">             &quot;If flag enable_log_retention_by_op_idx is disabled, this flag has no effect.&quot;);</a>
+<a name="ln78"> </a>
+<a name="ln79">DEFINE_int32(update_metrics_interval_ms, 1000,</a>
+<a name="ln80">             &quot;How often to update xDC cluster metrics.&quot;);</a>
+<a name="ln81"> </a>
+<a name="ln82">DEFINE_bool(enable_collect_cdc_metrics, false, &quot;Enable collecting cdc metrics.&quot;);</a>
+<a name="ln83"> </a>
+<a name="ln84">DECLARE_bool(enable_log_retention_by_op_idx);</a>
+<a name="ln85"> </a>
+<a name="ln86">DECLARE_int32(cdc_checkpoint_opid_interval_ms);</a>
+<a name="ln87"> </a>
+<a name="ln88">METRIC_DEFINE_entity(cdc);</a>
+<a name="ln89"> </a>
+<a name="ln90">namespace yb {</a>
+<a name="ln91">namespace cdc {</a>
+<a name="ln92"> </a>
+<a name="ln93">using namespace std::literals;</a>
+<a name="ln94"> </a>
+<a name="ln95">using rpc::RpcContext;</a>
+<a name="ln96">using tserver::TSTabletManager;</a>
+<a name="ln97">using client::internal::RemoteTabletServer;</a>
+<a name="ln98"> </a>
+<a name="ln99">constexpr int kMaxDurationForTabletLookup = 50;</a>
+<a name="ln100">constexpr char kDefaultMetricTableName[] = &quot;DEFAULT_TABLE_NAME&quot;;</a>
+<a name="ln101">constexpr char kDefaultMetricTableId[] = &quot;DEFAULT_TABLE_ID&quot;;</a>
+<a name="ln102">const client::YBTableName kCdcStateTableName(</a>
+<a name="ln103">    YQL_DATABASE_CQL, master::kSystemNamespaceName, master::kCdcStateTableName);</a>
+<a name="ln104"> </a>
+<a name="ln105">CDCServiceImpl::CDCServiceImpl(TSTabletManager* tablet_manager,</a>
+<a name="ln106">                               const scoped_refptr&lt;MetricEntity&gt;&amp; metric_entity_server,</a>
+<a name="ln107">                               MetricRegistry* metric_registry)</a>
+<a name="ln108">    : CDCServiceIf(metric_entity_server),</a>
+<a name="ln109">      tablet_manager_(tablet_manager),</a>
+<a name="ln110">      metric_registry_(metric_registry),</a>
+<a name="ln111">      server_metrics_(std::make_shared&lt;CDCServerMetrics&gt;(metric_entity_server)) {</a>
+<a name="ln112">  const auto server = tablet_manager-&gt;server();</a>
+<a name="ln113">  async_client_init_.emplace(</a>
+<a name="ln114">      &quot;cdc_client&quot;, FLAGS_cdc_ybclient_reactor_threads, FLAGS_cdc_read_rpc_timeout_ms / 1000,</a>
+<a name="ln115">      server-&gt;permanent_uuid(), &amp;server-&gt;options(), server-&gt;metric_entity(), server-&gt;mem_tracker(),</a>
+<a name="ln116">      server-&gt;messenger());</a>
+<a name="ln117">  async_client_init_-&gt;Start();</a>
+<a name="ln118"> </a>
+<a name="ln119">  update_peers_and_metrics_thread_.reset(new std::thread(</a>
+<a name="ln120">      &amp;CDCServiceImpl::UpdatePeersAndMetrics, this));</a>
+<a name="ln121">}</a>
+<a name="ln122"> </a>
+<a name="ln123">CDCServiceImpl::~CDCServiceImpl() {</a>
+<a name="ln124">  Shutdown();</a>
+<a name="ln125">}</a>
+<a name="ln126"> </a>
+<a name="ln127">namespace {</a>
+<a name="ln128">bool YsqlTableHasPrimaryKey(const client::YBSchema&amp; schema) {</a>
+<a name="ln129">  for (const auto&amp; col : schema.columns()) {</a>
+<a name="ln130">      if (col.order() == static_cast&lt;int32_t&gt;(PgSystemAttrNum::kYBRowId)) {</a>
+<a name="ln131">        // ybrowid column is added for tables that don't have user-specified primary key.</a>
+<a name="ln132">        return false;</a>
+<a name="ln133">    }</a>
+<a name="ln134">  }</a>
+<a name="ln135">  return true;</a>
+<a name="ln136">}</a>
+<a name="ln137"> </a>
+<a name="ln138">bool IsTabletPeerLeader(const std::shared_ptr&lt;tablet::TabletPeer&gt;&amp; peer) {</a>
+<a name="ln139">  return peer-&gt;LeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY;</a>
+<a name="ln140">}</a>
+<a name="ln141">} // namespace</a>
+<a name="ln142"> </a>
+<a name="ln143">template &lt;class ReqType, class RespType&gt;</a>
+<a name="ln144">bool CDCServiceImpl::CheckOnline(const ReqType* req, RespType* resp, rpc::RpcContext* rpc) {</a>
+<a name="ln145">  TRACE(&quot;Received RPC $0: $1&quot;, rpc-&gt;ToString(), req-&gt;DebugString());</a>
+<a name="ln146">  if (PREDICT_FALSE(!tablet_manager_)) {</a>
+<a name="ln147">    SetupErrorAndRespond(resp-&gt;mutable_error(),</a>
+<a name="ln148">                         STATUS(ServiceUnavailable, &quot;Tablet Server is not running&quot;),</a>
+<a name="ln149">                         CDCErrorPB::NOT_RUNNING,</a>
+<a name="ln150">                         rpc);</a>
+<a name="ln151">    return false;</a>
+<a name="ln152">  }</a>
+<a name="ln153">  return true;</a>
+<a name="ln154">}</a>
+<a name="ln155"> </a>
+<a name="ln156">void CDCServiceImpl::CreateCDCStream(const CreateCDCStreamRequestPB* req,</a>
+<a name="ln157">                                     CreateCDCStreamResponsePB* resp,</a>
+<a name="ln158">                                     RpcContext context) {</a>
+<a name="ln159">  if (!CheckOnline(req, resp, &amp;context)) {</a>
+<a name="ln160">    return;</a>
+<a name="ln161">  }</a>
+<a name="ln162"> </a>
+<a name="ln163">  RPC_CHECK_AND_RETURN_ERROR(req-&gt;has_table_id(),</a>
+<a name="ln164">                             STATUS(InvalidArgument, &quot;Table ID is required to create CDC stream&quot;),</a>
+<a name="ln165">                             resp-&gt;mutable_error(),</a>
+<a name="ln166">                             CDCErrorPB::INVALID_REQUEST,</a>
+<a name="ln167">                             context);</a>
+<a name="ln168"> </a>
+<a name="ln169">  std::shared_ptr&lt;client::YBTable&gt; table;</a>
+<a name="ln170">  Status s = async_client_init_-&gt;client()-&gt;OpenTable(req-&gt;table_id(), &amp;table);</a>
+<a name="ln171">  RPC_STATUS_RETURN_ERROR(s, resp-&gt;mutable_error(), CDCErrorPB::TABLE_NOT_FOUND, context);</a>
+<a name="ln172"> </a>
+<a name="ln173">  // We don't allow CDC on YEDIS and tables without a primary key.</a>
+<a name="ln174">  if (req-&gt;record_format() != CDCRecordFormat::WAL) {</a>
+<a name="ln175">    RPC_CHECK_NE_AND_RETURN_ERROR(table-&gt;table_type(), client::YBTableType::REDIS_TABLE_TYPE,</a>
+<a name="ln176">                                  STATUS(InvalidArgument, &quot;Cannot setup CDC on YEDIS_TABLE&quot;),</a>
+<a name="ln177">                                  resp-&gt;mutable_error(),</a>
+<a name="ln178">                                  CDCErrorPB::INVALID_REQUEST,</a>
+<a name="ln179">                                  context);</a>
+<a name="ln180"> </a>
+<a name="ln181">    // Check if YSQL table has a primary key. CQL tables always have a user specified primary key.</a>
+<a name="ln182">    RPC_CHECK_AND_RETURN_ERROR(</a>
+<a name="ln183">        table-&gt;table_type() != client::YBTableType::PGSQL_TABLE_TYPE ||</a>
+<a name="ln184">        YsqlTableHasPrimaryKey(table-&gt;schema()),</a>
+<a name="ln185">        STATUS(InvalidArgument, &quot;Cannot setup CDC on table without primary key&quot;),</a>
+<a name="ln186">        resp-&gt;mutable_error(),</a>
+<a name="ln187">        CDCErrorPB::INVALID_REQUEST,</a>
+<a name="ln188">        context);</a>
+<a name="ln189">  }</a>
+<a name="ln190"> </a>
+<a name="ln191">  std::unordered_map&lt;std::string, std::string&gt; options;</a>
+<a name="ln192">  options.reserve(2);</a>
+<a name="ln193">  options.emplace(kRecordType, CDCRecordType_Name(req-&gt;record_type()));</a>
+<a name="ln194">  options.emplace(kRecordFormat, CDCRecordFormat_Name(req-&gt;record_format()));</a>
+<a name="ln195"> </a>
+<a name="ln196">  auto result = async_client_init_-&gt;client()-&gt;CreateCDCStream(req-&gt;table_id(), options);</a>
+<a name="ln197">  RPC_CHECK_AND_RETURN_ERROR(result.ok(), result.status(), resp-&gt;mutable_error(),</a>
+<a name="ln198">                             CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln199"> </a>
+<a name="ln200">  resp-&gt;set_stream_id(*result);</a>
+<a name="ln201"> </a>
+<a name="ln202">  // Add stream to cache.</a>
+<a name="ln203">  AddStreamMetadataToCache(*result, std::make_shared&lt;StreamMetadata&gt;(req-&gt;table_id(),</a>
+<a name="ln204">                                                                     req-&gt;record_type(),</a>
+<a name="ln205">                                                                     req-&gt;record_format()));</a>
+<a name="ln206">  context.RespondSuccess();</a>
+<a name="ln207">}</a>
+<a name="ln208"> </a>
+<a name="ln209">void CDCServiceImpl::DeleteCDCStream(const DeleteCDCStreamRequestPB* req,</a>
+<a name="ln210">                                     DeleteCDCStreamResponsePB* resp,</a>
+<a name="ln211">                                     RpcContext context) {</a>
+<a name="ln212">  if (!CheckOnline(req, resp, &amp;context)) {</a>
+<a name="ln213">    return;</a>
+<a name="ln214">  }</a>
+<a name="ln215"> </a>
+<a name="ln216">  LOG(INFO) &lt;&lt; &quot;Received DeleteCDCStream request &quot; &lt;&lt; req-&gt;ShortDebugString();</a>
+<a name="ln217"> </a>
+<a name="ln218">  RPC_CHECK_AND_RETURN_ERROR(req-&gt;stream_id_size() &gt; 0,</a>
+<a name="ln219">                             STATUS(InvalidArgument, &quot;Stream ID is required to delete CDC stream&quot;),</a>
+<a name="ln220">                             resp-&gt;mutable_error(),</a>
+<a name="ln221">                             CDCErrorPB::INVALID_REQUEST,</a>
+<a name="ln222">                             context);</a>
+<a name="ln223"> </a>
+<a name="ln224">  vector&lt;CDCStreamId&gt; streams(req-&gt;stream_id().begin(), req-&gt;stream_id().end());</a>
+<a name="ln225">  Status s = async_client_init_-&gt;client()-&gt;DeleteCDCStream(streams);</a>
+<a name="ln226">  RPC_STATUS_RETURN_ERROR(s, resp-&gt;mutable_error(), CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln227"> </a>
+<a name="ln228">  context.RespondSuccess();</a>
+<a name="ln229">}</a>
+<a name="ln230"> </a>
+<a name="ln231">void CDCServiceImpl::ListTablets(const ListTabletsRequestPB* req,</a>
+<a name="ln232">                                 ListTabletsResponsePB* resp,</a>
+<a name="ln233">                                 RpcContext context) {</a>
+<a name="ln234">  if (!CheckOnline(req, resp, &amp;context)) {</a>
+<a name="ln235">    return;</a>
+<a name="ln236">  }</a>
+<a name="ln237"> </a>
+<a name="ln238">  RPC_CHECK_AND_RETURN_ERROR(req-&gt;has_stream_id(),</a>
+<a name="ln239">                             STATUS(InvalidArgument, &quot;Stream ID is required to list tablets&quot;),</a>
+<a name="ln240">                             resp-&gt;mutable_error(),</a>
+<a name="ln241">                             CDCErrorPB::INVALID_REQUEST,</a>
+<a name="ln242">                             context);</a>
+<a name="ln243"> </a>
+<a name="ln244">  auto tablets = GetTablets(req-&gt;stream_id());</a>
+<a name="ln245">  RPC_CHECK_AND_RETURN_ERROR(tablets.ok(), tablets.status(), resp-&gt;mutable_error(),</a>
+<a name="ln246">                             CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln247"> </a>
+<a name="ln248">  if (!req-&gt;local_only()) {</a>
+<a name="ln249">    resp-&gt;mutable_tablets()-&gt;Reserve(tablets-&gt;size());</a>
+<a name="ln250">  }</a>
+<a name="ln251"> </a>
+<a name="ln252">  for (const auto&amp; tablet : *tablets) {</a>
+<a name="ln253">    // Filter local tablets if needed.</a>
+<a name="ln254">    if (req-&gt;local_only()) {</a>
+<a name="ln255">      bool is_local = false;</a>
+<a name="ln256">      for (const auto&amp; replica :  tablet.replicas()) {</a>
+<a name="ln257">        if (replica.ts_info().permanent_uuid() == tablet_manager_-&gt;server()-&gt;permanent_uuid()) {</a>
+<a name="ln258">          is_local = true;</a>
+<a name="ln259">          break;</a>
+<a name="ln260">        }</a>
+<a name="ln261">      }</a>
+<a name="ln262"> </a>
+<a name="ln263">      if (!is_local) {</a>
+<a name="ln264">        continue;</a>
+<a name="ln265">      }</a>
+<a name="ln266">    }</a>
+<a name="ln267"> </a>
+<a name="ln268">    auto res = resp-&gt;add_tablets();</a>
+<a name="ln269">    res-&gt;set_tablet_id(tablet.tablet_id());</a>
+<a name="ln270">    res-&gt;mutable_tservers()-&gt;Reserve(tablet.replicas_size());</a>
+<a name="ln271">    for (const auto&amp; replica : tablet.replicas()) {</a>
+<a name="ln272">      auto tserver =  res-&gt;add_tservers();</a>
+<a name="ln273">      tserver-&gt;mutable_broadcast_addresses()-&gt;CopyFrom(replica.ts_info().broadcast_addresses());</a>
+<a name="ln274">      if (tserver-&gt;broadcast_addresses_size() == 0) {</a>
+<a name="ln275">        LOG(WARNING) &lt;&lt; &quot;No public broadcast addresses found for &quot;</a>
+<a name="ln276">                     &lt;&lt; replica.ts_info().permanent_uuid() &lt;&lt; &quot;.  Using private addresses instead.&quot;;</a>
+<a name="ln277">        tserver-&gt;mutable_broadcast_addresses()-&gt;CopyFrom(replica.ts_info().private_rpc_addresses());</a>
+<a name="ln278">      }</a>
+<a name="ln279">    }</a>
+<a name="ln280">  }</a>
+<a name="ln281"> </a>
+<a name="ln282">  context.RespondSuccess();</a>
+<a name="ln283">}</a>
+<a name="ln284"> </a>
+<a name="ln285">Result&lt;google::protobuf::RepeatedPtrField&lt;master::TabletLocationsPB&gt;&gt; CDCServiceImpl::GetTablets(</a>
+<a name="ln286">    const CDCStreamId&amp; stream_id) {</a>
+<a name="ln287">  auto stream_metadata = VERIFY_RESULT(GetStream(stream_id));</a>
+<a name="ln288">  client::YBTableName table_name;</a>
+<a name="ln289">  table_name.set_table_id(stream_metadata-&gt;table_id);</a>
+<a name="ln290">  google::protobuf::RepeatedPtrField&lt;master::TabletLocationsPB&gt; tablets;</a>
+<a name="ln291">  RETURN_NOT_OK(async_client_init_-&gt;client()-&gt;GetTablets(table_name, 0, &amp;tablets));</a>
+<a name="ln292">  return tablets;</a>
+<a name="ln293">}</a>
+<a name="ln294"> </a>
+<a name="ln295">void CDCServiceImpl::GetChanges(const GetChangesRequestPB* req,</a>
+<a name="ln296">                                GetChangesResponsePB* resp,</a>
+<a name="ln297">                                RpcContext context) {</a>
+<a name="ln298">  if (!CheckOnline(req, resp, &amp;context)) {</a>
+<a name="ln299">    return;</a>
+<a name="ln300">  }</a>
+<a name="ln301"> </a>
+<a name="ln302">  YB_LOG_EVERY_N_SECS(INFO, 300) &lt;&lt; &quot;Received GetChanges request &quot; &lt;&lt; req-&gt;ShortDebugString();</a>
+<a name="ln303"> </a>
+<a name="ln304">  RPC_CHECK_AND_RETURN_ERROR(req-&gt;has_tablet_id(),</a>
+<a name="ln305">                             STATUS(InvalidArgument, &quot;Tablet ID is required to get CDC changes&quot;),</a>
+<a name="ln306">                             resp-&gt;mutable_error(),</a>
+<a name="ln307">                             CDCErrorPB::INVALID_REQUEST,</a>
+<a name="ln308">                             context);</a>
+<a name="ln309">  RPC_CHECK_AND_RETURN_ERROR(req-&gt;has_stream_id(),</a>
+<a name="ln310">                             STATUS(InvalidArgument, &quot;Stream ID is required to get CDC changes&quot;),</a>
+<a name="ln311">                             resp-&gt;mutable_error(),</a>
+<a name="ln312">                             CDCErrorPB::INVALID_REQUEST,</a>
+<a name="ln313">                             context);</a>
+<a name="ln314"> </a>
+<a name="ln315">  // Check that requested tablet_id is part of the CDC stream.</a>
+<a name="ln316">  ProducerTabletInfo producer_tablet = {&quot;&quot; /* UUID */, req-&gt;stream_id(), req-&gt;tablet_id()};</a>
+<a name="ln317">  Status s = CheckTabletValidForStream(producer_tablet);</a>
+<a name="ln318">  RPC_STATUS_RETURN_ERROR(s, resp-&gt;mutable_error(), CDCErrorPB::INVALID_REQUEST, context);</a>
+<a name="ln319"> </a>
+<a name="ln320">  std::shared_ptr&lt;tablet::TabletPeer&gt; tablet_peer;</a>
+<a name="ln321">  s = tablet_manager_-&gt;GetTabletPeer(req-&gt;tablet_id(), &amp;tablet_peer);</a>
+<a name="ln322">  auto original_leader_term = tablet_peer ? tablet_peer-&gt;LeaderTerm() : OpId::kUnknownTerm;</a>
+<a name="ln323"> </a>
+<a name="ln324">  // If we we can't serve this tablet...</a>
+<a name="ln325">  if (s.IsNotFound() || tablet_peer-&gt;LeaderStatus() != consensus::LeaderStatus::LEADER_AND_READY) {</a>
+<a name="ln326">    if (req-&gt;serve_as_proxy()) {</a>
+<a name="ln327">      // Forward GetChanges() to tablet leader. This commonly happens in Kubernetes setups.</a>
+<a name="ln328">      auto context_ptr = std::make_shared&lt;RpcContext&gt;(std::move(context));</a>
+<a name="ln329">      TabletLeaderGetChanges(req, resp, context_ptr, tablet_peer);</a>
+<a name="ln330">    // Otherwise, figure out the proper return code.</a>
+<a name="ln331">    } else if (s.IsNotFound()) {</a>
+<a name="ln332">      SetupErrorAndRespond(resp-&gt;mutable_error(), s, CDCErrorPB::TABLET_NOT_FOUND, &amp;context);</a>
+<a name="ln333">    } else if (tablet_peer-&gt;LeaderStatus() == consensus::LeaderStatus::NOT_LEADER) {</a>
+<a name="ln334">      // TODO: we may be able to get some changes, even if we're not the leader.</a>
+<a name="ln335">      SetupErrorAndRespond(resp-&gt;mutable_error(),</a>
+<a name="ln336">          STATUS(NotFound, Format(&quot;Not leader for $0&quot;, req-&gt;tablet_id())),</a>
+<a name="ln337">          CDCErrorPB::TABLET_NOT_FOUND, &amp;context);</a>
+<a name="ln338">    } else {</a>
+<a name="ln339">      SetupErrorAndRespond(resp-&gt;mutable_error(),</a>
+<a name="ln340">          STATUS(LeaderNotReadyToServe, &quot;Not ready to serve&quot;),</a>
+<a name="ln341">          CDCErrorPB::LEADER_NOT_READY, &amp;context);</a>
+<a name="ln342">    }</a>
+<a name="ln343">    return;</a>
+<a name="ln344">  }</a>
+<a name="ln345"> </a>
+<a name="ln346">  auto session = async_client_init_-&gt;client()-&gt;NewSession();</a>
+<a name="ln347">  OpId op_id;</a>
+<a name="ln348"> </a>
+<a name="ln349">  if (req-&gt;has_from_checkpoint()) {</a>
+<a name="ln350">    op_id = OpId::FromPB(req-&gt;from_checkpoint().op_id());</a>
+<a name="ln351">  } else {</a>
+<a name="ln352">    auto result = GetLastCheckpoint(producer_tablet, session);</a>
+<a name="ln353">    RPC_CHECK_AND_RETURN_ERROR(result.ok(), result.status(), resp-&gt;mutable_error(),</a>
+<a name="ln354">                               CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln355">    op_id = *result;</a>
+<a name="ln356">  }</a>
+<a name="ln357"> </a>
+<a name="ln358">  auto record = GetStream(req-&gt;stream_id());</a>
+<a name="ln359">  RPC_CHECK_AND_RETURN_ERROR(record.ok(), record.status(), resp-&gt;mutable_error(),</a>
+<a name="ln360">                             CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln361"> </a>
+<a name="ln362">  int64_t last_readable_index;</a>
+<a name="ln363">  consensus::ReplicateMsgsHolder msgs_holder;</a>
+<a name="ln364">  MemTrackerPtr mem_tracker = GetMemTracker(tablet_peer, producer_tablet);</a>
+<a name="ln365"> </a>
+<a name="ln366">  // Read the latest changes from the Log.</a>
+<a name="ln367">  s = cdc::GetChanges(</a>
+<a name="ln368">      req-&gt;stream_id(), req-&gt;tablet_id(), op_id, *record-&gt;get(), tablet_peer, mem_tracker,</a>
+<a name="ln369">      &amp;msgs_holder, resp, &amp;last_readable_index);</a>
+<a name="ln370">  RPC_STATUS_RETURN_ERROR(</a>
+<a name="ln371">      s,</a>
+<a name="ln372">      resp-&gt;mutable_error(),</a>
+<a name="ln373">      s.IsNotFound() ? CDCErrorPB::CHECKPOINT_TOO_OLD : CDCErrorPB::UNKNOWN_ERROR,</a>
+<a name="ln374">      context);</a>
+<a name="ln375"> </a>
+<a name="ln376">  // Verify leadership was maintained for the duration of the GetChanges() read.</a>
+<a name="ln377">  s = tablet_manager_-&gt;GetTabletPeer(req-&gt;tablet_id(), &amp;tablet_peer);</a>
+<a name="ln378">  if (s.IsNotFound() || tablet_peer-&gt;LeaderStatus() != consensus::LeaderStatus::LEADER_AND_READY ||</a>
+<a name="ln379">      tablet_peer-&gt;LeaderTerm() != original_leader_term) {</a>
+<a name="ln380">    SetupErrorAndRespond(resp-&gt;mutable_error(),</a>
+<a name="ln381">        STATUS(NotFound, Format(&quot;Not leader for $0&quot;, req-&gt;tablet_id())),</a>
+<a name="ln382">        CDCErrorPB::TABLET_NOT_FOUND, &amp;context);</a>
+<a name="ln383">    return;</a>
+<a name="ln384">  }</a>
+<a name="ln385"> </a>
+<a name="ln386">  // Store information about the last server read &amp; remote client ACK.</a>
+<a name="ln387">  uint64_t last_record_hybrid_time = resp-&gt;records_size() &gt; 0 ?</a>
+<a name="ln388">      resp-&gt;records(resp-&gt;records_size() - 1).time() : 0;</a>
+<a name="ln389"> </a>
+<a name="ln390">  s = UpdateCheckpoint(producer_tablet, OpId::FromPB(resp-&gt;checkpoint().op_id()), op_id, session,</a>
+<a name="ln391">                       last_record_hybrid_time);</a>
+<a name="ln392">  RPC_STATUS_RETURN_ERROR(s, resp-&gt;mutable_error(), CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln393"> </a>
+<a name="ln394">  {</a>
+<a name="ln395">    std::shared_ptr&lt;consensus::Consensus&gt; shared_consensus = tablet_peer-&gt;shared_consensus();</a>
+<a name="ln396"> </a>
+<a name="ln397">    RPC_CHECK_NE_AND_RETURN_ERROR(shared_consensus, nullptr,</a>
+<a name="ln398">        STATUS_SUBSTITUTE(InternalError, &quot;Failed to get tablet $0 peer consensus&quot;,</a>
+<a name="ln399">            req-&gt;tablet_id()),</a>
+<a name="ln400">        resp-&gt;mutable_error(),</a>
+<a name="ln401">        CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln402"> </a>
+<a name="ln403">    shared_consensus-&gt;UpdateCDCConsumerOpId(GetMinSentCheckpointForTablet(req-&gt;tablet_id()));</a>
+<a name="ln404">  }</a>
+<a name="ln405"> </a>
+<a name="ln406">  // Update relevant GetChanges metrics before handing off the Response.</a>
+<a name="ln407">  auto tablet_metric = GetCDCTabletMetrics(producer_tablet, tablet_peer);</a>
+<a name="ln408">  if (tablet_metric) {</a>
+<a name="ln409">    auto lid = resp-&gt;checkpoint().op_id();</a>
+<a name="ln410">    tablet_metric-&gt;last_read_opid_term-&gt;set_value(lid.term());</a>
+<a name="ln411">    tablet_metric-&gt;last_read_opid_index-&gt;set_value(lid.index());</a>
+<a name="ln412">    tablet_metric-&gt;last_readable_opid_index-&gt;set_value(last_readable_index);</a>
+<a name="ln413">    tablet_metric-&gt;last_checkpoint_opid_index-&gt;set_value(op_id.index);</a>
+<a name="ln414">    if (resp-&gt;records_size() &gt; 0) {</a>
+<a name="ln415">      auto&amp; last_record = resp-&gt;records(resp-&gt;records_size()-1);</a>
+<a name="ln416">      tablet_metric-&gt;last_read_hybridtime-&gt;set_value(last_record.time());</a>
+<a name="ln417">      auto last_record_micros = HybridTime(last_record.time()).GetPhysicalValueMicros();</a>
+<a name="ln418">      tablet_metric-&gt;last_read_physicaltime-&gt;set_value(last_record_micros);</a>
+<a name="ln419">      // Only count bytes responded if we are including a response payload.</a>
+<a name="ln420">      tablet_metric-&gt;rpc_payload_bytes_responded-&gt;Increment(resp-&gt;ByteSize());</a>
+<a name="ln421">      // Get the physical time of the last committed record on producer.</a>
+<a name="ln422">      auto last_replicated_micros = GetLastReplicatedTime(tablet_peer);</a>
+<a name="ln423">      tablet_metric-&gt;async_replication_sent_lag_micros-&gt;set_value(</a>
+<a name="ln424">          last_replicated_micros - last_record_micros);</a>
+<a name="ln425">      auto&amp; first_record = resp-&gt;records(0);</a>
+<a name="ln426">      auto first_record_micros = HybridTime(first_record.time()).GetPhysicalValueMicros();</a>
+<a name="ln427">      tablet_metric-&gt;last_checkpoint_physicaltime-&gt;set_value(first_record_micros);</a>
+<a name="ln428">      tablet_metric-&gt;async_replication_committed_lag_micros-&gt;set_value(</a>
+<a name="ln429">          last_replicated_micros - first_record_micros);</a>
+<a name="ln430">    } else {</a>
+<a name="ln431">      tablet_metric-&gt;rpc_heartbeats_responded-&gt;Increment();</a>
+<a name="ln432">      // If there are no more entries to be read, that means we're caught up.</a>
+<a name="ln433">      auto last_replicated_micros = GetLastReplicatedTime(tablet_peer);</a>
+<a name="ln434">      tablet_metric-&gt;last_read_physicaltime-&gt;set_value(last_replicated_micros);</a>
+<a name="ln435">      tablet_metric-&gt;last_checkpoint_physicaltime-&gt;set_value(last_replicated_micros);</a>
+<a name="ln436">      tablet_metric-&gt;async_replication_sent_lag_micros-&gt;set_value(0);</a>
+<a name="ln437">      tablet_metric-&gt;async_replication_committed_lag_micros-&gt;set_value(0);</a>
+<a name="ln438">    }</a>
+<a name="ln439">  }</a>
+<a name="ln440"> </a>
+<a name="ln441">  context.RespondSuccess();</a>
+<a name="ln442">}</a>
+<a name="ln443"> </a>
+<a name="ln444">void CDCServiceImpl::UpdatePeersCdcMinReplicatedIndex(const TabletId&amp; tablet_id,</a>
+<a name="ln445">                                                      int64_t min_index) {</a>
+<a name="ln446">  std::vector&lt;client::internal::RemoteTabletServer *&gt; servers;</a>
+<a name="ln447">  auto s = GetTServers(tablet_id, &amp;servers);</a>
+<a name="ln448">  if (!s.ok()) {</a>
+<a name="ln449">    LOG(WARNING) &lt;&lt; &quot;Unable to get remote tablet servers for tablet id &quot; &lt;&lt; tablet_id;</a>
+<a name="ln450">  } else {</a>
+<a name="ln451">    for (const auto &amp;server : servers) {</a>
+<a name="ln452">      if (server-&gt;IsLocal()) {</a>
+<a name="ln453">        // We modify our log directly. Avoid calling itself through the proxy.</a>
+<a name="ln454">        continue;</a>
+<a name="ln455">      }</a>
+<a name="ln456">      LOG(INFO) &lt;&lt; &quot;Modifying remote peer &quot; &lt;&lt; server-&gt;ToString();</a>
+<a name="ln457">      auto proxy = GetCDCServiceProxy(server);</a>
+<a name="ln458">      UpdateCdcReplicatedIndexRequestPB update_index_req;</a>
+<a name="ln459">      UpdateCdcReplicatedIndexResponsePB update_index_resp;</a>
+<a name="ln460">      update_index_req.set_tablet_id(tablet_id);</a>
+<a name="ln461">      update_index_req.set_replicated_index(min_index);</a>
+<a name="ln462">      rpc::RpcController rpc;</a>
+<a name="ln463">      rpc.set_timeout(MonoDelta::FromMilliseconds(FLAGS_cdc_write_rpc_timeout_ms));</a>
+<a name="ln464">      WARN_NOT_OK(proxy-&gt;UpdateCdcReplicatedIndex(update_index_req, &amp;update_index_resp, &amp;rpc),</a>
+<a name="ln465">                  &quot;UpdateCdcReplicatedIndex failed&quot;);</a>
+<a name="ln466">      // For now ignore the response.</a>
+<a name="ln467">    }</a>
+<a name="ln468">  }</a>
+<a name="ln469">}</a>
+<a name="ln470"> </a>
+<a name="ln471">void CDCServiceImpl::UpdateLagMetrics() {</a>
+<a name="ln472">  TabletCheckpoints tablet_checkpoints;</a>
+<a name="ln473">  {</a>
+<a name="ln474">    SharedLock&lt;decltype(mutex_)&gt; l(mutex_);</a>
+<a name="ln475">    tablet_checkpoints = tablet_checkpoints_;</a>
+<a name="ln476">  }</a>
+<a name="ln477"> </a>
+<a name="ln478">  client::TableHandle table;</a>
+<a name="ln479">  auto s = table.Open(kCdcStateTableName, async_client_init_-&gt;client());</a>
+<a name="ln480">  if (!s.ok()) {</a>
+<a name="ln481">    // It is possible that this runs before the cdc_state table is created. This is</a>
+<a name="ln482">    // ok. It just means that this is the first time the cluster starts.</a>
+<a name="ln483">    YB_LOG_EVERY_N_SECS(WARNING, 30) &lt;&lt; &quot;Unable to open table &quot; &lt;&lt; kCdcStateTableName.table_name()</a>
+<a name="ln484">                                     &lt;&lt; &quot; for metrics update.&quot;;</a>
+<a name="ln485">    return;</a>
+<a name="ln486">  }</a>
+<a name="ln487"> </a>
+<a name="ln488">  std::unordered_set&lt;ProducerTabletInfo, ProducerTabletInfo::Hash&gt; tablets_in_cdc_state_table;</a>
+<a name="ln489">  client::TableIteratorOptions options;</a>
+<a name="ln490">  options.columns = std::vector&lt;string&gt;{master::kCdcTabletId, master::kCdcStreamId};</a>
+<a name="ln491">  bool failed = false;</a>
+<a name="ln492">  options.error_handler = [&amp;failed](const Status&amp; status) {</a>
+<a name="ln493">    YB_LOG_EVERY_N_SECS(WARNING, 30) &lt;&lt; &quot;Scan of table &quot; &lt;&lt; kCdcStateTableName.table_name()</a>
+<a name="ln494">                                     &lt;&lt; &quot; failed: &quot; &lt;&lt; status &lt;&lt; &quot;. Could not update metrics.&quot;;</a>
+<a name="ln495">    failed = true;</a>
+<a name="ln496">  };</a>
+<a name="ln497">  // First go through tablets in the cdc_state table and update metrics for each one.</a>
+<a name="ln498">  for (const auto&amp; row : client::TableRange(table, options)) {</a>
+<a name="ln499">    auto tablet_id = row.column(master::kCdcTabletIdIdx).string_value();</a>
+<a name="ln500">    auto stream_id = row.column(master::kCdcStreamIdIdx).string_value();</a>
+<a name="ln501">    std::shared_ptr&lt;tablet::TabletPeer&gt; tablet_peer;</a>
+<a name="ln502">    Status s = tablet_manager_-&gt;GetTabletPeer(tablet_id, &amp;tablet_peer);</a>
+<a name="ln503">    if (s.IsNotFound()) {</a>
+<a name="ln504">      continue;</a>
+<a name="ln505">    }</a>
+<a name="ln506"> </a>
+<a name="ln507">    ProducerTabletInfo tablet_info = {&quot;&quot; /* universe_uuid */, stream_id, tablet_id};</a>
+<a name="ln508">    tablets_in_cdc_state_table.insert(tablet_info);</a>
+<a name="ln509">    auto tablet_metric = GetCDCTabletMetrics(tablet_info, tablet_peer);</a>
+<a name="ln510">    if (!tablet_metric) {</a>
+<a name="ln511">      continue;</a>
+<a name="ln512">    }</a>
+<a name="ln513">    if (tablet_peer-&gt;LeaderStatus() != consensus::LeaderStatus::LEADER_AND_READY) {</a>
+<a name="ln514">      // Set lag to 0 because we're not the leader for this tablet anymore, which means another peer</a>
+<a name="ln515">      // is responsible for tracking this tablet's lag.</a>
+<a name="ln516">      tablet_metric-&gt;async_replication_sent_lag_micros-&gt;set_value(0);</a>
+<a name="ln517">      tablet_metric-&gt;async_replication_committed_lag_micros-&gt;set_value(0);</a>
+<a name="ln518">    } else {</a>
+<a name="ln519">      // Get the physical time of the last committed record on producer.</a>
+<a name="ln520">      auto last_replicated_micros = GetLastReplicatedTime(tablet_peer);</a>
+<a name="ln521"> </a>
+<a name="ln522">      auto last_sent_micros = tablet_metric-&gt;last_read_physicaltime-&gt;value();</a>
+<a name="ln523">      auto last_committed_micros = tablet_metric-&gt;last_checkpoint_physicaltime-&gt;value();</a>
+<a name="ln524"> </a>
+<a name="ln525">      tablet_metric-&gt;async_replication_sent_lag_micros-&gt;set_value(</a>
+<a name="ln526">          last_replicated_micros - last_sent_micros);</a>
+<a name="ln527">      tablet_metric-&gt;async_replication_committed_lag_micros-&gt;set_value(</a>
+<a name="ln528">          last_replicated_micros - last_committed_micros);</a>
+<a name="ln529">    }</a>
+<a name="ln530">  }</a>
+<a name="ln531">  if (failed) {</a>
+<a name="ln532">    return;</a>
+<a name="ln533">  }</a>
+<a name="ln534"> </a>
+<a name="ln535">  // Now, go through tablets in tablet_checkpoints_ and set lag to 0 for all tablets we're no</a>
+<a name="ln536">  // longer replicating.</a>
+<a name="ln537">  for (auto it = tablet_checkpoints.begin(); it != tablet_checkpoints.end(); it++) {</a>
+<a name="ln538">    ProducerTabletInfo tablet_info = {&quot;&quot; /* universe_uuid */, it-&gt;stream_id(), it-&gt;tablet_id()};</a>
+<a name="ln539">    if (tablets_in_cdc_state_table.find(tablet_info) == tablets_in_cdc_state_table.end()) {</a>
+<a name="ln540">      // We're no longer replicating this tablet, so set lag to 0.</a>
+<a name="ln541">      std::shared_ptr&lt;tablet::TabletPeer&gt; tablet_peer;</a>
+<a name="ln542">      Status s = tablet_manager_-&gt;GetTabletPeer(it-&gt;tablet_id(), &amp;tablet_peer);</a>
+<a name="ln543">      if (s.IsNotFound()) {</a>
+<a name="ln544">        continue;</a>
+<a name="ln545">      }</a>
+<a name="ln546">      auto tablet_metric = GetCDCTabletMetrics(it-&gt;producer_tablet_info, tablet_peer);</a>
+<a name="ln547">      if (!tablet_metric) {</a>
+<a name="ln548">        continue;</a>
+<a name="ln549">      }</a>
+<a name="ln550">      tablet_metric-&gt;async_replication_sent_lag_micros-&gt;set_value(0);</a>
+<a name="ln551">      tablet_metric-&gt;async_replication_committed_lag_micros-&gt;set_value(0);</a>
+<a name="ln552">    }</a>
+<a name="ln553">  }</a>
+<a name="ln554">}</a>
+<a name="ln555"> </a>
+<a name="ln556">MicrosTime CDCServiceImpl::GetLastReplicatedTime(</a>
+<a name="ln557">    const std::shared_ptr&lt;tablet::TabletPeer&gt;&amp; tablet_peer) {</a>
+<a name="ln558">  yb::tablet::RemoveIntentsData data;</a>
+<a name="ln559">  tablet_peer-&gt;GetLastReplicatedData(&amp;data);</a>
+<a name="ln560">  return data.log_ht.GetPhysicalValueMicros();</a>
+<a name="ln561">}</a>
+<a name="ln562"> </a>
+<a name="ln563">void CDCServiceImpl::UpdatePeersAndMetrics() {</a>
+<a name="ln564">  MonoTime time_since_update_peers = MonoTime::Now();</a>
+<a name="ln565"> </a>
+<a name="ln566">  // Returns false if the CDC service has been stopped.</a>
+<a name="ln567">  auto sleep_while_not_stopped = [this]() {</a>
+<a name="ln568">    auto time_to_sleep = MonoDelta::FromMilliseconds(</a>
+<a name="ln569">        GetAtomicFlag(&amp;FLAGS_update_metrics_interval_ms));</a>
+<a name="ln570">    auto time_slept = MonoDelta::FromMilliseconds(0);</a>
+<a name="ln571">    auto sleep_period = MonoDelta::FromMilliseconds(100);</a>
+<a name="ln572">    while (time_slept &lt; time_to_sleep) {</a>
+<a name="ln573">      SleepFor(sleep_period);</a>
+<a name="ln574">      if (cdc_service_stopped_.load(std::memory_order_acquire)) {</a>
+<a name="ln575">        return false;</a>
+<a name="ln576">      }</a>
+<a name="ln577">      time_slept += sleep_period;</a>
+<a name="ln578">    }</a>
+<a name="ln579">    return true;</a>
+<a name="ln580">  };</a>
+<a name="ln581"> </a>
+<a name="ln582">  do {</a>
+<a name="ln583">    // Always update lag metrics, default every 1s.</a>
+<a name="ln584"> </a>
+<a name="ln585">    if (ANNOTATE_UNPROTECTED_READ(FLAGS_enable_collect_cdc_metrics)) {</a>
+<a name="ln586">      UpdateLagMetrics();</a>
+<a name="ln587">    }</a>
+<a name="ln588"> </a>
+<a name="ln589">    // If its not been 60s since the last peer update, continue.</a>
+<a name="ln590">    if (!FLAGS_enable_log_retention_by_op_idx || MonoTime::Now() - time_since_update_peers &lt;</a>
+<a name="ln591">        MonoDelta::FromSeconds(GetAtomicFlag(&amp;FLAGS_update_min_cdc_indices_interval_secs))) {</a>
+<a name="ln592">      continue;</a>
+<a name="ln593">    }</a>
+<a name="ln594"> </a>
+<a name="ln595">    time_since_update_peers = MonoTime::Now();</a>
+<a name="ln596">    LOG(INFO) &lt;&lt; &quot;Started to read minimum replicated indices for all tablets&quot;;</a>
+<a name="ln597"> </a>
+<a name="ln598">    client::TableHandle table;</a>
+<a name="ln599">    auto s = table.Open(kCdcStateTableName, async_client_init_-&gt;client());</a>
+<a name="ln600">    if (!s.ok()) {</a>
+<a name="ln601">      // It is possible that this runs before the cdc_state table is created. This is</a>
+<a name="ln602">      // ok. It just means that this is the first time the cluster starts.</a>
+<a name="ln603">      YB_LOG_EVERY_N_SECS(WARNING, 3600) &lt;&lt; &quot;Unable to open table &quot;</a>
+<a name="ln604">                                         &lt;&lt; kCdcStateTableName.table_name()</a>
+<a name="ln605">                                         &lt;&lt; &quot;. CDC min replicated indices won't be updated&quot;;</a>
+<a name="ln606">      continue;</a>
+<a name="ln607">    }</a>
+<a name="ln608"> </a>
+<a name="ln609">    int count = 0;</a>
+<a name="ln610">    std::unordered_map&lt;std::string, int64_t&gt; tablet_min_checkpoint_index;</a>
+<a name="ln611">    client::TableIteratorOptions options;</a>
+<a name="ln612">    bool failed = false;</a>
+<a name="ln613">    options.error_handler = [&amp;failed](const Status&amp; status) {</a>
+<a name="ln614">      LOG(WARNING) &lt;&lt; &quot;Scan of table &quot; &lt;&lt; kCdcStateTableName.table_name() &lt;&lt; &quot; failed: &quot; &lt;&lt; status;</a>
+<a name="ln615">      failed = true;</a>
+<a name="ln616">    };</a>
+<a name="ln617">    options.columns = std::vector&lt;std::string&gt;{master::kCdcTabletId, master::kCdcStreamId,</a>
+<a name="ln618">        master::kCdcCheckpoint, master::kCdcLastReplicationTime};</a>
+<a name="ln619">    for (const auto&amp; row : client::TableRange(table, options)) {</a>
+<a name="ln620">      count++;</a>
+<a name="ln621">      auto tablet_id = row.column(master::kCdcTabletIdIdx).string_value();</a>
+<a name="ln622">      auto stream_id = row.column(master::kCdcStreamIdIdx).string_value();</a>
+<a name="ln623">      auto checkpoint = row.column(master::kCdcCheckpointIdx).string_value();</a>
+<a name="ln624">      std::string last_replicated_time_str;</a>
+<a name="ln625">      const auto&amp; timestamp_ql_value = row.column(3);</a>
+<a name="ln626">      if (!timestamp_ql_value.IsNull()) {</a>
+<a name="ln627">        last_replicated_time_str = timestamp_ql_value.timestamp_value().ToFormattedString();</a>
+<a name="ln628">      }</a>
+<a name="ln629"> </a>
+<a name="ln630">      VLOG(1) &lt;&lt; &quot;stream_id: &quot; &lt;&lt; stream_id &lt;&lt; &quot;, tablet_id: &quot; &lt;&lt; tablet_id</a>
+<a name="ln631">              &lt;&lt; &quot;, checkpoint: &quot; &lt;&lt; checkpoint &lt;&lt; &quot;, last replicated time: &quot;</a>
+<a name="ln632">              &lt;&lt; last_replicated_time_str;</a>
+<a name="ln633"> </a>
+<a name="ln634">      auto result = OpId::FromString(checkpoint);</a>
+<a name="ln635">      if (!result.ok()) {</a>
+<a name="ln636">        LOG(WARNING) &lt;&lt; &quot;Read invalid op id &quot; &lt;&lt; row.column(1).string_value()</a>
+<a name="ln637">                     &lt;&lt; &quot; for tablet &quot; &lt;&lt; tablet_id;</a>
+<a name="ln638">        continue;</a>
+<a name="ln639">      }</a>
+<a name="ln640"> </a>
+<a name="ln641">      auto index = (*result).index;</a>
+<a name="ln642">      auto it = tablet_min_checkpoint_index.find(tablet_id);</a>
+<a name="ln643">      if (it == tablet_min_checkpoint_index.end()) {</a>
+<a name="ln644">        tablet_min_checkpoint_index[tablet_id] = index;</a>
+<a name="ln645">      } else {</a>
+<a name="ln646">        if (index &lt; it-&gt;second) {</a>
+<a name="ln647">          it-&gt;second = index;</a>
+<a name="ln648">        }</a>
+<a name="ln649">      }</a>
+<a name="ln650">    }</a>
+<a name="ln651">    if (failed) {</a>
+<a name="ln652">      continue;</a>
+<a name="ln653">    }</a>
+<a name="ln654">    LOG(INFO) &lt;&lt; &quot;Read &quot; &lt;&lt; count &lt;&lt; &quot; records from &quot; &lt;&lt; kCdcStateTableName.table_name();</a>
+<a name="ln655"> </a>
+<a name="ln656">    VLOG(3) &lt;&lt; &quot;tablet_min_checkpoint_index size &quot; &lt;&lt; tablet_min_checkpoint_index.size();</a>
+<a name="ln657">    for (const auto &amp;elem : tablet_min_checkpoint_index) {</a>
+<a name="ln658">      auto tablet_id = elem.first;</a>
+<a name="ln659">      std::shared_ptr&lt;tablet::TabletPeer&gt; tablet_peer;</a>
+<a name="ln660"> </a>
+<a name="ln661">      Status s = tablet_manager_-&gt;GetTabletPeer(tablet_id, &amp;tablet_peer);</a>
+<a name="ln662">      if (s.IsNotFound()) {</a>
+<a name="ln663">        VLOG(2) &lt;&lt; &quot;Did not found tablet peer for tablet &quot; &lt;&lt; tablet_id;</a>
+<a name="ln664">        continue;</a>
+<a name="ln665">      } else if (!IsTabletPeerLeader(tablet_peer)) {</a>
+<a name="ln666">        VLOG(2) &lt;&lt; &quot;Tablet peer &quot; &lt;&lt; tablet_peer-&gt;permanent_uuid()</a>
+<a name="ln667">                &lt;&lt; &quot; is not the leader for tablet &quot; &lt;&lt; tablet_id;</a>
+<a name="ln668">        continue;</a>
+<a name="ln669">      } else if (!s.ok()) {</a>
+<a name="ln670">        LOG(WARNING) &lt;&lt; &quot;Error getting tablet_peer for tablet &quot; &lt;&lt; tablet_id &lt;&lt; &quot;: &quot; &lt;&lt; s;</a>
+<a name="ln671">        continue;</a>
+<a name="ln672">      }</a>
+<a name="ln673"> </a>
+<a name="ln674">      auto min_index = elem.second;</a>
+<a name="ln675">      s = tablet_peer-&gt;set_cdc_min_replicated_index(min_index);</a>
+<a name="ln676">      if (!s.ok()) {</a>
+<a name="ln677">        LOG(WARNING) &lt;&lt; &quot;Unable to set cdc min index for tablet peer &quot;</a>
+<a name="ln678">                     &lt;&lt; tablet_peer-&gt;permanent_uuid()</a>
+<a name="ln679">                     &lt;&lt; &quot; and tablet &quot; &lt;&lt; tablet_peer-&gt;tablet_id()</a>
+<a name="ln680">                     &lt;&lt; &quot;: &quot; &lt;&lt; s;</a>
+<a name="ln681">      }</a>
+<a name="ln682">      LOG(INFO) &lt;&lt; &quot;Updating followers for tablet &quot; &lt;&lt; tablet_id &lt;&lt; &quot; with index &quot; &lt;&lt; min_index;</a>
+<a name="ln683">      UpdatePeersCdcMinReplicatedIndex(tablet_id, min_index);</a>
+<a name="ln684">    }</a>
+<a name="ln685">    LOG(INFO) &lt;&lt; &quot;Done reading all the indices for all tablets and updating peers&quot;;</a>
+<a name="ln686">  } while (sleep_while_not_stopped());</a>
+<a name="ln687">}</a>
+<a name="ln688"> </a>
+<a name="ln689">Result&lt;client::internal::RemoteTabletPtr&gt; CDCServiceImpl::GetRemoteTablet(</a>
+<a name="ln690">    const TabletId&amp; tablet_id) {</a>
+<a name="ln691">  std::promise&lt;Result&lt;client::internal::RemoteTabletPtr&gt;&gt; tablet_lookup_promise;</a>
+<a name="ln692">  auto future = tablet_lookup_promise.get_future();</a>
+<a name="ln693">  auto callback = [&amp;tablet_lookup_promise](</a>
+<a name="ln694">      const Result&lt;client::internal::RemoteTabletPtr&gt;&amp; result) {</a>
+<a name="ln695">    tablet_lookup_promise.set_value(result);</a>
+<a name="ln696">  };</a>
+<a name="ln697"> </a>
+<a name="ln698">  auto start = CoarseMonoClock::Now();</a>
+<a name="ln699">  async_client_init_-&gt;client()-&gt;LookupTabletById(</a>
+<a name="ln700">      tablet_id,</a>
+<a name="ln701">      CoarseMonoClock::Now() + MonoDelta::FromMilliseconds(FLAGS_cdc_read_rpc_timeout_ms),</a>
+<a name="ln702">      callback, client::UseCache::kFalse);</a>
+<a name="ln703">  future.wait();</a>
+<a name="ln704"> </a>
+<a name="ln705">  auto duration = CoarseMonoClock::Now() - start;</a>
+<a name="ln706">  if (duration &gt; (kMaxDurationForTabletLookup * 1ms)) {</a>
+<a name="ln707">    LOG(WARNING) &lt;&lt; &quot;LookupTabletByKey took long time: &quot; &lt;&lt; duration &lt;&lt; &quot; ms&quot;;</a>
+<a name="ln708">  }</a>
+<a name="ln709"> </a>
+<a name="ln710">  auto remote_tablet = VERIFY_RESULT(future.get());</a>
+<a name="ln711">  return remote_tablet;</a>
+<a name="ln712">}</a>
+<a name="ln713"> </a>
+<a name="ln714">Result&lt;RemoteTabletServer *&gt; CDCServiceImpl::GetLeaderTServer(const TabletId&amp; tablet_id) {</a>
+<a name="ln715">  auto result = VERIFY_RESULT(GetRemoteTablet(tablet_id));</a>
+<a name="ln716"> </a>
+<a name="ln717">  auto ts = result-&gt;LeaderTServer();</a>
+<a name="ln718">  if (ts == nullptr) {</a>
+<a name="ln719">    return STATUS(NotFound, &quot;Tablet leader not found for tablet&quot;, tablet_id);</a>
+<a name="ln720">  }</a>
+<a name="ln721">  return ts;</a>
+<a name="ln722">}</a>
+<a name="ln723"> </a>
+<a name="ln724">Status CDCServiceImpl::GetTServers(const TabletId&amp; tablet_id,</a>
+<a name="ln725">                                   std::vector&lt;client::internal::RemoteTabletServer*&gt;* servers) {</a>
+<a name="ln726">  auto result = VERIFY_RESULT(GetRemoteTablet(tablet_id));</a>
+<a name="ln727"> </a>
+<a name="ln728">  result-&gt;GetRemoteTabletServers(servers);</a>
+<a name="ln729">  return Status::OK();</a>
+<a name="ln730">}</a>
+<a name="ln731"> </a>
+<a name="ln732">std::shared_ptr&lt;CDCServiceProxy&gt; CDCServiceImpl::GetCDCServiceProxy(RemoteTabletServer* ts) {</a>
+<a name="ln733">  auto hostport = HostPortFromPB(DesiredHostPort(</a>
+<a name="ln734">      ts-&gt;public_rpc_hostports(), ts-&gt;private_rpc_hostports(), ts-&gt;cloud_info(),</a>
+<a name="ln735">      async_client_init_-&gt;client()-&gt;cloud_info()));</a>
+<a name="ln736">  DCHECK(!hostport.host().empty());</a>
+<a name="ln737"> </a>
+<a name="ln738">  {</a>
+<a name="ln739">    SharedLock&lt;decltype(mutex_)&gt; l(mutex_);</a>
+<a name="ln740">    auto it = cdc_service_map_.find(hostport);</a>
+<a name="ln741">    if (it != cdc_service_map_.end()) {</a>
+<a name="ln742">      return it-&gt;second;</a>
+<a name="ln743">    }</a>
+<a name="ln744">  }</a>
+<a name="ln745"> </a>
+<a name="ln746">  auto cdc_service = std::make_shared&lt;CDCServiceProxy&gt;(&amp;async_client_init_-&gt;client()-&gt;proxy_cache(),</a>
+<a name="ln747">                                                       hostport);</a>
+<a name="ln748">  {</a>
+<a name="ln749">    std::lock_guard&lt;decltype(mutex_)&gt; l(mutex_);</a>
+<a name="ln750">    cdc_service_map_.emplace(hostport, cdc_service);</a>
+<a name="ln751">  }</a>
+<a name="ln752">  return cdc_service;</a>
+<a name="ln753">}</a>
+<a name="ln754"> </a>
+<a name="ln755">void CDCServiceImpl::TabletLeaderGetChanges(const GetChangesRequestPB* req,</a>
+<a name="ln756">                                            GetChangesResponsePB* resp,</a>
+<a name="ln757">                                            std::shared_ptr&lt;RpcContext&gt; context,</a>
+<a name="ln758">                                            std::shared_ptr&lt;tablet::TabletPeer&gt; peer) {</a>
+<a name="ln759">  auto rpc_handle = rpcs_.Prepare();</a>
+<a name="ln760">  RPC_CHECK_AND_RETURN_ERROR(rpc_handle != rpcs_.InvalidHandle(),</a>
+<a name="ln761">      STATUS(Aborted,</a>
+<a name="ln762">          Format(&quot;Could not create valid handle for GetChangesCDCRpc: tablet=$0, peer=$1&quot;,</a>
+<a name="ln763">                 req-&gt;tablet_id(),</a>
+<a name="ln764">                 peer-&gt;permanent_uuid())),</a>
+<a name="ln765">      resp-&gt;mutable_error(), CDCErrorPB::INTERNAL_ERROR, *context.get());</a>
+<a name="ln766"> </a>
+<a name="ln767">  // Increment Proxy Metric.</a>
+<a name="ln768">  server_metrics_-&gt;cdc_rpc_proxy_count-&gt;Increment();</a>
+<a name="ln769"> </a>
+<a name="ln770">  // Forward this Request Info to the proper TabletServer.</a>
+<a name="ln771">  GetChangesRequestPB new_req;</a>
+<a name="ln772">  new_req.CopyFrom(*req);</a>
+<a name="ln773">  new_req.set_serve_as_proxy(false);</a>
+<a name="ln774">  CoarseTimePoint deadline = context-&gt;GetClientDeadline();</a>
+<a name="ln775">  if (deadline == CoarseTimePoint::max()) { // Not specified by user.</a>
+<a name="ln776">    deadline = CoarseMonoClock::now() + async_client_init_-&gt;client()-&gt;default_rpc_timeout();</a>
+<a name="ln777">  }</a>
+<a name="ln778">  *rpc_handle = CreateGetChangesCDCRpc(</a>
+<a name="ln779">      deadline,</a>
+<a name="ln780">      nullptr, /* RemoteTablet: will get this from 'new_req' */</a>
+<a name="ln781">      async_client_init_-&gt;client(),</a>
+<a name="ln782">      &amp;new_req,</a>
+<a name="ln783">      [=] (Status status, GetChangesResponsePB&amp;&amp; new_resp) {</a>
+<a name="ln784">        auto retained = rpcs_.Unregister(rpc_handle);</a>
+<a name="ln785">        *resp = std::move(new_resp);</a>
+<a name="ln786">        RPC_STATUS_RETURN_ERROR(status, resp-&gt;mutable_error(), resp-&gt;error().code(),</a>
+<a name="ln787">                                *context.get());</a>
+<a name="ln788">        context-&gt;RespondSuccess();</a>
+<a name="ln789">      });</a>
+<a name="ln790">  (**rpc_handle).SendRpc();</a>
+<a name="ln791">}</a>
+<a name="ln792"> </a>
+<a name="ln793">void CDCServiceImpl::TabletLeaderGetCheckpoint(const GetCheckpointRequestPB* req,</a>
+<a name="ln794">                                               GetCheckpointResponsePB* resp,</a>
+<a name="ln795">                                               RpcContext* context,</a>
+<a name="ln796">                                               const std::shared_ptr&lt;tablet::TabletPeer&gt;&amp; peer) {</a>
+<a name="ln797">  auto result = GetLeaderTServer(req-&gt;tablet_id());</a>
+<a name="ln798">  RPC_CHECK_AND_RETURN_ERROR(result.ok(), result.status(), resp-&gt;mutable_error(),</a>
+<a name="ln799">                             CDCErrorPB::TABLET_NOT_FOUND, *context);</a>
+<a name="ln800"> </a>
+<a name="ln801">  auto ts_leader = *result;</a>
+<a name="ln802">  // Check that tablet leader identified by master is not current tablet peer.</a>
+<a name="ln803">  // This can happen during tablet rebalance if master and tserver have different views of</a>
+<a name="ln804">  // leader. We need to avoid self-looping in this case.</a>
+<a name="ln805">  if (peer) {</a>
+<a name="ln806">    RPC_CHECK_NE_AND_RETURN_ERROR(ts_leader-&gt;permanent_uuid(), peer-&gt;permanent_uuid(),</a>
+<a name="ln807">                                  STATUS(IllegalState,</a>
+<a name="ln808">                                         Format(&quot;Tablet leader changed: leader=$0, peer=$1&quot;,</a>
+<a name="ln809">                                                ts_leader-&gt;permanent_uuid(),</a>
+<a name="ln810">                                                peer-&gt;permanent_uuid())),</a>
+<a name="ln811">                                  resp-&gt;mutable_error(), CDCErrorPB::NOT_LEADER, *context);</a>
+<a name="ln812">  }</a>
+<a name="ln813"> </a>
+<a name="ln814">  auto cdc_proxy = GetCDCServiceProxy(ts_leader);</a>
+<a name="ln815">  rpc::RpcController rpc;</a>
+<a name="ln816">  rpc.set_timeout(MonoDelta::FromMilliseconds(FLAGS_cdc_read_rpc_timeout_ms));</a>
+<a name="ln817">  // TODO(NIC): Change to GetCheckpointAsync like CDCPoller::DoPoll.</a>
+<a name="ln818">  auto status = cdc_proxy-&gt;GetCheckpoint(*req, resp, &amp;rpc);</a>
+<a name="ln819">  RPC_STATUS_RETURN_ERROR(status, resp-&gt;mutable_error(), CDCErrorPB::INTERNAL_ERROR, *context);</a>
+<a name="ln820">  context-&gt;RespondSuccess();</a>
+<a name="ln821">}</a>
+<a name="ln822"> </a>
+<a name="ln823">void CDCServiceImpl::GetCheckpoint(const GetCheckpointRequestPB* req,</a>
+<a name="ln824">                                   GetCheckpointResponsePB* resp,</a>
+<a name="ln825">                                   RpcContext context) {</a>
+<a name="ln826">  if (!CheckOnline(req, resp, &amp;context)) {</a>
+<a name="ln827">    return;</a>
+<a name="ln828">  }</a>
+<a name="ln829"> </a>
+<a name="ln830">  RPC_CHECK_AND_RETURN_ERROR(req-&gt;has_tablet_id(),</a>
+<a name="ln831">                             STATUS(InvalidArgument, &quot;Tablet ID is required to get CDC checkpoint&quot;),</a>
+<a name="ln832">                             resp-&gt;mutable_error(),</a>
+<a name="ln833">                             CDCErrorPB::INVALID_REQUEST,</a>
+<a name="ln834">                             context);</a>
+<a name="ln835">  RPC_CHECK_AND_RETURN_ERROR(req-&gt;has_stream_id(),</a>
+<a name="ln836">                             STATUS(InvalidArgument, &quot;Stream ID is required to get CDC checkpoint&quot;),</a>
+<a name="ln837">                             resp-&gt;mutable_error(),</a>
+<a name="ln838">                             CDCErrorPB::INVALID_REQUEST,</a>
+<a name="ln839">                             context);</a>
+<a name="ln840"> </a>
+<a name="ln841">  std::shared_ptr&lt;tablet::TabletPeer&gt; tablet_peer;</a>
+<a name="ln842">  Status s = tablet_manager_-&gt;GetTabletPeer(req-&gt;tablet_id(), &amp;tablet_peer);</a>
+<a name="ln843"> </a>
+<a name="ln844">  if (s.IsNotFound() || !IsTabletPeerLeader(tablet_peer)) {</a>
+<a name="ln845">    // Forward GetChanges() to tablet leader. This happens often in Kubernetes setups.</a>
+<a name="ln846">    TabletLeaderGetCheckpoint(req, resp, &amp;context, tablet_peer);</a>
+<a name="ln847">    return;</a>
+<a name="ln848">  }</a>
+<a name="ln849"> </a>
+<a name="ln850">  // Check that requested tablet_id is part of the CDC stream.</a>
+<a name="ln851">  ProducerTabletInfo producer_tablet = {&quot;&quot; /* UUID */, req-&gt;stream_id(), req-&gt;tablet_id()};</a>
+<a name="ln852">  s = CheckTabletValidForStream(producer_tablet);</a>
+<a name="ln853">  RPC_STATUS_RETURN_ERROR(s, resp-&gt;mutable_error(), CDCErrorPB::INVALID_REQUEST, context);</a>
+<a name="ln854"> </a>
+<a name="ln855">  auto session = async_client_init_-&gt;client()-&gt;NewSession();</a>
+<a name="ln856"> </a>
+<a name="ln857">  auto result = GetLastCheckpoint(producer_tablet, session);</a>
+<a name="ln858">  RPC_CHECK_AND_RETURN_ERROR(result.ok(), result.status(), resp-&gt;mutable_error(),</a>
+<a name="ln859">                             CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln860"> </a>
+<a name="ln861">  result-&gt;ToPB(resp-&gt;mutable_checkpoint()-&gt;mutable_op_id());</a>
+<a name="ln862">  context.RespondSuccess();</a>
+<a name="ln863">}</a>
+<a name="ln864"> </a>
+<a name="ln865">void CDCServiceImpl::UpdateCdcReplicatedIndex(const UpdateCdcReplicatedIndexRequestPB* req,</a>
+<a name="ln866">                                              UpdateCdcReplicatedIndexResponsePB* resp,</a>
+<a name="ln867">                                              rpc::RpcContext context) {</a>
+<a name="ln868">  if (!CheckOnline(req, resp, &amp;context)) {</a>
+<a name="ln869">    return;</a>
+<a name="ln870">  }</a>
+<a name="ln871"> </a>
+<a name="ln872">  RPC_CHECK_AND_RETURN_ERROR(req-&gt;has_tablet_id(),</a>
+<a name="ln873">                             STATUS(InvalidArgument,</a>
+<a name="ln874">                                    &quot;Tablet ID is required to set the log replicated index&quot;),</a>
+<a name="ln875">                             resp-&gt;mutable_error(),</a>
+<a name="ln876">                             CDCErrorPB::INVALID_REQUEST,</a>
+<a name="ln877">                             context);</a>
+<a name="ln878"> </a>
+<a name="ln879">  RPC_CHECK_AND_RETURN_ERROR(req-&gt;has_replicated_index(),</a>
+<a name="ln880">                             STATUS(InvalidArgument,</a>
+<a name="ln881">                                    &quot;Replicated index is required to set the log replicated index&quot;),</a>
+<a name="ln882">                             resp-&gt;mutable_error(),</a>
+<a name="ln883">                             CDCErrorPB::INVALID_REQUEST,</a>
+<a name="ln884">                             context);</a>
+<a name="ln885"> </a>
+<a name="ln886">  std::shared_ptr&lt;tablet::TabletPeer&gt; tablet_peer;</a>
+<a name="ln887">  RPC_STATUS_RETURN_ERROR(tablet_manager_-&gt;GetTabletPeer(req-&gt;tablet_id(), &amp;tablet_peer),</a>
+<a name="ln888">                          resp-&gt;mutable_error(), CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln889"> </a>
+<a name="ln890">  RPC_CHECK_AND_RETURN_ERROR(tablet_peer-&gt;log_available(),</a>
+<a name="ln891">                             STATUS(TryAgain, &quot;Tablet peer is not ready to set its log cdc index&quot;),</a>
+<a name="ln892">                             resp-&gt;mutable_error(),</a>
+<a name="ln893">                             CDCErrorPB::INTERNAL_ERROR,</a>
+<a name="ln894">                             context);</a>
+<a name="ln895"> </a>
+<a name="ln896">  RPC_STATUS_RETURN_ERROR(tablet_peer-&gt;set_cdc_min_replicated_index(req-&gt;replicated_index()),</a>
+<a name="ln897">                          resp-&gt;mutable_error(), CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln898"> </a>
+<a name="ln899">  context.RespondSuccess();</a>
+<a name="ln900">}</a>
+<a name="ln901"> </a>
+<a name="ln902">  Result&lt;OpId&gt; CDCServiceImpl::TabletLeaderLatestEntryOpId(const TabletId&amp; tablet_id) {</a>
+<a name="ln903">    auto ts_leader = VERIFY_RESULT(GetLeaderTServer(tablet_id));</a>
+<a name="ln904"> </a>
+<a name="ln905">    auto cdc_proxy = GetCDCServiceProxy(ts_leader);</a>
+<a name="ln906">    rpc::RpcController rpc;</a>
+<a name="ln907">    rpc.set_timeout(MonoDelta::FromMilliseconds(FLAGS_cdc_read_rpc_timeout_ms));</a>
+<a name="ln908">    GetLatestEntryOpIdRequestPB req;</a>
+<a name="ln909">    GetLatestEntryOpIdResponsePB resp;</a>
+<a name="ln910">    req.set_tablet_id(tablet_id);</a>
+<a name="ln911">    auto status = cdc_proxy-&gt;GetLatestEntryOpId(req, &amp;resp, &amp;rpc);</a>
+<a name="ln912">    if (!status.ok()) {</a>
+<a name="ln913">      // If we failed to get the latest entry op id, we try other tservers. The leader is guaranteed</a>
+<a name="ln914">      // to have the most up-to-date information, but for our purposes, it's ok to be slightly</a>
+<a name="ln915">      // behind.</a>
+<a name="ln916">      std::vector&lt;client::internal::RemoteTabletServer *&gt; servers;</a>
+<a name="ln917">      auto s = GetTServers(tablet_id, &amp;servers);</a>
+<a name="ln918">      for (const auto&amp; server : servers) {</a>
+<a name="ln919">        // We don't want to try the leader again.</a>
+<a name="ln920">        if (server-&gt;permanent_uuid() == ts_leader-&gt;permanent_uuid()) {</a>
+<a name="ln921">          continue;</a>
+<a name="ln922">        }</a>
+<a name="ln923">        auto follower_cdc_proxy = GetCDCServiceProxy(server);</a>
+<a name="ln924">        status = follower_cdc_proxy-&gt;GetLatestEntryOpId(req, &amp;resp, &amp;rpc);</a>
+<a name="ln925">        if (status.ok()) {</a>
+<a name="ln926">          return OpId::FromPB(resp.op_id());</a>
+<a name="ln927">        }</a>
+<a name="ln928">      }</a>
+<a name="ln929">      DCHECK(!status.ok());</a>
+<a name="ln930">      return status;</a>
+<a name="ln931">    }</a>
+<a name="ln932">    return OpId::FromPB(resp.op_id());</a>
+<a name="ln933">  }</a>
+<a name="ln934"> </a>
+<a name="ln935">void CDCServiceImpl::GetLatestEntryOpId(const GetLatestEntryOpIdRequestPB* req,</a>
+<a name="ln936">                                        GetLatestEntryOpIdResponsePB* resp,</a>
+<a name="ln937">                                        rpc::RpcContext context) {</a>
+<a name="ln938">  std::shared_ptr&lt;tablet::TabletPeer&gt; tablet_peer;</a>
+<a name="ln939">  Status s = tablet_manager_-&gt;GetTabletPeer(req-&gt;tablet_id(), &amp;tablet_peer);</a>
+<a name="ln940">  RPC_STATUS_RETURN_ERROR(s, resp-&gt;mutable_error(), CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln941"> </a>
+<a name="ln942">  if (!tablet_peer-&gt;log_available()) {</a>
+<a name="ln943">    const string err_message = strings::Substitute(&quot;Unable to get the latest entry op id from &quot;</a>
+<a name="ln944">        &quot;peer $0 and tablet $1 because its log object hasn't been initialized&quot;,</a>
+<a name="ln945">        tablet_peer-&gt;permanent_uuid(), tablet_peer-&gt;tablet_id());</a>
+<a name="ln946">    LOG(WARNING) &lt;&lt; err_message;</a>
+<a name="ln947">    SetupErrorAndRespond(resp-&gt;mutable_error(),</a>
+<a name="ln948">                         STATUS(ServiceUnavailable, err_message),</a>
+<a name="ln949">                         CDCErrorPB::INTERNAL_ERROR,</a>
+<a name="ln950">                         &amp;context);</a>
+<a name="ln951">    return;</a>
+<a name="ln952">  }</a>
+<a name="ln953">  OpId op_id = tablet_peer-&gt;log()-&gt;GetLatestEntryOpId();</a>
+<a name="ln954">  op_id.ToPB(resp-&gt;mutable_op_id());</a>
+<a name="ln955">  context.RespondSuccess();</a>
+<a name="ln956">}</a>
+<a name="ln957"> </a>
+<a name="ln958">void CDCServiceImpl::BootstrapProducer(const BootstrapProducerRequestPB* req,</a>
+<a name="ln959">                                       BootstrapProducerResponsePB* resp,</a>
+<a name="ln960">                                       rpc::RpcContext context) {</a>
+<a name="ln961">  LOG(INFO) &lt;&lt; &quot;Received BootstrapProducer request &quot; &lt;&lt; req-&gt;ShortDebugString();</a>
+<a name="ln962">  RPC_CHECK_AND_RETURN_ERROR(req-&gt;table_ids().size() &gt; 0,</a>
+<a name="ln963">                             STATUS(InvalidArgument, &quot;Table ID is required to create CDC stream&quot;),</a>
+<a name="ln964">                             resp-&gt;mutable_error(),</a>
+<a name="ln965">                             CDCErrorPB::INVALID_REQUEST,</a>
+<a name="ln966">                             context);</a>
+<a name="ln967"> </a>
+<a name="ln968">  client::TableHandle cdc_state_table;</a>
+<a name="ln969"> </a>
+<a name="ln970">  std::vector&lt;client::YBOperationPtr&gt; ops;</a>
+<a name="ln971">  auto session = async_client_init_-&gt;client()-&gt;NewSession();</a>
+<a name="ln972"> </a>
+<a name="ln973">  // Used to delete streams in case of failure.</a>
+<a name="ln974">  std::vector&lt;CDCStreamId&gt; created_cdc_streams;</a>
+<a name="ln975">  auto scope_exit = ScopeExit([this, &amp;created_cdc_streams] {</a>
+<a name="ln976">    if (!created_cdc_streams.empty()) {</a>
+<a name="ln977">      Status s = async_client_init_-&gt;client()-&gt;DeleteCDCStream(created_cdc_streams);</a>
+<a name="ln978">      if (!s.ok()) {</a>
+<a name="ln979">        LOG(WARNING) &lt;&lt; &quot;Unable to delete streams &quot; &lt;&lt; JoinCSVLine(created_cdc_streams)</a>
+<a name="ln980">                     &lt;&lt; &quot;: &quot; &lt;&lt; s;</a>
+<a name="ln981">      }</a>
+<a name="ln982">    }</a>
+<a name="ln983">  });</a>
+<a name="ln984"> </a>
+<a name="ln985">  std::vector&lt;CDCStreamId&gt; bootstrap_ids;</a>
+<a name="ln986"> </a>
+<a name="ln987">  for (const auto&amp; table_id : req-&gt;table_ids()) {</a>
+<a name="ln988">    std::shared_ptr&lt;client::YBTable&gt; table;</a>
+<a name="ln989">    Status s = async_client_init_-&gt;client()-&gt;OpenTable(table_id, &amp;table);</a>
+<a name="ln990">    RPC_STATUS_RETURN_ERROR(s, resp-&gt;mutable_error(), CDCErrorPB::TABLE_NOT_FOUND, context);</a>
+<a name="ln991"> </a>
+<a name="ln992">    // TODO: We will support YSQL tables once we can take backups for those tables.</a>
+<a name="ln993">    RPC_CHECK_NE_AND_RETURN_ERROR(table-&gt;table_type(), client::YBTableType::PGSQL_TABLE_TYPE,</a>
+<a name="ln994">        STATUS(InvalidArgument, &quot;Bootstrapping and backup of YSQL tables is not supported yet&quot;),</a>
+<a name="ln995">        resp-&gt;mutable_error(),</a>
+<a name="ln996">        CDCErrorPB::INVALID_REQUEST,</a>
+<a name="ln997">        context);</a>
+<a name="ln998"> </a>
+<a name="ln999">    // Generate a bootstrap id by calling CreateCDCStream, and also setup the stream in the master.</a>
+<a name="ln1000">    // If the consumer's master sends a CreateCDCStream with a bootstrap id, the producer's master</a>
+<a name="ln1001">    // will verify that the stream id exists and return success if it does since everything else</a>
+<a name="ln1002">    // has already been done by this call.</a>
+<a name="ln1003">    std::unordered_map&lt;std::string, std::string&gt; options;</a>
+<a name="ln1004">    options.reserve(2);</a>
+<a name="ln1005">    options.emplace(cdc::kRecordType, CDCRecordType_Name(cdc::CDCRecordType::CHANGE));</a>
+<a name="ln1006">    options.emplace(cdc::kRecordFormat, CDCRecordFormat_Name(cdc::CDCRecordFormat::WAL));</a>
+<a name="ln1007"> </a>
+<a name="ln1008">    auto result = async_client_init_-&gt;client()-&gt;CreateCDCStream(table_id, options);</a>
+<a name="ln1009">    RPC_CHECK_AND_RETURN_ERROR(result.ok(), result.status(), resp-&gt;mutable_error(),</a>
+<a name="ln1010">                               CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln1011">    const std::string&amp; bootstrap_id = *result;</a>
+<a name="ln1012">    created_cdc_streams.push_back(bootstrap_id);</a>
+<a name="ln1013"> </a>
+<a name="ln1014">    if (!cdc_state_table.table()) {</a>
+<a name="ln1015">      Status s = cdc_state_table.Open(kCdcStateTableName, async_client_init_-&gt;client());</a>
+<a name="ln1016">      RPC_STATUS_RETURN_ERROR(s, resp-&gt;mutable_error(), CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln1017">    }</a>
+<a name="ln1018"> </a>
+<a name="ln1019">    google::protobuf::RepeatedPtrField&lt;master::TabletLocationsPB&gt; tablets;</a>
+<a name="ln1020">    s = async_client_init_-&gt;client()-&gt;GetTabletsFromTableId(table_id, 0, &amp;tablets);</a>
+<a name="ln1021">    RPC_STATUS_RETURN_ERROR(s, resp-&gt;mutable_error(), CDCErrorPB::TABLE_NOT_FOUND, context);</a>
+<a name="ln1022"> </a>
+<a name="ln1023">    // For each tablet, create a row in cdc_state table containing the generated bootstrap id, and</a>
+<a name="ln1024">    // the latest op id in the logs.</a>
+<a name="ln1025">    for (const auto &amp;tablet : tablets) {</a>
+<a name="ln1026">      std::shared_ptr&lt;tablet::TabletPeer&gt; tablet_peer;</a>
+<a name="ln1027">      OpId op_id;</a>
+<a name="ln1028"> </a>
+<a name="ln1029">      s = tablet_manager_-&gt;GetTabletPeer(tablet.tablet_id(), &amp;tablet_peer);</a>
+<a name="ln1030">      if (!s.ok()) {</a>
+<a name="ln1031">        auto result = TabletLeaderLatestEntryOpId(tablet.tablet_id());</a>
+<a name="ln1032">        RPC_CHECK_AND_RETURN_ERROR(result.ok(), result.status(), resp-&gt;mutable_error(),</a>
+<a name="ln1033">            CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln1034">        op_id = *result;</a>
+<a name="ln1035">      } else {</a>
+<a name="ln1036">        if (!tablet_peer-&gt;log_available()) {</a>
+<a name="ln1037">          const string err_message = strings::Substitute(&quot;Unable to get the latest entry op id &quot;</a>
+<a name="ln1038">              &quot;from peer $0 and tablet $1 because its log object hasn't been initialized&quot;,</a>
+<a name="ln1039">              tablet_peer-&gt;permanent_uuid(), tablet_peer-&gt;tablet_id());</a>
+<a name="ln1040">          LOG(WARNING) &lt;&lt; err_message;</a>
+<a name="ln1041">          SetupErrorAndRespond(resp-&gt;mutable_error(),</a>
+<a name="ln1042">                               STATUS(ServiceUnavailable, err_message),</a>
+<a name="ln1043">                               CDCErrorPB::INTERNAL_ERROR,</a>
+<a name="ln1044">                               &amp;context);</a>
+<a name="ln1045">          return;</a>
+<a name="ln1046">        }</a>
+<a name="ln1047">        op_id = tablet_peer-&gt;log()-&gt;GetLatestEntryOpId();</a>
+<a name="ln1048">      }</a>
+<a name="ln1049"> </a>
+<a name="ln1050">      const auto op = cdc_state_table.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);</a>
+<a name="ln1051">      auto *const write_req = op-&gt;mutable_request();</a>
+<a name="ln1052"> </a>
+<a name="ln1053">      QLAddStringHashValue(write_req, tablet.tablet_id());</a>
+<a name="ln1054">      QLAddStringRangeValue(write_req, bootstrap_id);</a>
+<a name="ln1055">      cdc_state_table.AddStringColumnValue(write_req, master::kCdcCheckpoint, op_id.ToString());</a>
+<a name="ln1056">      ops.push_back(std::move(op));</a>
+<a name="ln1057"> </a>
+<a name="ln1058">      {</a>
+<a name="ln1059">        ProducerTabletInfo producer_tablet{</a>
+<a name="ln1060">          &quot;&quot; /* Universe UUID */, bootstrap_id, tablet.tablet_id()};</a>
+<a name="ln1061">        auto now = CoarseMonoClock::Now();</a>
+<a name="ln1062">        TabletCheckpoint sent_checkpoint({op_id, now});</a>
+<a name="ln1063">        TabletCheckpoint commit_checkpoint({op_id, now});</a>
+<a name="ln1064">        std::lock_guard&lt;decltype(mutex_)&gt; l(mutex_);</a>
+<a name="ln1065">        tablet_checkpoints_.emplace(producer_tablet, commit_checkpoint, sent_checkpoint);</a>
+<a name="ln1066">      }</a>
+<a name="ln1067">    }</a>
+<a name="ln1068">    bootstrap_ids.push_back(std::move(bootstrap_id));</a>
+<a name="ln1069">  }</a>
+<a name="ln1070">  Status s = session-&gt;ApplyAndFlush(ops);</a>
+<a name="ln1071">  RPC_STATUS_RETURN_ERROR(s, resp-&gt;mutable_error(), CDCErrorPB::INTERNAL_ERROR, context);</a>
+<a name="ln1072"> </a>
+<a name="ln1073">  for (const auto&amp; bootstrap_id : bootstrap_ids) {</a>
+<a name="ln1074">    resp-&gt;add_cdc_bootstrap_ids(bootstrap_id);</a>
+<a name="ln1075">  }</a>
+<a name="ln1076">  // Clear this vector so no streams are deleted by scope_exit since we succeeded.</a>
+<a name="ln1077">  created_cdc_streams.clear();</a>
+<a name="ln1078">  context.RespondSuccess();</a>
+<a name="ln1079">}</a>
+<a name="ln1080"> </a>
+<a name="ln1081">void CDCServiceImpl::Shutdown() {</a>
+<a name="ln1082">  if (async_client_init_) {</a>
+<a name="ln1083">    async_client_init_-&gt;Shutdown();</a>
+<a name="ln1084">    rpcs_.Shutdown();</a>
+<a name="ln1085">    if (update_peers_and_metrics_thread_) {</a>
+<a name="ln1086">      cdc_service_stopped_.store(true, std::memory_order_release);</a>
+<a name="ln1087">      update_peers_and_metrics_thread_-&gt;join();</a>
+<a name="ln1088">    }</a>
+<a name="ln1089">    async_client_init_ = boost::none;</a>
+<a name="ln1090">  }</a>
+<a name="ln1091">}</a>
+<a name="ln1092"> </a>
+<a name="ln1093">Result&lt;OpId&gt; CDCServiceImpl::GetLastCheckpoint(</a>
+<a name="ln1094">    const ProducerTabletInfo&amp; producer_tablet,</a>
+<a name="ln1095">    const std::shared_ptr&lt;client::YBSession&gt;&amp; session) {</a>
+<a name="ln1096">  {</a>
+<a name="ln1097">    SharedLock&lt;decltype(mutex_)&gt; l(mutex_);</a>
+<a name="ln1098">    auto it = tablet_checkpoints_.find(producer_tablet);</a>
+<a name="ln1099">    if (it != tablet_checkpoints_.end()) {</a>
+<a name="ln1100">      // Use checkpoint from cache only if it is current.</a>
+<a name="ln1101">      if (it-&gt;cdc_state_checkpoint.op_id.index &gt; 0 &amp;&amp;</a>
+<a name="ln1102">          CoarseMonoClock::Now() - it-&gt;cdc_state_checkpoint.last_update_time &lt;=</a>
+<a name="ln1103">              (FLAGS_cdc_state_checkpoint_update_interval_ms * 1ms)) {</a>
+<a name="ln1104">        return it-&gt;cdc_state_checkpoint.op_id;</a>
+<a name="ln1105">      }</a>
+<a name="ln1106">    }</a>
+<a name="ln1107">  }</a>
+<a name="ln1108"> </a>
+<a name="ln1109">  client::TableHandle table;</a>
+<a name="ln1110">  RETURN_NOT_OK(table.Open(kCdcStateTableName, async_client_init_-&gt;client()));</a>
+<a name="ln1111"> </a>
+<a name="ln1112">  const auto op = table.NewReadOp();</a>
+<a name="ln1113">  auto* const req = op-&gt;mutable_request();</a>
+<a name="ln1114">  DCHECK(!producer_tablet.stream_id.empty() &amp;&amp; !producer_tablet.tablet_id.empty());</a>
+<a name="ln1115">  QLAddStringHashValue(req, producer_tablet.tablet_id);</a>
+<a name="ln1116"> </a>
+<a name="ln1117">  auto cond = req-&gt;mutable_where_expr()-&gt;mutable_condition();</a>
+<a name="ln1118">  cond-&gt;set_op(QLOperator::QL_OP_AND);</a>
+<a name="ln1119">  QLAddStringCondition(cond, Schema::first_column_id() + master::kCdcStreamIdIdx,</a>
+<a name="ln1120">      QL_OP_EQUAL, producer_tablet.stream_id);</a>
+<a name="ln1121">  req-&gt;mutable_column_refs()-&gt;add_ids(Schema::first_column_id() + master::kCdcTabletIdIdx);</a>
+<a name="ln1122">  req-&gt;mutable_column_refs()-&gt;add_ids(Schema::first_column_id() + master::kCdcStreamIdIdx);</a>
+<a name="ln1123">  table.AddColumns({master::kCdcCheckpoint}, req);</a>
+<a name="ln1124"> </a>
+<a name="ln1125">  RETURN_NOT_OK(session-&gt;ReadSync(op));</a>
+<a name="ln1126">  auto row_block = ql::RowsResult(op.get()).GetRowBlock();</a>
+<a name="ln1127">  if (row_block-&gt;row_count() == 0) {</a>
+<a name="ln1128">    return OpId(0, 0);</a>
+<a name="ln1129">  }</a>
+<a name="ln1130"> </a>
+<a name="ln1131">  DCHECK_EQ(row_block-&gt;row_count(), 1);</a>
+<a name="ln1132">  DCHECK_EQ(row_block-&gt;row(0).column(0).type(), InternalType::kStringValue);</a>
+<a name="ln1133"> </a>
+<a name="ln1134">  return OpId::FromString(row_block-&gt;row(0).column(0).string_value());</a>
+<a name="ln1135">}</a>
+<a name="ln1136"> </a>
+<a name="ln1137">Status CDCServiceImpl::UpdateCheckpoint(const ProducerTabletInfo&amp; producer_tablet,</a>
+<a name="ln1138">                                        const OpId&amp; sent_op_id,</a>
+<a name="ln1139">                                        const OpId&amp; commit_op_id,</a>
+<a name="ln1140">                                        const std::shared_ptr&lt;client::YBSession&gt;&amp; session,</a>
+<a name="ln1141">                                        uint64_t last_record_hybrid_time) {</a>
+<a name="ln1142">  bool update_cdc_state = true;</a>
+<a name="ln1143">  auto now = CoarseMonoClock::Now();</a>
+<a name="ln1144">  TabletCheckpoint sent_checkpoint({sent_op_id, now});</a>
+<a name="ln1145">  TabletCheckpoint commit_checkpoint({commit_op_id, now});</a>
+<a name="ln1146"> </a>
+<a name="ln1147">  {</a>
+<a name="ln1148">    std::lock_guard&lt;decltype(mutex_)&gt; l(mutex_);</a>
+<a name="ln1149">    auto it = tablet_checkpoints_.find(producer_tablet);</a>
+<a name="ln1150">    if (it != tablet_checkpoints_.end()) {</a>
+<a name="ln1151">      it-&gt;sent_checkpoint = sent_checkpoint;</a>
+<a name="ln1152"> </a>
+<a name="ln1153">      if (commit_op_id.index &gt; 0) {</a>
+<a name="ln1154">        it-&gt;cdc_state_checkpoint.op_id = commit_op_id;</a>
+<a name="ln1155">      }</a>
+<a name="ln1156"> </a>
+<a name="ln1157">      // Check if we need to update cdc_state table.</a>
+<a name="ln1158">      if (now - it-&gt;cdc_state_checkpoint.last_update_time &lt;=</a>
+<a name="ln1159">          (FLAGS_cdc_state_checkpoint_update_interval_ms * 1ms)) {</a>
+<a name="ln1160">        update_cdc_state = false;</a>
+<a name="ln1161">      } else {</a>
+<a name="ln1162">        it-&gt;cdc_state_checkpoint.last_update_time = now;</a>
+<a name="ln1163">      }</a>
+<a name="ln1164">    } else {</a>
+<a name="ln1165">      tablet_checkpoints_.emplace(producer_tablet, commit_checkpoint, sent_checkpoint);</a>
+<a name="ln1166">    }</a>
+<a name="ln1167">  }</a>
+<a name="ln1168"> </a>
+<a name="ln1169">  if (update_cdc_state) {</a>
+<a name="ln1170">    client::TableHandle table;</a>
+<a name="ln1171">    RETURN_NOT_OK(table.Open(kCdcStateTableName, async_client_init_-&gt;client()));</a>
+<a name="ln1172">    const auto op = table.NewUpdateOp();</a>
+<a name="ln1173">    auto* const req = op-&gt;mutable_request();</a>
+<a name="ln1174">    DCHECK(!producer_tablet.stream_id.empty() &amp;&amp; !producer_tablet.tablet_id.empty());</a>
+<a name="ln1175">    QLAddStringHashValue(req, producer_tablet.tablet_id);</a>
+<a name="ln1176">    QLAddStringRangeValue(req, producer_tablet.stream_id);</a>
+<a name="ln1177">    table.AddStringColumnValue(req, master::kCdcCheckpoint, commit_op_id.ToString());</a>
+<a name="ln1178">    // If we have a last record hybrid time, use that for physical time. If not, it means we're</a>
+<a name="ln1179">    // caught up, so the current time.</a>
+<a name="ln1180">    uint64_t last_replication_time_micros = last_record_hybrid_time != 0 ?</a>
+<a name="ln1181">        HybridTime(last_record_hybrid_time).GetPhysicalValueMicros() : GetCurrentTimeMicros();</a>
+<a name="ln1182">    table.AddTimestampColumnValue(</a>
+<a name="ln1183">        req, master::kCdcLastReplicationTime,</a>
+<a name="ln1184">        last_replication_time_micros);</a>
+<a name="ln1185">    RETURN_NOT_OK(session-&gt;ApplyAndFlush(op));</a>
+<a name="ln1186">  }</a>
+<a name="ln1187"> </a>
+<a name="ln1188">  return Status::OK();</a>
+<a name="ln1189">}</a>
+<a name="ln1190"> </a>
+<a name="ln1191">OpId CDCServiceImpl::GetMinSentCheckpointForTablet(const std::string&amp; tablet_id) {</a>
+<a name="ln1192">  OpId min_op_id = OpId::Max();</a>
+<a name="ln1193">  auto now = CoarseMonoClock::Now();</a>
+<a name="ln1194"> </a>
+<a name="ln1195">  SharedLock&lt;rw_spinlock&gt; l(mutex_);</a>
+<a name="ln1196">  auto it_range = tablet_checkpoints_.get&lt;TabletTag&gt;().equal_range(tablet_id);</a>
+<a name="ln1197">  if (it_range.first == it_range.second) {</a>
+<a name="ln1198">    LOG(WARNING) &lt;&lt; &quot;Tablet ID not found in stream_tablets map: &quot; &lt;&lt; tablet_id;</a>
+<a name="ln1199">    return min_op_id;</a>
+<a name="ln1200">  }</a>
+<a name="ln1201"> </a>
+<a name="ln1202">  auto cdc_checkpoint_opid_interval = FLAGS_cdc_checkpoint_opid_interval_ms * 1ms;</a>
+<a name="ln1203">  for (auto it = it_range.first; it != it_range.second; ++it) {</a>
+<a name="ln1204">    // We don't want to include streams that are not being actively polled.</a>
+<a name="ln1205">    // So, if the stream has not been polled in the last x seconds,</a>
+<a name="ln1206">    // then we ignore that stream while calculating min op ID.</a>
+<a name="ln1207">    if (now - it-&gt;sent_checkpoint.last_update_time &lt;= cdc_checkpoint_opid_interval &amp;&amp;</a>
+<a name="ln1208">        it-&gt;sent_checkpoint.op_id.index &lt; min_op_id.index) {</a>
+<a name="ln1209">      min_op_id = it-&gt;sent_checkpoint.op_id;</a>
+<a name="ln1210">    }</a>
+<a name="ln1211">  }</a>
+<a name="ln1212">  return min_op_id;</a>
+<a name="ln1213">}</a>
+<a name="ln1214"> </a>
+<a name="ln1215">std::shared_ptr&lt;CDCTabletMetrics&gt; CDCServiceImpl::GetCDCTabletMetrics(</a>
+<a name="ln1216">    const ProducerTabletInfo&amp; producer,</a>
+<a name="ln1217">    std::shared_ptr&lt;tablet::TabletPeer&gt; tablet_peer) {</a>
+<a name="ln1218">  // 'nullptr' not recommended: using for tests.</a>
+<a name="ln1219">  if (tablet_peer == nullptr) {</a>
+<a name="ln1220">    auto status = tablet_manager_-&gt;GetTabletPeer(producer.tablet_id, &amp;tablet_peer);</a>
+<a name="ln1221">    if (!status.ok() || tablet_peer == nullptr) return nullptr;</a>
+<a name="ln1222">  }</a>
+<a name="ln1223"> </a>
+<a name="ln1224">  auto tablet = tablet_peer-&gt;shared_tablet();</a>
+<a name="ln1225">  if (tablet == nullptr) return nullptr;</a>
+<a name="ln1226"> </a>
+<a name="ln1227">  std::string key = &quot;CDCMetrics::&quot; + producer.stream_id;</a>
+<a name="ln1228">  std::shared_ptr&lt;void&gt; metrics_raw = tablet-&gt;GetAdditionalMetadata(key);</a>
+<a name="ln1229">  if (metrics_raw == nullptr) {</a>
+<a name="ln1230">    //  Create a new METRIC_ENTITY_cdc here.</a>
+<a name="ln1231">    MetricEntity::AttributeMap attrs;</a>
+<a name="ln1232">    {</a>
+<a name="ln1233">      SharedLock&lt;rw_spinlock&gt; l(mutex_);</a>
+<a name="ln1234">      auto it = stream_metadata_.find(producer.stream_id);</a>
+<a name="ln1235">      attrs[&quot;table_id&quot;] = it != stream_metadata_.end() ?</a>
+<a name="ln1236">          it-&gt;second-&gt;table_id : kDefaultMetricTableId;</a>
+<a name="ln1237">      // Todo(Rahul): Right now, we don't easily expose table name from the producer.</a>
+<a name="ln1238">      // Populate this table name when we expose per table stats.</a>
+<a name="ln1239">      attrs[&quot;table_name&quot;] = kDefaultMetricTableName;</a>
+<a name="ln1240">      attrs[&quot;stream_id&quot;] = producer.stream_id;</a>
+<a name="ln1241">    }</a>
+<a name="ln1242">    auto entity = METRIC_ENTITY_cdc.Instantiate(metric_registry_,</a>
+<a name="ln1243">        std::to_string(ProducerTabletInfo::Hash {}(producer)), attrs);</a>
+<a name="ln1244">    metrics_raw = std::make_shared&lt;CDCTabletMetrics&gt;(entity);</a>
+<a name="ln1245">    // Adding the new metric to the tablet so it maintains the same lifetime scope.</a>
+<a name="ln1246">    tablet-&gt;AddAdditionalMetadata(key, metrics_raw);</a>
+<a name="ln1247">  }</a>
+<a name="ln1248"> </a>
+<a name="ln1249">  return std::static_pointer_cast&lt;CDCTabletMetrics&gt;(metrics_raw);</a>
+<a name="ln1250">}</a>
+<a name="ln1251"> </a>
+<a name="ln1252">OpId CDCServiceImpl::GetMinAppliedCheckpointForTablet(</a>
+<a name="ln1253">    const std::string&amp; tablet_id,</a>
+<a name="ln1254">    const std::shared_ptr&lt;client::YBSession&gt;&amp; session) {</a>
+<a name="ln1255"> </a>
+<a name="ln1256">  OpId min_op_id = OpId::Max();</a>
+<a name="ln1257">  bool min_op_id_updated = false;</a>
+<a name="ln1258"> </a>
+<a name="ln1259">  {</a>
+<a name="ln1260">    SharedLock&lt;rw_spinlock&gt; l(mutex_);</a>
+<a name="ln1261">    // right =&gt; multimap where keys are tablet_ids and values are stream_ids.</a>
+<a name="ln1262">    // left =&gt; multimap where keys are stream_ids and values are tablet_ids.</a>
+<a name="ln1263">    auto it_range = tablet_checkpoints_.get&lt;TabletTag&gt;().equal_range(tablet_id);</a>
+<a name="ln1264">    if (it_range.first != it_range.second) {</a>
+<a name="ln1265">      // Iterate over all the streams for this tablet.</a>
+<a name="ln1266">      for (auto it = it_range.first; it != it_range.second; ++it) {</a>
+<a name="ln1267">        if (it-&gt;cdc_state_checkpoint.op_id.index &lt; min_op_id.index) {</a>
+<a name="ln1268">          min_op_id = it-&gt;cdc_state_checkpoint.op_id;</a>
+<a name="ln1269">          min_op_id_updated = true;</a>
+<a name="ln1270">        }</a>
+<a name="ln1271">      }</a>
+<a name="ln1272">    } else {</a>
+<a name="ln1273">      VLOG(2) &lt;&lt; &quot;Didn't find any streams for tablet &quot; &lt;&lt; tablet_id;</a>
+<a name="ln1274">    }</a>
+<a name="ln1275">  }</a>
+<a name="ln1276">  if (min_op_id_updated) {</a>
+<a name="ln1277">    return min_op_id;</a>
+<a name="ln1278">  }</a>
+<a name="ln1279"> </a>
+<a name="ln1280">  LOG(INFO) &lt;&lt; &quot;Unable to find checkpoint for tablet &quot; &lt;&lt; tablet_id &lt;&lt; &quot; in the cache&quot;;</a>
+<a name="ln1281">  min_op_id = OpId();</a>
+<a name="ln1282"> </a>
+<a name="ln1283">  // We didn't find any streams for this tablet in the cache.</a>
+<a name="ln1284">  // Let's read the cdc_state table and save this information in the cache so that it can be used</a>
+<a name="ln1285">  // next time.</a>
+<a name="ln1286">  client::TableHandle table;</a>
+<a name="ln1287">  auto s = table.Open(kCdcStateTableName, async_client_init_-&gt;client());</a>
+<a name="ln1288">  if (!s.ok()) {</a>
+<a name="ln1289">    YB_LOG_EVERY_N(WARNING, 30) &lt;&lt; &quot;Unable to open table &quot; &lt;&lt; kCdcStateTableName.table_name();</a>
+<a name="ln1290">    // Return consensus::MinimumOpId()</a>
+<a name="ln1291">    return min_op_id;</a>
+<a name="ln1292">  }</a>
+<a name="ln1293"> </a>
+<a name="ln1294">  const auto op = table.NewReadOp();</a>
+<a name="ln1295">  auto* const req = op-&gt;mutable_request();</a>
+<a name="ln1296">  QLAddStringHashValue(req, tablet_id);</a>
+<a name="ln1297">  table.AddColumns({master::kCdcCheckpoint, master::kCdcStreamId}, req);</a>
+<a name="ln1298">  if (!session-&gt;ApplyAndFlush(op).ok()) {</a>
+<a name="ln1299">    YB_LOG_EVERY_N(WARNING, 30) &lt;&lt; &quot;Unable to read table &quot; &lt;&lt; kCdcStateTableName.table_name();</a>
+<a name="ln1300">    // Return consensus::MinimumOpId()</a>
+<a name="ln1301">    return min_op_id;</a>
+<a name="ln1302">  }</a>
+<a name="ln1303"> </a>
+<a name="ln1304">  auto row_block = ql::RowsResult(op.get()).GetRowBlock();</a>
+<a name="ln1305">  if (row_block-&gt;row_count() == 0) {</a>
+<a name="ln1306">    YB_LOG_EVERY_N(WARNING, 30) &lt;&lt; &quot;Unable to find any cdc record for tablet &quot; &lt;&lt; tablet_id</a>
+<a name="ln1307">                                 &lt;&lt; &quot; in table &quot; &lt;&lt; kCdcStateTableName.table_name();</a>
+<a name="ln1308">    // Return consensus::MinimumOpId()</a>
+<a name="ln1309">    return min_op_id;</a>
+<a name="ln1310">  }</a>
+<a name="ln1311"> </a>
+<a name="ln1312">  DCHECK_EQ(row_block-&gt;row(0).column(0).type(), InternalType::kStringValue);</a>
+<a name="ln1313"> </a>
+<a name="ln1314">  auto min_index = consensus::MaximumOpId().index();</a>
+<a name="ln1315">  for (const auto&amp; row : row_block-&gt;rows()) {</a>
+<a name="ln1316">    std::string stream_id = row.column(1).string_value();</a>
+<a name="ln1317">    auto result = OpId::FromString(row.column(0).string_value());</a>
+<a name="ln1318">    if (!result.ok()) {</a>
+<a name="ln1319">      LOG(WARNING) &lt;&lt; &quot;Invalid checkpoint &quot; &lt;&lt; row.column(0).string_value()</a>
+<a name="ln1320">                   &lt;&lt; &quot; for tablet &quot; &lt;&lt; tablet_id &lt;&lt; &quot; and stream &quot; &lt;&lt; stream_id;</a>
+<a name="ln1321">      continue;</a>
+<a name="ln1322">    }</a>
+<a name="ln1323"> </a>
+<a name="ln1324">    auto index = (*result).index;</a>
+<a name="ln1325">    auto term = (*result).term;</a>
+<a name="ln1326"> </a>
+<a name="ln1327">    if (index &lt; min_index) {</a>
+<a name="ln1328">      min_op_id.term = term;</a>
+<a name="ln1329">      min_op_id.index = index;</a>
+<a name="ln1330">    }</a>
+<a name="ln1331"> </a>
+<a name="ln1332">    // If the checkpoints cache hasn't been updated yet, update it so we don't have to read</a>
+<a name="ln1333">    // the table next time we get a request for this tablet.</a>
+<a name="ln1334">    std::lock_guard&lt;rw_spinlock&gt; l(mutex_);</a>
+<a name="ln1335">    ProducerTabletInfo producer_tablet{&quot;&quot; /*UUID*/, stream_id, tablet_id};</a>
+<a name="ln1336">    auto cached_checkpoint = tablet_checkpoints_.find(producer_tablet);</a>
+<a name="ln1337">    if (cached_checkpoint == tablet_checkpoints_.end()) {</a>
+<a name="ln1338">      std::chrono::time_point&lt;CoarseMonoClock&gt; min_clock =</a>
+<a name="ln1339">          CoarseMonoClock::time_point(CoarseMonoClock::duration(0));</a>
+<a name="ln1340">      OpId checkpoint_op_id(term, index);</a>
+<a name="ln1341">      TabletCheckpoint commit_checkpoint({checkpoint_op_id, min_clock});</a>
+<a name="ln1342">      tablet_checkpoints_.emplace(producer_tablet, commit_checkpoint, commit_checkpoint);</a>
+<a name="ln1343">    }</a>
+<a name="ln1344">  }</a>
+<a name="ln1345"> </a>
+<a name="ln1346">  return min_op_id;</a>
+<a name="ln1347">}</a>
+<a name="ln1348"> </a>
+<a name="ln1349">Result&lt;std::shared_ptr&lt;StreamMetadata&gt;&gt; CDCServiceImpl::GetStream(const std::string&amp; stream_id) {</a>
+<a name="ln1350">  auto stream = GetStreamMetadataFromCache(stream_id);</a>
+<a name="ln1351">  if (stream != nullptr) {</a>
+<a name="ln1352">    return stream;</a>
+<a name="ln1353">  }</a>
+<a name="ln1354"> </a>
+<a name="ln1355">  // Look up stream in sys catalog.</a>
+<a name="ln1356">  TableId table_id;</a>
+<a name="ln1357">  std::unordered_map&lt;std::string, std::string&gt; options;</a>
+<a name="ln1358">  RETURN_NOT_OK(async_client_init_-&gt;client()-&gt;GetCDCStream(stream_id, &amp;table_id, &amp;options));</a>
+<a name="ln1359"> </a>
+<a name="ln1360">  auto stream_metadata = std::make_shared&lt;StreamMetadata&gt;();;</a>
+<a name="ln1361">  stream_metadata-&gt;table_id = table_id;</a>
+<a name="ln1362">  for (const auto&amp; option : options) {</a>
+<a name="ln1363">    if (option.first == kRecordType) {</a>
+<a name="ln1364">      SCHECK(CDCRecordType_Parse(option.second, &amp;stream_metadata-&gt;record_type),</a>
+<a name="ln1365">             IllegalState, &quot;CDC record type parsing error&quot;);</a>
+<a name="ln1366">    } else if (option.first == kRecordFormat) {</a>
+<a name="ln1367">      SCHECK(CDCRecordFormat_Parse(option.second, &amp;stream_metadata-&gt;record_format),</a>
+<a name="ln1368">             IllegalState, &quot;CDC record format parsing error&quot;);</a>
+<a name="ln1369">    } else {</a>
+<a name="ln1370">      LOG(WARNING) &lt;&lt; &quot;Unsupported CDC option: &quot; &lt;&lt; option.first;</a>
+<a name="ln1371">    }</a>
+<a name="ln1372">  }</a>
+<a name="ln1373"> </a>
+<a name="ln1374">  AddStreamMetadataToCache(stream_id, stream_metadata);</a>
+<a name="ln1375">  return stream_metadata;</a>
+<a name="ln1376">}</a>
+<a name="ln1377"> </a>
+<a name="ln1378">void CDCServiceImpl::AddStreamMetadataToCache(const std::string&amp; stream_id,</a>
+<a name="ln1379">                                              const std::shared_ptr&lt;StreamMetadata&gt;&amp; metadata) {</a>
+<a name="ln1380">  std::lock_guard&lt;decltype(mutex_)&gt; l(mutex_);</a>
+<a name="ln1381">  stream_metadata_.emplace(stream_id, metadata);</a>
+<a name="ln1382">}</a>
+<a name="ln1383"> </a>
+<a name="ln1384">std::shared_ptr&lt;StreamMetadata&gt; CDCServiceImpl::GetStreamMetadataFromCache(</a>
+<a name="ln1385">    const std::string&amp; stream_id) {</a>
+<a name="ln1386">  SharedLock&lt;decltype(mutex_)&gt; l(mutex_);</a>
+<a name="ln1387">  auto it = stream_metadata_.find(stream_id);</a>
+<a name="ln1388">  if (it != stream_metadata_.end()) {</a>
+<a name="ln1389">    return it-&gt;second;</a>
+<a name="ln1390">  } else {</a>
+<a name="ln1391">    return nullptr;</a>
+<a name="ln1392">  }</a>
+<a name="ln1393">}</a>
+<a name="ln1394"> </a>
+<a name="ln1395">MemTrackerPtr CDCServiceImpl::GetMemTracker(</a>
+<a name="ln1396">    const std::shared_ptr&lt;tablet::TabletPeer&gt;&amp; tablet_peer,</a>
+<a name="ln1397">    const ProducerTabletInfo&amp; producer_info) {</a>
+<a name="ln1398">  SharedLock&lt;rw_spinlock&gt; l(mutex_);</a>
+<a name="ln1399">  auto it = tablet_checkpoints_.find(producer_info);</a>
+<a name="ln1400">  if (it == tablet_checkpoints_.end()) {</a>
+<a name="ln1401">    return nullptr;</a>
+<a name="ln1402">  }</a>
+<a name="ln1403">  if (!it-&gt;mem_tracker) {</a>
+<a name="ln1404">    auto cdc_mem_tracker = MemTracker::FindOrCreateTracker(</a>
+<a name="ln1405">        &quot;CDC&quot;, tablet_peer-&gt;tablet()-&gt;mem_tracker());</a>
+<a name="ln1406">    const_cast&lt;MemTrackerPtr&amp;&gt;(it-&gt;mem_tracker) = MemTracker::FindOrCreateTracker(</a>
+<a name="ln1407">        producer_info.stream_id, cdc_mem_tracker);</a>
+<a name="ln1408">  }</a>
+<a name="ln1409">  return it-&gt;mem_tracker;</a>
+<a name="ln1410">}</a>
+<a name="ln1411"> </a>
+<a name="ln1412">Status CDCServiceImpl::CheckTabletValidForStream(const ProducerTabletInfo&amp; info) {</a>
+<a name="ln1413">  {</a>
+<a name="ln1414">    SharedLock&lt;rw_spinlock&gt; l(mutex_);</a>
+<a name="ln1415">    if (tablet_checkpoints_.count(info) != 0) {</a>
+<a name="ln1416">      return Status::OK();</a>
+<a name="ln1417">    }</a>
+<a name="ln1418">    const auto&amp; stream_index = tablet_checkpoints_.get&lt;StreamTag&gt;();</a>
+<a name="ln1419">    if (stream_index.find(info.stream_id) != stream_index.end()) {</a>
+<a name="ln1420">      // Did not find matching tablet ID.</a>
+<a name="ln1421">      return STATUS_FORMAT(InvalidArgument, &quot;Tablet ID $0 is not part of stream ID $1&quot;,</a>
+<a name="ln1422">                           info.tablet_id, info.stream_id);</a>
+<a name="ln1423">    }</a>
+<a name="ln1424">  }</a>
+<a name="ln1425"> </a>
+<a name="ln1426">  // If we don't recognize the stream_id, populate our full tablet list for this stream.</a>
+<a name="ln1427">  auto tablets = VERIFY_RESULT(GetTablets(info.stream_id));</a>
+<a name="ln1428">  bool found = false;</a>
+<a name="ln1429">  {</a>
+<a name="ln1430">    std::lock_guard&lt;rw_spinlock&gt; l(mutex_);</a>
+<a name="ln1431">    for (const auto &amp;tablet : tablets) {</a>
+<a name="ln1432">      // Add every tablet in the stream.</a>
+<a name="ln1433">      ProducerTabletInfo producer_info{info.universe_uuid, info.stream_id, tablet.tablet_id()};</a>
+<a name="ln1434">      tablet_checkpoints_.emplace(producer_info, TabletCheckpoint(), TabletCheckpoint());</a>
+<a name="ln1435">      // If this is the tablet that the user requested.</a>
+<a name="ln1436">      if (tablet.tablet_id() == info.tablet_id) {</a>
+<a name="ln1437">        found = true;</a>
+<a name="ln1438">      }</a>
+<a name="ln1439">    }</a>
+<a name="ln1440">  }</a>
+<a name="ln1441">  return found ? Status::OK()</a>
+<a name="ln1442">               : STATUS_FORMAT(InvalidArgument, &quot;Tablet ID $0 is not part of stream ID $1&quot;,</a>
+<a name="ln1443">                               info.tablet_id, info.stream_id);</a>
+<a name="ln1444">}</a>
+<a name="ln1445"> </a>
+<a name="ln1446">}  // namespace cdc</a>
+<a name="ln1447">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="325"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1004/" target="_blank">V1004</a> The 'tablet_peer' pointer was used unsafely after it was verified against nullptr. Check lines: 322, 325.</p></div>
+<div class="balloon" rel="630"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="656"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="663"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="666"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="736"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="929"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1114"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1174"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1273"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v002/" target="_blank">V002</a> Some diagnostic messages may contain incorrect line number in this file.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

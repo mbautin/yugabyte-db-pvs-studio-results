@@ -1,0 +1,428 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>eval_where.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln17">#include &quot;yb/yql/cql/ql/exec/executor.h&quot;</a>
+<a name="ln18">#include &quot;yb/util/yb_partition.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">namespace yb {</a>
+<a name="ln21">namespace ql {</a>
+<a name="ln22"> </a>
+<a name="ln23">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln24"> </a>
+<a name="ln25">Status Executor::WhereClauseToPB(QLWriteRequestPB *req,</a>
+<a name="ln26">                                 const MCVector&lt;ColumnOp&gt;&amp; key_where_ops,</a>
+<a name="ln27">                                 const MCList&lt;ColumnOp&gt;&amp; where_ops,</a>
+<a name="ln28">                                 const MCList&lt;SubscriptedColumnOp&gt;&amp; subcol_where_ops) {</a>
+<a name="ln29"> </a>
+<a name="ln30">  // Setup the key columns.</a>
+<a name="ln31">  for (const auto&amp; op : key_where_ops) {</a>
+<a name="ln32">    const ColumnDesc *col_desc = op.desc();</a>
+<a name="ln33">    QLExpressionPB *col_expr_pb;</a>
+<a name="ln34">    if (col_desc-&gt;is_hash()) {</a>
+<a name="ln35">      col_expr_pb = req-&gt;add_hashed_column_values();</a>
+<a name="ln36">    } else if (col_desc-&gt;is_primary()) {</a>
+<a name="ln37">      col_expr_pb = req-&gt;add_range_column_values();</a>
+<a name="ln38">    } else {</a>
+<a name="ln39">      LOG(FATAL) &lt;&lt; &quot;Unexpected non primary key column in this context&quot;;</a>
+<a name="ln40">    }</a>
+<a name="ln41">    RETURN_NOT_OK(PTExprToPB(op.expr(), col_expr_pb));</a>
+<a name="ln42">    RETURN_NOT_OK(EvalExpr(col_expr_pb, QLTableRow::empty_row()));</a>
+<a name="ln43">  }</a>
+<a name="ln44"> </a>
+<a name="ln45">  // Setup the rest of the columns.</a>
+<a name="ln46">  CHECK(where_ops.empty() || req-&gt;type() == QLWriteRequestPB::QL_STMT_DELETE)</a>
+<a name="ln47">      &lt;&lt; &quot;Server only supports range operations in write requests for deletes&quot;;</a>
+<a name="ln48"> </a>
+<a name="ln49">  CHECK(subcol_where_ops.empty())</a>
+<a name="ln50">      &lt;&lt; &quot;Server doesn't support sub-column conditions in where clause for write requests&quot;;</a>
+<a name="ln51"> </a>
+<a name="ln52">  // Setup the where clause -- only allowed for deletes, should be checked before getting here.</a>
+<a name="ln53">  if (!where_ops.empty()) {</a>
+<a name="ln54">    QLConditionPB *where_pb = req-&gt;mutable_where_expr()-&gt;mutable_condition();</a>
+<a name="ln55">    where_pb-&gt;set_op(QL_OP_AND);</a>
+<a name="ln56">    for (const auto &amp;col_op : where_ops) {</a>
+<a name="ln57">      RETURN_NOT_OK(WhereOpToPB(where_pb-&gt;add_operands()-&gt;mutable_condition(), col_op));</a>
+<a name="ln58">    }</a>
+<a name="ln59">  }</a>
+<a name="ln60"> </a>
+<a name="ln61">  return Status::OK();</a>
+<a name="ln62">}</a>
+<a name="ln63"> </a>
+<a name="ln64">Result&lt;uint64_t&gt; Executor::WhereClauseToPB(QLReadRequestPB *req,</a>
+<a name="ln65">                                           const MCVector&lt;ColumnOp&gt;&amp; key_where_ops,</a>
+<a name="ln66">                                           const MCList&lt;ColumnOp&gt;&amp; where_ops,</a>
+<a name="ln67">                                           const MCList&lt;SubscriptedColumnOp&gt;&amp; subcol_where_ops,</a>
+<a name="ln68">                                           const MCList&lt;JsonColumnOp&gt;&amp; jsoncol_where_ops,</a>
+<a name="ln69">                                           const MCList&lt;PartitionKeyOp&gt;&amp; partition_key_ops,</a>
+<a name="ln70">                                           const MCList&lt;FuncOp&gt;&amp; func_ops,</a>
+<a name="ln71">                                           TnodeContext* tnode_context) {</a>
+<a name="ln72">  uint64_t max_rows_estimate = std::numeric_limits&lt;uint64_t&gt;::max();</a>
+<a name="ln73"> </a>
+<a name="ln74">  // Setup the lower/upper bounds on the partition key -- if any</a>
+<a name="ln75">  for (const auto&amp; op : partition_key_ops) {</a>
+<a name="ln76">    QLExpressionPB expr_pb;</a>
+<a name="ln77">    RETURN_NOT_OK(PTExprToPB(op.expr(), &amp;expr_pb));</a>
+<a name="ln78">    QLExprResult result;</a>
+<a name="ln79">    RETURN_NOT_OK(EvalExpr(expr_pb, QLTableRow::empty_row(), result.Writer()));</a>
+<a name="ln80">    const auto&amp; value = result.Value();</a>
+<a name="ln81">    DCHECK(value.has_int64_value() || value.has_int32_value())</a>
+<a name="ln82">        &lt;&lt; &quot;Partition key operations are expected to return 64/16 bit integer&quot;;</a>
+<a name="ln83">    uint16_t hash_code;</a>
+<a name="ln84">    // 64 bits for token and 32 bits for partition_hash.</a>
+<a name="ln85">    if (value.has_int32_value()) {</a>
+<a name="ln86">      // Validate bounds for uint16_t.</a>
+<a name="ln87">      int32_t val = value.int32_value();</a>
+<a name="ln88">      if (val &lt; std::numeric_limits&lt;uint16_t&gt;::min() ||</a>
+<a name="ln89">          val &gt; std::numeric_limits&lt;uint16_t&gt;::max()) {</a>
+<a name="ln90">        return STATUS_SUBSTITUTE(InvalidArgument, &quot;$0 out of bounds for unsigned 16 bit integer&quot;,</a>
+<a name="ln91">                                 val);</a>
+<a name="ln92">      }</a>
+<a name="ln93">      hash_code = val;</a>
+<a name="ln94">    } else {</a>
+<a name="ln95">      hash_code = YBPartition::CqlToYBHashCode(value.int64_value());</a>
+<a name="ln96">    }</a>
+<a name="ln97"> </a>
+<a name="ln98">    // We always use inclusive intervals [start, end] for hash_code</a>
+<a name="ln99">    switch (op.yb_op()) {</a>
+<a name="ln100">      case QL_OP_GREATER_THAN:</a>
+<a name="ln101">        if (hash_code &lt; YBPartition::kMaxHashCode) {</a>
+<a name="ln102">          req-&gt;set_hash_code(hash_code + 1);</a>
+<a name="ln103">        } else {</a>
+<a name="ln104">          // Token hash greater than max implies no results.</a>
+<a name="ln105">          return 0;</a>
+<a name="ln106">        }</a>
+<a name="ln107">        break;</a>
+<a name="ln108">      case QL_OP_GREATER_THAN_EQUAL:</a>
+<a name="ln109">        req-&gt;set_hash_code(hash_code);</a>
+<a name="ln110">        break;</a>
+<a name="ln111">      case QL_OP_LESS_THAN:</a>
+<a name="ln112">        // Cassandra treats INT64_MIN upper bound as special case that includes everything (i.e. it</a>
+<a name="ln113">        // adds no real restriction). So we skip (do nothing) in that case.</a>
+<a name="ln114">        if (!value.has_int64_value() || value.int64_value() != INT64_MIN) {</a>
+<a name="ln115">          if (hash_code &gt; YBPartition::kMinHashCode) {</a>
+<a name="ln116">            req-&gt;set_max_hash_code(hash_code - 1);</a>
+<a name="ln117">          } else {</a>
+<a name="ln118">            // Token hash smaller than min implies no results.</a>
+<a name="ln119">            return 0;</a>
+<a name="ln120">          }</a>
+<a name="ln121">        }</a>
+<a name="ln122">        break;</a>
+<a name="ln123">      case QL_OP_LESS_THAN_EQUAL:</a>
+<a name="ln124">        // Cassandra treats INT64_MIN upper bound as special case that includes everything (i.e. it</a>
+<a name="ln125">        // adds no real restriction). So we skip (do nothing) in that case.</a>
+<a name="ln126">        if (!value.has_int64_value() || value.int64_value() != INT64_MIN) {</a>
+<a name="ln127">          req-&gt;set_max_hash_code(hash_code);</a>
+<a name="ln128">        }</a>
+<a name="ln129">        break;</a>
+<a name="ln130">      case QL_OP_EQUAL:</a>
+<a name="ln131">        req-&gt;set_hash_code(hash_code);</a>
+<a name="ln132">        req-&gt;set_max_hash_code(hash_code);</a>
+<a name="ln133">        break;</a>
+<a name="ln134"> </a>
+<a name="ln135">      default:</a>
+<a name="ln136">        LOG(FATAL) &lt;&lt; &quot;Unsupported operator for token-based partition key condition&quot;;</a>
+<a name="ln137">    }</a>
+<a name="ln138">  }</a>
+<a name="ln139"> </a>
+<a name="ln140">  // Try to set up key_where_ops as the requests' hash key columns.</a>
+<a name="ln141">  // For selects with 'IN' conditions on the hash keys we may need to read several partitions.</a>
+<a name="ln142">  // If we find an 'IN', we add subsequent hash column values options to the execution context.</a>
+<a name="ln143">  // Then, the executor will use them to produce the partitions that need to be read.</a>
+<a name="ln144">  bool is_multi_partition = false;</a>
+<a name="ln145">  uint64_t partitions_count = 1;</a>
+<a name="ln146">  for (const auto&amp; op : key_where_ops) {</a>
+<a name="ln147">    const ColumnDesc *col_desc = op.desc();</a>
+<a name="ln148">    CHECK(col_desc-&gt;is_hash()) &lt;&lt; &quot;Unexpected non-partition column in this context&quot;;</a>
+<a name="ln149"> </a>
+<a name="ln150">    VLOG(3) &lt;&lt; &quot;READ request, column id = &quot; &lt;&lt; col_desc-&gt;id();</a>
+<a name="ln151"> </a>
+<a name="ln152">    switch (op.yb_op()) {</a>
+<a name="ln153">      case QL_OP_EQUAL: {</a>
+<a name="ln154">        if (!is_multi_partition) {</a>
+<a name="ln155">          QLExpressionPB *col_pb = req-&gt;add_hashed_column_values();</a>
+<a name="ln156">          col_pb-&gt;set_column_id(col_desc-&gt;id());</a>
+<a name="ln157">          RETURN_NOT_OK(PTExprToPB(op.expr(), col_pb));</a>
+<a name="ln158">          RETURN_NOT_OK(EvalExpr(col_pb, QLTableRow::empty_row()));</a>
+<a name="ln159">        } else {</a>
+<a name="ln160">          QLExpressionPB col_pb;</a>
+<a name="ln161">          col_pb.set_column_id(col_desc-&gt;id());</a>
+<a name="ln162">          RETURN_NOT_OK(PTExprToPB(op.expr(), &amp;col_pb));</a>
+<a name="ln163">          RETURN_NOT_OK(EvalExpr(&amp;col_pb, QLTableRow::empty_row()));</a>
+<a name="ln164">          tnode_context-&gt;hash_values_options().push_back({col_pb});</a>
+<a name="ln165">        }</a>
+<a name="ln166">        break;</a>
+<a name="ln167">      }</a>
+<a name="ln168"> </a>
+<a name="ln169">      case QL_OP_IN: {</a>
+<a name="ln170">        if (!is_multi_partition) {</a>
+<a name="ln171">          is_multi_partition = true;</a>
+<a name="ln172">        }</a>
+<a name="ln173"> </a>
+<a name="ln174">        // De-duplicating and ordering values from the 'IN' expression.</a>
+<a name="ln175">        QLExpressionPB col_pb;</a>
+<a name="ln176">        RETURN_NOT_OK(PTExprToPB(op.expr(), &amp;col_pb));</a>
+<a name="ln177"> </a>
+<a name="ln178">        // Fast path for returning no results when 'IN' list is empty.</a>
+<a name="ln179">        if (col_pb.value().list_value().elems_size() == 0) {</a>
+<a name="ln180">          return 0;</a>
+<a name="ln181">        }</a>
+<a name="ln182"> </a>
+<a name="ln183">        std::set&lt;QLValuePB&gt; set_values;</a>
+<a name="ln184">        for (QLValuePB&amp; value_pb : *col_pb.mutable_value()-&gt;mutable_list_value()-&gt;mutable_elems()) {</a>
+<a name="ln185">          set_values.insert(std::move(value_pb));</a>
+<a name="ln186">        }</a>
+<a name="ln187"> </a>
+<a name="ln188">        // Adding partition options information to the execution context.</a>
+<a name="ln189">        partitions_count *= set_values.size();</a>
+<a name="ln190">        tnode_context-&gt;hash_values_options().emplace_back();</a>
+<a name="ln191">        auto&amp; options = tnode_context-&gt;hash_values_options().back();</a>
+<a name="ln192">        for (auto&amp; value_pb : set_values) {</a>
+<a name="ln193">          options.emplace_back();</a>
+<a name="ln194">          options.back().set_column_id(col_desc-&gt;id());</a>
+<a name="ln195">          *options.back().mutable_value() = std::move(value_pb);</a>
+<a name="ln196">        }</a>
+<a name="ln197">        break;</a>
+<a name="ln198">      }</a>
+<a name="ln199"> </a>
+<a name="ln200">      default:</a>
+<a name="ln201">        // This should be caught by the analyzer before getting here.</a>
+<a name="ln202">        LOG(FATAL) &lt;&lt; &quot;Only '=' and 'IN' operators allowed on hash keys&quot;;</a>
+<a name="ln203">    }</a>
+<a name="ln204">  }</a>
+<a name="ln205"> </a>
+<a name="ln206">  if (!key_where_ops.empty()) {</a>
+<a name="ln207">    // If this is a multi-partition select, set the partitions count in the execution context.</a>
+<a name="ln208">    if (is_multi_partition) {</a>
+<a name="ln209">      tnode_context-&gt;set_partitions_count(partitions_count);</a>
+<a name="ln210">    }</a>
+<a name="ln211">    max_rows_estimate = partitions_count;</a>
+<a name="ln212">  }</a>
+<a name="ln213"> </a>
+<a name="ln214">  // Generate query condition if where clause is not empty.</a>
+<a name="ln215">  if (!where_ops.empty() || !subcol_where_ops.empty() || !func_ops.empty() ||</a>
+<a name="ln216">      !jsoncol_where_ops.empty()) {</a>
+<a name="ln217"> </a>
+<a name="ln218">    // Setup the where clause.</a>
+<a name="ln219">    QLConditionPB *where_pb = req-&gt;mutable_where_expr()-&gt;mutable_condition();</a>
+<a name="ln220">    where_pb-&gt;set_op(QL_OP_AND);</a>
+<a name="ln221">    for (const auto&amp; col_op : where_ops) {</a>
+<a name="ln222">      QLConditionPB* cond = where_pb-&gt;add_operands()-&gt;mutable_condition();</a>
+<a name="ln223">      RETURN_NOT_OK(WhereOpToPB(cond, col_op));</a>
+<a name="ln224">      // Update the estimate for the number of selected rows if needed.</a>
+<a name="ln225">      if (col_op.desc()-&gt;is_primary()) {</a>
+<a name="ln226">        if (cond-&gt;op() == QL_OP_IN) {</a>
+<a name="ln227">          int in_size = cond-&gt;operands(1).value().list_value().elems_size();</a>
+<a name="ln228">          if (in_size == 0 || // Can happen when binding an empty list as 'IN' argument.</a>
+<a name="ln229">              max_rows_estimate &lt;= std::numeric_limits&lt;uint64_t&gt;::max() / in_size) {</a>
+<a name="ln230">            max_rows_estimate *= in_size;</a>
+<a name="ln231">          } else {</a>
+<a name="ln232">            max_rows_estimate = std::numeric_limits&lt;uint64_t&gt;::max();</a>
+<a name="ln233">          }</a>
+<a name="ln234">        } else if (cond-&gt;op() == QL_OP_EQUAL) {</a>
+<a name="ln235">          // Nothing to do (equality condition implies one option).</a>
+<a name="ln236">        } else {</a>
+<a name="ln237">          // Cannot yet estimate num rows for inequality (and other) conditions.</a>
+<a name="ln238">          max_rows_estimate = std::numeric_limits&lt;uint64_t&gt;::max();</a>
+<a name="ln239">        }</a>
+<a name="ln240">      }</a>
+<a name="ln241">    }</a>
+<a name="ln242"> </a>
+<a name="ln243">    for (const auto&amp; col_op : subcol_where_ops) {</a>
+<a name="ln244">      RETURN_NOT_OK(WhereSubColOpToPB(where_pb-&gt;add_operands()-&gt;mutable_condition(), col_op));</a>
+<a name="ln245">    }</a>
+<a name="ln246">    for (const auto&amp; col_op : jsoncol_where_ops) {</a>
+<a name="ln247">      RETURN_NOT_OK(WhereJsonColOpToPB(where_pb-&gt;add_operands()-&gt;mutable_condition(), col_op));</a>
+<a name="ln248">    }</a>
+<a name="ln249">    for (const auto&amp; func_op : func_ops) {</a>
+<a name="ln250">      RETURN_NOT_OK(FuncOpToPB(where_pb-&gt;add_operands()-&gt;mutable_condition(), func_op));</a>
+<a name="ln251">    }</a>
+<a name="ln252">  }</a>
+<a name="ln253"> </a>
+<a name="ln254">  // If not all primary keys have '=' or 'IN' conditions the max rows estimate is not reliable.</a>
+<a name="ln255">  if (!static_cast&lt;const PTSelectStmt*&gt;(tnode_context-&gt;tnode())-&gt;HasPrimaryKeysSet()) {</a>
+<a name="ln256">    return std::numeric_limits&lt;uint64_t&gt;::max();</a>
+<a name="ln257">  }</a>
+<a name="ln258"> </a>
+<a name="ln259">  return max_rows_estimate;</a>
+<a name="ln260">}</a>
+<a name="ln261"> </a>
+<a name="ln262">Status Executor::WhereOpToPB(QLConditionPB *condition, const ColumnOp&amp; col_op) {</a>
+<a name="ln263">  // Set the operator.</a>
+<a name="ln264">  condition-&gt;set_op(col_op.yb_op());</a>
+<a name="ln265"> </a>
+<a name="ln266">  // Operand 1: The column.</a>
+<a name="ln267">  const ColumnDesc *col_desc = col_op.desc();</a>
+<a name="ln268">  QLExpressionPB *expr_pb = condition-&gt;add_operands();</a>
+<a name="ln269">  VLOG(3) &lt;&lt; &quot;WHERE condition, column id = &quot; &lt;&lt; col_desc-&gt;id();</a>
+<a name="ln270">  expr_pb-&gt;set_column_id(col_desc-&gt;id());</a>
+<a name="ln271"> </a>
+<a name="ln272">  // Operand 2: The expression.</a>
+<a name="ln273">  expr_pb = condition-&gt;add_operands();</a>
+<a name="ln274"> </a>
+<a name="ln275">  // Special case for IN condition arguments on primary key -- we de-duplicate and order them here</a>
+<a name="ln276">  // to match Cassandra semantics.</a>
+<a name="ln277">  if (col_op.yb_op() == QL_OP_IN &amp;&amp; col_op.desc()-&gt;is_primary()) {</a>
+<a name="ln278">    QLExpressionPB tmp_expr_pb;</a>
+<a name="ln279">    RETURN_NOT_OK(PTExprToPB(col_op.expr(), &amp;tmp_expr_pb));</a>
+<a name="ln280">    std::set&lt;QLValuePB&gt; opts_set;</a>
+<a name="ln281">    for (auto &amp;value_pb : *tmp_expr_pb.mutable_value()-&gt;mutable_list_value()-&gt;mutable_elems()) {</a>
+<a name="ln282">      opts_set.insert(std::move(value_pb));</a>
+<a name="ln283">    }</a>
+<a name="ln284"> </a>
+<a name="ln285">    expr_pb-&gt;mutable_value()-&gt;mutable_list_value(); // Set value type to list.</a>
+<a name="ln286">    for (auto &amp;value_pb : opts_set) {</a>
+<a name="ln287">      *expr_pb-&gt;mutable_value()-&gt;mutable_list_value()-&gt;add_elems() = value_pb;</a>
+<a name="ln288">    }</a>
+<a name="ln289">    return Status::OK();</a>
+<a name="ln290">  }</a>
+<a name="ln291"> </a>
+<a name="ln292">  return PTExprToPB(col_op.expr(), expr_pb);</a>
+<a name="ln293">}</a>
+<a name="ln294"> </a>
+<a name="ln295">Status Executor::WhereKeyToPB(QLReadRequestPB *req,</a>
+<a name="ln296">                              const Schema&amp; schema,</a>
+<a name="ln297">                              const QLRow&amp; key) {</a>
+<a name="ln298">  // Add the hash column values</a>
+<a name="ln299">  DCHECK(req-&gt;hashed_column_values().empty());</a>
+<a name="ln300">  for (size_t idx = 0; idx &lt; schema.num_hash_key_columns(); idx++) {</a>
+<a name="ln301">    *req-&gt;add_hashed_column_values()-&gt;mutable_value() = key.column(idx).value();</a>
+<a name="ln302">  }</a>
+<a name="ln303"> </a>
+<a name="ln304">  // Add the range column values to the where clause</a>
+<a name="ln305">  QLConditionPB *where_pb = req-&gt;mutable_where_expr()-&gt;mutable_condition();</a>
+<a name="ln306">  if (!where_pb-&gt;has_op()) {</a>
+<a name="ln307">    where_pb-&gt;set_op(QL_OP_AND);</a>
+<a name="ln308">  }</a>
+<a name="ln309">  DCHECK_EQ(where_pb-&gt;op(), QL_OP_AND);</a>
+<a name="ln310">  for (size_t idx = schema.num_hash_key_columns(); idx &lt; schema.num_key_columns(); idx++) {</a>
+<a name="ln311">    QLConditionPB *col_cond_pb = where_pb-&gt;add_operands()-&gt;mutable_condition();</a>
+<a name="ln312">    col_cond_pb-&gt;set_op(QL_OP_EQUAL);</a>
+<a name="ln313">    col_cond_pb-&gt;add_operands()-&gt;set_column_id(schema.column_id(idx));</a>
+<a name="ln314">    *col_cond_pb-&gt;add_operands()-&gt;mutable_value() = key.column(idx).value();</a>
+<a name="ln315">  }</a>
+<a name="ln316"> </a>
+<a name="ln317">  return Status::OK();</a>
+<a name="ln318">}</a>
+<a name="ln319"> </a>
+<a name="ln320">Status Executor::WhereJsonColOpToPB(QLConditionPB *condition, const JsonColumnOp&amp; col_op) {</a>
+<a name="ln321">  // Set the operator.</a>
+<a name="ln322">  condition-&gt;set_op(col_op.yb_op());</a>
+<a name="ln323"> </a>
+<a name="ln324">  // Operand 1: The column.</a>
+<a name="ln325">  const ColumnDesc *col_desc = col_op.desc();</a>
+<a name="ln326">  QLExpressionPB *expr_pb = condition-&gt;add_operands();</a>
+<a name="ln327">  VLOG(3) &lt;&lt; &quot;WHERE condition, sub-column with id = &quot; &lt;&lt; col_desc-&gt;id();</a>
+<a name="ln328">  auto col_pb = expr_pb-&gt;mutable_json_column();</a>
+<a name="ln329">  col_pb-&gt;set_column_id(col_desc-&gt;id());</a>
+<a name="ln330">  for (auto&amp; arg : col_op.args()-&gt;node_list()) {</a>
+<a name="ln331">    RETURN_NOT_OK(PTJsonOperatorToPB(std::dynamic_pointer_cast&lt;PTJsonOperator&gt;(arg),</a>
+<a name="ln332">                                     col_pb-&gt;add_json_operations()));</a>
+<a name="ln333">  }</a>
+<a name="ln334">  // Operand 2: The expression.</a>
+<a name="ln335">  expr_pb = condition-&gt;add_operands();</a>
+<a name="ln336">  return PTExprToPB(col_op.expr(), expr_pb);</a>
+<a name="ln337">}</a>
+<a name="ln338"> </a>
+<a name="ln339">Status Executor::WhereSubColOpToPB(QLConditionPB *condition, const SubscriptedColumnOp&amp; col_op) {</a>
+<a name="ln340">  // Set the operator.</a>
+<a name="ln341">  condition-&gt;set_op(col_op.yb_op());</a>
+<a name="ln342"> </a>
+<a name="ln343">  // Operand 1: The column.</a>
+<a name="ln344">  const ColumnDesc *col_desc = col_op.desc();</a>
+<a name="ln345">  QLExpressionPB *expr_pb = condition-&gt;add_operands();</a>
+<a name="ln346">  VLOG(3) &lt;&lt; &quot;WHERE condition, sub-column with id = &quot; &lt;&lt; col_desc-&gt;id();</a>
+<a name="ln347">  auto col_pb = expr_pb-&gt;mutable_subscripted_col();</a>
+<a name="ln348">  col_pb-&gt;set_column_id(col_desc-&gt;id());</a>
+<a name="ln349">  for (auto&amp; arg : col_op.args()-&gt;node_list()) {</a>
+<a name="ln350">    RETURN_NOT_OK(PTExprToPB(arg, col_pb-&gt;add_subscript_args()));</a>
+<a name="ln351">  }</a>
+<a name="ln352">  // Operand 2: The expression.</a>
+<a name="ln353">  expr_pb = condition-&gt;add_operands();</a>
+<a name="ln354">  return PTExprToPB(col_op.expr(), expr_pb);</a>
+<a name="ln355">}</a>
+<a name="ln356"> </a>
+<a name="ln357">Status Executor::FuncOpToPB(QLConditionPB *condition, const FuncOp&amp; func_op) {</a>
+<a name="ln358">  // Set the operator.</a>
+<a name="ln359">  condition-&gt;set_op(func_op.yb_op());</a>
+<a name="ln360"> </a>
+<a name="ln361">  // Operand 1: The function call.</a>
+<a name="ln362">  PTBcall::SharedPtr ptr = func_op.func_expr();</a>
+<a name="ln363">  QLExpressionPB *expr_pb = condition-&gt;add_operands();</a>
+<a name="ln364">  RETURN_NOT_OK(PTExprToPB(static_cast&lt;const PTBcall*&gt;(ptr.get()), expr_pb));</a>
+<a name="ln365"> </a>
+<a name="ln366">  // Operand 2: The expression.</a>
+<a name="ln367">  expr_pb = condition-&gt;add_operands();</a>
+<a name="ln368">  return PTExprToPB(func_op.value_expr(), expr_pb);</a>
+<a name="ln369">}</a>
+<a name="ln370"> </a>
+<a name="ln371">}  // namespace ql</a>
+<a name="ln372">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="41"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v614/" target="_blank">V614</a> Potentially uninitialized pointer 'col_expr_pb' used. Consider checking the second actual argument of the 'PTExprToPB' function.</p></div>
+<div class="balloon" rel="46"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="49"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="81"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="148"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="150"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="269"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="285"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v773/" target="_blank">V773</a> The return value of function 'mutable_list_value' is required to be utilized. A memory leak is possible.</p></div>
+<div class="balloon" rel="299"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="327"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="346"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

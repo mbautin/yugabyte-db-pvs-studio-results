@@ -1,0 +1,556 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>io_posix.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Copyright (c) 2011 The LevelDB Authors. All rights reserved.</a>
+<a name="ln21">// Use of this source code is governed by a BSD-style license that can be</a>
+<a name="ln22">// found in the LICENSE file. See the AUTHORS file for names of contributors.</a>
+<a name="ln23"> </a>
+<a name="ln24">#ifdef ROCKSDB_LIB_IO_POSIX</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/rocksdb/util/io_posix.h&quot;</a>
+<a name="ln27">#include &lt;errno.h&gt;</a>
+<a name="ln28">#include &lt;fcntl.h&gt;</a>
+<a name="ln29">#if defined(__linux__)</a>
+<a name="ln30">#include &lt;linux/fs.h&gt;</a>
+<a name="ln31">#endif</a>
+<a name="ln32">#include &lt;stdio.h&gt;</a>
+<a name="ln33">#include &lt;stdlib.h&gt;</a>
+<a name="ln34">#include &lt;string.h&gt;</a>
+<a name="ln35">#include &lt;sys/ioctl.h&gt;</a>
+<a name="ln36">#include &lt;sys/mman.h&gt;</a>
+<a name="ln37">#include &lt;sys/stat.h&gt;</a>
+<a name="ln38">#include &lt;sys/types.h&gt;</a>
+<a name="ln39">#ifdef __linux__</a>
+<a name="ln40">#include &lt;sys/statfs.h&gt;</a>
+<a name="ln41">#include &lt;sys/syscall.h&gt;</a>
+<a name="ln42">#endif</a>
+<a name="ln43">#include &quot;yb/rocksdb/port/port.h&quot;</a>
+<a name="ln44">#include &quot;yb/rocksdb/util/coding.h&quot;</a>
+<a name="ln45">#include &quot;yb/rocksdb/util/posix_logger.h&quot;</a>
+<a name="ln46">#include &quot;yb/rocksdb/util/sync_point.h&quot;</a>
+<a name="ln47"> </a>
+<a name="ln48">#include &quot;yb/util/file_system_posix.h&quot;</a>
+<a name="ln49">#include &quot;yb/util/malloc.h&quot;</a>
+<a name="ln50">#include &quot;yb/util/slice.h&quot;</a>
+<a name="ln51">#include &quot;yb/util/stats/iostats_context_imp.h&quot;</a>
+<a name="ln52">#include &quot;yb/util/string_util.h&quot;</a>
+<a name="ln53"> </a>
+<a name="ln54">namespace rocksdb {</a>
+<a name="ln55"> </a>
+<a name="ln56">// A wrapper for fadvise, if the platform doesn't support fadvise,</a>
+<a name="ln57">// it will simply return Status::NotSupport.</a>
+<a name="ln58">int Fadvise(int fd, off_t offset, size_t len, int advice) {</a>
+<a name="ln59">#ifdef __linux__</a>
+<a name="ln60">  return posix_fadvise(fd, offset, len, advice);</a>
+<a name="ln61">#else</a>
+<a name="ln62">  return 0;  // simply do nothing.</a>
+<a name="ln63">#endif</a>
+<a name="ln64">}</a>
+<a name="ln65"> </a>
+<a name="ln66">/*</a>
+<a name="ln67"> * PosixMmapReadableFile</a>
+<a name="ln68"> *</a>
+<a name="ln69"> * mmap() based random-access</a>
+<a name="ln70"> */</a>
+<a name="ln71">// base[0,length-1] contains the mmapped contents of the file.</a>
+<a name="ln72">PosixMmapReadableFile::PosixMmapReadableFile(const int fd,</a>
+<a name="ln73">                                             const std::string&amp; fname,</a>
+<a name="ln74">                                             void* base, size_t length,</a>
+<a name="ln75">                                             const EnvOptions&amp; options)</a>
+<a name="ln76">    : fd_(fd), filename_(fname), mmapped_region_(base), length_(length) {</a>
+<a name="ln77">  fd_ = fd_ + 0;  // suppress the warning for used variables</a>
+<a name="ln78">  assert(options.use_mmap_reads);</a>
+<a name="ln79">  assert(options.use_os_buffer);</a>
+<a name="ln80">}</a>
+<a name="ln81"> </a>
+<a name="ln82">PosixMmapReadableFile::~PosixMmapReadableFile() {</a>
+<a name="ln83">  int ret = munmap(mmapped_region_, length_);</a>
+<a name="ln84">  if (ret != 0) {</a>
+<a name="ln85">    fprintf(stdout, &quot;failed to munmap %p length %&quot; ROCKSDB_PRIszt &quot; \n&quot;,</a>
+<a name="ln86">            mmapped_region_, length_);</a>
+<a name="ln87">  }</a>
+<a name="ln88">}</a>
+<a name="ln89"> </a>
+<a name="ln90">Status PosixMmapReadableFile::Read(uint64_t offset, size_t n, Slice* result,</a>
+<a name="ln91">                                   uint8_t* scratch) const {</a>
+<a name="ln92">  Status s;</a>
+<a name="ln93">  if (offset &gt; length_) {</a>
+<a name="ln94">    *result = Slice();</a>
+<a name="ln95">    return STATUS_IO_ERROR(filename_, EINVAL);</a>
+<a name="ln96">  } else if (offset + n &gt; length_) {</a>
+<a name="ln97">    n = static_cast&lt;size_t&gt;(length_ - offset);</a>
+<a name="ln98">  }</a>
+<a name="ln99">  *result = Slice(reinterpret_cast&lt;char*&gt;(mmapped_region_) + offset, n);</a>
+<a name="ln100">  return s;</a>
+<a name="ln101">}</a>
+<a name="ln102"> </a>
+<a name="ln103">Status PosixMmapReadableFile::InvalidateCache(size_t offset, size_t length) {</a>
+<a name="ln104">#ifndef __linux__</a>
+<a name="ln105">  return Status::OK();</a>
+<a name="ln106">#else</a>
+<a name="ln107">  // free OS pages</a>
+<a name="ln108">  int ret = Fadvise(fd_, offset, length, POSIX_FADV_DONTNEED);</a>
+<a name="ln109">  if (ret == 0) {</a>
+<a name="ln110">    return Status::OK();</a>
+<a name="ln111">  }</a>
+<a name="ln112">  return STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln113">#endif</a>
+<a name="ln114">}</a>
+<a name="ln115"> </a>
+<a name="ln116">yb::Result&lt;uint64_t&gt; PosixMmapReadableFile::INode() const {</a>
+<a name="ln117">  struct stat st;</a>
+<a name="ln118">  if (stat(filename_.c_str(), &amp;st) != 0) {</a>
+<a name="ln119">    return STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln120">  } else {</a>
+<a name="ln121">    return st.st_ino;</a>
+<a name="ln122">  }</a>
+<a name="ln123">}</a>
+<a name="ln124"> </a>
+<a name="ln125">size_t PosixMmapReadableFile::memory_footprint() const {</a>
+<a name="ln126">  return malloc_usable_size(this) + filename_.capacity();</a>
+<a name="ln127">}</a>
+<a name="ln128"> </a>
+<a name="ln129">/*</a>
+<a name="ln130"> * PosixMmapFile</a>
+<a name="ln131"> *</a>
+<a name="ln132"> * We preallocate up to an extra megabyte and use memcpy to append new</a>
+<a name="ln133"> * data to the file.  This is safe since we either properly close the</a>
+<a name="ln134"> * file before reading from it, or for log files, the reading code</a>
+<a name="ln135"> * knows enough to skip zero suffixes.</a>
+<a name="ln136"> */</a>
+<a name="ln137">Status PosixMmapFile::UnmapCurrentRegion() {</a>
+<a name="ln138">  TEST_KILL_RANDOM(&quot;PosixMmapFile::UnmapCurrentRegion:0&quot;, rocksdb_kill_odds);</a>
+<a name="ln139">  if (base_ != nullptr) {</a>
+<a name="ln140">    int munmap_status = munmap(base_, limit_ - base_);</a>
+<a name="ln141">    if (munmap_status != 0) {</a>
+<a name="ln142">      return STATUS_IO_ERROR(filename_, munmap_status);</a>
+<a name="ln143">    }</a>
+<a name="ln144">    file_offset_ += limit_ - base_;</a>
+<a name="ln145">    base_ = nullptr;</a>
+<a name="ln146">    limit_ = nullptr;</a>
+<a name="ln147">    last_sync_ = nullptr;</a>
+<a name="ln148">    dst_ = nullptr;</a>
+<a name="ln149"> </a>
+<a name="ln150">    // Increase the amount we map the next time, but capped at 1MB</a>
+<a name="ln151">    if (map_size_ &lt; (1 &lt;&lt; 20)) {</a>
+<a name="ln152">      map_size_ *= 2;</a>
+<a name="ln153">    }</a>
+<a name="ln154">  }</a>
+<a name="ln155">  return Status::OK();</a>
+<a name="ln156">}</a>
+<a name="ln157"> </a>
+<a name="ln158">Status PosixMmapFile::MapNewRegion() {</a>
+<a name="ln159">#ifdef ROCKSDB_FALLOCATE_PRESENT</a>
+<a name="ln160">  assert(base_ == nullptr);</a>
+<a name="ln161"> </a>
+<a name="ln162">  TEST_KILL_RANDOM(&quot;PosixMmapFile::UnmapCurrentRegion:0&quot;, rocksdb_kill_odds);</a>
+<a name="ln163">  // we can't fallocate with FALLOC_FL_KEEP_SIZE here</a>
+<a name="ln164">  if (allow_fallocate_) {</a>
+<a name="ln165">    IOSTATS_TIMER_GUARD(allocate_nanos);</a>
+<a name="ln166">    int alloc_status = fallocate(fd_, 0, file_offset_, map_size_);</a>
+<a name="ln167">    if (alloc_status != 0) {</a>
+<a name="ln168">      // fallback to posix_fallocate</a>
+<a name="ln169">      alloc_status = posix_fallocate(fd_, file_offset_, map_size_);</a>
+<a name="ln170">    }</a>
+<a name="ln171">    if (alloc_status != 0) {</a>
+<a name="ln172">      return STATUS(IOError, &quot;Error allocating space to file : &quot; + filename_ +</a>
+<a name="ln173">                             &quot;Error : &quot; + strerror(alloc_status));</a>
+<a name="ln174">    }</a>
+<a name="ln175">  }</a>
+<a name="ln176"> </a>
+<a name="ln177">  TEST_KILL_RANDOM(&quot;PosixMmapFile::Append:1&quot;, rocksdb_kill_odds);</a>
+<a name="ln178">  void* ptr = mmap(nullptr, map_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_,</a>
+<a name="ln179">                   file_offset_);</a>
+<a name="ln180">  if (ptr == MAP_FAILED) {</a>
+<a name="ln181">    return STATUS(IOError, &quot;MMap failed on &quot; + filename_);</a>
+<a name="ln182">  }</a>
+<a name="ln183">  TEST_KILL_RANDOM(&quot;PosixMmapFile::Append:2&quot;, rocksdb_kill_odds);</a>
+<a name="ln184"> </a>
+<a name="ln185">  base_ = reinterpret_cast&lt;char*&gt;(ptr);</a>
+<a name="ln186">  limit_ = base_ + map_size_;</a>
+<a name="ln187">  dst_ = base_;</a>
+<a name="ln188">  last_sync_ = base_;</a>
+<a name="ln189">  return Status::OK();</a>
+<a name="ln190">#else</a>
+<a name="ln191">  return STATUS(NotSupported, &quot;This platform doesn't support fallocate()&quot;);</a>
+<a name="ln192">#endif</a>
+<a name="ln193">}</a>
+<a name="ln194"> </a>
+<a name="ln195">Status PosixMmapFile::Msync() {</a>
+<a name="ln196">  if (dst_ == last_sync_) {</a>
+<a name="ln197">    return Status::OK();</a>
+<a name="ln198">  }</a>
+<a name="ln199">  // Find the beginnings of the pages that contain the first and last</a>
+<a name="ln200">  // bytes to be synced.</a>
+<a name="ln201">  size_t p1 = TruncateToPageBoundary(last_sync_ - base_);</a>
+<a name="ln202">  size_t p2 = TruncateToPageBoundary(dst_ - base_ - 1);</a>
+<a name="ln203">  last_sync_ = dst_;</a>
+<a name="ln204">  TEST_KILL_RANDOM(&quot;PosixMmapFile::Msync:0&quot;, rocksdb_kill_odds);</a>
+<a name="ln205">  if (msync(base_ + p1, p2 - p1 + page_size_, MS_SYNC) &lt; 0) {</a>
+<a name="ln206">    return STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln207">  }</a>
+<a name="ln208">  return Status::OK();</a>
+<a name="ln209">}</a>
+<a name="ln210"> </a>
+<a name="ln211">PosixMmapFile::PosixMmapFile(const std::string&amp; fname, int fd, size_t page_size,</a>
+<a name="ln212">                             const EnvOptions&amp; options)</a>
+<a name="ln213">    : filename_(fname),</a>
+<a name="ln214">      fd_(fd),</a>
+<a name="ln215">      page_size_(page_size),</a>
+<a name="ln216">      map_size_(Roundup(65536, page_size)),</a>
+<a name="ln217">      base_(nullptr),</a>
+<a name="ln218">      limit_(nullptr),</a>
+<a name="ln219">      dst_(nullptr),</a>
+<a name="ln220">      last_sync_(nullptr),</a>
+<a name="ln221">      file_offset_(0) {</a>
+<a name="ln222">#ifdef ROCKSDB_FALLOCATE_PRESENT</a>
+<a name="ln223">  allow_fallocate_ = options.allow_fallocate;</a>
+<a name="ln224">  fallocate_with_keep_size_ = options.fallocate_with_keep_size;</a>
+<a name="ln225">#endif</a>
+<a name="ln226">  assert((page_size &amp; (page_size - 1)) == 0);</a>
+<a name="ln227">  assert(options.use_mmap_writes);</a>
+<a name="ln228">}</a>
+<a name="ln229"> </a>
+<a name="ln230">PosixMmapFile::~PosixMmapFile() {</a>
+<a name="ln231">  if (fd_ &gt;= 0) {</a>
+<a name="ln232">    WARN_NOT_OK(PosixMmapFile::Close(), &quot;Failed to close posix mmap file&quot;);</a>
+<a name="ln233">  }</a>
+<a name="ln234">}</a>
+<a name="ln235"> </a>
+<a name="ln236">Status PosixMmapFile::Append(const Slice&amp; data) {</a>
+<a name="ln237">  const char* src = data.cdata();</a>
+<a name="ln238">  size_t left = data.size();</a>
+<a name="ln239">  while (left &gt; 0) {</a>
+<a name="ln240">    assert(base_ &lt;= dst_);</a>
+<a name="ln241">    assert(dst_ &lt;= limit_);</a>
+<a name="ln242">    size_t avail = limit_ - dst_;</a>
+<a name="ln243">    if (avail == 0) {</a>
+<a name="ln244">      Status s = UnmapCurrentRegion();</a>
+<a name="ln245">      if (!s.ok()) {</a>
+<a name="ln246">        return s;</a>
+<a name="ln247">      }</a>
+<a name="ln248">      s = MapNewRegion();</a>
+<a name="ln249">      if (!s.ok()) {</a>
+<a name="ln250">        return s;</a>
+<a name="ln251">      }</a>
+<a name="ln252">      TEST_KILL_RANDOM(&quot;PosixMmapFile::Append:0&quot;, rocksdb_kill_odds);</a>
+<a name="ln253">    }</a>
+<a name="ln254"> </a>
+<a name="ln255">    size_t n = (left &lt;= avail) ? left : avail;</a>
+<a name="ln256">    memcpy(dst_, src, n);</a>
+<a name="ln257">    dst_ += n;</a>
+<a name="ln258">    src += n;</a>
+<a name="ln259">    left -= n;</a>
+<a name="ln260">  }</a>
+<a name="ln261">  return Status::OK();</a>
+<a name="ln262">}</a>
+<a name="ln263"> </a>
+<a name="ln264">Status PosixMmapFile::Close() {</a>
+<a name="ln265">  Status s;</a>
+<a name="ln266">  size_t unused = limit_ - dst_;</a>
+<a name="ln267"> </a>
+<a name="ln268">  s = UnmapCurrentRegion();</a>
+<a name="ln269">  if (!s.ok()) {</a>
+<a name="ln270">    s = STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln271">  } else if (unused &gt; 0) {</a>
+<a name="ln272">    // Trim the extra space at the end of the file</a>
+<a name="ln273">    if (ftruncate(fd_, file_offset_ - unused) &lt; 0) {</a>
+<a name="ln274">      s = STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln275">    }</a>
+<a name="ln276">  }</a>
+<a name="ln277"> </a>
+<a name="ln278">  if (close(fd_) &lt; 0) {</a>
+<a name="ln279">    if (s.ok()) {</a>
+<a name="ln280">      s = STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln281">    }</a>
+<a name="ln282">  }</a>
+<a name="ln283"> </a>
+<a name="ln284">  fd_ = -1;</a>
+<a name="ln285">  base_ = nullptr;</a>
+<a name="ln286">  limit_ = nullptr;</a>
+<a name="ln287">  return s;</a>
+<a name="ln288">}</a>
+<a name="ln289"> </a>
+<a name="ln290">Status PosixMmapFile::Flush() { return Status::OK(); }</a>
+<a name="ln291"> </a>
+<a name="ln292">Status PosixMmapFile::Sync() {</a>
+<a name="ln293">  if (fdatasync(fd_) &lt; 0) {</a>
+<a name="ln294">    return STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln295">  }</a>
+<a name="ln296"> </a>
+<a name="ln297">  return Msync();</a>
+<a name="ln298">}</a>
+<a name="ln299"> </a>
+<a name="ln300">/**</a>
+<a name="ln301"> * Flush data as well as metadata to stable storage.</a>
+<a name="ln302"> */</a>
+<a name="ln303">Status PosixMmapFile::Fsync() {</a>
+<a name="ln304">  if (fsync(fd_) &lt; 0) {</a>
+<a name="ln305">    return STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln306">  }</a>
+<a name="ln307"> </a>
+<a name="ln308">  return Msync();</a>
+<a name="ln309">}</a>
+<a name="ln310"> </a>
+<a name="ln311">/**</a>
+<a name="ln312"> * Get the size of valid data in the file. This will not match the</a>
+<a name="ln313"> * size that is returned from the filesystem because we use mmap</a>
+<a name="ln314"> * to extend file by map_size every time.</a>
+<a name="ln315"> */</a>
+<a name="ln316">uint64_t PosixMmapFile::GetFileSize() {</a>
+<a name="ln317">  size_t used = dst_ - base_;</a>
+<a name="ln318">  return file_offset_ + used;</a>
+<a name="ln319">}</a>
+<a name="ln320"> </a>
+<a name="ln321">Status PosixMmapFile::InvalidateCache(size_t offset, size_t length) {</a>
+<a name="ln322">#ifndef __linux__</a>
+<a name="ln323">  return Status::OK();</a>
+<a name="ln324">#else</a>
+<a name="ln325">  // free OS pages</a>
+<a name="ln326">  int ret = Fadvise(fd_, offset, length, POSIX_FADV_DONTNEED);</a>
+<a name="ln327">  if (ret == 0) {</a>
+<a name="ln328">    return Status::OK();</a>
+<a name="ln329">  }</a>
+<a name="ln330">  return STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln331">#endif</a>
+<a name="ln332">}</a>
+<a name="ln333"> </a>
+<a name="ln334">#ifdef ROCKSDB_FALLOCATE_PRESENT</a>
+<a name="ln335">Status PosixMmapFile::Allocate(uint64_t offset, uint64_t len) {</a>
+<a name="ln336">  assert(offset &lt;= std::numeric_limits&lt;off_t&gt;::max());</a>
+<a name="ln337">  assert(len &lt;= std::numeric_limits&lt;off_t&gt;::max());</a>
+<a name="ln338">  TEST_KILL_RANDOM(&quot;PosixMmapFile::Allocate:0&quot;, rocksdb_kill_odds);</a>
+<a name="ln339">  int alloc_status = 0;</a>
+<a name="ln340">  if (allow_fallocate_) {</a>
+<a name="ln341">    alloc_status = fallocate(</a>
+<a name="ln342">        fd_, fallocate_with_keep_size_ ? FALLOC_FL_KEEP_SIZE : 0,</a>
+<a name="ln343">          static_cast&lt;off_t&gt;(offset), static_cast&lt;off_t&gt;(len));</a>
+<a name="ln344">  }</a>
+<a name="ln345">  if (alloc_status == 0) {</a>
+<a name="ln346">    return Status::OK();</a>
+<a name="ln347">  } else {</a>
+<a name="ln348">    return STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln349">  }</a>
+<a name="ln350">}</a>
+<a name="ln351">#endif</a>
+<a name="ln352"> </a>
+<a name="ln353">/*</a>
+<a name="ln354"> * PosixWritableFile</a>
+<a name="ln355"> *</a>
+<a name="ln356"> * Use posix write to write data to a file.</a>
+<a name="ln357"> */</a>
+<a name="ln358">PosixWritableFile::PosixWritableFile(const std::string&amp; fname, int fd,</a>
+<a name="ln359">                                     const EnvOptions&amp; options)</a>
+<a name="ln360">    : filename_(fname), fd_(fd), filesize_(0) {</a>
+<a name="ln361">#ifdef ROCKSDB_FALLOCATE_PRESENT</a>
+<a name="ln362">  allow_fallocate_ = options.allow_fallocate;</a>
+<a name="ln363">  fallocate_with_keep_size_ = options.fallocate_with_keep_size;</a>
+<a name="ln364">#endif</a>
+<a name="ln365">  assert(!options.use_mmap_writes);</a>
+<a name="ln366">}</a>
+<a name="ln367"> </a>
+<a name="ln368">PosixWritableFile::~PosixWritableFile() {</a>
+<a name="ln369">  if (fd_ &gt;= 0) {</a>
+<a name="ln370">    WARN_NOT_OK(PosixWritableFile::Close(), &quot;Failed to close posix writable file&quot;);</a>
+<a name="ln371">  }</a>
+<a name="ln372">}</a>
+<a name="ln373"> </a>
+<a name="ln374">Status PosixWritableFile::Append(const Slice&amp; data) {</a>
+<a name="ln375">  const char* src = data.cdata();</a>
+<a name="ln376">  size_t left = data.size();</a>
+<a name="ln377">  while (left != 0) {</a>
+<a name="ln378">    ssize_t done = write(fd_, src, left);</a>
+<a name="ln379">    if (done &lt; 0) {</a>
+<a name="ln380">      if (errno == EINTR) {</a>
+<a name="ln381">        continue;</a>
+<a name="ln382">      }</a>
+<a name="ln383">      return STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln384">    }</a>
+<a name="ln385">    left -= done;</a>
+<a name="ln386">    src += done;</a>
+<a name="ln387">  }</a>
+<a name="ln388">  filesize_ += data.size();</a>
+<a name="ln389">  return Status::OK();</a>
+<a name="ln390">}</a>
+<a name="ln391"> </a>
+<a name="ln392">Status PosixWritableFile::Close() {</a>
+<a name="ln393">  Status s;</a>
+<a name="ln394"> </a>
+<a name="ln395">  size_t block_size;</a>
+<a name="ln396">  size_t last_allocated_block;</a>
+<a name="ln397">  GetPreallocationStatus(&amp;block_size, &amp;last_allocated_block);</a>
+<a name="ln398">  if (last_allocated_block &gt; 0) {</a>
+<a name="ln399">    // trim the extra space preallocated at the end of the file</a>
+<a name="ln400">    // NOTE(ljin): we probably don't want to surface failure as an IOError,</a>
+<a name="ln401">    // but it will be nice to log these errors.</a>
+<a name="ln402">    int dummy __attribute__((unused));</a>
+<a name="ln403">    dummy = ftruncate(fd_, filesize_);</a>
+<a name="ln404">#ifdef ROCKSDB_FALLOCATE_PRESENT</a>
+<a name="ln405">    // in some file systems, ftruncate only trims trailing space if the</a>
+<a name="ln406">    // new file size is smaller than the current size. Calling fallocate</a>
+<a name="ln407">    // with FALLOC_FL_PUNCH_HOLE flag to explicitly release these unused</a>
+<a name="ln408">    // blocks. FALLOC_FL_PUNCH_HOLE is supported on at least the following</a>
+<a name="ln409">    // filesystems:</a>
+<a name="ln410">    //   XFS (since Linux 2.6.38)</a>
+<a name="ln411">    //   ext4 (since Linux 3.0)</a>
+<a name="ln412">    //   Btrfs (since Linux 3.7)</a>
+<a name="ln413">    //   tmpfs (since Linux 3.5)</a>
+<a name="ln414">    // We ignore error since failure of this operation does not affect</a>
+<a name="ln415">    // correctness.</a>
+<a name="ln416">    IOSTATS_TIMER_GUARD(allocate_nanos);</a>
+<a name="ln417">    if (allow_fallocate_) {</a>
+<a name="ln418">      fallocate(fd_, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, filesize_,</a>
+<a name="ln419">                block_size * last_allocated_block - filesize_);</a>
+<a name="ln420">    }</a>
+<a name="ln421">#endif</a>
+<a name="ln422">  }</a>
+<a name="ln423"> </a>
+<a name="ln424">  if (close(fd_) &lt; 0) {</a>
+<a name="ln425">    s = STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln426">  }</a>
+<a name="ln427">  fd_ = -1;</a>
+<a name="ln428">  return s;</a>
+<a name="ln429">}</a>
+<a name="ln430"> </a>
+<a name="ln431">// write out the cached data to the OS cache</a>
+<a name="ln432">Status PosixWritableFile::Flush() { return Status::OK(); }</a>
+<a name="ln433"> </a>
+<a name="ln434">Status PosixWritableFile::Sync() {</a>
+<a name="ln435">  if (fdatasync(fd_) &lt; 0) {</a>
+<a name="ln436">    return STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln437">  }</a>
+<a name="ln438">  return Status::OK();</a>
+<a name="ln439">}</a>
+<a name="ln440"> </a>
+<a name="ln441">Status PosixWritableFile::Fsync() {</a>
+<a name="ln442">  if (fsync(fd_) &lt; 0) {</a>
+<a name="ln443">    return STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln444">  }</a>
+<a name="ln445">  return Status::OK();</a>
+<a name="ln446">}</a>
+<a name="ln447"> </a>
+<a name="ln448">bool PosixWritableFile::IsSyncThreadSafe() const { return true; }</a>
+<a name="ln449"> </a>
+<a name="ln450">uint64_t PosixWritableFile::GetFileSize() { return filesize_; }</a>
+<a name="ln451"> </a>
+<a name="ln452">Status PosixWritableFile::InvalidateCache(size_t offset, size_t length) {</a>
+<a name="ln453">#ifndef __linux__</a>
+<a name="ln454">  return Status::OK();</a>
+<a name="ln455">#else</a>
+<a name="ln456">  // free OS pages</a>
+<a name="ln457">  int ret = Fadvise(fd_, offset, length, POSIX_FADV_DONTNEED);</a>
+<a name="ln458">  if (ret == 0) {</a>
+<a name="ln459">    return Status::OK();</a>
+<a name="ln460">  }</a>
+<a name="ln461">  return STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln462">#endif</a>
+<a name="ln463">}</a>
+<a name="ln464"> </a>
+<a name="ln465">#ifdef ROCKSDB_FALLOCATE_PRESENT</a>
+<a name="ln466">Status PosixWritableFile::Allocate(uint64_t offset, uint64_t len) {</a>
+<a name="ln467">  assert(offset &lt;= std::numeric_limits&lt;off_t&gt;::max());</a>
+<a name="ln468">  assert(len &lt;= std::numeric_limits&lt;off_t&gt;::max());</a>
+<a name="ln469">  TEST_KILL_RANDOM(&quot;PosixWritableFile::Allocate:0&quot;, rocksdb_kill_odds);</a>
+<a name="ln470">  IOSTATS_TIMER_GUARD(allocate_nanos);</a>
+<a name="ln471">  int alloc_status = 0;</a>
+<a name="ln472">  if (allow_fallocate_) {</a>
+<a name="ln473">    alloc_status = fallocate(</a>
+<a name="ln474">        fd_, fallocate_with_keep_size_ ? FALLOC_FL_KEEP_SIZE : 0,</a>
+<a name="ln475">        static_cast&lt;off_t&gt;(offset), static_cast&lt;off_t&gt;(len));</a>
+<a name="ln476">  }</a>
+<a name="ln477">  if (alloc_status == 0) {</a>
+<a name="ln478">    return Status::OK();</a>
+<a name="ln479">  } else {</a>
+<a name="ln480">    return STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln481">  }</a>
+<a name="ln482">}</a>
+<a name="ln483"> </a>
+<a name="ln484">Status PosixWritableFile::RangeSync(uint64_t offset, uint64_t nbytes) {</a>
+<a name="ln485">  assert(offset &lt;= std::numeric_limits&lt;off_t&gt;::max());</a>
+<a name="ln486">  assert(nbytes &lt;= std::numeric_limits&lt;off_t&gt;::max());</a>
+<a name="ln487">  if (sync_file_range(fd_, static_cast&lt;off_t&gt;(offset),</a>
+<a name="ln488">      static_cast&lt;off_t&gt;(nbytes), SYNC_FILE_RANGE_WRITE) == 0) {</a>
+<a name="ln489">    return Status::OK();</a>
+<a name="ln490">  } else {</a>
+<a name="ln491">    return STATUS_IO_ERROR(filename_, errno);</a>
+<a name="ln492">  }</a>
+<a name="ln493">}</a>
+<a name="ln494"> </a>
+<a name="ln495">size_t PosixWritableFile::GetUniqueId(char* id) const {</a>
+<a name="ln496">  return yb::GetUniqueIdFromFile(fd_, pointer_cast&lt;uint8_t*&gt;(id));</a>
+<a name="ln497">}</a>
+<a name="ln498">#endif</a>
+<a name="ln499"> </a>
+<a name="ln500">PosixDirectory::~PosixDirectory() { close(fd_); }</a>
+<a name="ln501"> </a>
+<a name="ln502">Status PosixDirectory::Fsync() {</a>
+<a name="ln503">  if (fsync(fd_) == -1) {</a>
+<a name="ln504">    return STATUS_IO_ERROR(&quot;directory&quot;, errno);</a>
+<a name="ln505">  }</a>
+<a name="ln506">  return Status::OK();</a>
+<a name="ln507">}</a>
+<a name="ln508">}  // namespace rocksdb</a>
+<a name="ln509">#endif</a>
+
+</code></pre>
+<div class="balloon" rel="86"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v774/" target="_blank">V774</a> The 'mmapped_region_' pointer was used after the memory was released.</p></div>
+<div class="balloon" rel="144"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v774/" target="_blank">V774</a> The 'base_' pointer was used after the memory was released.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

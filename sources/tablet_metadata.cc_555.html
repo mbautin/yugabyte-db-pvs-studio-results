@@ -1,0 +1,998 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>tablet_metadata.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/tablet/tablet_metadata.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;algorithm&gt;</a>
+<a name="ln36">#include &lt;mutex&gt;</a>
+<a name="ln37">#include &lt;string&gt;</a>
+<a name="ln38"> </a>
+<a name="ln39">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln40">#include &lt;boost/optional.hpp&gt;</a>
+<a name="ln41">#include &quot;yb/rocksdb/db.h&quot;</a>
+<a name="ln42">#include &quot;yb/rocksdb/options.h&quot;</a>
+<a name="ln43">#include &quot;yb/common/entity_ids.h&quot;</a>
+<a name="ln44">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln45">#include &quot;yb/consensus/consensus_util.h&quot;</a>
+<a name="ln46">#include &quot;yb/consensus/opid_util.h&quot;</a>
+<a name="ln47">#include &quot;yb/docdb/docdb_rocksdb_util.h&quot;</a>
+<a name="ln48">#include &quot;yb/gutil/atomicops.h&quot;</a>
+<a name="ln49">#include &quot;yb/gutil/bind.h&quot;</a>
+<a name="ln50">#include &quot;yb/gutil/dynamic_annotations.h&quot;</a>
+<a name="ln51">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln52">#include &quot;yb/gutil/stl_util.h&quot;</a>
+<a name="ln53">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln54">#include &quot;yb/rocksutil/yb_rocksdb.h&quot;</a>
+<a name="ln55">#include &quot;yb/rocksutil/yb_rocksdb_logger.h&quot;</a>
+<a name="ln56">#include &quot;yb/server/metadata.h&quot;</a>
+<a name="ln57">#include &quot;yb/tablet/tablet_options.h&quot;</a>
+<a name="ln58">#include &quot;yb/util/debug/trace_event.h&quot;</a>
+<a name="ln59">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln60">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln61">#include &quot;yb/util/pb_util.h&quot;</a>
+<a name="ln62">#include &quot;yb/util/random.h&quot;</a>
+<a name="ln63">#include &quot;yb/util/status.h&quot;</a>
+<a name="ln64">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln65"> </a>
+<a name="ln66">DEFINE_bool(enable_tablet_orphaned_block_deletion, true,</a>
+<a name="ln67">            &quot;Whether to enable deletion of orphaned blocks from disk. &quot;</a>
+<a name="ln68">            &quot;Note: This is only exposed for debugging purposes!&quot;);</a>
+<a name="ln69">TAG_FLAG(enable_tablet_orphaned_block_deletion, advanced);</a>
+<a name="ln70">TAG_FLAG(enable_tablet_orphaned_block_deletion, hidden);</a>
+<a name="ln71">TAG_FLAG(enable_tablet_orphaned_block_deletion, runtime);</a>
+<a name="ln72"> </a>
+<a name="ln73">using std::shared_ptr;</a>
+<a name="ln74"> </a>
+<a name="ln75">using base::subtle::Barrier_AtomicIncrement;</a>
+<a name="ln76">using strings::Substitute;</a>
+<a name="ln77"> </a>
+<a name="ln78">using yb::consensus::MinimumOpId;</a>
+<a name="ln79"> </a>
+<a name="ln80">namespace yb {</a>
+<a name="ln81">namespace tablet {</a>
+<a name="ln82"> </a>
+<a name="ln83">const int64 kNoDurableMemStore = -1;</a>
+<a name="ln84">const std::string kIntentsSubdir = &quot;intents&quot;;</a>
+<a name="ln85">const std::string kIntentsDBSuffix = &quot;.intents&quot;;</a>
+<a name="ln86">const std::string kSnapshotsDirSuffix = &quot;.snapshots&quot;;</a>
+<a name="ln87"> </a>
+<a name="ln88">// ============================================================================</a>
+<a name="ln89">//  Raft group metadata</a>
+<a name="ln90">// ============================================================================</a>
+<a name="ln91"> </a>
+<a name="ln92">TableInfo::TableInfo(std::string table_id,</a>
+<a name="ln93">                     std::string namespace_name,</a>
+<a name="ln94">                     std::string table_name,</a>
+<a name="ln95">                     TableType table_type,</a>
+<a name="ln96">                     const Schema&amp; schema,</a>
+<a name="ln97">                     const IndexMap&amp; index_map,</a>
+<a name="ln98">                     const boost::optional&lt;IndexInfo&gt;&amp; index_info,</a>
+<a name="ln99">                     const uint32_t schema_version,</a>
+<a name="ln100">                     PartitionSchema partition_schema)</a>
+<a name="ln101">    : table_id(std::move(table_id)),</a>
+<a name="ln102">      namespace_name(std::move(namespace_name)),</a>
+<a name="ln103">      table_name(std::move(table_name)),</a>
+<a name="ln104">      table_type(table_type),</a>
+<a name="ln105">      schema(schema),</a>
+<a name="ln106">      index_map(index_map),</a>
+<a name="ln107">      index_info(index_info ? new IndexInfo(*index_info) : nullptr),</a>
+<a name="ln108">      schema_version(schema_version),</a>
+<a name="ln109">      partition_schema(std::move(partition_schema)) {</a>
+<a name="ln110">}</a>
+<a name="ln111"> </a>
+<a name="ln112">TableInfo::TableInfo(const TableInfo&amp; other,</a>
+<a name="ln113">                     const Schema&amp; schema,</a>
+<a name="ln114">                     const IndexMap&amp; index_map,</a>
+<a name="ln115">                     const std::vector&lt;DeletedColumn&gt;&amp; deleted_cols,</a>
+<a name="ln116">                     const uint32_t schema_version)</a>
+<a name="ln117">    : table_id(other.table_id),</a>
+<a name="ln118">      namespace_name(other.namespace_name),</a>
+<a name="ln119">      table_name(other.table_name),</a>
+<a name="ln120">      table_type(other.table_type),</a>
+<a name="ln121">      schema(schema),</a>
+<a name="ln122">      index_map(index_map),</a>
+<a name="ln123">      index_info(other.index_info ? new IndexInfo(*other.index_info) : nullptr),</a>
+<a name="ln124">      schema_version(schema_version),</a>
+<a name="ln125">      partition_schema(other.partition_schema),</a>
+<a name="ln126">      deleted_cols(other.deleted_cols) {</a>
+<a name="ln127">  this-&gt;deleted_cols.insert(this-&gt;deleted_cols.end(), deleted_cols.begin(), deleted_cols.end());</a>
+<a name="ln128">}</a>
+<a name="ln129"> </a>
+<a name="ln130">Status TableInfo::LoadFromPB(const TableInfoPB&amp; pb) {</a>
+<a name="ln131">  table_id = pb.table_id();</a>
+<a name="ln132">  namespace_name = pb.namespace_name();</a>
+<a name="ln133">  table_name = pb.table_name();</a>
+<a name="ln134">  table_type = pb.table_type();</a>
+<a name="ln135"> </a>
+<a name="ln136">  RETURN_NOT_OK(SchemaFromPB(pb.schema(), &amp;schema));</a>
+<a name="ln137">  if (pb.has_index_info()) {</a>
+<a name="ln138">    index_info.reset(new IndexInfo(pb.index_info()));</a>
+<a name="ln139">  }</a>
+<a name="ln140">  index_map.FromPB(pb.indexes());</a>
+<a name="ln141">  schema_version = pb.schema_version();</a>
+<a name="ln142"> </a>
+<a name="ln143">  RETURN_NOT_OK(PartitionSchema::FromPB(pb.partition_schema(), schema, &amp;partition_schema));</a>
+<a name="ln144"> </a>
+<a name="ln145">  for (const DeletedColumnPB&amp; deleted_col : pb.deleted_cols()) {</a>
+<a name="ln146">    DeletedColumn col;</a>
+<a name="ln147">    RETURN_NOT_OK(DeletedColumn::FromPB(deleted_col, &amp;col));</a>
+<a name="ln148">    deleted_cols.push_back(col);</a>
+<a name="ln149">  }</a>
+<a name="ln150"> </a>
+<a name="ln151">  return Status::OK();</a>
+<a name="ln152">}</a>
+<a name="ln153"> </a>
+<a name="ln154">void TableInfo::ToPB(TableInfoPB* pb) const {</a>
+<a name="ln155">  pb-&gt;set_table_id(table_id);</a>
+<a name="ln156">  pb-&gt;set_namespace_name(namespace_name);</a>
+<a name="ln157">  pb-&gt;set_table_name(table_name);</a>
+<a name="ln158">  pb-&gt;set_table_type(table_type);</a>
+<a name="ln159"> </a>
+<a name="ln160">  DCHECK(schema.has_column_ids());</a>
+<a name="ln161">  SchemaToPB(schema, pb-&gt;mutable_schema());</a>
+<a name="ln162">  if (index_info) {</a>
+<a name="ln163">    index_info-&gt;ToPB(pb-&gt;mutable_index_info());</a>
+<a name="ln164">  }</a>
+<a name="ln165">  index_map.ToPB(pb-&gt;mutable_indexes());</a>
+<a name="ln166">  pb-&gt;set_schema_version(schema_version);</a>
+<a name="ln167"> </a>
+<a name="ln168">  partition_schema.ToPB(pb-&gt;mutable_partition_schema());</a>
+<a name="ln169"> </a>
+<a name="ln170">  for (const DeletedColumn&amp; deleted_col : deleted_cols) {</a>
+<a name="ln171">    deleted_col.CopyToPB(pb-&gt;mutable_deleted_cols()-&gt;Add());</a>
+<a name="ln172">  }</a>
+<a name="ln173">}</a>
+<a name="ln174"> </a>
+<a name="ln175">Status KvStoreInfo::LoadTablesFromPB(</a>
+<a name="ln176">    google::protobuf::RepeatedPtrField&lt;TableInfoPB&gt; pbs, TableId primary_table_id) {</a>
+<a name="ln177">  tables.clear();</a>
+<a name="ln178">  for (const auto&amp; table_pb : pbs) {</a>
+<a name="ln179">    auto table_info = std::make_shared&lt;TableInfo&gt;();</a>
+<a name="ln180">    RETURN_NOT_OK(table_info-&gt;LoadFromPB(table_pb));</a>
+<a name="ln181">    if (table_info-&gt;table_id != primary_table_id) {</a>
+<a name="ln182">      if (table_pb.schema().table_properties().is_ysql_catalog_table()) {</a>
+<a name="ln183">        Uuid cotable_id;</a>
+<a name="ln184">        CHECK_OK(cotable_id.FromHexString(table_info-&gt;table_id));</a>
+<a name="ln185">        // TODO(#79): when adding for multiple KV-stores per Raft group support - check if we need</a>
+<a name="ln186">        // to set cotable ID.</a>
+<a name="ln187">        table_info-&gt;schema.set_cotable_id(cotable_id);</a>
+<a name="ln188">      } else {</a>
+<a name="ln189">        auto pgtable_id = VERIFY_RESULT(GetPgsqlTableOid(table_info-&gt;table_id));</a>
+<a name="ln190">        table_info-&gt;schema.set_pgtable_id(pgtable_id);</a>
+<a name="ln191">      }</a>
+<a name="ln192">    }</a>
+<a name="ln193">    tables[table_info-&gt;table_id] = std::move(table_info);</a>
+<a name="ln194">  }</a>
+<a name="ln195">  return Status::OK();</a>
+<a name="ln196">}</a>
+<a name="ln197"> </a>
+<a name="ln198">Status KvStoreInfo::LoadFromPB(const KvStoreInfoPB&amp; pb, TableId primary_table_id) {</a>
+<a name="ln199">  kv_store_id = KvStoreId(pb.kv_store_id());</a>
+<a name="ln200">  rocksdb_dir = pb.rocksdb_dir();</a>
+<a name="ln201">  lower_bound_key = pb.lower_bound_key();</a>
+<a name="ln202">  upper_bound_key = pb.upper_bound_key();</a>
+<a name="ln203">  has_been_fully_compacted = pb.has_been_fully_compacted();</a>
+<a name="ln204">  return LoadTablesFromPB(pb.tables(), primary_table_id);</a>
+<a name="ln205">}</a>
+<a name="ln206"> </a>
+<a name="ln207">void KvStoreInfo::ToPB(TableId primary_table_id, KvStoreInfoPB* pb) const {</a>
+<a name="ln208">  pb-&gt;set_kv_store_id(kv_store_id.ToString());</a>
+<a name="ln209">  pb-&gt;set_rocksdb_dir(rocksdb_dir);</a>
+<a name="ln210">  if (lower_bound_key.empty()) {</a>
+<a name="ln211">    pb-&gt;clear_lower_bound_key();</a>
+<a name="ln212">  } else {</a>
+<a name="ln213">    pb-&gt;set_lower_bound_key(lower_bound_key);</a>
+<a name="ln214">  }</a>
+<a name="ln215">  if (upper_bound_key.empty()) {</a>
+<a name="ln216">    pb-&gt;clear_upper_bound_key();</a>
+<a name="ln217">  } else {</a>
+<a name="ln218">    pb-&gt;set_upper_bound_key(upper_bound_key);</a>
+<a name="ln219">  }</a>
+<a name="ln220">  pb-&gt;set_has_been_fully_compacted(has_been_fully_compacted);</a>
+<a name="ln221"> </a>
+<a name="ln222">  // Putting primary table first, then all other tables.</a>
+<a name="ln223">  const auto&amp; it = tables.find(primary_table_id);</a>
+<a name="ln224">  if (it != tables.end()) {</a>
+<a name="ln225">    it-&gt;second-&gt;ToPB(pb-&gt;add_tables());</a>
+<a name="ln226">  }</a>
+<a name="ln227">  for (const auto&amp; it : tables) {</a>
+<a name="ln228">    if (it.first != primary_table_id) {</a>
+<a name="ln229">      it.second-&gt;ToPB(pb-&gt;add_tables());</a>
+<a name="ln230">    }</a>
+<a name="ln231">  }</a>
+<a name="ln232">}</a>
+<a name="ln233"> </a>
+<a name="ln234">namespace {</a>
+<a name="ln235"> </a>
+<a name="ln236">std::string MakeTabletDirName(const TabletId&amp; tablet_id) {</a>
+<a name="ln237">  return Format(&quot;tablet-$0&quot;, tablet_id);</a>
+<a name="ln238">}</a>
+<a name="ln239"> </a>
+<a name="ln240">} // namespace</a>
+<a name="ln241"> </a>
+<a name="ln242">// ============================================================================</a>
+<a name="ln243"> </a>
+<a name="ln244">Status RaftGroupMetadata::CreateNew(FsManager* fs_manager,</a>
+<a name="ln245">                                 const TableId&amp; table_id,</a>
+<a name="ln246">                                 const RaftGroupId&amp; raft_group_id,</a>
+<a name="ln247">                                 const string&amp; namespace_name,</a>
+<a name="ln248">                                 const string&amp; table_name,</a>
+<a name="ln249">                                 const TableType table_type,</a>
+<a name="ln250">                                 const Schema&amp; schema,</a>
+<a name="ln251">                                 const IndexMap&amp; index_map,</a>
+<a name="ln252">                                 const PartitionSchema&amp; partition_schema,</a>
+<a name="ln253">                                 const Partition&amp; partition,</a>
+<a name="ln254">                                 const boost::optional&lt;IndexInfo&gt;&amp; index_info,</a>
+<a name="ln255">                                 const uint32_t schema_version,</a>
+<a name="ln256">                                 const TabletDataState&amp; initial_tablet_data_state,</a>
+<a name="ln257">                                 RaftGroupMetadataPtr* metadata,</a>
+<a name="ln258">                                 const string&amp; data_root_dir,</a>
+<a name="ln259">                                 const string&amp; wal_root_dir,</a>
+<a name="ln260">                                 const bool colocated) {</a>
+<a name="ln261"> </a>
+<a name="ln262">  // Verify that no existing Raft group exists with the same ID.</a>
+<a name="ln263">  if (fs_manager-&gt;env()-&gt;FileExists(fs_manager-&gt;GetRaftGroupMetadataPath(raft_group_id))) {</a>
+<a name="ln264">    return STATUS(AlreadyPresent, &quot;Raft group already exists&quot;, raft_group_id);</a>
+<a name="ln265">  }</a>
+<a name="ln266"> </a>
+<a name="ln267">  auto wal_top_dir = wal_root_dir;</a>
+<a name="ln268">  auto data_top_dir = data_root_dir;</a>
+<a name="ln269">  // Use the original randomized logic if the indices are not explicitly passed in</a>
+<a name="ln270">  yb::Random rand(GetCurrentTimeMicros());</a>
+<a name="ln271">  if (data_root_dir.empty()) {</a>
+<a name="ln272">    auto data_root_dirs = fs_manager-&gt;GetDataRootDirs();</a>
+<a name="ln273">    CHECK(!data_root_dirs.empty()) &lt;&lt; &quot;No data root directories found&quot;;</a>
+<a name="ln274">    data_top_dir = data_root_dirs[rand.Uniform(data_root_dirs.size())];</a>
+<a name="ln275">  }</a>
+<a name="ln276"> </a>
+<a name="ln277">  if (wal_root_dir.empty()) {</a>
+<a name="ln278">    auto wal_root_dirs = fs_manager-&gt;GetWalRootDirs();</a>
+<a name="ln279">    CHECK(!wal_root_dirs.empty()) &lt;&lt; &quot;No wal root directories found&quot;;</a>
+<a name="ln280">    wal_top_dir = wal_root_dirs[rand.Uniform(wal_root_dirs.size())];</a>
+<a name="ln281">  }</a>
+<a name="ln282"> </a>
+<a name="ln283">  const string table_dir_name = Substitute(&quot;table-$0&quot;, table_id);</a>
+<a name="ln284">  const string tablet_dir_name = MakeTabletDirName(raft_group_id);</a>
+<a name="ln285">  const string wal_dir = JoinPathSegments(wal_top_dir, table_dir_name, tablet_dir_name);</a>
+<a name="ln286">  const string rocksdb_dir = JoinPathSegments(</a>
+<a name="ln287">      data_top_dir, FsManager::kRocksDBDirName, table_dir_name, tablet_dir_name);</a>
+<a name="ln288"> </a>
+<a name="ln289">  RaftGroupMetadataPtr ret(new RaftGroupMetadata(fs_manager,</a>
+<a name="ln290">                                                       table_id,</a>
+<a name="ln291">                                                       raft_group_id,</a>
+<a name="ln292">                                                       namespace_name,</a>
+<a name="ln293">                                                       table_name,</a>
+<a name="ln294">                                                       table_type,</a>
+<a name="ln295">                                                       rocksdb_dir,</a>
+<a name="ln296">                                                       wal_dir,</a>
+<a name="ln297">                                                       schema,</a>
+<a name="ln298">                                                       index_map,</a>
+<a name="ln299">                                                       partition_schema,</a>
+<a name="ln300">                                                       partition,</a>
+<a name="ln301">                                                       index_info,</a>
+<a name="ln302">                                                       schema_version,</a>
+<a name="ln303">                                                       initial_tablet_data_state,</a>
+<a name="ln304">                                                       colocated));</a>
+<a name="ln305">  RETURN_NOT_OK(ret-&gt;Flush());</a>
+<a name="ln306">  metadata-&gt;swap(ret);</a>
+<a name="ln307">  return Status::OK();</a>
+<a name="ln308">}</a>
+<a name="ln309"> </a>
+<a name="ln310">Status RaftGroupMetadata::Load(FsManager* fs_manager,</a>
+<a name="ln311">                            const RaftGroupId&amp; raft_group_id,</a>
+<a name="ln312">                            RaftGroupMetadataPtr* metadata) {</a>
+<a name="ln313">  RaftGroupMetadataPtr ret(new RaftGroupMetadata(fs_manager, raft_group_id));</a>
+<a name="ln314">  RETURN_NOT_OK(ret-&gt;LoadFromDisk());</a>
+<a name="ln315">  metadata-&gt;swap(ret);</a>
+<a name="ln316">  return Status::OK();</a>
+<a name="ln317">}</a>
+<a name="ln318"> </a>
+<a name="ln319">Status RaftGroupMetadata::LoadOrCreate(FsManager* fs_manager,</a>
+<a name="ln320">                                    const string&amp; table_id,</a>
+<a name="ln321">                                    const RaftGroupId&amp; raft_group_id,</a>
+<a name="ln322">                                    const string&amp; namespace_name,</a>
+<a name="ln323">                                    const string&amp; table_name,</a>
+<a name="ln324">                                    TableType table_type,</a>
+<a name="ln325">                                    const Schema&amp; schema,</a>
+<a name="ln326">                                    const PartitionSchema&amp; partition_schema,</a>
+<a name="ln327">                                    const Partition&amp; partition,</a>
+<a name="ln328">                                    const boost::optional&lt;IndexInfo&gt;&amp; index_info,</a>
+<a name="ln329">                                    const TabletDataState&amp; initial_tablet_data_state,</a>
+<a name="ln330">                                    RaftGroupMetadataPtr* metadata) {</a>
+<a name="ln331">  Status s = Load(fs_manager, raft_group_id, metadata);</a>
+<a name="ln332">  if (s.ok()) {</a>
+<a name="ln333">    if (!(**metadata).schema()-&gt;Equals(schema)) {</a>
+<a name="ln334">      return STATUS(Corruption, Substitute(&quot;Schema on disk ($0) does not &quot;</a>
+<a name="ln335">        &quot;match expected schema ($1)&quot;, (*metadata)-&gt;schema()-&gt;ToString(),</a>
+<a name="ln336">        schema.ToString()));</a>
+<a name="ln337">    }</a>
+<a name="ln338">    return Status::OK();</a>
+<a name="ln339">  } else if (s.IsNotFound()) {</a>
+<a name="ln340">    return CreateNew(</a>
+<a name="ln341">        fs_manager, table_id, raft_group_id, namespace_name, table_name, table_type, schema,</a>
+<a name="ln342">        IndexMap(), partition_schema, partition, index_info, 0 /* schema_version */,</a>
+<a name="ln343">        initial_tablet_data_state, metadata);</a>
+<a name="ln344">  } else {</a>
+<a name="ln345">    return s;</a>
+<a name="ln346">  }</a>
+<a name="ln347">}</a>
+<a name="ln348"> </a>
+<a name="ln349">template &lt;class TablesMap&gt;</a>
+<a name="ln350">CHECKED_STATUS MakeTableNotFound(const TableId&amp; table_id, const RaftGroupId&amp; raft_group_id,</a>
+<a name="ln351">                                 const TablesMap&amp; tables) {</a>
+<a name="ln352">#ifndef NDEBUG</a>
+<a name="ln353">  // This very large message should be logged instead of being appended to STATUS.</a>
+<a name="ln354">  std::string suffix = Format(&quot;. Tables: $0.&quot;, tables);</a>
+<a name="ln355">  VLOG(1) &lt;&lt; &quot;Table &quot; &lt;&lt; table_id &lt;&lt; &quot; not found in Raft group &quot; &lt;&lt; raft_group_id &lt;&lt; suffix;</a>
+<a name="ln356">#endif</a>
+<a name="ln357">  return STATUS_FORMAT(NotFound, &quot;Table $0 not found in Raft group $1&quot;, table_id, raft_group_id);</a>
+<a name="ln358">}</a>
+<a name="ln359"> </a>
+<a name="ln360">Result&lt;TableInfoPtr&gt; RaftGroupMetadata::GetTableInfo(const std::string&amp; table_id) const {</a>
+<a name="ln361">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln362">  return GetTableInfoUnlocked(table_id);</a>
+<a name="ln363">}</a>
+<a name="ln364"> </a>
+<a name="ln365">Result&lt;TableInfoPtr&gt; RaftGroupMetadata::GetTableInfoUnlocked(const std::string&amp; table_id) const {</a>
+<a name="ln366">  const auto&amp; tables = kv_store_.tables;</a>
+<a name="ln367">  const auto id = !table_id.empty() ? table_id : primary_table_id_;</a>
+<a name="ln368">  const auto iter = tables.find(id);</a>
+<a name="ln369">  if (iter == tables.end()) {</a>
+<a name="ln370">    return MakeTableNotFound(table_id, raft_group_id_, tables);</a>
+<a name="ln371">  }</a>
+<a name="ln372">  return iter-&gt;second;</a>
+<a name="ln373">}</a>
+<a name="ln374"> </a>
+<a name="ln375">Status RaftGroupMetadata::DeleteTabletData(TabletDataState delete_type,</a>
+<a name="ln376">                                           const yb::OpId&amp; last_logged_opid) {</a>
+<a name="ln377">  CHECK(delete_type == TABLET_DATA_DELETED ||</a>
+<a name="ln378">        delete_type == TABLET_DATA_TOMBSTONED)</a>
+<a name="ln379">      &lt;&lt; &quot;DeleteTabletData() called with unsupported delete_type on tablet &quot;</a>
+<a name="ln380">      &lt;&lt; raft_group_id_ &lt;&lt; &quot;: &quot; &lt;&lt; TabletDataState_Name(delete_type)</a>
+<a name="ln381">      &lt;&lt; &quot; (&quot; &lt;&lt; delete_type &lt;&lt; &quot;)&quot;;</a>
+<a name="ln382"> </a>
+<a name="ln383">  // First add all of our blocks to the orphan list</a>
+<a name="ln384">  // and clear our rowsets. This serves to erase all the data.</a>
+<a name="ln385">  //</a>
+<a name="ln386">  // We also set the state in our persisted metadata to indicate that</a>
+<a name="ln387">  // we have been deleted.</a>
+<a name="ln388">  {</a>
+<a name="ln389">    std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln390">    tablet_data_state_ = delete_type;</a>
+<a name="ln391">    if (last_logged_opid) {</a>
+<a name="ln392">      tombstone_last_logged_opid_ = last_logged_opid;</a>
+<a name="ln393">    }</a>
+<a name="ln394">  }</a>
+<a name="ln395"> </a>
+<a name="ln396">  rocksdb::Options rocksdb_options;</a>
+<a name="ln397">  TabletOptions tablet_options;</a>
+<a name="ln398">  std::string log_prefix = consensus::MakeTabletLogPrefix(raft_group_id_, fs_manager_-&gt;uuid());</a>
+<a name="ln399">  docdb::InitRocksDBOptions(</a>
+<a name="ln400">      &amp;rocksdb_options, log_prefix, nullptr /* statistics */, tablet_options);</a>
+<a name="ln401"> </a>
+<a name="ln402">  const auto&amp; rocksdb_dir = this-&gt;rocksdb_dir();</a>
+<a name="ln403">  LOG(INFO) &lt;&lt; &quot;Destroying regular db at: &quot; &lt;&lt; rocksdb_dir;</a>
+<a name="ln404">  rocksdb::Status status = rocksdb::DestroyDB(rocksdb_dir, rocksdb_options);</a>
+<a name="ln405"> </a>
+<a name="ln406">  if (!status.ok()) {</a>
+<a name="ln407">    LOG(ERROR) &lt;&lt; &quot;Failed to destroy regular DB at: &quot; &lt;&lt; rocksdb_dir &lt;&lt; &quot;: &quot; &lt;&lt; status;</a>
+<a name="ln408">  } else {</a>
+<a name="ln409">    LOG(INFO) &lt;&lt; &quot;Successfully destroyed regular DB at: &quot; &lt;&lt; rocksdb_dir;</a>
+<a name="ln410">  }</a>
+<a name="ln411"> </a>
+<a name="ln412">  if (fs_manager_-&gt;env()-&gt;FileExists(rocksdb_dir)) {</a>
+<a name="ln413">    auto s = fs_manager_-&gt;env()-&gt;DeleteRecursively(rocksdb_dir);</a>
+<a name="ln414">    LOG_IF(WARNING, !s.ok()) &lt;&lt; &quot;Unable to delete rocksdb data directory &quot; &lt;&lt; rocksdb_dir;</a>
+<a name="ln415">  }</a>
+<a name="ln416"> </a>
+<a name="ln417">  const auto intents_dir = this-&gt;intents_rocksdb_dir();</a>
+<a name="ln418">  if (fs_manager_-&gt;env()-&gt;FileExists(intents_dir)) {</a>
+<a name="ln419">    status = rocksdb::DestroyDB(intents_dir, rocksdb_options);</a>
+<a name="ln420"> </a>
+<a name="ln421">    if (!status.ok()) {</a>
+<a name="ln422">      LOG(ERROR) &lt;&lt; &quot;Failed to destroy provisional records DB at: &quot; &lt;&lt; intents_dir &lt;&lt; &quot;: &quot;</a>
+<a name="ln423">                 &lt;&lt; status;</a>
+<a name="ln424">    } else {</a>
+<a name="ln425">      LOG(INFO) &lt;&lt; &quot;Successfully destroyed provisional records DB at: &quot; &lt;&lt; intents_dir;</a>
+<a name="ln426">    }</a>
+<a name="ln427">  }</a>
+<a name="ln428"> </a>
+<a name="ln429">  if (fs_manager_-&gt;env()-&gt;FileExists(intents_dir)) {</a>
+<a name="ln430">    auto s = fs_manager_-&gt;env()-&gt;DeleteRecursively(intents_dir);</a>
+<a name="ln431">    LOG_IF(WARNING, !s.ok()) &lt;&lt; &quot;Unable to delete intents directory &quot; &lt;&lt; intents_dir;</a>
+<a name="ln432">  }</a>
+<a name="ln433"> </a>
+<a name="ln434">  const auto snapshots_dir = this-&gt;snapshots_dir();</a>
+<a name="ln435">  if (fs_manager_-&gt;env()-&gt;FileExists(snapshots_dir)) {</a>
+<a name="ln436">    auto s = fs_manager_-&gt;env()-&gt;DeleteRecursively(snapshots_dir);</a>
+<a name="ln437">    LOG_IF(WARNING, !s.ok()) &lt;&lt; &quot;Unable to delete snapshots directory &quot; &lt;&lt; snapshots_dir;</a>
+<a name="ln438">  }</a>
+<a name="ln439"> </a>
+<a name="ln440">  // Flushing will sync the new tablet_data_state_ to disk and will now also</a>
+<a name="ln441">  // delete all the data.</a>
+<a name="ln442">  RETURN_NOT_OK(Flush());</a>
+<a name="ln443"> </a>
+<a name="ln444">  // Re-sync to disk one more time.</a>
+<a name="ln445">  // This call will typically re-sync with an empty orphaned blocks list</a>
+<a name="ln446">  // (unless deleting any orphans failed during the last Flush()), so that we</a>
+<a name="ln447">  // don't try to re-delete the deleted orphaned blocks on every startup.</a>
+<a name="ln448">  return Flush();</a>
+<a name="ln449">}</a>
+<a name="ln450"> </a>
+<a name="ln451">bool RaftGroupMetadata::IsTombstonedWithNoRocksDBData() const {</a>
+<a name="ln452">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln453">  const auto&amp; rocksdb_dir = kv_store_.rocksdb_dir;</a>
+<a name="ln454">  const auto intents_dir = rocksdb_dir + kIntentsDBSuffix;</a>
+<a name="ln455">  return tablet_data_state_ == TABLET_DATA_TOMBSTONED &amp;&amp;</a>
+<a name="ln456">      !fs_manager_-&gt;env()-&gt;FileExists(rocksdb_dir) &amp;&amp;</a>
+<a name="ln457">      !fs_manager_-&gt;env()-&gt;FileExists(intents_dir);</a>
+<a name="ln458">}</a>
+<a name="ln459"> </a>
+<a name="ln460">Status RaftGroupMetadata::DeleteSuperBlock() {</a>
+<a name="ln461">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln462">  if (tablet_data_state_ != TABLET_DATA_DELETED) {</a>
+<a name="ln463">    return STATUS(IllegalState,</a>
+<a name="ln464">        Substitute(&quot;Tablet $0 is not in TABLET_DATA_DELETED state. &quot;</a>
+<a name="ln465">                   &quot;Call DeleteTabletData(TABLET_DATA_DELETED) first. &quot;</a>
+<a name="ln466">                   &quot;Tablet data state: $1 ($2)&quot;,</a>
+<a name="ln467">                   raft_group_id_,</a>
+<a name="ln468">                   TabletDataState_Name(tablet_data_state_),</a>
+<a name="ln469">                   tablet_data_state_));</a>
+<a name="ln470">  }</a>
+<a name="ln471"> </a>
+<a name="ln472">  string path = fs_manager_-&gt;GetRaftGroupMetadataPath(raft_group_id_);</a>
+<a name="ln473">  RETURN_NOT_OK_PREPEND(fs_manager_-&gt;env()-&gt;DeleteFile(path),</a>
+<a name="ln474">                        &quot;Unable to delete superblock for Raft group &quot; + raft_group_id_);</a>
+<a name="ln475">  return Status::OK();</a>
+<a name="ln476">}</a>
+<a name="ln477"> </a>
+<a name="ln478">RaftGroupMetadata::RaftGroupMetadata(FsManager* fs_manager,</a>
+<a name="ln479">                               TableId table_id,</a>
+<a name="ln480">                               RaftGroupId raft_group_id,</a>
+<a name="ln481">                               string namespace_name,</a>
+<a name="ln482">                               string table_name,</a>
+<a name="ln483">                               TableType table_type,</a>
+<a name="ln484">                               const string rocksdb_dir,</a>
+<a name="ln485">                               const string wal_dir,</a>
+<a name="ln486">                               const Schema&amp; schema,</a>
+<a name="ln487">                               const IndexMap&amp; index_map,</a>
+<a name="ln488">                               PartitionSchema partition_schema,</a>
+<a name="ln489">                               Partition partition,</a>
+<a name="ln490">                               const boost::optional&lt;IndexInfo&gt;&amp; index_info,</a>
+<a name="ln491">                               const uint32_t schema_version,</a>
+<a name="ln492">                               const TabletDataState&amp; tablet_data_state,</a>
+<a name="ln493">                               const bool colocated)</a>
+<a name="ln494">    : state_(kNotWrittenYet),</a>
+<a name="ln495">      raft_group_id_(std::move(raft_group_id)),</a>
+<a name="ln496">      partition_(std::make_shared&lt;Partition&gt;(std::move(partition))),</a>
+<a name="ln497">      primary_table_id_(table_id),</a>
+<a name="ln498">      kv_store_(KvStoreId(raft_group_id), rocksdb_dir),</a>
+<a name="ln499">      fs_manager_(fs_manager),</a>
+<a name="ln500">      wal_dir_(wal_dir),</a>
+<a name="ln501">      tablet_data_state_(tablet_data_state),</a>
+<a name="ln502">      colocated_(colocated),</a>
+<a name="ln503">      cdc_min_replicated_index_(std::numeric_limits&lt;int64_t&gt;::max()) {</a>
+<a name="ln504">  CHECK(schema.has_column_ids());</a>
+<a name="ln505">  CHECK_GT(schema.num_key_columns(), 0);</a>
+<a name="ln506">  kv_store_.tables.emplace(</a>
+<a name="ln507">      primary_table_id_,</a>
+<a name="ln508">      std::make_shared&lt;TableInfo&gt;(</a>
+<a name="ln509">          std::move(table_id),</a>
+<a name="ln510">          std::move(namespace_name),</a>
+<a name="ln511">          std::move(table_name),</a>
+<a name="ln512">          table_type,</a>
+<a name="ln513">          schema,</a>
+<a name="ln514">          index_map,</a>
+<a name="ln515">          index_info,</a>
+<a name="ln516">          schema_version,</a>
+<a name="ln517">          std::move(partition_schema)));</a>
+<a name="ln518">}</a>
+<a name="ln519"> </a>
+<a name="ln520">RaftGroupMetadata::~RaftGroupMetadata() {</a>
+<a name="ln521">}</a>
+<a name="ln522"> </a>
+<a name="ln523">RaftGroupMetadata::RaftGroupMetadata(FsManager* fs_manager, RaftGroupId raft_group_id)</a>
+<a name="ln524">    : state_(kNotLoadedYet),</a>
+<a name="ln525">      raft_group_id_(std::move(raft_group_id)),</a>
+<a name="ln526">      kv_store_(KvStoreId(raft_group_id)),</a>
+<a name="ln527">      fs_manager_(fs_manager) {</a>
+<a name="ln528">}</a>
+<a name="ln529"> </a>
+<a name="ln530">Status RaftGroupMetadata::LoadFromDisk() {</a>
+<a name="ln531">  TRACE_EVENT1(&quot;raft_group&quot;, &quot;RaftGroupMetadata::LoadFromDisk&quot;,</a>
+<a name="ln532">               &quot;raft_group_id&quot;, raft_group_id_);</a>
+<a name="ln533"> </a>
+<a name="ln534">  CHECK_EQ(state_, kNotLoadedYet);</a>
+<a name="ln535"> </a>
+<a name="ln536">  RaftGroupReplicaSuperBlockPB superblock;</a>
+<a name="ln537">  RETURN_NOT_OK(ReadSuperBlockFromDisk(&amp;superblock));</a>
+<a name="ln538">  RETURN_NOT_OK_PREPEND(LoadFromSuperBlock(superblock),</a>
+<a name="ln539">                        &quot;Failed to load data from superblock protobuf&quot;);</a>
+<a name="ln540">  state_ = kInitialized;</a>
+<a name="ln541">  return Status::OK();</a>
+<a name="ln542">}</a>
+<a name="ln543"> </a>
+<a name="ln544">Status RaftGroupMetadata::LoadFromSuperBlock(const RaftGroupReplicaSuperBlockPB&amp; superblock) {</a>
+<a name="ln545">  if (!superblock.has_kv_store()) {</a>
+<a name="ln546">    // Backward compatibility for tablet=KV-store=raft-group.</a>
+<a name="ln547">    RaftGroupReplicaSuperBlockPB superblock_migrated(superblock);</a>
+<a name="ln548">    RETURN_NOT_OK(MigrateSuperblock(&amp;superblock_migrated));</a>
+<a name="ln549">    RETURN_NOT_OK(LoadFromSuperBlock(superblock_migrated));</a>
+<a name="ln550">    return Flush();</a>
+<a name="ln551">  }</a>
+<a name="ln552"> </a>
+<a name="ln553">  VLOG(2) &lt;&lt; &quot;Loading RaftGroupMetadata from SuperBlockPB:&quot; &lt;&lt; std::endl</a>
+<a name="ln554">          &lt;&lt; superblock.DebugString();</a>
+<a name="ln555"> </a>
+<a name="ln556">  {</a>
+<a name="ln557">    std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln558"> </a>
+<a name="ln559">    // Verify that the Raft group id matches with the one in the protobuf.</a>
+<a name="ln560">    if (superblock.raft_group_id() != raft_group_id_) {</a>
+<a name="ln561">      return STATUS(Corruption, &quot;Expected id=&quot; + raft_group_id_ +</a>
+<a name="ln562">                                &quot; found &quot; + superblock.raft_group_id(),</a>
+<a name="ln563">                                superblock.DebugString());</a>
+<a name="ln564">    }</a>
+<a name="ln565">    Partition partition;</a>
+<a name="ln566">    Partition::FromPB(superblock.partition(), &amp;partition);</a>
+<a name="ln567">    partition_ = std::make_shared&lt;Partition&gt;(partition);</a>
+<a name="ln568">    primary_table_id_ = superblock.primary_table_id();</a>
+<a name="ln569">    colocated_ = superblock.colocated();</a>
+<a name="ln570"> </a>
+<a name="ln571">    RETURN_NOT_OK(kv_store_.LoadFromPB(superblock.kv_store(), primary_table_id_));</a>
+<a name="ln572"> </a>
+<a name="ln573">    wal_dir_ = superblock.wal_dir();</a>
+<a name="ln574">    tablet_data_state_ = superblock.tablet_data_state();</a>
+<a name="ln575"> </a>
+<a name="ln576">    if (superblock.has_tombstone_last_logged_opid()) {</a>
+<a name="ln577">      tombstone_last_logged_opid_ = yb::OpId::FromPB(superblock.tombstone_last_logged_opid());</a>
+<a name="ln578">    } else {</a>
+<a name="ln579">      tombstone_last_logged_opid_ = OpId();</a>
+<a name="ln580">    }</a>
+<a name="ln581">    cdc_min_replicated_index_ = superblock.cdc_min_replicated_index();</a>
+<a name="ln582">  }</a>
+<a name="ln583"> </a>
+<a name="ln584">  return Status::OK();</a>
+<a name="ln585">}</a>
+<a name="ln586"> </a>
+<a name="ln587">Status RaftGroupMetadata::Flush() {</a>
+<a name="ln588">  TRACE_EVENT1(&quot;raft_group&quot;, &quot;RaftGroupMetadata::Flush&quot;,</a>
+<a name="ln589">               &quot;raft_group_id&quot;, raft_group_id_);</a>
+<a name="ln590"> </a>
+<a name="ln591">  MutexLock l_flush(flush_lock_);</a>
+<a name="ln592">  RaftGroupReplicaSuperBlockPB pb;</a>
+<a name="ln593">  {</a>
+<a name="ln594">    std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln595">    ToSuperBlockUnlocked(&amp;pb);</a>
+<a name="ln596">  }</a>
+<a name="ln597">  RETURN_NOT_OK(ReplaceSuperBlockUnlocked(pb));</a>
+<a name="ln598">  TRACE(&quot;Metadata flushed&quot;);</a>
+<a name="ln599"> </a>
+<a name="ln600">  return Status::OK();</a>
+<a name="ln601">}</a>
+<a name="ln602"> </a>
+<a name="ln603">Status RaftGroupMetadata::ReplaceSuperBlock(const RaftGroupReplicaSuperBlockPB &amp;pb) {</a>
+<a name="ln604">  {</a>
+<a name="ln605">    MutexLock l(flush_lock_);</a>
+<a name="ln606">    RETURN_NOT_OK_PREPEND(ReplaceSuperBlockUnlocked(pb), &quot;Unable to replace superblock&quot;);</a>
+<a name="ln607">  }</a>
+<a name="ln608"> </a>
+<a name="ln609">  RETURN_NOT_OK_PREPEND(LoadFromSuperBlock(pb),</a>
+<a name="ln610">                        &quot;Failed to load data from superblock protobuf&quot;);</a>
+<a name="ln611"> </a>
+<a name="ln612">  return Status::OK();</a>
+<a name="ln613">}</a>
+<a name="ln614"> </a>
+<a name="ln615">Status RaftGroupMetadata::ReplaceSuperBlockUnlocked(const RaftGroupReplicaSuperBlockPB &amp;pb) {</a>
+<a name="ln616">  flush_lock_.AssertAcquired();</a>
+<a name="ln617"> </a>
+<a name="ln618">  string path = fs_manager_-&gt;GetRaftGroupMetadataPath(raft_group_id_);</a>
+<a name="ln619">  RETURN_NOT_OK_PREPEND(pb_util::WritePBContainerToPath(</a>
+<a name="ln620">                            fs_manager_-&gt;env(), path, pb,</a>
+<a name="ln621">                            pb_util::OVERWRITE, pb_util::SYNC),</a>
+<a name="ln622">                        Substitute(&quot;Failed to write Raft group metadata $0&quot;, raft_group_id_));</a>
+<a name="ln623"> </a>
+<a name="ln624">  return Status::OK();</a>
+<a name="ln625">}</a>
+<a name="ln626"> </a>
+<a name="ln627">Status RaftGroupMetadata::ReadSuperBlockFromDisk(RaftGroupReplicaSuperBlockPB* superblock) const {</a>
+<a name="ln628">  string path = fs_manager_-&gt;GetRaftGroupMetadataPath(raft_group_id_);</a>
+<a name="ln629">  RETURN_NOT_OK_PREPEND(</a>
+<a name="ln630">      pb_util::ReadPBContainerFromPath(fs_manager_-&gt;env(), path, superblock),</a>
+<a name="ln631">      Substitute(&quot;Could not load Raft group metadata from $0&quot;, path));</a>
+<a name="ln632">  // Migration for backward compatibility with versions which don't have separate</a>
+<a name="ln633">  // TableType::TRANSACTION_STATUS_TABLE_TYPE.</a>
+<a name="ln634">  if (superblock-&gt;obsolete_table_type() == TableType::REDIS_TABLE_TYPE &amp;&amp;</a>
+<a name="ln635">      superblock-&gt;obsolete_table_name() == kTransactionsTableName) {</a>
+<a name="ln636">    superblock-&gt;set_obsolete_table_type(TableType::TRANSACTION_STATUS_TABLE_TYPE);</a>
+<a name="ln637">  }</a>
+<a name="ln638">  return Status::OK();</a>
+<a name="ln639">}</a>
+<a name="ln640"> </a>
+<a name="ln641">void RaftGroupMetadata::ToSuperBlock(RaftGroupReplicaSuperBlockPB* superblock) const {</a>
+<a name="ln642">  // acquire the lock so that rowsets_ doesn't get changed until we're finished.</a>
+<a name="ln643">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln644">  ToSuperBlockUnlocked(superblock);</a>
+<a name="ln645">}</a>
+<a name="ln646"> </a>
+<a name="ln647">void RaftGroupMetadata::ToSuperBlockUnlocked(RaftGroupReplicaSuperBlockPB* superblock) const {</a>
+<a name="ln648">  DCHECK(data_mutex_.is_locked());</a>
+<a name="ln649">  // Convert to protobuf.</a>
+<a name="ln650">  RaftGroupReplicaSuperBlockPB pb;</a>
+<a name="ln651">  pb.set_raft_group_id(raft_group_id_);</a>
+<a name="ln652">  partition_-&gt;ToPB(pb.mutable_partition());</a>
+<a name="ln653"> </a>
+<a name="ln654">  kv_store_.ToPB(primary_table_id_, pb.mutable_kv_store());</a>
+<a name="ln655"> </a>
+<a name="ln656">  pb.set_wal_dir(wal_dir_);</a>
+<a name="ln657">  pb.set_tablet_data_state(tablet_data_state_);</a>
+<a name="ln658">  if (tombstone_last_logged_opid_) {</a>
+<a name="ln659">    tombstone_last_logged_opid_.ToPB(pb.mutable_tombstone_last_logged_opid());</a>
+<a name="ln660">  }</a>
+<a name="ln661"> </a>
+<a name="ln662">  pb.set_primary_table_id(primary_table_id_);</a>
+<a name="ln663">  pb.set_colocated(colocated_);</a>
+<a name="ln664">  pb.set_cdc_min_replicated_index(cdc_min_replicated_index_);</a>
+<a name="ln665"> </a>
+<a name="ln666">  superblock-&gt;Swap(&amp;pb);</a>
+<a name="ln667">}</a>
+<a name="ln668"> </a>
+<a name="ln669">void RaftGroupMetadata::SetSchema(const Schema&amp; schema,</a>
+<a name="ln670">                                  const IndexMap&amp; index_map,</a>
+<a name="ln671">                                  const std::vector&lt;DeletedColumn&gt;&amp; deleted_cols,</a>
+<a name="ln672">                                  const uint32_t version,</a>
+<a name="ln673">                                  const TableId&amp; table_id) {</a>
+<a name="ln674">  DCHECK(schema.has_column_ids());</a>
+<a name="ln675">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln676">  TableId target_table_id = table_id.empty() ? primary_table_id_ : table_id;</a>
+<a name="ln677">  auto result = GetTableInfoUnlocked(target_table_id);</a>
+<a name="ln678">  DCHECK(result.ok());</a>
+<a name="ln679">  TableInfoPtr new_table_info = std::make_shared&lt;TableInfo&gt;(*result.get(),</a>
+<a name="ln680">                                                            schema,</a>
+<a name="ln681">                                                            index_map,</a>
+<a name="ln682">                                                            deleted_cols,</a>
+<a name="ln683">                                                            version);</a>
+<a name="ln684">  if (target_table_id != primary_table_id_) {</a>
+<a name="ln685">    if (schema.table_properties().is_ysql_catalog_table()) {</a>
+<a name="ln686">      Uuid cotable_id;</a>
+<a name="ln687">      CHECK_OK(cotable_id.FromHexString(target_table_id));</a>
+<a name="ln688">      new_table_info-&gt;schema.set_cotable_id(cotable_id);</a>
+<a name="ln689">    } else {</a>
+<a name="ln690">      auto result = CHECK_RESULT(GetPgsqlTableOid(target_table_id));</a>
+<a name="ln691">      new_table_info-&gt;schema.set_pgtable_id(result);</a>
+<a name="ln692">    }</a>
+<a name="ln693">  }</a>
+<a name="ln694">  VLOG_WITH_PREFIX(1) &lt;&lt; raft_group_id_ &lt;&lt; &quot; Updating table &quot; &lt;&lt; target_table_id</a>
+<a name="ln695">                      &lt;&lt; &quot; to Schema version &quot; &lt;&lt; version</a>
+<a name="ln696">                      &lt;&lt; &quot; from \n&quot; &lt;&lt; yb::ToString(kv_store_.tables[target_table_id])</a>
+<a name="ln697">                      &lt;&lt; &quot; to \n&quot; &lt;&lt; yb::ToString(new_table_info);</a>
+<a name="ln698">  kv_store_.tables[target_table_id].swap(new_table_info);</a>
+<a name="ln699">}</a>
+<a name="ln700"> </a>
+<a name="ln701">void RaftGroupMetadata::SetPartitionSchema(const PartitionSchema&amp; partition_schema) {</a>
+<a name="ln702">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln703">  auto&amp; tables = kv_store_.tables;</a>
+<a name="ln704">  DCHECK(tables.find(primary_table_id_) != tables.end());</a>
+<a name="ln705">  tables[primary_table_id_]-&gt;partition_schema = partition_schema;</a>
+<a name="ln706">}</a>
+<a name="ln707"> </a>
+<a name="ln708">void RaftGroupMetadata::SetTableName(</a>
+<a name="ln709">    const string&amp; namespace_name, const string&amp; table_name, const TableId&amp; table_id) {</a>
+<a name="ln710">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln711">  auto&amp; tables = kv_store_.tables;</a>
+<a name="ln712">  auto&amp; id = table_id.empty() ? primary_table_id_ : table_id;</a>
+<a name="ln713">  DCHECK(tables.find(id) != tables.end());</a>
+<a name="ln714">  tables[id]-&gt;namespace_name = namespace_name;</a>
+<a name="ln715">  tables[id]-&gt;table_name = table_name;</a>
+<a name="ln716">}</a>
+<a name="ln717"> </a>
+<a name="ln718">void RaftGroupMetadata::AddTable(const std::string&amp; table_id,</a>
+<a name="ln719">                              const std::string&amp; namespace_name,</a>
+<a name="ln720">                              const std::string&amp; table_name,</a>
+<a name="ln721">                              const TableType table_type,</a>
+<a name="ln722">                              const Schema&amp; schema,</a>
+<a name="ln723">                              const IndexMap&amp; index_map,</a>
+<a name="ln724">                              const PartitionSchema&amp; partition_schema,</a>
+<a name="ln725">                              const boost::optional&lt;IndexInfo&gt;&amp; index_info,</a>
+<a name="ln726">                              const uint32_t schema_version) {</a>
+<a name="ln727">  DCHECK(schema.has_column_ids());</a>
+<a name="ln728">  TableInfoPtr new_table_info = std::make_shared&lt;TableInfo&gt;(table_id,</a>
+<a name="ln729">                                                            namespace_name,</a>
+<a name="ln730">                                                            table_name,</a>
+<a name="ln731">                                                            table_type,</a>
+<a name="ln732">                                                            schema,</a>
+<a name="ln733">                                                            index_map,</a>
+<a name="ln734">                                                            index_info,</a>
+<a name="ln735">                                                            schema_version,</a>
+<a name="ln736">                                                            partition_schema);</a>
+<a name="ln737">  if (table_id != primary_table_id_) {</a>
+<a name="ln738">    if (schema.table_properties().is_ysql_catalog_table()) {</a>
+<a name="ln739">      Uuid cotable_id;</a>
+<a name="ln740">      CHECK_OK(cotable_id.FromHexString(table_id));</a>
+<a name="ln741">      new_table_info-&gt;schema.set_cotable_id(cotable_id);</a>
+<a name="ln742">    } else {</a>
+<a name="ln743">      auto result = CHECK_RESULT(GetPgsqlTableOid(table_id));</a>
+<a name="ln744">      new_table_info-&gt;schema.set_pgtable_id(result);</a>
+<a name="ln745">    }</a>
+<a name="ln746">  }</a>
+<a name="ln747">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln748">  auto&amp; tables = kv_store_.tables;</a>
+<a name="ln749">  auto existing_table_iter = tables.find(table_id);</a>
+<a name="ln750">  if (existing_table_iter != tables.end()) {</a>
+<a name="ln751">    const auto&amp; existing_table = *existing_table_iter-&gt;second.get();</a>
+<a name="ln752">    if (!existing_table.schema.table_properties().is_ysql_catalog_table() &amp;&amp;</a>
+<a name="ln753">        schema.table_properties().is_ysql_catalog_table()) {</a>
+<a name="ln754">      // This must be the one-time migration with transactional DDL being turned on for the first</a>
+<a name="ln755">      // time on this cluster.</a>
+<a name="ln756">    } else {</a>
+<a name="ln757">      LOG(DFATAL) &lt;&lt; &quot;Table &quot; &lt;&lt; table_id &lt;&lt; &quot; already exists. New table info: &quot;</a>
+<a name="ln758">          &lt;&lt; new_table_info-&gt;ToString() &lt;&lt; &quot;, old table info: &quot; &lt;&lt; existing_table.ToString();</a>
+<a name="ln759">    }</a>
+<a name="ln760">  }</a>
+<a name="ln761">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Updating to Schema version &quot; &lt;&lt; schema_version</a>
+<a name="ln762">                      &lt;&lt; &quot; from\n&quot; &lt;&lt; yb::ToString(tables[table_id])</a>
+<a name="ln763">                      &lt;&lt; &quot;\nto\n&quot; &lt;&lt; yb::ToString(new_table_info);</a>
+<a name="ln764">  tables[table_id].swap(new_table_info);</a>
+<a name="ln765">}</a>
+<a name="ln766"> </a>
+<a name="ln767">void RaftGroupMetadata::RemoveTable(const TableId&amp; table_id) {</a>
+<a name="ln768">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln769">  auto&amp; tables = kv_store_.tables;</a>
+<a name="ln770">  tables.erase(table_id);</a>
+<a name="ln771">}</a>
+<a name="ln772"> </a>
+<a name="ln773">string RaftGroupMetadata::data_root_dir() const {</a>
+<a name="ln774">  const auto&amp; rocksdb_dir = kv_store_.rocksdb_dir;</a>
+<a name="ln775">  if (rocksdb_dir.empty()) {</a>
+<a name="ln776">    return &quot;&quot;;</a>
+<a name="ln777">  } else {</a>
+<a name="ln778">    auto data_root_dir = DirName(DirName(rocksdb_dir));</a>
+<a name="ln779">    if (strcmp(BaseName(data_root_dir).c_str(), FsManager::kRocksDBDirName) == 0) {</a>
+<a name="ln780">      data_root_dir = DirName(data_root_dir);</a>
+<a name="ln781">    }</a>
+<a name="ln782">    return data_root_dir;</a>
+<a name="ln783">  }</a>
+<a name="ln784">}</a>
+<a name="ln785"> </a>
+<a name="ln786">string RaftGroupMetadata::wal_root_dir() const {</a>
+<a name="ln787">  if (wal_dir_.empty()) {</a>
+<a name="ln788">    return &quot;&quot;;</a>
+<a name="ln789">  } else {</a>
+<a name="ln790">    auto wal_root_dir = DirName(wal_dir_);</a>
+<a name="ln791">    if (strcmp(BaseName(wal_root_dir).c_str(), FsManager::kWalDirName) != 0) {</a>
+<a name="ln792">      wal_root_dir = DirName(wal_root_dir);</a>
+<a name="ln793">    }</a>
+<a name="ln794">    return wal_root_dir;</a>
+<a name="ln795">  }</a>
+<a name="ln796">}</a>
+<a name="ln797"> </a>
+<a name="ln798">void RaftGroupMetadata::set_wal_retention_secs(uint32 wal_retention_secs) {</a>
+<a name="ln799">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln800">  auto it = kv_store_.tables.find(primary_table_id_);</a>
+<a name="ln801">  if (it == kv_store_.tables.end()) {</a>
+<a name="ln802">    LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Unable to set WAL retention time for primary table &quot;</a>
+<a name="ln803">                            &lt;&lt; primary_table_id_;</a>
+<a name="ln804">    return;</a>
+<a name="ln805">  }</a>
+<a name="ln806">  it-&gt;second-&gt;wal_retention_secs = wal_retention_secs;</a>
+<a name="ln807">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Set RaftGroupMetadata wal retention time to &quot;</a>
+<a name="ln808">                        &lt;&lt; wal_retention_secs &lt;&lt; &quot; seconds&quot;;</a>
+<a name="ln809">}</a>
+<a name="ln810"> </a>
+<a name="ln811">uint32_t RaftGroupMetadata::wal_retention_secs() const {</a>
+<a name="ln812">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln813">  auto it = kv_store_.tables.find(primary_table_id_);</a>
+<a name="ln814">  if (it == kv_store_.tables.end()) {</a>
+<a name="ln815">    return 0;</a>
+<a name="ln816">  }</a>
+<a name="ln817">  return it-&gt;second-&gt;wal_retention_secs;</a>
+<a name="ln818">}</a>
+<a name="ln819"> </a>
+<a name="ln820">Status RaftGroupMetadata::set_cdc_min_replicated_index(int64 cdc_min_replicated_index) {</a>
+<a name="ln821">  {</a>
+<a name="ln822">    std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln823">    cdc_min_replicated_index_ = cdc_min_replicated_index;</a>
+<a name="ln824">  }</a>
+<a name="ln825">  return Flush();</a>
+<a name="ln826">}</a>
+<a name="ln827"> </a>
+<a name="ln828">int64_t RaftGroupMetadata::cdc_min_replicated_index() const {</a>
+<a name="ln829">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln830">  return cdc_min_replicated_index_;</a>
+<a name="ln831">}</a>
+<a name="ln832"> </a>
+<a name="ln833">void RaftGroupMetadata::set_tablet_data_state(TabletDataState state) {</a>
+<a name="ln834">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln835">  tablet_data_state_ = state;</a>
+<a name="ln836">}</a>
+<a name="ln837"> </a>
+<a name="ln838">string RaftGroupMetadata::LogPrefix() const {</a>
+<a name="ln839">  return consensus::MakeTabletLogPrefix(raft_group_id_, fs_manager_-&gt;uuid());</a>
+<a name="ln840">}</a>
+<a name="ln841"> </a>
+<a name="ln842">TabletDataState RaftGroupMetadata::tablet_data_state() const {</a>
+<a name="ln843">  std::lock_guard&lt;MutexType&gt; lock(data_mutex_);</a>
+<a name="ln844">  return tablet_data_state_;</a>
+<a name="ln845">}</a>
+<a name="ln846"> </a>
+<a name="ln847">std::string RaftGroupMetadata::GetSubRaftGroupWalDir(const RaftGroupId&amp; raft_group_id) const {</a>
+<a name="ln848">  return JoinPathSegments(DirName(wal_dir_), MakeTabletDirName(raft_group_id));</a>
+<a name="ln849">}</a>
+<a name="ln850"> </a>
+<a name="ln851">std::string RaftGroupMetadata::GetSubRaftGroupDataDir(const RaftGroupId&amp; raft_group_id) const {</a>
+<a name="ln852">  return JoinPathSegments(DirName(kv_store_.rocksdb_dir), MakeTabletDirName(raft_group_id));</a>
+<a name="ln853">}</a>
+<a name="ln854"> </a>
+<a name="ln855">Result&lt;RaftGroupMetadataPtr&gt; RaftGroupMetadata::CreateSubtabletMetadata(</a>
+<a name="ln856">    const RaftGroupId&amp; raft_group_id, const Partition&amp; partition,</a>
+<a name="ln857">    const std::string&amp; lower_bound_key, const std::string&amp; upper_bound_key) const {</a>
+<a name="ln858">  RaftGroupReplicaSuperBlockPB superblock;</a>
+<a name="ln859">  ToSuperBlock(&amp;superblock);</a>
+<a name="ln860"> </a>
+<a name="ln861">  RaftGroupMetadataPtr metadata(new RaftGroupMetadata(fs_manager_, raft_group_id_));</a>
+<a name="ln862">  RETURN_NOT_OK(metadata-&gt;LoadFromSuperBlock(superblock));</a>
+<a name="ln863">  metadata-&gt;raft_group_id_ = raft_group_id;</a>
+<a name="ln864">  metadata-&gt;wal_dir_ = GetSubRaftGroupWalDir(raft_group_id);</a>
+<a name="ln865">  metadata-&gt;kv_store_.lower_bound_key = lower_bound_key;</a>
+<a name="ln866">  metadata-&gt;kv_store_.upper_bound_key = upper_bound_key;</a>
+<a name="ln867">  metadata-&gt;kv_store_.rocksdb_dir = GetSubRaftGroupDataDir(raft_group_id);</a>
+<a name="ln868">  metadata-&gt;kv_store_.has_been_fully_compacted = false;</a>
+<a name="ln869">  *metadata-&gt;partition_ = partition;</a>
+<a name="ln870">  metadata-&gt;state_ = kInitialized;</a>
+<a name="ln871">  metadata-&gt;tablet_data_state_ = TABLET_DATA_UNKNOWN;</a>
+<a name="ln872">  RETURN_NOT_OK(metadata-&gt;Flush());</a>
+<a name="ln873">  return metadata;</a>
+<a name="ln874">}</a>
+<a name="ln875"> </a>
+<a name="ln876"> </a>
+<a name="ln877">namespace {</a>
+<a name="ln878">// MigrateSuperblockForDXXXX functions are only needed for backward compatibility with</a>
+<a name="ln879">// YugabyteDB versions which don't have changes from DXXXX revision.</a>
+<a name="ln880">// Each MigrateSuperblockForDXXXX could be removed after all YugabyteDB installations are</a>
+<a name="ln881">// upgraded to have revision DXXXX.</a>
+<a name="ln882"> </a>
+<a name="ln883">CHECKED_STATUS MigrateSuperblockForD5900(RaftGroupReplicaSuperBlockPB* superblock) {</a>
+<a name="ln884">  // In previous version of superblock format we stored primary table metadata in superblock's</a>
+<a name="ln885">  // top-level fields (deprecated table_* and other). TableInfo objects were stored inside</a>
+<a name="ln886">  // RaftGroupReplicaSuperBlockPB.tables.</a>
+<a name="ln887">  //</a>
+<a name="ln888">  // In new format TableInfo objects and some other top-level fields are moved from superblock's</a>
+<a name="ln889">  // top-level fields into RaftGroupReplicaSuperBlockPB.kv_store. Primary table (see</a>
+<a name="ln890">  // RaftGroupMetadata::primary_table_id_ field description) metadata is stored inside one of</a>
+<a name="ln891">  // RaftGroupReplicaSuperBlockPB.kv_store.tables objects and is referenced by</a>
+<a name="ln892">  // RaftGroupReplicaSuperBlockPB.primary_table_id.</a>
+<a name="ln893">  if (superblock-&gt;has_kv_store()) {</a>
+<a name="ln894">    return Status::OK();</a>
+<a name="ln895">  }</a>
+<a name="ln896"> </a>
+<a name="ln897">  LOG(INFO) &lt;&lt; &quot;Migrating superblock for raft group &quot; &lt;&lt; superblock-&gt;raft_group_id();</a>
+<a name="ln898"> </a>
+<a name="ln899">  KvStoreInfoPB* kv_store_pb = superblock-&gt;mutable_kv_store();</a>
+<a name="ln900">  kv_store_pb-&gt;set_kv_store_id(superblock-&gt;raft_group_id());</a>
+<a name="ln901">  kv_store_pb-&gt;set_rocksdb_dir(superblock-&gt;obsolete_rocksdb_dir());</a>
+<a name="ln902">  kv_store_pb-&gt;mutable_rocksdb_files()-&gt;CopyFrom(superblock-&gt;obsolete_rocksdb_files());</a>
+<a name="ln903">  kv_store_pb-&gt;mutable_snapshot_files()-&gt;CopyFrom(superblock-&gt;obsolete_snapshot_files());</a>
+<a name="ln904"> </a>
+<a name="ln905">  TableInfoPB* primary_table = kv_store_pb-&gt;add_tables();</a>
+<a name="ln906">  primary_table-&gt;set_table_id(superblock-&gt;primary_table_id());</a>
+<a name="ln907">  primary_table-&gt;set_table_name(superblock-&gt;obsolete_table_name());</a>
+<a name="ln908">  primary_table-&gt;set_table_type(superblock-&gt;obsolete_table_type());</a>
+<a name="ln909">  primary_table-&gt;mutable_schema()-&gt;CopyFrom(superblock-&gt;obsolete_schema());</a>
+<a name="ln910">  primary_table-&gt;set_schema_version(superblock-&gt;obsolete_schema_version());</a>
+<a name="ln911">  primary_table-&gt;mutable_partition_schema()-&gt;CopyFrom(superblock-&gt;obsolete_partition_schema());</a>
+<a name="ln912">  primary_table-&gt;mutable_indexes()-&gt;CopyFrom(superblock-&gt;obsolete_indexes());</a>
+<a name="ln913">  primary_table-&gt;mutable_index_info()-&gt;CopyFrom(superblock-&gt;obsolete_index_info());</a>
+<a name="ln914">  primary_table-&gt;mutable_deleted_cols()-&gt;CopyFrom(superblock-&gt;obsolete_deleted_cols());</a>
+<a name="ln915"> </a>
+<a name="ln916">  kv_store_pb-&gt;mutable_tables()-&gt;MergeFrom(superblock-&gt;obsolete_tables());</a>
+<a name="ln917"> </a>
+<a name="ln918">  return Status::OK();</a>
+<a name="ln919">}</a>
+<a name="ln920"> </a>
+<a name="ln921">} // namespace</a>
+<a name="ln922"> </a>
+<a name="ln923">Status MigrateSuperblock(RaftGroupReplicaSuperBlockPB* superblock) {</a>
+<a name="ln924">  return MigrateSuperblockForD5900(superblock);</a>
+<a name="ln925">}</a>
+<a name="ln926"> </a>
+<a name="ln927">} // namespace tablet</a>
+<a name="ln928">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="160"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="184"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="273"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="279"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="355"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="377"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="414"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="431"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="437"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="504"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="526"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1030/" target="_blank">V1030</a> The 'raft_group_id' variable is used after it was moved.</p></div>
+<div class="balloon" rel="553"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="648"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="674"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="678"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="687"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="690"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="694"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="704"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="713"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="727"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="740"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="743"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="761"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="523"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: tablet_data_state_, colocated_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

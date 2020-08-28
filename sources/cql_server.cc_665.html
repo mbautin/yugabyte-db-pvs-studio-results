@@ -1,0 +1,225 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>cql_server.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;yb/rpc/rpc_introspection.pb.h&gt;</a>
+<a name="ln15">#include &quot;yb/yql/cql/cqlserver/cql_server.h&quot;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln18">#include &quot;yb/util/net/dns_resolver.h&quot;</a>
+<a name="ln19">#include &quot;yb/util/size_literals.h&quot;</a>
+<a name="ln20">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln21">#include &quot;yb/yql/cql/cqlserver/cql_service.h&quot;</a>
+<a name="ln22">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">using yb::rpc::ServiceIf;</a>
+<a name="ln25">using namespace yb::size_literals;  // NOLINT.</a>
+<a name="ln26"> </a>
+<a name="ln27">DEFINE_int32(cql_service_queue_length, 10000,</a>
+<a name="ln28">             &quot;RPC queue length for CQL service&quot;);</a>
+<a name="ln29">TAG_FLAG(cql_service_queue_length, advanced);</a>
+<a name="ln30"> </a>
+<a name="ln31">DEFINE_int32(cql_nodelist_refresh_interval_secs, 300,</a>
+<a name="ln32">             &quot;Interval after which a node list refresh event should be sent to all CQL clients.&quot;);</a>
+<a name="ln33">TAG_FLAG(cql_nodelist_refresh_interval_secs, runtime);</a>
+<a name="ln34">TAG_FLAG(cql_nodelist_refresh_interval_secs, advanced);</a>
+<a name="ln35"> </a>
+<a name="ln36">DEFINE_int64(cql_rpc_memory_limit, 0, &quot;CQL RPC memory limit&quot;);</a>
+<a name="ln37"> </a>
+<a name="ln38">using namespace std::placeholders;</a>
+<a name="ln39"> </a>
+<a name="ln40">namespace yb {</a>
+<a name="ln41">namespace cqlserver {</a>
+<a name="ln42"> </a>
+<a name="ln43">namespace {</a>
+<a name="ln44"> </a>
+<a name="ln45">boost::posix_time::time_duration refresh_interval() {</a>
+<a name="ln46">  return boost::posix_time::seconds(FLAGS_cql_nodelist_refresh_interval_secs);</a>
+<a name="ln47">}</a>
+<a name="ln48"> </a>
+<a name="ln49">}</a>
+<a name="ln50"> </a>
+<a name="ln51">CQLServer::CQLServer(const CQLServerOptions&amp; opts,</a>
+<a name="ln52">                     boost::asio::io_service* io,</a>
+<a name="ln53">                     tserver::TabletServer* tserver)</a>
+<a name="ln54">    : RpcAndWebServerBase(</a>
+<a name="ln55">          &quot;CQLServer&quot;, opts, &quot;yb.cqlserver&quot;,</a>
+<a name="ln56">          MemTracker::CreateTracker(</a>
+<a name="ln57">              &quot;CQL&quot;, tserver ? tserver-&gt;mem_tracker() : MemTracker::GetRootTracker(),</a>
+<a name="ln58">              AddToParent::kTrue, CreateMetrics::kFalse)),</a>
+<a name="ln59">      opts_(opts),</a>
+<a name="ln60">      timer_(*io, refresh_interval()),</a>
+<a name="ln61">      tserver_(tserver) {</a>
+<a name="ln62">  SetConnectionContextFactory(rpc::CreateConnectionContextFactory&lt;CQLConnectionContext&gt;(</a>
+<a name="ln63">      FLAGS_cql_rpc_memory_limit, mem_tracker()-&gt;parent()));</a>
+<a name="ln64">}</a>
+<a name="ln65"> </a>
+<a name="ln66">Status CQLServer::Start() {</a>
+<a name="ln67">  RETURN_NOT_OK(server::RpcAndWebServerBase::Init());</a>
+<a name="ln68"> </a>
+<a name="ln69">  auto cql_service = std::make_shared&lt;CQLServiceImpl&gt;(this, opts_);</a>
+<a name="ln70">  cql_service-&gt;CompleteInit();</a>
+<a name="ln71"> </a>
+<a name="ln72">  RETURN_NOT_OK(RegisterService(FLAGS_cql_service_queue_length, std::move(cql_service)));</a>
+<a name="ln73"> </a>
+<a name="ln74">  RETURN_NOT_OK(server::RpcAndWebServerBase::Start());</a>
+<a name="ln75"> </a>
+<a name="ln76">  // Start the CQL node list refresh timer.</a>
+<a name="ln77">  timer_.async_wait(boost::bind(&amp;CQLServer::CQLNodeListRefresh, this,</a>
+<a name="ln78">                                boost::asio::placeholders::error));</a>
+<a name="ln79">  return Status::OK();</a>
+<a name="ln80">}</a>
+<a name="ln81"> </a>
+<a name="ln82">void CQLServer::Shutdown() {</a>
+<a name="ln83">  boost::system::error_code ec;</a>
+<a name="ln84">  timer_.cancel(ec);</a>
+<a name="ln85">  if (ec) {</a>
+<a name="ln86">    LOG(WARNING) &lt;&lt; &quot;Failed to cancel timer: &quot; &lt;&lt; ec;</a>
+<a name="ln87">  }</a>
+<a name="ln88">  server::RpcAndWebServerBase::Shutdown();</a>
+<a name="ln89">}</a>
+<a name="ln90"> </a>
+<a name="ln91">void CQLServer::RescheduleTimer() {</a>
+<a name="ln92">  // Reschedule the timer.</a>
+<a name="ln93">  boost::system::error_code ec;</a>
+<a name="ln94">  auto new_expires = timer_.expires_at() + refresh_interval();</a>
+<a name="ln95">  timer_.expires_at(new_expires, ec);</a>
+<a name="ln96">  if (ec) {</a>
+<a name="ln97">    // Happens during shutdown.</a>
+<a name="ln98">    LOG(WARNING) &lt;&lt; &quot;Failed to reschedule timer: &quot; &lt;&lt; ec;</a>
+<a name="ln99">    return;</a>
+<a name="ln100">  }</a>
+<a name="ln101">  timer_.async_wait(boost::bind(&amp;CQLServer::CQLNodeListRefresh, this,</a>
+<a name="ln102">                                boost::asio::placeholders::error));</a>
+<a name="ln103">}</a>
+<a name="ln104"> </a>
+<a name="ln105">std::unique_ptr&lt;CQLServerEvent&gt; CQLServer::BuildTopologyChangeEvent(</a>
+<a name="ln106">    const std::string&amp; event_type, const Endpoint&amp; addr) {</a>
+<a name="ln107">  std::unique_ptr&lt;EventResponse&gt; event_response(new TopologyChangeEventResponse(event_type, addr));</a>
+<a name="ln108">  std::unique_ptr&lt;CQLServerEvent&gt; cql_server_event(new CQLServerEvent(std::move(event_response)));</a>
+<a name="ln109">  return cql_server_event;</a>
+<a name="ln110">}</a>
+<a name="ln111"> </a>
+<a name="ln112">void CQLServer::CQLNodeListRefresh(const boost::system::error_code &amp;ec) {</a>
+<a name="ln113">  if (ec) {</a>
+<a name="ln114">    return;</a>
+<a name="ln115">  }</a>
+<a name="ln116"> </a>
+<a name="ln117">  auto cqlserver_event_list = std::make_shared&lt;CQLServerEventList&gt;();</a>
+<a name="ln118">  auto&amp; resolver = tserver_-&gt;client()-&gt;messenger()-&gt;resolver();</a>
+<a name="ln119">  if (tserver_ != nullptr) {</a>
+<a name="ln120">    // Get all live tservers.</a>
+<a name="ln121">    std::vector&lt;master::TSInformationPB&gt; live_tservers;</a>
+<a name="ln122">    Status s = tserver_-&gt;GetLiveTServers(&amp;live_tservers);</a>
+<a name="ln123">    if (!s.ok()) {</a>
+<a name="ln124">      LOG (WARNING) &lt;&lt; s.ToString();</a>
+<a name="ln125">      RescheduleTimer();</a>
+<a name="ln126">      return;</a>
+<a name="ln127">    }</a>
+<a name="ln128"> </a>
+<a name="ln129">    // Queue NEW_NODE event for all the live tservers.</a>
+<a name="ln130">    for (const master::TSInformationPB&amp; ts_info : live_tservers) {</a>
+<a name="ln131">      const auto&amp; hostport_pb = DesiredHostPort(ts_info.registration().common(), CloudInfoPB());</a>
+<a name="ln132">      if (hostport_pb.host().empty()) {</a>
+<a name="ln133">        LOG (WARNING) &lt;&lt; &quot;Skipping TS since it doesn't have any rpc address: &quot;</a>
+<a name="ln134">                      &lt;&lt; ts_info.DebugString();</a>
+<a name="ln135">        continue;</a>
+<a name="ln136">      }</a>
+<a name="ln137"> </a>
+<a name="ln138">      // Use only the first rpc address.</a>
+<a name="ln139">      auto addr = resolver.Resolve(hostport_pb.host());</a>
+<a name="ln140">      if (PREDICT_FALSE(!addr.ok())) {</a>
+<a name="ln141">        LOG(WARNING) &lt;&lt; Format(&quot;Couldn't result host $0: $1&quot;, hostport_pb.host(), addr.status());</a>
+<a name="ln142">        continue;</a>
+<a name="ln143">      }</a>
+<a name="ln144"> </a>
+<a name="ln145">      // We need the CQL port not the tserver port so use the rpc port from the local CQL server.</a>
+<a name="ln146">      // Note: this relies on the fact that all tservers must use the same CQL port which is not</a>
+<a name="ln147">      // currently enforced on YB side, but is practically required by the drivers.</a>
+<a name="ln148">      const auto cql_port = first_rpc_address().port();</a>
+<a name="ln149"> </a>
+<a name="ln150">      // Queue event for all clients to add a node.</a>
+<a name="ln151">      //</a>
+<a name="ln152">      // TODO: the event should be sent only if there is appropriate subscription.</a>
+<a name="ln153">      //       https://github.com/yugabyte/yugabyte-db/issues/3090</a>
+<a name="ln154">      cqlserver_event_list-&gt;AddEvent(</a>
+<a name="ln155">          BuildTopologyChangeEvent(TopologyChangeEventResponse::kNewNode,</a>
+<a name="ln156">                                   Endpoint(*addr, cql_port)));</a>
+<a name="ln157">    }</a>
+<a name="ln158">  }</a>
+<a name="ln159"> </a>
+<a name="ln160">  // Queue node refresh event, to remove any nodes that are down. Note that the 'MOVED_NODE'</a>
+<a name="ln161">  // event forces the client to refresh its entire cluster topology. The RPC address associated</a>
+<a name="ln162">  // with the event doesn't have much significance.</a>
+<a name="ln163">  //</a>
+<a name="ln164">  // TODO: the event should be sent only if there is appropriate subscription.</a>
+<a name="ln165">  //       https://github.com/yugabyte/yugabyte-db/issues/3090</a>
+<a name="ln166">  cqlserver_event_list-&gt;AddEvent(</a>
+<a name="ln167">      BuildTopologyChangeEvent(TopologyChangeEventResponse::kMovedNode, first_rpc_address()));</a>
+<a name="ln168"> </a>
+<a name="ln169">  Status s = messenger_-&gt;QueueEventOnAllReactors(cqlserver_event_list, SOURCE_LOCATION());</a>
+<a name="ln170">  if (!s.ok()) {</a>
+<a name="ln171">    LOG (WARNING) &lt;&lt; strings::Substitute(&quot;Failed to push events: [$0], due to: $1&quot;,</a>
+<a name="ln172">                                         cqlserver_event_list-&gt;ToString(), s.ToString());</a>
+<a name="ln173">  }</a>
+<a name="ln174"> </a>
+<a name="ln175">  RescheduleTimer();</a>
+<a name="ln176">}</a>
+<a name="ln177"> </a>
+<a name="ln178">}  // namespace cqlserver</a>
+<a name="ln179">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="118"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v595/" target="_blank">V595</a> The 'tserver_' pointer was utilized before it was verified against nullptr. Check lines: 118, 119.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

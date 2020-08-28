@@ -1,0 +1,2086 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>escaping.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright 2008 Google Inc. All Rights Reserved.</a>
+<a name="ln2">// Authors: Numerous. See the .h for contact people.</a>
+<a name="ln3">//</a>
+<a name="ln4">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln5">//</a>
+<a name="ln6">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln9">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln10">//</a>
+<a name="ln11">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln12">//</a>
+<a name="ln13">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln14">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln15">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18"> </a>
+<a name="ln19">#include &quot;yb/gutil/strings/escaping.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;assert.h&gt;</a>
+<a name="ln22">#include &lt;stdio.h&gt;</a>
+<a name="ln23">#include &lt;string.h&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &lt;limits&gt;</a>
+<a name="ln26">using std::numeric_limits;</a>
+<a name="ln27">#include &lt;vector&gt;</a>
+<a name="ln28">using std::vector;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;yb/gutil/integral_types.h&quot;</a>
+<a name="ln31">#include &quot;yb/gutil/port.h&quot;</a>
+<a name="ln32">#include &quot;yb/gutil/gscoped_ptr.h&quot;</a>
+<a name="ln33">#include &quot;yb/gutil/strings/join.h&quot;</a>
+<a name="ln34">#include &quot;yb/gutil/utf/utf.h&quot;  // for runetochar</a>
+<a name="ln35">#include &quot;yb/gutil/charmap.h&quot;</a>
+<a name="ln36">#include &quot;yb/gutil/stl_util.h&quot;</a>
+<a name="ln37"> </a>
+<a name="ln38">namespace strings {</a>
+<a name="ln39"> </a>
+<a name="ln40">// These are used for the leave_nulls_escaped argument to CUnescapeInternal().</a>
+<a name="ln41">static bool kUnescapeNulls = false;</a>
+<a name="ln42">static bool kLeaveNullsEscaped = true;</a>
+<a name="ln43"> </a>
+<a name="ln44">// ----------------------------------------------------------------------</a>
+<a name="ln45">// EscapeStrForCSV()</a>
+<a name="ln46">//    Escapes the quotes in 'src' by doubling them. This is necessary</a>
+<a name="ln47">//    for generating CSV files (see SplitCSVLine).</a>
+<a name="ln48">//    Returns the number of characters written into dest (not counting</a>
+<a name="ln49">//    the \0) or -1 if there was insufficient space. Dest could end up</a>
+<a name="ln50">//    twice as long as src.</a>
+<a name="ln51">//</a>
+<a name="ln52">//    Example: [some &quot;string&quot; to test] --&gt; [some &quot;&quot;string&quot;&quot; to test]</a>
+<a name="ln53">// ----------------------------------------------------------------------</a>
+<a name="ln54">int EscapeStrForCSV(const char* src, char* dest, int dest_len) {</a>
+<a name="ln55">  int used = 0;</a>
+<a name="ln56"> </a>
+<a name="ln57">  while (true) {</a>
+<a name="ln58">    if (*src == '\0' &amp;&amp; used &lt; dest_len) {</a>
+<a name="ln59">      dest[used] = '\0';</a>
+<a name="ln60">      return used;</a>
+<a name="ln61">    }</a>
+<a name="ln62"> </a>
+<a name="ln63">    if (used + 1 &gt;= dest_len)  // +1 because we might require two characters</a>
+<a name="ln64">      return -1;</a>
+<a name="ln65"> </a>
+<a name="ln66">    if (*src == '&quot;')</a>
+<a name="ln67">      dest[used++] = '&quot;';</a>
+<a name="ln68"> </a>
+<a name="ln69">    dest[used++] = *src++;</a>
+<a name="ln70">  }</a>
+<a name="ln71">}</a>
+<a name="ln72"> </a>
+<a name="ln73">// ----------------------------------------------------------------------</a>
+<a name="ln74">// UnescapeCEscapeSequences()</a>
+<a name="ln75">//    This does all the unescaping that C does: \ooo, \r, \n, etc</a>
+<a name="ln76">//    Returns length of resulting string.</a>
+<a name="ln77">//    The implementation of \x parses any positive number of hex digits,</a>
+<a name="ln78">//    but it is an error if the value requires more than 8 bits, and the</a>
+<a name="ln79">//    result is truncated to 8 bits. The same is true for octals.</a>
+<a name="ln80">//</a>
+<a name="ln81">//    The second call stores its errors in a supplied string vector.</a>
+<a name="ln82">//    If the string vector pointer is NULL, it reports the errors with LOG().</a>
+<a name="ln83">//</a>
+<a name="ln84">//    *** DEPRECATED: Use CUnescape() in new code ***</a>
+<a name="ln85">//</a>
+<a name="ln86">//    NOTE: any changes to this function must also be reflected in the newer</a>
+<a name="ln87">//    CUnescape().</a>
+<a name="ln88">// ----------------------------------------------------------------------</a>
+<a name="ln89"> </a>
+<a name="ln90">#define IS_OCTAL_DIGIT(c) (((c) &gt;= '0') &amp;&amp; ((c) &lt;= '7'))</a>
+<a name="ln91"> </a>
+<a name="ln92">int UnescapeCEscapeSequences(const char* source, char* dest) {</a>
+<a name="ln93">  return UnescapeCEscapeSequences(source, dest, nullptr);</a>
+<a name="ln94">}</a>
+<a name="ln95"> </a>
+<a name="ln96">int UnescapeCEscapeSequences(const char* source, char* dest,</a>
+<a name="ln97">                             vector&lt;string&gt; *errors) {</a>
+<a name="ln98">  char* d = dest;</a>
+<a name="ln99">  const char* p = source;</a>
+<a name="ln100"> </a>
+<a name="ln101">  // Small optimization for case where source = dest and there's no escaping</a>
+<a name="ln102">  while ( p == d &amp;&amp; *p != '\0' &amp;&amp; *p != '\\' )</a>
+<a name="ln103">    p++, d++;</a>
+<a name="ln104"> </a>
+<a name="ln105">  while (*p != '\0') {</a>
+<a name="ln106">    if (*p != '\\') {</a>
+<a name="ln107">      *d++ = *p++;</a>
+<a name="ln108">    } else {</a>
+<a name="ln109">      switch ( *++p ) {                    // skip past the '\\'</a>
+<a name="ln110">        case '\0':</a>
+<a name="ln111">          LOG_STRING(ERROR, errors) &lt;&lt; &quot;String cannot end with \\&quot;;</a>
+<a name="ln112">          *d = '\0';</a>
+<a name="ln113">          return d - dest;   // we're done with p</a>
+<a name="ln114">        case 'a':  *d++ = '\a';  break;</a>
+<a name="ln115">        case 'b':  *d++ = '\b';  break;</a>
+<a name="ln116">        case 'f':  *d++ = '\f';  break;</a>
+<a name="ln117">        case 'n':  *d++ = '\n';  break;</a>
+<a name="ln118">        case 'r':  *d++ = '\r';  break;</a>
+<a name="ln119">        case 't':  *d++ = '\t';  break;</a>
+<a name="ln120">        case 'v':  *d++ = '\v';  break;</a>
+<a name="ln121">        case '\\': *d++ = '\\';  break;</a>
+<a name="ln122">        case '?':  *d++ = '\?';  break;    // \?  Who knew?</a>
+<a name="ln123">        case '\'': *d++ = '\'';  break;</a>
+<a name="ln124">        case '&quot;':  *d++ = '\&quot;';  break;</a>
+<a name="ln125">        case '0': case '1': case '2': case '3':  // octal digit: 1 to 3 digits</a>
+<a name="ln126">        case '4': case '5': case '6': case '7': {</a>
+<a name="ln127">          const char *octal_start = p;</a>
+<a name="ln128">          unsigned int ch = *p - '0';</a>
+<a name="ln129">          if ( IS_OCTAL_DIGIT(p[1]) )</a>
+<a name="ln130">            ch = ch * 8 + *++p - '0';</a>
+<a name="ln131">          if ( IS_OCTAL_DIGIT(p[1]) )      // safe (and easy) to do this twice</a>
+<a name="ln132">            ch = ch * 8 + *++p - '0';      // now points at last digit</a>
+<a name="ln133">          if (ch &gt; 0xFF)</a>
+<a name="ln134">            LOG_STRING(ERROR, errors) &lt;&lt; &quot;Value of &quot; &lt;&lt;</a>
+<a name="ln135">              &quot;\\&quot; &lt;&lt; string(octal_start, p+1-octal_start) &lt;&lt;</a>
+<a name="ln136">              &quot; exceeds 8 bits&quot;;</a>
+<a name="ln137">          *d++ = ch;</a>
+<a name="ln138">          break;</a>
+<a name="ln139">        }</a>
+<a name="ln140">        case 'x': case 'X': {</a>
+<a name="ln141">          if (!ascii_isxdigit(p[1])) {</a>
+<a name="ln142">            if (p[1] == '\0') {</a>
+<a name="ln143">              LOG_STRING(ERROR, errors) &lt;&lt; &quot;String cannot end with \\x&quot;;</a>
+<a name="ln144">            } else {</a>
+<a name="ln145">              LOG_STRING(ERROR, errors) &lt;&lt;</a>
+<a name="ln146">                &quot;\\x cannot be followed by a non-hex digit: \\&quot; &lt;&lt; *p &lt;&lt; p[1];</a>
+<a name="ln147">            }</a>
+<a name="ln148">            break;</a>
+<a name="ln149">          }</a>
+<a name="ln150">          unsigned int ch = 0;</a>
+<a name="ln151">          const char *hex_start = p;</a>
+<a name="ln152">          while (ascii_isxdigit(p[1]))  // arbitrarily many hex digits</a>
+<a name="ln153">            ch = (ch &lt;&lt; 4) + hex_digit_to_int(*++p);</a>
+<a name="ln154">          if (ch &gt; 0xFF)</a>
+<a name="ln155">            LOG_STRING(ERROR, errors) &lt;&lt; &quot;Value of &quot; &lt;&lt;</a>
+<a name="ln156">              &quot;\\&quot; &lt;&lt; string(hex_start, p+1-hex_start) &lt;&lt; &quot; exceeds 8 bits&quot;;</a>
+<a name="ln157">          *d++ = ch;</a>
+<a name="ln158">          break;</a>
+<a name="ln159">        }</a>
+<a name="ln160">        case 'u': {</a>
+<a name="ln161">          // \uhhhh =&gt; convert 4 hex digits to UTF-8</a>
+<a name="ln162">          char32 rune = 0;</a>
+<a name="ln163">          const char *hex_start = p;</a>
+<a name="ln164">          for (int i = 0; i &lt; 4; ++i) {</a>
+<a name="ln165">            if (ascii_isxdigit(p[1])) {  // Look one char ahead.</a>
+<a name="ln166">              rune = (rune &lt;&lt; 4) + hex_digit_to_int(*++p);  // Advance p.</a>
+<a name="ln167">            } else {</a>
+<a name="ln168">              LOG_STRING(ERROR, errors)</a>
+<a name="ln169">                &lt;&lt; &quot;\\u must be followed by 4 hex digits: \\&quot;</a>
+<a name="ln170">                &lt;&lt;  string(hex_start, p+1-hex_start);</a>
+<a name="ln171">              break;</a>
+<a name="ln172">            }</a>
+<a name="ln173">          }</a>
+<a name="ln174">          d += runetochar(d, &amp;rune);</a>
+<a name="ln175">          break;</a>
+<a name="ln176">        }</a>
+<a name="ln177">        case 'U': {</a>
+<a name="ln178">          // \Uhhhhhhhh =&gt; convert 8 hex digits to UTF-8</a>
+<a name="ln179">          char32 rune = 0;</a>
+<a name="ln180">          const char *hex_start = p;</a>
+<a name="ln181">          for (int i = 0; i &lt; 8; ++i) {</a>
+<a name="ln182">            if (ascii_isxdigit(p[1])) {  // Look one char ahead.</a>
+<a name="ln183">              // Don't change rune until we're sure this</a>
+<a name="ln184">              // is within the Unicode limit, but do advance p.</a>
+<a name="ln185">              char32 newrune = (rune &lt;&lt; 4) + hex_digit_to_int(*++p);</a>
+<a name="ln186">              if (newrune &gt; 0x10FFFF) {</a>
+<a name="ln187">                LOG_STRING(ERROR, errors)</a>
+<a name="ln188">                  &lt;&lt; &quot;Value of \\&quot;</a>
+<a name="ln189">                  &lt;&lt; string(hex_start, p + 1 - hex_start)</a>
+<a name="ln190">                  &lt;&lt; &quot; exceeds Unicode limit (0x10FFFF)&quot;;</a>
+<a name="ln191">                break;</a>
+<a name="ln192">              } else {</a>
+<a name="ln193">                rune = newrune;</a>
+<a name="ln194">              }</a>
+<a name="ln195">            } else {</a>
+<a name="ln196">              LOG_STRING(ERROR, errors)</a>
+<a name="ln197">                &lt;&lt; &quot;\\U must be followed by 8 hex digits: \\&quot;</a>
+<a name="ln198">                &lt;&lt;  string(hex_start, p+1-hex_start);</a>
+<a name="ln199">              break;</a>
+<a name="ln200">            }</a>
+<a name="ln201">          }</a>
+<a name="ln202">          d += runetochar(d, &amp;rune);</a>
+<a name="ln203">          break;</a>
+<a name="ln204">        }</a>
+<a name="ln205">        default:</a>
+<a name="ln206">          LOG_STRING(ERROR, errors) &lt;&lt; &quot;Unknown escape sequence: \\&quot; &lt;&lt; *p;</a>
+<a name="ln207">      }</a>
+<a name="ln208">      p++;                                 // read past letter we escaped</a>
+<a name="ln209">    }</a>
+<a name="ln210">  }</a>
+<a name="ln211">  *d = '\0';</a>
+<a name="ln212">  return d - dest;</a>
+<a name="ln213">}</a>
+<a name="ln214"> </a>
+<a name="ln215">// ----------------------------------------------------------------------</a>
+<a name="ln216">// UnescapeCEscapeString()</a>
+<a name="ln217">//    This does the same thing as UnescapeCEscapeSequences, but creates</a>
+<a name="ln218">//    a new string. The caller does not need to worry about allocating</a>
+<a name="ln219">//    a dest buffer. This should be used for non performance critical</a>
+<a name="ln220">//    tasks such as printing debug messages. It is safe for src and dest</a>
+<a name="ln221">//    to be the same.</a>
+<a name="ln222">//</a>
+<a name="ln223">//    The second call stores its errors in a supplied string vector.</a>
+<a name="ln224">//    If the string vector pointer is NULL, it reports the errors with LOG().</a>
+<a name="ln225">//</a>
+<a name="ln226">//    In the first and second calls, the length of dest is returned. In the</a>
+<a name="ln227">//    the third call, the new string is returned.</a>
+<a name="ln228">//</a>
+<a name="ln229">//    *** DEPRECATED: Use CUnescape() in new code ***</a>
+<a name="ln230">//</a>
+<a name="ln231">// ----------------------------------------------------------------------</a>
+<a name="ln232">int UnescapeCEscapeString(const string&amp; src, string* dest) {</a>
+<a name="ln233">  return UnescapeCEscapeString(src, dest, nullptr);</a>
+<a name="ln234">}</a>
+<a name="ln235"> </a>
+<a name="ln236">int UnescapeCEscapeString(const string&amp; src, string* dest,</a>
+<a name="ln237">                          vector&lt;string&gt; *errors) {</a>
+<a name="ln238">  CHECK(dest);</a>
+<a name="ln239">  dest-&gt;resize(src.size() + 1);</a>
+<a name="ln240">  int len = UnescapeCEscapeSequences(src.c_str(),</a>
+<a name="ln241">      const_cast&lt;char*&gt;(dest-&gt;data()), errors);</a>
+<a name="ln242">  dest-&gt;resize(len);</a>
+<a name="ln243">  return len;</a>
+<a name="ln244">}</a>
+<a name="ln245"> </a>
+<a name="ln246">string UnescapeCEscapeString(const string&amp; src) {</a>
+<a name="ln247">  gscoped_array&lt;char&gt; unescaped(new char[src.size() + 1]);</a>
+<a name="ln248">  int len = UnescapeCEscapeSequences(src.c_str(), unescaped.get(), nullptr);</a>
+<a name="ln249">  return string(unescaped.get(), len);</a>
+<a name="ln250">}</a>
+<a name="ln251"> </a>
+<a name="ln252">// ----------------------------------------------------------------------</a>
+<a name="ln253">// CUnescapeInternal()</a>
+<a name="ln254">//    Implements both CUnescape() and CUnescapeForNullTerminatedString().</a>
+<a name="ln255">//</a>
+<a name="ln256">//    Unescapes C escape sequences and is the reverse of CEscape().</a>
+<a name="ln257">//</a>
+<a name="ln258">//    If 'source' is valid, stores the unescaped string and its size in</a>
+<a name="ln259">//    'dest' and 'dest_len' respectively, and returns true. Otherwise</a>
+<a name="ln260">//    returns false and optionally stores the error description in</a>
+<a name="ln261">//    'error'. Set 'error' to NULL to disable error reporting.</a>
+<a name="ln262">//</a>
+<a name="ln263">//    'dest' should point to a buffer that is at least as big as 'source'.</a>
+<a name="ln264">//    'source' and 'dest' may be the same.</a>
+<a name="ln265">//</a>
+<a name="ln266">//     NOTE: any changes to this function must also be reflected in the older</a>
+<a name="ln267">//     UnescapeCEscapeSequences().</a>
+<a name="ln268">// ----------------------------------------------------------------------</a>
+<a name="ln269">static bool CUnescapeInternal(const GStringPiece&amp; source,</a>
+<a name="ln270">                              bool leave_nulls_escaped,</a>
+<a name="ln271">                              char* dest,</a>
+<a name="ln272">                              int* dest_len,</a>
+<a name="ln273">                              string* error) {</a>
+<a name="ln274">  char* d = dest;</a>
+<a name="ln275">  const char* p = source.data();</a>
+<a name="ln276">  const char* end = source.end();</a>
+<a name="ln277">  const char* last_byte = end - 1;</a>
+<a name="ln278"> </a>
+<a name="ln279">  // Small optimization for case where source = dest and there's no escaping</a>
+<a name="ln280">  while (p == d &amp;&amp; p &lt; end &amp;&amp; *p != '\\')</a>
+<a name="ln281">    p++, d++;</a>
+<a name="ln282"> </a>
+<a name="ln283">  while (p &lt; end) {</a>
+<a name="ln284">    if (*p != '\\') {</a>
+<a name="ln285">      *d++ = *p++;</a>
+<a name="ln286">    } else {</a>
+<a name="ln287">      if (++p &gt; last_byte) {       // skip past the '\\'</a>
+<a name="ln288">        if (error) *error = &quot;String cannot end with \\&quot;;</a>
+<a name="ln289">        return false;</a>
+<a name="ln290">      }</a>
+<a name="ln291">      switch (*p) {</a>
+<a name="ln292">        case 'a':  *d++ = '\a';  break;</a>
+<a name="ln293">        case 'b':  *d++ = '\b';  break;</a>
+<a name="ln294">        case 'f':  *d++ = '\f';  break;</a>
+<a name="ln295">        case 'n':  *d++ = '\n';  break;</a>
+<a name="ln296">        case 'r':  *d++ = '\r';  break;</a>
+<a name="ln297">        case 't':  *d++ = '\t';  break;</a>
+<a name="ln298">        case 'v':  *d++ = '\v';  break;</a>
+<a name="ln299">        case '\\': *d++ = '\\';  break;</a>
+<a name="ln300">        case '?':  *d++ = '\?';  break;    // \?  Who knew?</a>
+<a name="ln301">        case '\'': *d++ = '\'';  break;</a>
+<a name="ln302">        case '&quot;':  *d++ = '\&quot;';  break;</a>
+<a name="ln303">        case '0': case '1': case '2': case '3':  // octal digit: 1 to 3 digits</a>
+<a name="ln304">        case '4': case '5': case '6': case '7': {</a>
+<a name="ln305">          const char *octal_start = p;</a>
+<a name="ln306">          unsigned int ch = *p - '0';</a>
+<a name="ln307">          if (p &lt; last_byte &amp;&amp; IS_OCTAL_DIGIT(p[1]))</a>
+<a name="ln308">            ch = ch * 8 + *++p - '0';</a>
+<a name="ln309">          if (p &lt; last_byte &amp;&amp; IS_OCTAL_DIGIT(p[1]))</a>
+<a name="ln310">            ch = ch * 8 + *++p - '0';      // now points at last digit</a>
+<a name="ln311">          if (ch &gt; 0xff) {</a>
+<a name="ln312">            if (error) {</a>
+<a name="ln313">              *error = &quot;Value of \\&quot; +</a>
+<a name="ln314">                  string(octal_start, p + 1 - octal_start) +</a>
+<a name="ln315">                  &quot; exceeds 0xff&quot;;</a>
+<a name="ln316">            }</a>
+<a name="ln317">            return false;</a>
+<a name="ln318">          }</a>
+<a name="ln319">          if ((ch == 0) &amp;&amp; leave_nulls_escaped) {</a>
+<a name="ln320">            // Copy the escape sequence for the null character</a>
+<a name="ln321">            const int octal_size = p + 1 - octal_start;</a>
+<a name="ln322">            *d++ = '\\';</a>
+<a name="ln323">            memcpy(d, octal_start, octal_size);</a>
+<a name="ln324">            d += octal_size;</a>
+<a name="ln325">            break;</a>
+<a name="ln326">          }</a>
+<a name="ln327">          *d++ = ch;</a>
+<a name="ln328">          break;</a>
+<a name="ln329">        }</a>
+<a name="ln330">        case 'x': case 'X': {</a>
+<a name="ln331">          if (p &gt;= last_byte) {</a>
+<a name="ln332">            if (error) *error = &quot;String cannot end with \\x&quot;;</a>
+<a name="ln333">            return false;</a>
+<a name="ln334">          } else if (!ascii_isxdigit(p[1])) {</a>
+<a name="ln335">            if (error) *error = &quot;\\x cannot be followed by a non-hex digit&quot;;</a>
+<a name="ln336">            return false;</a>
+<a name="ln337">          }</a>
+<a name="ln338">          unsigned int ch = 0;</a>
+<a name="ln339">          const char *hex_start = p;</a>
+<a name="ln340">          while (p &lt; last_byte &amp;&amp; ascii_isxdigit(p[1]))</a>
+<a name="ln341">            // Arbitrarily many hex digits</a>
+<a name="ln342">            ch = (ch &lt;&lt; 4) + hex_digit_to_int(*++p);</a>
+<a name="ln343">          if (ch &gt; 0xFF) {</a>
+<a name="ln344">            if (error) {</a>
+<a name="ln345">              *error = &quot;Value of \\&quot; + string(hex_start, p + 1 - hex_start) +</a>
+<a name="ln346">                  &quot; exceeds 0xff&quot;;</a>
+<a name="ln347">            }</a>
+<a name="ln348">            return false;</a>
+<a name="ln349">          }</a>
+<a name="ln350">          if ((ch == 0) &amp;&amp; leave_nulls_escaped) {</a>
+<a name="ln351">            // Copy the escape sequence for the null character</a>
+<a name="ln352">            const int hex_size = p + 1 - hex_start;</a>
+<a name="ln353">            *d++ = '\\';</a>
+<a name="ln354">            memcpy(d, hex_start, hex_size);</a>
+<a name="ln355">            d += hex_size;</a>
+<a name="ln356">            break;</a>
+<a name="ln357">          }</a>
+<a name="ln358">          *d++ = ch;</a>
+<a name="ln359">          break;</a>
+<a name="ln360">        }</a>
+<a name="ln361">        case 'u': {</a>
+<a name="ln362">          // \uhhhh =&gt; convert 4 hex digits to UTF-8</a>
+<a name="ln363">          char32 rune = 0;</a>
+<a name="ln364">          const char *hex_start = p;</a>
+<a name="ln365">          if (p + 4 &gt;= end) {</a>
+<a name="ln366">            if (error) {</a>
+<a name="ln367">              *error = &quot;\\u must be followed by 4 hex digits: \\&quot; +</a>
+<a name="ln368">                  string(hex_start, p + 1 - hex_start);</a>
+<a name="ln369">            }</a>
+<a name="ln370">            return false;</a>
+<a name="ln371">          }</a>
+<a name="ln372">          for (int i = 0; i &lt; 4; ++i) {</a>
+<a name="ln373">            // Look one char ahead.</a>
+<a name="ln374">            if (ascii_isxdigit(p[1])) {</a>
+<a name="ln375">              rune = (rune &lt;&lt; 4) + hex_digit_to_int(*++p);  // Advance p.</a>
+<a name="ln376">            } else {</a>
+<a name="ln377">              if (error) {</a>
+<a name="ln378">                *error = &quot;\\u must be followed by 4 hex digits: \\&quot; +</a>
+<a name="ln379">                    string(hex_start, p + 1 - hex_start);</a>
+<a name="ln380">              }</a>
+<a name="ln381">              return false;</a>
+<a name="ln382">            }</a>
+<a name="ln383">          }</a>
+<a name="ln384">          if ((rune == 0) &amp;&amp; leave_nulls_escaped) {</a>
+<a name="ln385">            // Copy the escape sequence for the null character</a>
+<a name="ln386">            *d++ = '\\';</a>
+<a name="ln387">            memcpy(d, hex_start, 5);  // u0000</a>
+<a name="ln388">            d += 5;</a>
+<a name="ln389">            break;</a>
+<a name="ln390">          }</a>
+<a name="ln391">          d += runetochar(d, &amp;rune);</a>
+<a name="ln392">          break;</a>
+<a name="ln393">        }</a>
+<a name="ln394">        case 'U': {</a>
+<a name="ln395">          // \Uhhhhhhhh =&gt; convert 8 hex digits to UTF-8</a>
+<a name="ln396">          char32 rune = 0;</a>
+<a name="ln397">          const char *hex_start = p;</a>
+<a name="ln398">          if (p + 8 &gt;= end) {</a>
+<a name="ln399">            if (error) {</a>
+<a name="ln400">              *error = &quot;\\U must be followed by 8 hex digits: \\&quot; +</a>
+<a name="ln401">                  string(hex_start, p + 1 - hex_start);</a>
+<a name="ln402">            }</a>
+<a name="ln403">            return false;</a>
+<a name="ln404">          }</a>
+<a name="ln405">          for (int i = 0; i &lt; 8; ++i) {</a>
+<a name="ln406">            // Look one char ahead.</a>
+<a name="ln407">            if (ascii_isxdigit(p[1])) {</a>
+<a name="ln408">              // Don't change rune until we're sure this</a>
+<a name="ln409">              // is within the Unicode limit, but do advance p.</a>
+<a name="ln410">              char32 newrune = (rune &lt;&lt; 4) + hex_digit_to_int(*++p);</a>
+<a name="ln411">              if (newrune &gt; 0x10FFFF) {</a>
+<a name="ln412">                if (error) {</a>
+<a name="ln413">                  *error = &quot;Value of \\&quot; +</a>
+<a name="ln414">                      string(hex_start, p + 1 - hex_start) +</a>
+<a name="ln415">                      &quot; exceeds Unicode limit (0x10FFFF)&quot;;</a>
+<a name="ln416">                }</a>
+<a name="ln417">                return false;</a>
+<a name="ln418">              } else {</a>
+<a name="ln419">                rune = newrune;</a>
+<a name="ln420">              }</a>
+<a name="ln421">            } else {</a>
+<a name="ln422">              if (error) {</a>
+<a name="ln423">                *error = &quot;\\U must be followed by 8 hex digits: \\&quot; +</a>
+<a name="ln424">                    string(hex_start, p + 1 - hex_start);</a>
+<a name="ln425">              }</a>
+<a name="ln426">              return false;</a>
+<a name="ln427">            }</a>
+<a name="ln428">          }</a>
+<a name="ln429">          if ((rune == 0) &amp;&amp; leave_nulls_escaped) {</a>
+<a name="ln430">            // Copy the escape sequence for the null character</a>
+<a name="ln431">            *d++ = '\\';</a>
+<a name="ln432">            memcpy(d, hex_start, 9);  // U00000000</a>
+<a name="ln433">            d += 9;</a>
+<a name="ln434">            break;</a>
+<a name="ln435">          }</a>
+<a name="ln436">          d += runetochar(d, &amp;rune);</a>
+<a name="ln437">          break;</a>
+<a name="ln438">        }</a>
+<a name="ln439">        default: {</a>
+<a name="ln440">          if (error) *error = string(&quot;Unknown escape sequence: \\&quot;) + *p;</a>
+<a name="ln441">          return false;</a>
+<a name="ln442">        }</a>
+<a name="ln443">      }</a>
+<a name="ln444">      p++;                                 // read past letter we escaped</a>
+<a name="ln445">    }</a>
+<a name="ln446">  }</a>
+<a name="ln447">  *dest_len = d - dest;</a>
+<a name="ln448">  return true;</a>
+<a name="ln449">}</a>
+<a name="ln450"> </a>
+<a name="ln451">// ----------------------------------------------------------------------</a>
+<a name="ln452">// CUnescapeInternal()</a>
+<a name="ln453">//</a>
+<a name="ln454">//    Same as above but uses a C++ string for output. 'source' and 'dest'</a>
+<a name="ln455">//    may be the same.</a>
+<a name="ln456">// ----------------------------------------------------------------------</a>
+<a name="ln457">bool CUnescapeInternal(const GStringPiece&amp; source,</a>
+<a name="ln458">                       bool leave_nulls_escaped,</a>
+<a name="ln459">                       string* dest,</a>
+<a name="ln460">                       string* error) {</a>
+<a name="ln461">  dest-&gt;resize(source.size());</a>
+<a name="ln462">  int dest_size;</a>
+<a name="ln463">  if (!CUnescapeInternal(source,</a>
+<a name="ln464">                         leave_nulls_escaped,</a>
+<a name="ln465">                         const_cast&lt;char*&gt;(dest-&gt;data()),</a>
+<a name="ln466">                         &amp;dest_size,</a>
+<a name="ln467">                         error)) {</a>
+<a name="ln468">    return false;</a>
+<a name="ln469">  }</a>
+<a name="ln470">  dest-&gt;resize(dest_size);</a>
+<a name="ln471">  return true;</a>
+<a name="ln472">}</a>
+<a name="ln473"> </a>
+<a name="ln474">// ----------------------------------------------------------------------</a>
+<a name="ln475">// CUnescape()</a>
+<a name="ln476">//</a>
+<a name="ln477">// See CUnescapeInternal() for implementation details.</a>
+<a name="ln478">// ----------------------------------------------------------------------</a>
+<a name="ln479">bool CUnescape(const GStringPiece&amp; source, char* dest, int* dest_len,</a>
+<a name="ln480">               string* error) {</a>
+<a name="ln481">  return CUnescapeInternal(source, kUnescapeNulls, dest, dest_len, error);</a>
+<a name="ln482">}</a>
+<a name="ln483"> </a>
+<a name="ln484">bool CUnescape(const GStringPiece&amp; source, string* dest, string* error) {</a>
+<a name="ln485">  return CUnescapeInternal(source, kUnescapeNulls, dest, error);</a>
+<a name="ln486">}</a>
+<a name="ln487"> </a>
+<a name="ln488">// ----------------------------------------------------------------------</a>
+<a name="ln489">// CUnescapeForNullTerminatedString()</a>
+<a name="ln490">//</a>
+<a name="ln491">// See CUnescapeInternal() for implementation details.</a>
+<a name="ln492">// ----------------------------------------------------------------------</a>
+<a name="ln493">bool CUnescapeForNullTerminatedString(const GStringPiece&amp; source,</a>
+<a name="ln494">                                      char* dest,</a>
+<a name="ln495">                                      int* dest_len,</a>
+<a name="ln496">                                      string* error) {</a>
+<a name="ln497">  return CUnescapeInternal(source, kLeaveNullsEscaped, dest, dest_len, error);</a>
+<a name="ln498">}</a>
+<a name="ln499"> </a>
+<a name="ln500">bool CUnescapeForNullTerminatedString(const GStringPiece&amp; source,</a>
+<a name="ln501">                                      string* dest,</a>
+<a name="ln502">                                      string* error) {</a>
+<a name="ln503">  return CUnescapeInternal(source, kLeaveNullsEscaped, dest, error);</a>
+<a name="ln504">}</a>
+<a name="ln505"> </a>
+<a name="ln506">// ----------------------------------------------------------------------</a>
+<a name="ln507">// CEscapeString()</a>
+<a name="ln508">// CHexEscapeString()</a>
+<a name="ln509">// Utf8SafeCEscapeString()</a>
+<a name="ln510">// Utf8SafeCHexEscapeString()</a>
+<a name="ln511">//    Copies 'src' to 'dest', escaping dangerous characters using</a>
+<a name="ln512">//    C-style escape sequences. This is very useful for preparing query</a>
+<a name="ln513">//    flags. 'src' and 'dest' should not overlap. The 'Hex' version uses</a>
+<a name="ln514">//    hexadecimal rather than octal sequences. The 'Utf8Safe' version doesn't</a>
+<a name="ln515">//    touch UTF-8 bytes.</a>
+<a name="ln516">//    Returns the number of bytes written to 'dest' (not including the \0)</a>
+<a name="ln517">//    or -1 if there was insufficient space.</a>
+<a name="ln518">//</a>
+<a name="ln519">//    Currently only \n, \r, \t, &quot;, ', \ and !ascii_isprint() chars are escaped.</a>
+<a name="ln520">// ----------------------------------------------------------------------</a>
+<a name="ln521">int CEscapeInternal(const char* src, int src_len, char* dest,</a>
+<a name="ln522">                    int dest_len, bool use_hex, bool utf8_safe) {</a>
+<a name="ln523">  const char* src_end = src + src_len;</a>
+<a name="ln524">  int used = 0;</a>
+<a name="ln525">  bool last_hex_escape = false;  // true if last output char was \xNN</a>
+<a name="ln526"> </a>
+<a name="ln527">  for (; src &lt; src_end; src++) {</a>
+<a name="ln528">    if (dest_len - used &lt; 2)   // Need space for two letter escape</a>
+<a name="ln529">      return -1;</a>
+<a name="ln530"> </a>
+<a name="ln531">    bool is_hex_escape = false;</a>
+<a name="ln532">    switch (*src) {</a>
+<a name="ln533">      case '\n': dest[used++] = '\\'; dest[used++] = 'n';  break;</a>
+<a name="ln534">      case '\r': dest[used++] = '\\'; dest[used++] = 'r';  break;</a>
+<a name="ln535">      case '\t': dest[used++] = '\\'; dest[used++] = 't';  break;</a>
+<a name="ln536">      case '\&quot;': dest[used++] = '\\'; dest[used++] = '\&quot;'; break;</a>
+<a name="ln537">      case '\'': dest[used++] = '\\'; dest[used++] = '\''; break;</a>
+<a name="ln538">      case '\\': dest[used++] = '\\'; dest[used++] = '\\'; break;</a>
+<a name="ln539">      default:</a>
+<a name="ln540">        // Note that if we emit \xNN and the src character after that is a hex</a>
+<a name="ln541">        // digit then that digit must be escaped too to prevent it being</a>
+<a name="ln542">        // interpreted as part of the character code by C.</a>
+<a name="ln543">        if ((!utf8_safe || *src &lt; 0x80) &amp;&amp;</a>
+<a name="ln544">            (!ascii_isprint(*src) ||</a>
+<a name="ln545">             (last_hex_escape &amp;&amp; ascii_isxdigit(*src)))) {</a>
+<a name="ln546">          if (dest_len - used &lt; 4)  // need space for 4 letter escape</a>
+<a name="ln547">            return -1;</a>
+<a name="ln548">          sprintf(dest + used, (use_hex ? &quot;\\x%02x&quot; : &quot;\\%03o&quot;), *src);</a>
+<a name="ln549">          is_hex_escape = use_hex;</a>
+<a name="ln550">          used += 4;</a>
+<a name="ln551">        } else {</a>
+<a name="ln552">          dest[used++] = *src;</a>
+<a name="ln553">          break;</a>
+<a name="ln554">        }</a>
+<a name="ln555">    }</a>
+<a name="ln556">    last_hex_escape = is_hex_escape;</a>
+<a name="ln557">  }</a>
+<a name="ln558"> </a>
+<a name="ln559">  if (dest_len - used &lt; 1)   // make sure that there is room for \0</a>
+<a name="ln560">    return -1;</a>
+<a name="ln561"> </a>
+<a name="ln562">  dest[used] = '\0';   // doesn't count towards return value though</a>
+<a name="ln563">  return used;</a>
+<a name="ln564">}</a>
+<a name="ln565"> </a>
+<a name="ln566">int CEscapeString(const char* src, int src_len, char* dest, int dest_len) {</a>
+<a name="ln567">  return CEscapeInternal(src, src_len, dest, dest_len, false, false);</a>
+<a name="ln568">}</a>
+<a name="ln569"> </a>
+<a name="ln570">int CHexEscapeString(const char* src, int src_len, char* dest, int dest_len) {</a>
+<a name="ln571">  return CEscapeInternal(src, src_len, dest, dest_len, true, false);</a>
+<a name="ln572">}</a>
+<a name="ln573"> </a>
+<a name="ln574">int Utf8SafeCEscapeString(const char* src, int src_len, char* dest,</a>
+<a name="ln575">                          int dest_len) {</a>
+<a name="ln576">  return CEscapeInternal(src, src_len, dest, dest_len, false, true);</a>
+<a name="ln577">}</a>
+<a name="ln578"> </a>
+<a name="ln579">int Utf8SafeCHexEscapeString(const char* src, int src_len, char* dest,</a>
+<a name="ln580">                             int dest_len) {</a>
+<a name="ln581">  return CEscapeInternal(src, src_len, dest, dest_len, true, true);</a>
+<a name="ln582">}</a>
+<a name="ln583"> </a>
+<a name="ln584">// ----------------------------------------------------------------------</a>
+<a name="ln585">// CEscape()</a>
+<a name="ln586">// CHexEscape()</a>
+<a name="ln587">// Utf8SafeCEscape()</a>
+<a name="ln588">// Utf8SafeCHexEscape()</a>
+<a name="ln589">//    Copies 'src' to result, escaping dangerous characters using</a>
+<a name="ln590">//    C-style escape sequences. This is very useful for preparing query</a>
+<a name="ln591">//    flags. 'src' and 'dest' should not overlap. The 'Hex' version</a>
+<a name="ln592">//    hexadecimal rather than octal sequences. The 'Utf8Safe' version</a>
+<a name="ln593">//    doesn't touch UTF-8 bytes.</a>
+<a name="ln594">//</a>
+<a name="ln595">//    Currently only \n, \r, \t, &quot;, ', \ and !ascii_isprint() chars are escaped.</a>
+<a name="ln596">// ----------------------------------------------------------------------</a>
+<a name="ln597">string CEscape(const GStringPiece&amp; src) {</a>
+<a name="ln598">  const int dest_length = src.size() * 4 + 1;  // Maximum possible expansion</a>
+<a name="ln599">  gscoped_array&lt;char&gt; dest(new char[dest_length]);</a>
+<a name="ln600">  const int len = CEscapeInternal(src.data(), src.size(),</a>
+<a name="ln601">                                  dest.get(), dest_length, false, false);</a>
+<a name="ln602">  DCHECK_GE(len, 0);</a>
+<a name="ln603">  return string(dest.get(), len);</a>
+<a name="ln604">}</a>
+<a name="ln605"> </a>
+<a name="ln606">string CHexEscape(const GStringPiece&amp; src) {</a>
+<a name="ln607">  const int dest_length = src.size() * 4 + 1;  // Maximum possible expansion</a>
+<a name="ln608">  gscoped_array&lt;char&gt; dest(new char[dest_length]);</a>
+<a name="ln609">  const int len = CEscapeInternal(src.data(), src.size(),</a>
+<a name="ln610">                                  dest.get(), dest_length, true, false);</a>
+<a name="ln611">  DCHECK_GE(len, 0);</a>
+<a name="ln612">  return string(dest.get(), len);</a>
+<a name="ln613">}</a>
+<a name="ln614"> </a>
+<a name="ln615">string Utf8SafeCEscape(const GStringPiece&amp; src) {</a>
+<a name="ln616">  const int dest_length = src.size() * 4 + 1;  // Maximum possible expansion</a>
+<a name="ln617">  gscoped_array&lt;char&gt; dest(new char[dest_length]);</a>
+<a name="ln618">  const int len = CEscapeInternal(src.data(), src.size(),</a>
+<a name="ln619">                                  dest.get(), dest_length, false, true);</a>
+<a name="ln620">  DCHECK_GE(len, 0);</a>
+<a name="ln621">  return string(dest.get(), len);</a>
+<a name="ln622">}</a>
+<a name="ln623"> </a>
+<a name="ln624">string Utf8SafeCHexEscape(const GStringPiece&amp; src) {</a>
+<a name="ln625">  const int dest_length = src.size() * 4 + 1;  // Maximum possible expansion</a>
+<a name="ln626">  gscoped_array&lt;char&gt; dest(new char[dest_length]);</a>
+<a name="ln627">  const int len = CEscapeInternal(src.data(), src.size(),</a>
+<a name="ln628">                                  dest.get(), dest_length, true, true);</a>
+<a name="ln629">  DCHECK_GE(len, 0);</a>
+<a name="ln630">  return string(dest.get(), len);</a>
+<a name="ln631">}</a>
+<a name="ln632"> </a>
+<a name="ln633">// ----------------------------------------------------------------------</a>
+<a name="ln634">// BackslashEscape and BackslashUnescape</a>
+<a name="ln635">// ----------------------------------------------------------------------</a>
+<a name="ln636">void BackslashEscape(const GStringPiece&amp; src,</a>
+<a name="ln637">                     const strings::CharSet&amp; to_escape,</a>
+<a name="ln638">                     string* dest) {</a>
+<a name="ln639">  dest-&gt;reserve(dest-&gt;size() + src.size());</a>
+<a name="ln640">  for (const char *p = src.data(), *end = src.data() + src.size();</a>
+<a name="ln641">       p != end; ) {</a>
+<a name="ln642">    // Advance to next character we need to escape, or to end of source</a>
+<a name="ln643">    const char* next = p;</a>
+<a name="ln644">    while (next &lt; end &amp;&amp; !to_escape.Test(*next)) {</a>
+<a name="ln645">      next++;</a>
+<a name="ln646">    }</a>
+<a name="ln647">    // Append the whole run of non-escaped chars</a>
+<a name="ln648">    dest-&gt;append(p, next - p);</a>
+<a name="ln649">    if (next == end) break;</a>
+<a name="ln650">    // Char at *next needs to be escaped.  Append backslash followed by *next</a>
+<a name="ln651">    char c[2];</a>
+<a name="ln652">    c[0] = '\\';</a>
+<a name="ln653">    c[1] = *next;</a>
+<a name="ln654">    dest-&gt;append(c, 2);</a>
+<a name="ln655">    p = next + 1;</a>
+<a name="ln656">  }</a>
+<a name="ln657">}</a>
+<a name="ln658"> </a>
+<a name="ln659">void BackslashUnescape(const GStringPiece&amp; src,</a>
+<a name="ln660">                       const strings::CharSet&amp; to_unescape,</a>
+<a name="ln661">                       string* dest) {</a>
+<a name="ln662">  dest-&gt;reserve(dest-&gt;size() + src.size());</a>
+<a name="ln663">  bool escaped = false;</a>
+<a name="ln664">  for (const char* p = src.data(), *end = src.data() + src.size();</a>
+<a name="ln665">       p != end; ++p) {</a>
+<a name="ln666">    if (escaped) {</a>
+<a name="ln667">      if (!to_unescape.Test(*p)) {</a>
+<a name="ln668">        // Keep the backslash</a>
+<a name="ln669">        dest-&gt;push_back('\\');</a>
+<a name="ln670">      }</a>
+<a name="ln671">      dest-&gt;push_back(*p);</a>
+<a name="ln672">      escaped = false;</a>
+<a name="ln673">    } else if (*p == '\\') {</a>
+<a name="ln674">      escaped = true;</a>
+<a name="ln675">    } else {</a>
+<a name="ln676">      dest-&gt;push_back(*p);</a>
+<a name="ln677">    }</a>
+<a name="ln678">  }</a>
+<a name="ln679">}</a>
+<a name="ln680"> </a>
+<a name="ln681">// ----------------------------------------------------------------------</a>
+<a name="ln682">// int QuotedPrintableUnescape()</a>
+<a name="ln683">//</a>
+<a name="ln684">// Check out http://www.cis.ohio-state.edu/htbin/rfc/rfc2045.html for</a>
+<a name="ln685">// more details, only briefly implemented. But from the web...</a>
+<a name="ln686">// Quoted-printable is an encoding method defined in the MIME</a>
+<a name="ln687">// standard. It is used primarily to encode 8-bit text (such as text</a>
+<a name="ln688">// that includes foreign characters) into 7-bit US ASCII, creating a</a>
+<a name="ln689">// document that is mostly readable by humans, even in its encoded</a>
+<a name="ln690">// form. All MIME compliant applications can decode quoted-printable</a>
+<a name="ln691">// text, though they may not necessarily be able to properly display the</a>
+<a name="ln692">// document as it was originally intended. As quoted-printable encoding</a>
+<a name="ln693">// is implemented most commonly, printable ASCII characters (values 33</a>
+<a name="ln694">// through 126, excluding 61), tabs and spaces that do not appear at the</a>
+<a name="ln695">// end of lines, and end-of-line characters are not encoded. Other</a>
+<a name="ln696">// characters are represented by an equal sign (=) immediately followed</a>
+<a name="ln697">// by that character's hexadecimal value. Lines that are longer than 76</a>
+<a name="ln698">// characters are shortened by line breaks, with the equal sign marking</a>
+<a name="ln699">// where the breaks occurred.</a>
+<a name="ln700">//</a>
+<a name="ln701">// Note that QuotedPrintableUnescape is different from 'Q'-encoding as</a>
+<a name="ln702">// defined in rfc2047. In particular, This does not treat '_'s as spaces.</a>
+<a name="ln703">// See QEncodingUnescape().</a>
+<a name="ln704">// ----------------------------------------------------------------------</a>
+<a name="ln705"> </a>
+<a name="ln706">int QuotedPrintableUnescape(const char *source, int slen,</a>
+<a name="ln707">                            char *dest, int szdest) {</a>
+<a name="ln708">  char* d = dest;</a>
+<a name="ln709">  const char* p = source;</a>
+<a name="ln710"> </a>
+<a name="ln711">  while ( p &lt; source+slen &amp;&amp; *p != '\0' &amp;&amp; d &lt; dest+szdest ) {</a>
+<a name="ln712">    switch (*p) {</a>
+<a name="ln713">      case '=':</a>
+<a name="ln714">        // If it's valid, convert to hex and insert or remove line-wrap.</a>
+<a name="ln715">        // In the case of line-wrap removal, we allow LF as well as CRLF.</a>
+<a name="ln716">        if ( p &lt; source + slen - 1 ) {</a>
+<a name="ln717">          if ( p[1] == '\n' ) {</a>
+<a name="ln718">            p++;</a>
+<a name="ln719">          } else if ( p &lt; source + slen - 2 ) {</a>
+<a name="ln720">            if ( ascii_isxdigit(p[1]) &amp;&amp; ascii_isxdigit(p[2]) ) {</a>
+<a name="ln721">              *d++ = hex_digit_to_int(p[1])*16 + hex_digit_to_int(p[2]);</a>
+<a name="ln722">              p += 2;</a>
+<a name="ln723">            } else if ( p[1] == '\r' &amp;&amp; p[2] == '\n' ) {</a>
+<a name="ln724">              p += 2;</a>
+<a name="ln725">            }</a>
+<a name="ln726">          }</a>
+<a name="ln727">        }</a>
+<a name="ln728">        p++;</a>
+<a name="ln729">        break;</a>
+<a name="ln730">      default:</a>
+<a name="ln731">        *d++ = *p++;</a>
+<a name="ln732">        break;</a>
+<a name="ln733">    }</a>
+<a name="ln734">  }</a>
+<a name="ln735">  return (d-dest);</a>
+<a name="ln736">}</a>
+<a name="ln737"> </a>
+<a name="ln738">// ----------------------------------------------------------------------</a>
+<a name="ln739">// int QEncodingUnescape()</a>
+<a name="ln740">//</a>
+<a name="ln741">// This is very similar to QuotedPrintableUnescape except that we convert</a>
+<a name="ln742">// '_'s into spaces. (See RFC 2047)</a>
+<a name="ln743">// ----------------------------------------------------------------------</a>
+<a name="ln744">int QEncodingUnescape(const char *source, int slen,</a>
+<a name="ln745">                      char *dest, int szdest) {</a>
+<a name="ln746">  char* d = dest;</a>
+<a name="ln747">  const char* p = source;</a>
+<a name="ln748"> </a>
+<a name="ln749">  while ( p &lt; source+slen &amp;&amp; *p != '\0' &amp;&amp; d &lt; dest+szdest ) {</a>
+<a name="ln750">    switch (*p) {</a>
+<a name="ln751">      case '=':</a>
+<a name="ln752">        // If it's valid, convert to hex and insert or remove line-wrap.</a>
+<a name="ln753">        // In the case of line-wrap removal, the assumption is that this</a>
+<a name="ln754">        // is an RFC-compliant message with lines terminated by CRLF.</a>
+<a name="ln755">        if (p &lt; source+slen-2) {</a>
+<a name="ln756">          if ( ascii_isxdigit(p[1]) &amp;&amp; ascii_isxdigit(p[2]) ) {</a>
+<a name="ln757">            *d++ = hex_digit_to_int(p[1])*16 + hex_digit_to_int(p[2]);</a>
+<a name="ln758">            p += 2;</a>
+<a name="ln759">          } else if ( p[1] == '\r' &amp;&amp; p[2] == '\n' ) {</a>
+<a name="ln760">            p += 2;</a>
+<a name="ln761">          }</a>
+<a name="ln762">        }</a>
+<a name="ln763">        p++;</a>
+<a name="ln764">        break;</a>
+<a name="ln765">      case '_':   // According to rfc2047, _'s are to be treated as spaces</a>
+<a name="ln766">        *d++ = ' ';</a>
+<a name="ln767">        p++;</a>
+<a name="ln768">        break;</a>
+<a name="ln769">      default:</a>
+<a name="ln770">        *d++ = *p++;</a>
+<a name="ln771">        break;</a>
+<a name="ln772">    }</a>
+<a name="ln773">  }</a>
+<a name="ln774">  return (d-dest);</a>
+<a name="ln775">}</a>
+<a name="ln776"> </a>
+<a name="ln777">int CalculateBase64EscapedLen(int input_len, bool do_padding) {</a>
+<a name="ln778">  // Base64 encodes three bytes of input at a time. If the input is not</a>
+<a name="ln779">  // divisible by three, we pad as appropriate.</a>
+<a name="ln780">  //</a>
+<a name="ln781">  // (from http://www.ietf.org/rfc/rfc3548.txt)</a>
+<a name="ln782">  // Special processing is performed if fewer than 24 bits are available</a>
+<a name="ln783">  // at the end of the data being encoded.  A full encoding quantum is</a>
+<a name="ln784">  // always completed at the end of a quantity.  When fewer than 24 input</a>
+<a name="ln785">  // bits are available in an input group, zero bits are added (on the</a>
+<a name="ln786">  // right) to form an integral number of 6-bit groups.  Padding at the</a>
+<a name="ln787">  // end of the data is performed using the '=' character.  Since all base</a>
+<a name="ln788">  // 64 input is an integral number of octets, only the following cases</a>
+<a name="ln789">  // can arise:</a>
+<a name="ln790"> </a>
+<a name="ln791"> </a>
+<a name="ln792">  // Base64 encodes each three bytes of input into four bytes of output.</a>
+<a name="ln793">  int len = (input_len / 3) * 4;</a>
+<a name="ln794"> </a>
+<a name="ln795">  if (input_len % 3 == 0) {</a>
+<a name="ln796">    // (from http://www.ietf.org/rfc/rfc3548.txt)</a>
+<a name="ln797">    // (1) the final quantum of encoding input is an integral multiple of 24</a>
+<a name="ln798">    // bits; here, the final unit of encoded output will be an integral</a>
+<a name="ln799">    // multiple of 4 characters with no &quot;=&quot; padding,</a>
+<a name="ln800">  } else if (input_len % 3 == 1) {</a>
+<a name="ln801">    // (from http://www.ietf.org/rfc/rfc3548.txt)</a>
+<a name="ln802">    // (2) the final quantum of encoding input is exactly 8 bits; here, the</a>
+<a name="ln803">    // final unit of encoded output will be two characters followed by two</a>
+<a name="ln804">    // &quot;=&quot; padding characters, or</a>
+<a name="ln805">    len += 2;</a>
+<a name="ln806">    if (do_padding) {</a>
+<a name="ln807">      len += 2;</a>
+<a name="ln808">    }</a>
+<a name="ln809">  } else {  // (input_len % 3 == 2)</a>
+<a name="ln810">    // (from http://www.ietf.org/rfc/rfc3548.txt)</a>
+<a name="ln811">    // (3) the final quantum of encoding input is exactly 16 bits; here, the</a>
+<a name="ln812">    // final unit of encoded output will be three characters followed by one</a>
+<a name="ln813">    // &quot;=&quot; padding character.</a>
+<a name="ln814">    len += 3;</a>
+<a name="ln815">    if (do_padding) {</a>
+<a name="ln816">      len += 1;</a>
+<a name="ln817">    }</a>
+<a name="ln818">  }</a>
+<a name="ln819"> </a>
+<a name="ln820">  assert(len &gt;= input_len);  // make sure we didn't overflow</a>
+<a name="ln821">  return len;</a>
+<a name="ln822">}</a>
+<a name="ln823"> </a>
+<a name="ln824">// Base64Escape does padding, so this calculation includes padding.</a>
+<a name="ln825">int CalculateBase64EscapedLen(int input_len) {</a>
+<a name="ln826">  return CalculateBase64EscapedLen(input_len, true);</a>
+<a name="ln827">}</a>
+<a name="ln828"> </a>
+<a name="ln829">// ----------------------------------------------------------------------</a>
+<a name="ln830">// int Base64Unescape() - base64 decoder</a>
+<a name="ln831">// int Base64Escape() - base64 encoder</a>
+<a name="ln832">// int WebSafeBase64Unescape() - Google's variation of base64 decoder</a>
+<a name="ln833">// int WebSafeBase64Escape() - Google's variation of base64 encoder</a>
+<a name="ln834">//</a>
+<a name="ln835">// Check out</a>
+<a name="ln836">// http://www.cis.ohio-state.edu/htbin/rfc/rfc2045.html for formal</a>
+<a name="ln837">// description, but what we care about is that...</a>
+<a name="ln838">//   Take the encoded stuff in groups of 4 characters and turn each</a>
+<a name="ln839">//   character into a code 0 to 63 thus:</a>
+<a name="ln840">//           A-Z map to 0 to 25</a>
+<a name="ln841">//           a-z map to 26 to 51</a>
+<a name="ln842">//           0-9 map to 52 to 61</a>
+<a name="ln843">//           +(- for WebSafe) maps to 62</a>
+<a name="ln844">//           /(_ for WebSafe) maps to 63</a>
+<a name="ln845">//   There will be four numbers, all less than 64 which can be represented</a>
+<a name="ln846">//   by a 6 digit binary number (aaaaaa, bbbbbb, cccccc, dddddd respectively).</a>
+<a name="ln847">//   Arrange the 6 digit binary numbers into three bytes as such:</a>
+<a name="ln848">//   aaaaaabb bbbbcccc ccdddddd</a>
+<a name="ln849">//   Equals signs (one or two) are used at the end of the encoded block to</a>
+<a name="ln850">//   indicate that the text was not an integer multiple of three bytes long.</a>
+<a name="ln851">// In the sorted variation, we instead use the mapping</a>
+<a name="ln852">//           .   maps to 0</a>
+<a name="ln853">//           0-9 map to 1-10</a>
+<a name="ln854">//           A-Z map to 11-37</a>
+<a name="ln855">//           _   maps to 38</a>
+<a name="ln856">//           a-z map to 39-63</a>
+<a name="ln857">// This mapping has the property that the output will be sorted in the same</a>
+<a name="ln858">// order as the input, i.e. a &lt; b iff map(a) &lt; map(b). It is web-safe and</a>
+<a name="ln859">// filename-safe.</a>
+<a name="ln860">// ----------------------------------------------------------------------</a>
+<a name="ln861"> </a>
+<a name="ln862">int Base64UnescapeInternal(const char *src, int szsrc,</a>
+<a name="ln863">                           char *dest, int szdest,</a>
+<a name="ln864">                           const signed char* unbase64) {</a>
+<a name="ln865">  static const char kPad64 = '=';</a>
+<a name="ln866"> </a>
+<a name="ln867">  int decode = 0;</a>
+<a name="ln868">  int destidx = 0;</a>
+<a name="ln869">  int state = 0;</a>
+<a name="ln870">  unsigned int ch = 0;</a>
+<a name="ln871">  unsigned int temp = 0;</a>
+<a name="ln872"> </a>
+<a name="ln873">  // The GET_INPUT macro gets the next input character, skipping</a>
+<a name="ln874">  // over any whitespace, and stopping when we reach the end of the</a>
+<a name="ln875">  // string or when we read any non-data character.  The arguments are</a>
+<a name="ln876">  // an arbitrary identifier (used as a label for goto) and the number</a>
+<a name="ln877">  // of data bytes that must remain in the input to avoid aborting the</a>
+<a name="ln878">  // loop.</a>
+<a name="ln879">#define GET_INPUT(label, remain)                 \</a>
+<a name="ln880">  label:                                         \</a>
+<a name="ln881">    --szsrc;                                     \</a>
+<a name="ln882">    ch = *src++;                                 \</a>
+<a name="ln883">    decode = unbase64[ch];                       \</a>
+<a name="ln884">    if (decode &lt; 0) {                            \</a>
+<a name="ln885">      if (ascii_isspace(ch) &amp;&amp; szsrc &gt;= remain)  \</a>
+<a name="ln886">        goto label;                              \</a>
+<a name="ln887">      state = 4 - remain;                        \</a>
+<a name="ln888">      break;                                     \</a>
+<a name="ln889">    }</a>
+<a name="ln890"> </a>
+<a name="ln891">  // if dest is null, we're just checking to see if it's legal input</a>
+<a name="ln892">  // rather than producing output.  (I suspect this could just be done</a>
+<a name="ln893">  // with a regexp...).  We duplicate the loop so this test can be</a>
+<a name="ln894">  // outside it instead of in every iteration.</a>
+<a name="ln895"> </a>
+<a name="ln896">  if (dest) {</a>
+<a name="ln897">    // This loop consumes 4 input bytes and produces 3 output bytes</a>
+<a name="ln898">    // per iteration.  We can't know at the start that there is enough</a>
+<a name="ln899">    // data left in the string for a full iteration, so the loop may</a>
+<a name="ln900">    // break out in the middle; if so 'state' will be set to the</a>
+<a name="ln901">    // number of input bytes read.</a>
+<a name="ln902"> </a>
+<a name="ln903">    while (szsrc &gt;= 4)  {</a>
+<a name="ln904">      // We'll start by optimistically assuming that the next four</a>
+<a name="ln905">      // bytes of the string (src[0..3]) are four good data bytes</a>
+<a name="ln906">      // (that is, no nulls, whitespace, padding chars, or illegal</a>
+<a name="ln907">      // chars).  We need to test src[0..2] for nulls individually</a>
+<a name="ln908">      // before constructing temp to preserve the property that we</a>
+<a name="ln909">      // never read past a null in the string (no matter how long</a>
+<a name="ln910">      // szsrc claims the string is).</a>
+<a name="ln911"> </a>
+<a name="ln912">      if (!src[0] || !src[1] || !src[2] ||</a>
+<a name="ln913">          (temp = ((unbase64[src[0]] &lt;&lt; 18) |</a>
+<a name="ln914">                   (unbase64[src[1]] &lt;&lt; 12) |</a>
+<a name="ln915">                   (unbase64[src[2]] &lt;&lt; 6) |</a>
+<a name="ln916">                   (unbase64[src[3]]))) &amp; 0x80000000) {</a>
+<a name="ln917">        // Iff any of those four characters was bad (null, illegal,</a>
+<a name="ln918">        // whitespace, padding), then temp's high bit will be set</a>
+<a name="ln919">        // (because unbase64[] is -1 for all bad characters).</a>
+<a name="ln920">        //</a>
+<a name="ln921">        // We'll back up and resort to the slower decoder, which knows</a>
+<a name="ln922">        // how to handle those cases.</a>
+<a name="ln923"> </a>
+<a name="ln924">        GET_INPUT(first, 4);</a>
+<a name="ln925">        temp = decode;</a>
+<a name="ln926">        GET_INPUT(second, 3);</a>
+<a name="ln927">        temp = (temp &lt;&lt; 6) | decode;</a>
+<a name="ln928">        GET_INPUT(third, 2);</a>
+<a name="ln929">        temp = (temp &lt;&lt; 6) | decode;</a>
+<a name="ln930">        GET_INPUT(fourth, 1);</a>
+<a name="ln931">        temp = (temp &lt;&lt; 6) | decode;</a>
+<a name="ln932">      } else {</a>
+<a name="ln933">        // We really did have four good data bytes, so advance four</a>
+<a name="ln934">        // characters in the string.</a>
+<a name="ln935"> </a>
+<a name="ln936">        szsrc -= 4;</a>
+<a name="ln937">        src += 4;</a>
+<a name="ln938">        decode = -1;</a>
+<a name="ln939">        ch = '\0';</a>
+<a name="ln940">      }</a>
+<a name="ln941"> </a>
+<a name="ln942">      // temp has 24 bits of input, so write that out as three bytes.</a>
+<a name="ln943"> </a>
+<a name="ln944">      if (destidx+3 &gt; szdest) return -1;</a>
+<a name="ln945">      dest[destidx+2] = temp;</a>
+<a name="ln946">      temp &gt;&gt;= 8;</a>
+<a name="ln947">      dest[destidx+1] = temp;</a>
+<a name="ln948">      temp &gt;&gt;= 8;</a>
+<a name="ln949">      dest[destidx] = temp;</a>
+<a name="ln950">      destidx += 3;</a>
+<a name="ln951">    }</a>
+<a name="ln952">  } else {</a>
+<a name="ln953">    while (szsrc &gt;= 4)  {</a>
+<a name="ln954">      if (!src[0] || !src[1] || !src[2] ||</a>
+<a name="ln955">          (temp = ((unbase64[src[0]] &lt;&lt; 18) |</a>
+<a name="ln956">                   (unbase64[src[1]] &lt;&lt; 12) |</a>
+<a name="ln957">                   (unbase64[src[2]] &lt;&lt; 6) |</a>
+<a name="ln958">                   (unbase64[src[3]]))) &amp; 0x80000000) {</a>
+<a name="ln959">        GET_INPUT(first_no_dest, 4);</a>
+<a name="ln960">        GET_INPUT(second_no_dest, 3);</a>
+<a name="ln961">        GET_INPUT(third_no_dest, 2);</a>
+<a name="ln962">        GET_INPUT(fourth_no_dest, 1);</a>
+<a name="ln963">      } else {</a>
+<a name="ln964">        szsrc -= 4;</a>
+<a name="ln965">        src += 4;</a>
+<a name="ln966">        decode = -1;</a>
+<a name="ln967">        ch = '\0';</a>
+<a name="ln968">      }</a>
+<a name="ln969">      destidx += 3;</a>
+<a name="ln970">    }</a>
+<a name="ln971">  }</a>
+<a name="ln972"> </a>
+<a name="ln973">#undef GET_INPUT</a>
+<a name="ln974"> </a>
+<a name="ln975">  // if the loop terminated because we read a bad character, return</a>
+<a name="ln976">  // now.</a>
+<a name="ln977">  if (decode &lt; 0 &amp;&amp; ch != '\0' &amp;&amp; ch != kPad64 &amp;&amp; !ascii_isspace(ch))</a>
+<a name="ln978">    return -1;</a>
+<a name="ln979"> </a>
+<a name="ln980">  if (ch == kPad64) {</a>
+<a name="ln981">    // if we stopped by hitting an '=', un-read that character -- we'll</a>
+<a name="ln982">    // look at it again when we count to check for the proper number of</a>
+<a name="ln983">    // equals signs at the end.</a>
+<a name="ln984">    ++szsrc;</a>
+<a name="ln985">    --src;</a>
+<a name="ln986">  } else {</a>
+<a name="ln987">    // This loop consumes 1 input byte per iteration.  It's used to</a>
+<a name="ln988">    // clean up the 0-3 input bytes remaining when the first, faster</a>
+<a name="ln989">    // loop finishes.  'temp' contains the data from 'state' input</a>
+<a name="ln990">    // characters read by the first loop.</a>
+<a name="ln991">    while (szsrc &gt; 0)  {</a>
+<a name="ln992">      --szsrc;</a>
+<a name="ln993">      ch = *src++;</a>
+<a name="ln994">      decode = unbase64[ch];</a>
+<a name="ln995">      if (decode &lt; 0) {</a>
+<a name="ln996">        if (ascii_isspace(ch)) {</a>
+<a name="ln997">          continue;</a>
+<a name="ln998">        } else if (ch == '\0') {</a>
+<a name="ln999">          break;</a>
+<a name="ln1000">        } else if (ch == kPad64) {</a>
+<a name="ln1001">          // back up one character; we'll read it again when we check</a>
+<a name="ln1002">          // for the correct number of equals signs at the end.</a>
+<a name="ln1003">          ++szsrc;</a>
+<a name="ln1004">          --src;</a>
+<a name="ln1005">          break;</a>
+<a name="ln1006">        } else {</a>
+<a name="ln1007">          return -1;</a>
+<a name="ln1008">        }</a>
+<a name="ln1009">      }</a>
+<a name="ln1010"> </a>
+<a name="ln1011">      // Each input character gives us six bits of output.</a>
+<a name="ln1012">      temp = (temp &lt;&lt; 6) | decode;</a>
+<a name="ln1013">      ++state;</a>
+<a name="ln1014">      if (state == 4) {</a>
+<a name="ln1015">        // If we've accumulated 24 bits of output, write that out as</a>
+<a name="ln1016">        // three bytes.</a>
+<a name="ln1017">        if (dest) {</a>
+<a name="ln1018">          if (destidx+3 &gt; szdest) return -1;</a>
+<a name="ln1019">          dest[destidx+2] = temp;</a>
+<a name="ln1020">          temp &gt;&gt;= 8;</a>
+<a name="ln1021">          dest[destidx+1] = temp;</a>
+<a name="ln1022">          temp &gt;&gt;= 8;</a>
+<a name="ln1023">          dest[destidx] = temp;</a>
+<a name="ln1024">        }</a>
+<a name="ln1025">        destidx += 3;</a>
+<a name="ln1026">        state = 0;</a>
+<a name="ln1027">        temp = 0;</a>
+<a name="ln1028">      }</a>
+<a name="ln1029">    }</a>
+<a name="ln1030">  }</a>
+<a name="ln1031"> </a>
+<a name="ln1032">  // Process the leftover data contained in 'temp' at the end of the input.</a>
+<a name="ln1033">  int expected_equals = 0;</a>
+<a name="ln1034">  switch (state) {</a>
+<a name="ln1035">    case 0:</a>
+<a name="ln1036">      // Nothing left over; output is a multiple of 3 bytes.</a>
+<a name="ln1037">      break;</a>
+<a name="ln1038"> </a>
+<a name="ln1039">    case 1:</a>
+<a name="ln1040">      // Bad input; we have 6 bits left over.</a>
+<a name="ln1041">      return -1;</a>
+<a name="ln1042"> </a>
+<a name="ln1043">    case 2:</a>
+<a name="ln1044">      // Produce one more output byte from the 12 input bits we have left.</a>
+<a name="ln1045">      if (dest) {</a>
+<a name="ln1046">        if (destidx+1 &gt; szdest) return -1;</a>
+<a name="ln1047">        temp &gt;&gt;= 4;</a>
+<a name="ln1048">        dest[destidx] = temp;</a>
+<a name="ln1049">      }</a>
+<a name="ln1050">      ++destidx;</a>
+<a name="ln1051">      expected_equals = 2;</a>
+<a name="ln1052">      break;</a>
+<a name="ln1053"> </a>
+<a name="ln1054">    case 3:</a>
+<a name="ln1055">      // Produce two more output bytes from the 18 input bits we have left.</a>
+<a name="ln1056">      if (dest) {</a>
+<a name="ln1057">        if (destidx+2 &gt; szdest) return -1;</a>
+<a name="ln1058">        temp &gt;&gt;= 2;</a>
+<a name="ln1059">        dest[destidx+1] = temp;</a>
+<a name="ln1060">        temp &gt;&gt;= 8;</a>
+<a name="ln1061">        dest[destidx] = temp;</a>
+<a name="ln1062">      }</a>
+<a name="ln1063">      destidx += 2;</a>
+<a name="ln1064">      expected_equals = 1;</a>
+<a name="ln1065">      break;</a>
+<a name="ln1066"> </a>
+<a name="ln1067">    default:</a>
+<a name="ln1068">      // state should have no other values at this point.</a>
+<a name="ln1069">      LOG(FATAL) &lt;&lt; &quot;This can't happen; base64 decoder state = &quot; &lt;&lt; state;</a>
+<a name="ln1070">  }</a>
+<a name="ln1071"> </a>
+<a name="ln1072">  // The remainder of the string should be all whitespace, mixed with</a>
+<a name="ln1073">  // exactly 0 equals signs, or exactly 'expected_equals' equals</a>
+<a name="ln1074">  // signs.  (Always accepting 0 equals signs is a google extension</a>
+<a name="ln1075">  // not covered in the RFC.)</a>
+<a name="ln1076"> </a>
+<a name="ln1077">  int equals = 0;</a>
+<a name="ln1078">  while (szsrc &gt; 0 &amp;&amp; *src) {</a>
+<a name="ln1079">    if (*src == kPad64)</a>
+<a name="ln1080">      ++equals;</a>
+<a name="ln1081">    else if (!ascii_isspace(*src))</a>
+<a name="ln1082">      return -1;</a>
+<a name="ln1083">    --szsrc;</a>
+<a name="ln1084">    ++src;</a>
+<a name="ln1085">  }</a>
+<a name="ln1086"> </a>
+<a name="ln1087">  return (equals == 0 || equals == expected_equals) ? destidx : -1;</a>
+<a name="ln1088">}</a>
+<a name="ln1089"> </a>
+<a name="ln1090">// The arrays below were generated by the following code</a>
+<a name="ln1091">// #include &lt;sys/time.h&gt;</a>
+<a name="ln1092">// #include &lt;stdlib.h&gt;</a>
+<a name="ln1093">// #include &lt;string.h&gt;</a>
+<a name="ln1094">// main()</a>
+<a name="ln1095">// {</a>
+<a name="ln1096">//   static const char Base64[] =</a>
+<a name="ln1097">//     &quot;ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/&quot;;</a>
+<a name="ln1098">//   char *pos;</a>
+<a name="ln1099">//   int idx, i, j;</a>
+<a name="ln1100">//   printf(&quot;    &quot;);</a>
+<a name="ln1101">//   for (i = 0; i &lt; 255; i += 8) {</a>
+<a name="ln1102">//     for (j = i; j &lt; i + 8; j++) {</a>
+<a name="ln1103">//       pos = strchr(Base64, j);</a>
+<a name="ln1104">//       if ((pos == NULL) || (j == 0))</a>
+<a name="ln1105">//         idx = -1;</a>
+<a name="ln1106">//       else</a>
+<a name="ln1107">//         idx = pos - Base64;</a>
+<a name="ln1108">//       if (idx == -1)</a>
+<a name="ln1109">//         printf(&quot; %2d,     &quot;, idx);</a>
+<a name="ln1110">//       else</a>
+<a name="ln1111">//         printf(&quot; %2d/*%c*/,&quot;, idx, j);</a>
+<a name="ln1112">//     }</a>
+<a name="ln1113">//     printf(&quot;\n    &quot;);</a>
+<a name="ln1114">//   }</a>
+<a name="ln1115">// }</a>
+<a name="ln1116">//</a>
+<a name="ln1117">// where the value of &quot;Base64[]&quot; was replaced by one of the base-64 conversion</a>
+<a name="ln1118">// tables from the functions below.</a>
+<a name="ln1119">static const signed char kUnBase64[] = {</a>
+<a name="ln1120">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1121">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1122">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1123">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1124">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1125">  -1,      -1,      -1,      62/*+*/, -1,      -1,      -1,      63/*/ */,</a>
+<a name="ln1126">  52/*0*/, 53/*1*/, 54/*2*/, 55/*3*/, 56/*4*/, 57/*5*/, 58/*6*/, 59/*7*/,</a>
+<a name="ln1127">  60/*8*/, 61/*9*/, -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1128">  -1,       0/*A*/,  1/*B*/,  2/*C*/,  3/*D*/,  4/*E*/,  5/*F*/,  6/*G*/,</a>
+<a name="ln1129">  07/*H*/,  8/*I*/,  9/*J*/, 10/*K*/, 11/*L*/, 12/*M*/, 13/*N*/, 14/*O*/,</a>
+<a name="ln1130">  15/*P*/, 16/*Q*/, 17/*R*/, 18/*S*/, 19/*T*/, 20/*U*/, 21/*V*/, 22/*W*/,</a>
+<a name="ln1131">  23/*X*/, 24/*Y*/, 25/*Z*/, -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1132">  -1,      26/*a*/, 27/*b*/, 28/*c*/, 29/*d*/, 30/*e*/, 31/*f*/, 32/*g*/,</a>
+<a name="ln1133">  33/*h*/, 34/*i*/, 35/*j*/, 36/*k*/, 37/*l*/, 38/*m*/, 39/*n*/, 40/*o*/,</a>
+<a name="ln1134">  41/*p*/, 42/*q*/, 43/*r*/, 44/*s*/, 45/*t*/, 46/*u*/, 47/*v*/, 48/*w*/,</a>
+<a name="ln1135">  49/*x*/, 50/*y*/, 51/*z*/, -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1136">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1137">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1138">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1139">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1140">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1141">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1142">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1143">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1144">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1145">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1146">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1147">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1148">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1149">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1150">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1151">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1</a>
+<a name="ln1152">};</a>
+<a name="ln1153">static const signed char kUnWebSafeBase64[] = {</a>
+<a name="ln1154">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1155">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1156">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1157">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1158">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1159">  -1,      -1,      -1,      -1,      -1,      62/*-*/, -1,      -1,</a>
+<a name="ln1160">  52/*0*/, 53/*1*/, 54/*2*/, 55/*3*/, 56/*4*/, 57/*5*/, 58/*6*/, 59/*7*/,</a>
+<a name="ln1161">  60/*8*/, 61/*9*/, -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1162">  -1,       0/*A*/,  1/*B*/,  2/*C*/,  3/*D*/,  4/*E*/,  5/*F*/,  6/*G*/,</a>
+<a name="ln1163">  07/*H*/,  8/*I*/,  9/*J*/, 10/*K*/, 11/*L*/, 12/*M*/, 13/*N*/, 14/*O*/,</a>
+<a name="ln1164">  15/*P*/, 16/*Q*/, 17/*R*/, 18/*S*/, 19/*T*/, 20/*U*/, 21/*V*/, 22/*W*/,</a>
+<a name="ln1165">  23/*X*/, 24/*Y*/, 25/*Z*/, -1,      -1,      -1,      -1,      63/*_*/,</a>
+<a name="ln1166">  -1,      26/*a*/, 27/*b*/, 28/*c*/, 29/*d*/, 30/*e*/, 31/*f*/, 32/*g*/,</a>
+<a name="ln1167">  33/*h*/, 34/*i*/, 35/*j*/, 36/*k*/, 37/*l*/, 38/*m*/, 39/*n*/, 40/*o*/,</a>
+<a name="ln1168">  41/*p*/, 42/*q*/, 43/*r*/, 44/*s*/, 45/*t*/, 46/*u*/, 47/*v*/, 48/*w*/,</a>
+<a name="ln1169">  49/*x*/, 50/*y*/, 51/*z*/, -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1170">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1171">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1172">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1173">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1174">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1175">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1176">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1177">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1178">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1179">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1180">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1181">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1182">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1183">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1184">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1,</a>
+<a name="ln1185">  -1,      -1,      -1,      -1,      -1,      -1,      -1,      -1</a>
+<a name="ln1186">};</a>
+<a name="ln1187"> </a>
+<a name="ln1188">int Base64Unescape(const char *src, int szsrc, char *dest, int szdest) {</a>
+<a name="ln1189">  return Base64UnescapeInternal(src, szsrc, dest, szdest, kUnBase64);</a>
+<a name="ln1190">}</a>
+<a name="ln1191"> </a>
+<a name="ln1192">int WebSafeBase64Unescape(const char *src, int szsrc, char *dest, int szdest) {</a>
+<a name="ln1193">  return Base64UnescapeInternal(src, szsrc, dest, szdest, kUnWebSafeBase64);</a>
+<a name="ln1194">}</a>
+<a name="ln1195"> </a>
+<a name="ln1196">static bool Base64UnescapeInternal(const char* src, int slen, string* dest,</a>
+<a name="ln1197">                                   const signed char* unbase64) {</a>
+<a name="ln1198">  // Determine the size of the output string.  Base64 encodes every 3 bytes into</a>
+<a name="ln1199">  // 4 characters.  any leftover chars are added directly for good measure.</a>
+<a name="ln1200">  // This is documented in the base64 RFC: http://www.ietf.org/rfc/rfc3548.txt</a>
+<a name="ln1201">  const int dest_len = 3 * (slen / 4) + (slen % 4);</a>
+<a name="ln1202"> </a>
+<a name="ln1203">  dest-&gt;clear();</a>
+<a name="ln1204">  dest-&gt;resize(dest_len);</a>
+<a name="ln1205"> </a>
+<a name="ln1206">  // We are getting the destination buffer by getting the beginning of the</a>
+<a name="ln1207">  // string and converting it into a char *.</a>
+<a name="ln1208">  const int len = Base64UnescapeInternal(src, slen, string_as_array(dest),</a>
+<a name="ln1209">                                         dest-&gt;size(), unbase64);</a>
+<a name="ln1210">  if (len &lt; 0) {</a>
+<a name="ln1211">    dest-&gt;clear();</a>
+<a name="ln1212">    return false;</a>
+<a name="ln1213">  }</a>
+<a name="ln1214"> </a>
+<a name="ln1215">  // could be shorter if there was padding</a>
+<a name="ln1216">  DCHECK_LE(len, dest_len);</a>
+<a name="ln1217">  dest-&gt;resize(len);</a>
+<a name="ln1218"> </a>
+<a name="ln1219">  return true;</a>
+<a name="ln1220">}</a>
+<a name="ln1221"> </a>
+<a name="ln1222">bool Base64Unescape(const char *src, int slen, string* dest) {</a>
+<a name="ln1223">  return Base64UnescapeInternal(src, slen, dest, kUnBase64);</a>
+<a name="ln1224">}</a>
+<a name="ln1225"> </a>
+<a name="ln1226">bool WebSafeBase64Unescape(const char *src, int slen, string* dest) {</a>
+<a name="ln1227">  return Base64UnescapeInternal(src, slen, dest, kUnWebSafeBase64);</a>
+<a name="ln1228">}</a>
+<a name="ln1229"> </a>
+<a name="ln1230">int Base64EscapeInternal(const unsigned char *src, int szsrc,</a>
+<a name="ln1231">                         char *dest, int szdest, const char *base64,</a>
+<a name="ln1232">                         bool do_padding) {</a>
+<a name="ln1233">  static const char kPad64 = '=';</a>
+<a name="ln1234"> </a>
+<a name="ln1235">  if (szsrc &lt;= 0) return 0;</a>
+<a name="ln1236"> </a>
+<a name="ln1237">  char *cur_dest = dest;</a>
+<a name="ln1238">  const unsigned char *cur_src = src;</a>
+<a name="ln1239"> </a>
+<a name="ln1240">  // Three bytes of data encodes to four characters of cyphertext.</a>
+<a name="ln1241">  // So we can pump through three-byte chunks atomically.</a>
+<a name="ln1242">  while (szsrc &gt; 2) { /* keep going until we have less than 24 bits */</a>
+<a name="ln1243">    if ((szdest -= 4) &lt; 0) return 0;</a>
+<a name="ln1244">    cur_dest[0] = base64[cur_src[0] &gt;&gt; 2];</a>
+<a name="ln1245">    cur_dest[1] = base64[((cur_src[0] &amp; 0x03) &lt;&lt; 4) + (cur_src[1] &gt;&gt; 4)];</a>
+<a name="ln1246">    cur_dest[2] = base64[((cur_src[1] &amp; 0x0f) &lt;&lt; 2) + (cur_src[2] &gt;&gt; 6)];</a>
+<a name="ln1247">    cur_dest[3] = base64[cur_src[2] &amp; 0x3f];</a>
+<a name="ln1248"> </a>
+<a name="ln1249">    cur_dest += 4;</a>
+<a name="ln1250">    cur_src += 3;</a>
+<a name="ln1251">    szsrc -= 3;</a>
+<a name="ln1252">  }</a>
+<a name="ln1253"> </a>
+<a name="ln1254">  /* now deal with the tail (&lt;=2 bytes) */</a>
+<a name="ln1255">  switch (szsrc) {</a>
+<a name="ln1256">    case 0:</a>
+<a name="ln1257">      // Nothing left; nothing more to do.</a>
+<a name="ln1258">      break;</a>
+<a name="ln1259">    case 1:</a>
+<a name="ln1260">      // One byte left: this encodes to two characters, and (optionally)</a>
+<a name="ln1261">      // two pad characters to round out the four-character cypherblock.</a>
+<a name="ln1262">      if ((szdest -= 2) &lt; 0) return 0;</a>
+<a name="ln1263">      cur_dest[0] = base64[cur_src[0] &gt;&gt; 2];</a>
+<a name="ln1264">      cur_dest[1] = base64[(cur_src[0] &amp; 0x03) &lt;&lt; 4];</a>
+<a name="ln1265">      cur_dest += 2;</a>
+<a name="ln1266">      if (do_padding) {</a>
+<a name="ln1267">        if ((szdest -= 2) &lt; 0) return 0;</a>
+<a name="ln1268">        cur_dest[0] = kPad64;</a>
+<a name="ln1269">        cur_dest[1] = kPad64;</a>
+<a name="ln1270">        cur_dest += 2;</a>
+<a name="ln1271">      }</a>
+<a name="ln1272">      break;</a>
+<a name="ln1273">    case 2:</a>
+<a name="ln1274">      // Two bytes left: this encodes to three characters, and (optionally)</a>
+<a name="ln1275">      // one pad character to round out the four-character cypherblock.</a>
+<a name="ln1276">      if ((szdest -= 3) &lt; 0) return 0;</a>
+<a name="ln1277">      cur_dest[0] = base64[cur_src[0] &gt;&gt; 2];</a>
+<a name="ln1278">      cur_dest[1] = base64[((cur_src[0] &amp; 0x03) &lt;&lt; 4) + (cur_src[1] &gt;&gt; 4)];</a>
+<a name="ln1279">      cur_dest[2] = base64[(cur_src[1] &amp; 0x0f) &lt;&lt; 2];</a>
+<a name="ln1280">      cur_dest += 3;</a>
+<a name="ln1281">      if (do_padding) {</a>
+<a name="ln1282">        if ((szdest -= 1) &lt; 0) return 0;</a>
+<a name="ln1283">        cur_dest[0] = kPad64;</a>
+<a name="ln1284">        cur_dest += 1;</a>
+<a name="ln1285">      }</a>
+<a name="ln1286">      break;</a>
+<a name="ln1287">    default:</a>
+<a name="ln1288">      // Should not be reached: blocks of 3 bytes are handled</a>
+<a name="ln1289">      // in the while loop before this switch statement.</a>
+<a name="ln1290">      LOG_ASSERT(false) &lt;&lt; &quot;Logic problem? szsrc = &quot; &lt;&lt; szsrc;</a>
+<a name="ln1291">      break;</a>
+<a name="ln1292">  }</a>
+<a name="ln1293">  return (cur_dest - dest);</a>
+<a name="ln1294">}</a>
+<a name="ln1295"> </a>
+<a name="ln1296">static const char kBase64Chars[] =</a>
+<a name="ln1297">&quot;ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/&quot;;</a>
+<a name="ln1298"> </a>
+<a name="ln1299">static const char kWebSafeBase64Chars[] =</a>
+<a name="ln1300">&quot;ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_&quot;;</a>
+<a name="ln1301"> </a>
+<a name="ln1302">int Base64Escape(const unsigned char *src, int szsrc, char *dest, int szdest) {</a>
+<a name="ln1303">  return Base64EscapeInternal(src, szsrc, dest, szdest, kBase64Chars, true);</a>
+<a name="ln1304">}</a>
+<a name="ln1305">int WebSafeBase64Escape(const unsigned char *src, int szsrc, char *dest,</a>
+<a name="ln1306">                        int szdest, bool do_padding) {</a>
+<a name="ln1307">  return Base64EscapeInternal(src, szsrc, dest, szdest,</a>
+<a name="ln1308">                              kWebSafeBase64Chars, do_padding);</a>
+<a name="ln1309">}</a>
+<a name="ln1310"> </a>
+<a name="ln1311">void Base64EscapeInternal(const unsigned char* src, int szsrc,</a>
+<a name="ln1312">                          string* dest, bool do_padding,</a>
+<a name="ln1313">                          const char* base64_chars) {</a>
+<a name="ln1314">  const int calc_escaped_size =</a>
+<a name="ln1315">    CalculateBase64EscapedLen(szsrc, do_padding);</a>
+<a name="ln1316">  dest-&gt;clear();</a>
+<a name="ln1317">  dest-&gt;resize(calc_escaped_size, '\0');</a>
+<a name="ln1318">  const int escaped_len = Base64EscapeInternal(src, szsrc,</a>
+<a name="ln1319">                                               string_as_array(dest),</a>
+<a name="ln1320">                                               dest-&gt;size(),</a>
+<a name="ln1321">                                               base64_chars,</a>
+<a name="ln1322">                                               do_padding);</a>
+<a name="ln1323">  DCHECK_EQ(calc_escaped_size, escaped_len);</a>
+<a name="ln1324">}</a>
+<a name="ln1325"> </a>
+<a name="ln1326">void Base64Escape(const unsigned char *src, int szsrc,</a>
+<a name="ln1327">                  string* dest, bool do_padding) {</a>
+<a name="ln1328">  Base64EscapeInternal(src, szsrc, dest, do_padding, kBase64Chars);</a>
+<a name="ln1329">}</a>
+<a name="ln1330"> </a>
+<a name="ln1331">void WebSafeBase64Escape(const unsigned char *src, int szsrc,</a>
+<a name="ln1332">                         string *dest, bool do_padding) {</a>
+<a name="ln1333">  Base64EscapeInternal(src, szsrc, dest, do_padding, kWebSafeBase64Chars);</a>
+<a name="ln1334">}</a>
+<a name="ln1335"> </a>
+<a name="ln1336">void Base64Escape(const string&amp; src, string* dest) {</a>
+<a name="ln1337">  Base64Escape(reinterpret_cast&lt;const unsigned char*&gt;(src.data()),</a>
+<a name="ln1338">               src.size(), dest, true);</a>
+<a name="ln1339">}</a>
+<a name="ln1340"> </a>
+<a name="ln1341">void WebSafeBase64Escape(const string&amp; src, string* dest) {</a>
+<a name="ln1342">  WebSafeBase64Escape(reinterpret_cast&lt;const unsigned char*&gt;(src.data()),</a>
+<a name="ln1343">                      src.size(), dest, false);</a>
+<a name="ln1344">}</a>
+<a name="ln1345"> </a>
+<a name="ln1346">void WebSafeBase64EscapeWithPadding(const string&amp; src, string* dest) {</a>
+<a name="ln1347">  WebSafeBase64Escape(reinterpret_cast&lt;const unsigned char*&gt;(src.data()),</a>
+<a name="ln1348">                      src.size(), dest, true);</a>
+<a name="ln1349">}</a>
+<a name="ln1350"> </a>
+<a name="ln1351">// Returns true iff c is in the Base 32 alphabet.</a>
+<a name="ln1352">bool ValidBase32Byte(char c) {</a>
+<a name="ln1353">  return (c &gt;= 'A' &amp;&amp; c &lt;= 'Z') || (c &gt;= '2' &amp;&amp; c &lt;= '7') || c == '=';</a>
+<a name="ln1354">}</a>
+<a name="ln1355"> </a>
+<a name="ln1356">// Mapping from number of Base32 escaped characters (0 through 8) to number of</a>
+<a name="ln1357">// unescaped bytes.  8 Base32 escaped characters represent 5 unescaped bytes.</a>
+<a name="ln1358">// For N &lt; 8, then number of unescaped bytes is less than 5.  Note that in</a>
+<a name="ln1359">// valid input, N can only be 0, 2, 4, 5, 7, or 8 (corresponding to 0, 1, 2,</a>
+<a name="ln1360">// 3, 4, or 5 unescaped bytes).</a>
+<a name="ln1361">//</a>
+<a name="ln1362">// We use 5 for invalid values of N to be safe, since this is used to compute</a>
+<a name="ln1363">// the length of the buffer to hold unescaped data.</a>
+<a name="ln1364">//</a>
+<a name="ln1365">// See http://tools.ietf.org/html/rfc4648#section-6 for details.</a>
+<a name="ln1366">static const int kBase32NumUnescapedBytes[] = {</a>
+<a name="ln1367">  0, 5, 1, 5, 2, 3, 5, 4, 5</a>
+<a name="ln1368">};</a>
+<a name="ln1369"> </a>
+<a name="ln1370">int Base32Unescape(const char* src, int slen, char* dest, int szdest) {</a>
+<a name="ln1371">  int destidx = 0;</a>
+<a name="ln1372">  char escaped_bytes[8];</a>
+<a name="ln1373">  unsigned char unescaped_bytes[5];</a>
+<a name="ln1374">  while (slen &gt; 0) {</a>
+<a name="ln1375">    // Collect the next 8 escaped bytes and convert to upper case.  If there</a>
+<a name="ln1376">    // are less than 8 bytes left, pad with '=', but keep track of the number</a>
+<a name="ln1377">    // of non-padded bytes for later.</a>
+<a name="ln1378">    int non_padded_len = 8;</a>
+<a name="ln1379">    for (int i = 0; i &lt; 8; ++i) {</a>
+<a name="ln1380">      escaped_bytes[i] = (i &lt; slen) ? ascii_toupper(src[i]) : '=';</a>
+<a name="ln1381">      if (!ValidBase32Byte(escaped_bytes[i])) {</a>
+<a name="ln1382">        return -1;</a>
+<a name="ln1383">      }</a>
+<a name="ln1384">      // Stop counting escaped bytes at first '='.</a>
+<a name="ln1385">      if (escaped_bytes[i] == '=' &amp;&amp; non_padded_len == 8) {</a>
+<a name="ln1386">        non_padded_len = i;</a>
+<a name="ln1387">      }</a>
+<a name="ln1388">    }</a>
+<a name="ln1389"> </a>
+<a name="ln1390">    // Convert the 8 escaped bytes to 5 unescaped bytes and copy to dest.</a>
+<a name="ln1391">    EightBase32DigitsToFiveBytes(escaped_bytes, unescaped_bytes);</a>
+<a name="ln1392">    const int num_unescaped = kBase32NumUnescapedBytes[non_padded_len];</a>
+<a name="ln1393">    for (int i = 0; i &lt; num_unescaped; ++i) {</a>
+<a name="ln1394">      if (destidx == szdest) {</a>
+<a name="ln1395">        // No more room in dest, so terminate early.</a>
+<a name="ln1396">        return -1;</a>
+<a name="ln1397">      }</a>
+<a name="ln1398">      dest[destidx] = unescaped_bytes[i];</a>
+<a name="ln1399">      ++destidx;</a>
+<a name="ln1400">    }</a>
+<a name="ln1401">    src += 8;</a>
+<a name="ln1402">    slen -= 8;</a>
+<a name="ln1403">  }</a>
+<a name="ln1404">  return destidx;</a>
+<a name="ln1405">}</a>
+<a name="ln1406"> </a>
+<a name="ln1407">bool Base32Unescape(const char* src, int slen, string* dest) {</a>
+<a name="ln1408">  // Determine the size of the output string.</a>
+<a name="ln1409">  const int dest_len = 5 * (slen / 8) + kBase32NumUnescapedBytes[slen % 8];</a>
+<a name="ln1410"> </a>
+<a name="ln1411">  dest-&gt;clear();</a>
+<a name="ln1412">  dest-&gt;resize(dest_len);</a>
+<a name="ln1413"> </a>
+<a name="ln1414">  // We are getting the destination buffer by getting the beginning of the</a>
+<a name="ln1415">  // string and converting it into a char *.</a>
+<a name="ln1416">  const int len = Base32Unescape(src, slen,</a>
+<a name="ln1417">                                 string_as_array(dest), dest-&gt;size());</a>
+<a name="ln1418">  if (len &lt; 0) {</a>
+<a name="ln1419">    dest-&gt;clear();</a>
+<a name="ln1420">    return false;</a>
+<a name="ln1421">  }</a>
+<a name="ln1422"> </a>
+<a name="ln1423">  // Could be shorter if there was padding.</a>
+<a name="ln1424">  DCHECK_LE(len, dest_len);</a>
+<a name="ln1425">  dest-&gt;resize(len);</a>
+<a name="ln1426"> </a>
+<a name="ln1427">  return true;</a>
+<a name="ln1428">}</a>
+<a name="ln1429"> </a>
+<a name="ln1430">void GeneralFiveBytesToEightBase32Digits(const unsigned char *in_bytes,</a>
+<a name="ln1431">                                         char *out, const char *alphabet) {</a>
+<a name="ln1432">  // It's easier to just hard code this.</a>
+<a name="ln1433">  // The conversion isbased on the following picture of the division of a</a>
+<a name="ln1434">  // 40-bit block into 8 5-byte words:</a>
+<a name="ln1435">  //</a>
+<a name="ln1436">  //       5   3  2  5  1  4   4 1  5  2  3   5</a>
+<a name="ln1437">  //     |:::::::|:::::::|:::::::|:::::::|:::::::</a>
+<a name="ln1438">  //     +----+----+----+----+----+----+----+----</a>
+<a name="ln1439">  //</a>
+<a name="ln1440">  out[0] = alphabet[in_bytes[0] &gt;&gt; 3];</a>
+<a name="ln1441">  out[1] = alphabet[(in_bytes[0] &amp; 0x07) &lt;&lt; 2 | in_bytes[1] &gt;&gt; 6];</a>
+<a name="ln1442">  out[2] = alphabet[(in_bytes[1] &amp; 0x3E) &gt;&gt; 1];</a>
+<a name="ln1443">  out[3] = alphabet[(in_bytes[1] &amp; 0x01) &lt;&lt; 4 | in_bytes[2] &gt;&gt; 4];</a>
+<a name="ln1444">  out[4] = alphabet[(in_bytes[2] &amp; 0x0F) &lt;&lt; 1 | in_bytes[3] &gt;&gt; 7];</a>
+<a name="ln1445">  out[5] = alphabet[(in_bytes[3] &amp; 0x7C) &gt;&gt; 2];</a>
+<a name="ln1446">  out[6] = alphabet[(in_bytes[3] &amp; 0x03) &lt;&lt; 3 | in_bytes[4] &gt;&gt; 5];</a>
+<a name="ln1447">  out[7] = alphabet[(in_bytes[4] &amp; 0x1F)];</a>
+<a name="ln1448">}</a>
+<a name="ln1449"> </a>
+<a name="ln1450">static int GeneralBase32Escape(const unsigned char *src, size_t szsrc,</a>
+<a name="ln1451">                               char *dest, size_t szdest,</a>
+<a name="ln1452">                               const char *alphabet) {</a>
+<a name="ln1453">  static const char kPad32 = '=';</a>
+<a name="ln1454"> </a>
+<a name="ln1455">  if (szsrc == 0) return 0;</a>
+<a name="ln1456"> </a>
+<a name="ln1457">  char *cur_dest = dest;</a>
+<a name="ln1458">  const unsigned char *cur_src = src;</a>
+<a name="ln1459"> </a>
+<a name="ln1460">  // Five bytes of data encodes to eight characters of cyphertext.</a>
+<a name="ln1461">  // So we can pump through three-byte chunks atomically.</a>
+<a name="ln1462">  while (szsrc &gt; 4) {  // keep going until we have less than 40 bits</a>
+<a name="ln1463">    if ( szdest &lt; 8) return 0;</a>
+<a name="ln1464">    szdest -= 8;</a>
+<a name="ln1465"> </a>
+<a name="ln1466">    GeneralFiveBytesToEightBase32Digits(cur_src, cur_dest, alphabet);</a>
+<a name="ln1467"> </a>
+<a name="ln1468">    cur_dest += 8;</a>
+<a name="ln1469">    cur_src += 5;</a>
+<a name="ln1470">    szsrc -= 5;</a>
+<a name="ln1471">  }</a>
+<a name="ln1472"> </a>
+<a name="ln1473">  // Now deal with the tail (&lt;=4 bytes).</a>
+<a name="ln1474">  if (szsrc &gt; 0) {</a>
+<a name="ln1475">    if ( szdest &lt; 8) return 0;</a>
+<a name="ln1476">    szdest -= 8;</a>
+<a name="ln1477">    unsigned char last_chunk[5];</a>
+<a name="ln1478">    memcpy(last_chunk, cur_src, szsrc);</a>
+<a name="ln1479"> </a>
+<a name="ln1480">    for (size_t i = szsrc; i &lt; 5; ++i) {</a>
+<a name="ln1481">      last_chunk[i] = '\0';</a>
+<a name="ln1482">    }</a>
+<a name="ln1483"> </a>
+<a name="ln1484">    GeneralFiveBytesToEightBase32Digits(last_chunk, cur_dest, alphabet);</a>
+<a name="ln1485">    int filled = (szsrc * 8) / 5 + 1;</a>
+<a name="ln1486">    cur_dest += filled;</a>
+<a name="ln1487"> </a>
+<a name="ln1488">    // Add on the padding.</a>
+<a name="ln1489">    for (int i = 0; i &lt; (8 - filled); ++i) {</a>
+<a name="ln1490">      *(cur_dest++) = kPad32;</a>
+<a name="ln1491">    }</a>
+<a name="ln1492">  }</a>
+<a name="ln1493"> </a>
+<a name="ln1494">  return cur_dest - dest;</a>
+<a name="ln1495">}</a>
+<a name="ln1496"> </a>
+<a name="ln1497">static bool GeneralBase32Escape(const string&amp; src, string* dest,</a>
+<a name="ln1498">                                const char *alphabet) {</a>
+<a name="ln1499">  const int max_escaped_size = CalculateBase32EscapedLen(src.length());</a>
+<a name="ln1500">  dest-&gt;clear();</a>
+<a name="ln1501">  dest-&gt;resize(max_escaped_size + 1, '\0');</a>
+<a name="ln1502">  const int escaped_len =</a>
+<a name="ln1503">      GeneralBase32Escape(reinterpret_cast&lt;const unsigned char *&gt;(src.c_str()),</a>
+<a name="ln1504">                          src.length(),  &amp;*dest-&gt;begin(), dest-&gt;size(),</a>
+<a name="ln1505">                          alphabet);</a>
+<a name="ln1506"> </a>
+<a name="ln1507">  DCHECK_LE(max_escaped_size, escaped_len);</a>
+<a name="ln1508"> </a>
+<a name="ln1509">  if (escaped_len &lt; 0) {</a>
+<a name="ln1510">    dest-&gt;clear();</a>
+<a name="ln1511">    return false;</a>
+<a name="ln1512">  }</a>
+<a name="ln1513"> </a>
+<a name="ln1514">  dest-&gt;resize(escaped_len);</a>
+<a name="ln1515">  return true;</a>
+<a name="ln1516">}</a>
+<a name="ln1517"> </a>
+<a name="ln1518">static const char Base32Alphabet[] = {</a>
+<a name="ln1519">  'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',</a>
+<a name="ln1520">  'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',</a>
+<a name="ln1521">  'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X',</a>
+<a name="ln1522">  'Y', 'Z', '2', '3', '4', '5', '6', '7'</a>
+<a name="ln1523">  };</a>
+<a name="ln1524"> </a>
+<a name="ln1525">int Base32Escape(const unsigned char* src, size_t szsrc,</a>
+<a name="ln1526">                 char* dest, size_t szdest) {</a>
+<a name="ln1527">  return GeneralBase32Escape(src, szsrc, dest, szdest, Base32Alphabet);</a>
+<a name="ln1528">}</a>
+<a name="ln1529"> </a>
+<a name="ln1530">bool Base32Escape(const string&amp; src, string* dest) {</a>
+<a name="ln1531">  return GeneralBase32Escape(src, dest, Base32Alphabet);</a>
+<a name="ln1532">}</a>
+<a name="ln1533"> </a>
+<a name="ln1534">void FiveBytesToEightBase32Digits(const unsigned char *in_bytes, char *out) {</a>
+<a name="ln1535">  GeneralFiveBytesToEightBase32Digits(in_bytes, out, Base32Alphabet);</a>
+<a name="ln1536">}</a>
+<a name="ln1537"> </a>
+<a name="ln1538">static const char Base32HexAlphabet[] = {</a>
+<a name="ln1539">  '0', '1', '2', '3', '4', '5', '6', '7',</a>
+<a name="ln1540">  '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',</a>
+<a name="ln1541">  'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',</a>
+<a name="ln1542">  'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V',</a>
+<a name="ln1543">  };</a>
+<a name="ln1544"> </a>
+<a name="ln1545">int Base32HexEscape(const unsigned char* src, size_t szsrc,</a>
+<a name="ln1546">                 char* dest, size_t szdest) {</a>
+<a name="ln1547">  return GeneralBase32Escape(src, szsrc, dest, szdest, Base32HexAlphabet);</a>
+<a name="ln1548">}</a>
+<a name="ln1549"> </a>
+<a name="ln1550">bool Base32HexEscape(const string&amp; src, string* dest) {</a>
+<a name="ln1551">  return GeneralBase32Escape(src, dest, Base32HexAlphabet);</a>
+<a name="ln1552">}</a>
+<a name="ln1553"> </a>
+<a name="ln1554">int CalculateBase32EscapedLen(size_t input_len) {</a>
+<a name="ln1555">  DCHECK_LE(input_len, numeric_limits&lt;size_t&gt;::max() / 8);</a>
+<a name="ln1556">  size_t intermediate_result = 8 * input_len + 4;</a>
+<a name="ln1557">  size_t len = intermediate_result / 5;</a>
+<a name="ln1558">  len = (len + 7) &amp; ~7;</a>
+<a name="ln1559">  return len;</a>
+<a name="ln1560">}</a>
+<a name="ln1561"> </a>
+<a name="ln1562">// ----------------------------------------------------------------------</a>
+<a name="ln1563">// EightBase32DigitsToTenHexDigits()</a>
+<a name="ln1564">//   Converts an 8-digit base32 string to a 10-digit hex string.</a>
+<a name="ln1565">//</a>
+<a name="ln1566">//   *in must point to 8 base32 digits.</a>
+<a name="ln1567">//   *out must point to 10 bytes.</a>
+<a name="ln1568">//</a>
+<a name="ln1569">//   Base32 uses A-Z,2-7 to represent the numbers 0-31.</a>
+<a name="ln1570">//   See RFC3548 at http://www.ietf.org/rfc/rfc3548.txt</a>
+<a name="ln1571">//   for details on base32.</a>
+<a name="ln1572">// ----------------------------------------------------------------------</a>
+<a name="ln1573"> </a>
+<a name="ln1574"> </a>
+<a name="ln1575">void EightBase32DigitsToTenHexDigits(const char *in, char *out) {</a>
+<a name="ln1576">  unsigned char bytes[5];</a>
+<a name="ln1577">  EightBase32DigitsToFiveBytes(in, bytes);</a>
+<a name="ln1578">  b2a_hex(bytes, out, 5);</a>
+<a name="ln1579">}</a>
+<a name="ln1580"> </a>
+<a name="ln1581">void EightBase32DigitsToFiveBytes(const char *in, unsigned char *bytes_out) {</a>
+<a name="ln1582">  static const char Base32InverseAlphabet[] = {</a>
+<a name="ln1583">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1584">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1585">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1586">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1587">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1588">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1589">    99,      99,      26/*2*/, 27/*3*/, 28/*4*/, 29/*5*/, 30/*6*/, 31/*7*/,</a>
+<a name="ln1590">    99,      99,      99,      99,      99,      00/*=*/, 99,      99,</a>
+<a name="ln1591">    99,       0/*A*/,  1/*B*/,  2/*C*/,  3/*D*/,  4/*E*/,  5/*F*/,  6/*G*/,</a>
+<a name="ln1592">     7/*H*/,  8/*I*/,  9/*J*/, 10/*K*/, 11/*L*/, 12/*M*/, 13/*N*/, 14/*O*/,</a>
+<a name="ln1593">    15/*P*/, 16/*Q*/, 17/*R*/, 18/*S*/, 19/*T*/, 20/*U*/, 21/*V*/, 22/*W*/,</a>
+<a name="ln1594">    23/*X*/, 24/*Y*/, 25/*Z*/, 99,      99,      99,      99,      99,</a>
+<a name="ln1595">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1596">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1597">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1598">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1599">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1600">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1601">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1602">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1603">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1604">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1605">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1606">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1607">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1608">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1609">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1610">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1611">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1612">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1613">    99,      99,      99,      99,      99,      99,      99,      99,</a>
+<a name="ln1614">    99,      99,      99,      99,      99,      99,      99,      99</a>
+<a name="ln1615">  };</a>
+<a name="ln1616"> </a>
+<a name="ln1617">  // Convert to raw bytes. It's easier to just hard code this.</a>
+<a name="ln1618">  bytes_out[0] = Base32InverseAlphabet[in[0]] &lt;&lt; 3 |</a>
+<a name="ln1619">                 Base32InverseAlphabet[in[1]] &gt;&gt; 2;</a>
+<a name="ln1620"> </a>
+<a name="ln1621">  bytes_out[1] = Base32InverseAlphabet[in[1]] &lt;&lt; 6 |</a>
+<a name="ln1622">                 Base32InverseAlphabet[in[2]] &lt;&lt; 1 |</a>
+<a name="ln1623">                 Base32InverseAlphabet[in[3]] &gt;&gt; 4;</a>
+<a name="ln1624"> </a>
+<a name="ln1625">  bytes_out[2] = Base32InverseAlphabet[in[3]] &lt;&lt; 4 |</a>
+<a name="ln1626">                 Base32InverseAlphabet[in[4]] &gt;&gt; 1;</a>
+<a name="ln1627"> </a>
+<a name="ln1628">  bytes_out[3] = Base32InverseAlphabet[in[4]] &lt;&lt; 7 |</a>
+<a name="ln1629">                 Base32InverseAlphabet[in[5]] &lt;&lt; 2 |</a>
+<a name="ln1630">                 Base32InverseAlphabet[in[6]] &gt;&gt; 3;</a>
+<a name="ln1631"> </a>
+<a name="ln1632">  bytes_out[4] = Base32InverseAlphabet[in[6]] &lt;&lt; 5 |</a>
+<a name="ln1633">                 Base32InverseAlphabet[in[7]];</a>
+<a name="ln1634">}</a>
+<a name="ln1635"> </a>
+<a name="ln1636">// ----------------------------------------------------------------------</a>
+<a name="ln1637">// TenHexDigitsToEightBase32Digits()</a>
+<a name="ln1638">//   Converts a 10-digit hex string to an 8-digit base32 string.</a>
+<a name="ln1639">//</a>
+<a name="ln1640">//   *in must point to 10 hex digits.</a>
+<a name="ln1641">//   *out must point to 8 bytes.</a>
+<a name="ln1642">//</a>
+<a name="ln1643">//   See RFC3548 at http://www.ietf.org/rfc/rfc3548.txt</a>
+<a name="ln1644">//   for details on base32.</a>
+<a name="ln1645">// ----------------------------------------------------------------------</a>
+<a name="ln1646">void TenHexDigitsToEightBase32Digits(const char *in, char *out) {</a>
+<a name="ln1647">  unsigned char bytes[5];</a>
+<a name="ln1648"> </a>
+<a name="ln1649">  // Convert hex to raw bytes.</a>
+<a name="ln1650">  a2b_hex(in, bytes, 5);</a>
+<a name="ln1651">  FiveBytesToEightBase32Digits(bytes, out);</a>
+<a name="ln1652">}</a>
+<a name="ln1653"> </a>
+<a name="ln1654">// ----------------------------------------------------------------------</a>
+<a name="ln1655">// EscapeFileName / UnescapeFileName</a>
+<a name="ln1656">// ----------------------------------------------------------------------</a>
+<a name="ln1657">static const Charmap escape_file_name_exceptions(</a>
+<a name="ln1658">    &quot;abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ&quot;  // letters</a>
+<a name="ln1659">    &quot;0123456789&quot;  // digits</a>
+<a name="ln1660">    &quot;-_.&quot;);</a>
+<a name="ln1661"> </a>
+<a name="ln1662">void EscapeFileName(const GStringPiece&amp; src, string* dst) {</a>
+<a name="ln1663">  // Reserve at least src.size() chars</a>
+<a name="ln1664">  dst-&gt;reserve(dst-&gt;size() + src.size());</a>
+<a name="ln1665"> </a>
+<a name="ln1666">  for (char c : src) {</a>
+<a name="ln1667">    // We do not use &quot;isalpha&quot; because we want the behavior to be</a>
+<a name="ln1668">    // independent of the current locale settings.</a>
+<a name="ln1669">    if (escape_file_name_exceptions.contains(c)) {</a>
+<a name="ln1670">      dst-&gt;push_back(c);</a>
+<a name="ln1671"> </a>
+<a name="ln1672">    } else if (c == '/') {</a>
+<a name="ln1673">      dst-&gt;push_back('~');</a>
+<a name="ln1674"> </a>
+<a name="ln1675">    } else {</a>
+<a name="ln1676">      char tmp[2];</a>
+<a name="ln1677">      b2a_hex(reinterpret_cast&lt;const unsigned char*&gt;(&amp;c), tmp, 1);</a>
+<a name="ln1678">      dst-&gt;push_back('%');</a>
+<a name="ln1679">      dst-&gt;append(tmp, 2);</a>
+<a name="ln1680">    }</a>
+<a name="ln1681">  }</a>
+<a name="ln1682">}</a>
+<a name="ln1683"> </a>
+<a name="ln1684">void UnescapeFileName(const GStringPiece&amp; src_piece, string* dst) {</a>
+<a name="ln1685">  const char* src = src_piece.data();</a>
+<a name="ln1686">  const int len = src_piece.size();</a>
+<a name="ln1687">  for (int i = 0; i &lt; len; ++i) {</a>
+<a name="ln1688">    const char c = src[i];</a>
+<a name="ln1689">    if (c == '~') {</a>
+<a name="ln1690">      dst-&gt;push_back('/');</a>
+<a name="ln1691"> </a>
+<a name="ln1692">    } else if ((c == '%') &amp;&amp; (i + 2 &lt; len)) {</a>
+<a name="ln1693">      unsigned char tmp[1];</a>
+<a name="ln1694">      a2b_hex(src + i + 1, &amp;tmp[0], 1);</a>
+<a name="ln1695">      dst-&gt;push_back(tmp[0]);</a>
+<a name="ln1696">      i += 2;</a>
+<a name="ln1697"> </a>
+<a name="ln1698">    } else {</a>
+<a name="ln1699">      dst-&gt;push_back(c);</a>
+<a name="ln1700">    }</a>
+<a name="ln1701">  }</a>
+<a name="ln1702">}</a>
+<a name="ln1703"> </a>
+<a name="ln1704">static char hex_value[256] = {</a>
+<a name="ln1705">  0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,</a>
+<a name="ln1706">  0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,</a>
+<a name="ln1707">  0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,</a>
+<a name="ln1708">  0,  1,  2,  3,  4,  5,  6, 7, 8, 9, 0, 0, 0, 0, 0, 0,  // '0'..'9'</a>
+<a name="ln1709">  0, 10, 11, 12, 13, 14, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 'A'..'F'</a>
+<a name="ln1710">  0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,</a>
+<a name="ln1711">  0, 10, 11, 12, 13, 14, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 'a'..'f'</a>
+<a name="ln1712">  0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,</a>
+<a name="ln1713">  0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,</a>
+<a name="ln1714">  0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,</a>
+<a name="ln1715">  0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,</a>
+<a name="ln1716">  0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,</a>
+<a name="ln1717">  0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,</a>
+<a name="ln1718">  0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,</a>
+<a name="ln1719">  0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,</a>
+<a name="ln1720">  0,  0,  0,  0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0</a>
+<a name="ln1721">};</a>
+<a name="ln1722"> </a>
+<a name="ln1723">static char hex_char[] = &quot;0123456789abcdef&quot;;</a>
+<a name="ln1724"> </a>
+<a name="ln1725">// This is a templated function so that T can be either a char*</a>
+<a name="ln1726">// or a string.  This works because we use the [] operator to access</a>
+<a name="ln1727">// individual characters at a time.</a>
+<a name="ln1728">template &lt;typename T&gt;</a>
+<a name="ln1729">static void a2b_hex_t(const char* a, T b, int num) {</a>
+<a name="ln1730">  for (int i = 0; i &lt; num; i++) {</a>
+<a name="ln1731">    b[i] = (hex_value[a[i * 2] &amp; 0xFF] &lt;&lt; 4)</a>
+<a name="ln1732">         + (hex_value[a[i * 2 + 1] &amp; 0xFF]);</a>
+<a name="ln1733">  }</a>
+<a name="ln1734">}</a>
+<a name="ln1735"> </a>
+<a name="ln1736">string a2b_bin(const string&amp; a, bool byte_order_msb) {</a>
+<a name="ln1737">  string result;</a>
+<a name="ln1738">  const char *data = a.c_str();</a>
+<a name="ln1739">  int num_bytes = (a.size()+7)/8;</a>
+<a name="ln1740">  for (int byte_offset = 0; byte_offset &lt; num_bytes; ++byte_offset) {</a>
+<a name="ln1741">    unsigned char c = 0;</a>
+<a name="ln1742">    for (int bit_offset = 0; bit_offset &lt; 8; ++bit_offset) {</a>
+<a name="ln1743">      if (*data == '\0')</a>
+<a name="ln1744">        break;</a>
+<a name="ln1745">      if (*data++ != '0') {</a>
+<a name="ln1746">        int bits_to_shift = (byte_order_msb) ? 7-bit_offset : bit_offset;</a>
+<a name="ln1747">        c |= (1 &lt;&lt; bits_to_shift);</a>
+<a name="ln1748">      }</a>
+<a name="ln1749">    }</a>
+<a name="ln1750">    result.append(1, c);</a>
+<a name="ln1751">  }</a>
+<a name="ln1752">  return result;</a>
+<a name="ln1753">}</a>
+<a name="ln1754"> </a>
+<a name="ln1755">// This is a templated function so that T can be either a char*</a>
+<a name="ln1756">// or a string.  This works because we use the [] operator to access</a>
+<a name="ln1757">// individual characters at a time.</a>
+<a name="ln1758">template &lt;typename T&gt;</a>
+<a name="ln1759">static void b2a_hex_t(const unsigned char* b, T a, int num) {</a>
+<a name="ln1760">  for (int i = 0; i &lt; num; i++) {</a>
+<a name="ln1761">    a[i * 2 + 0] = hex_char[b[i] &gt;&gt; 4];</a>
+<a name="ln1762">    a[i * 2 + 1] = hex_char[b[i] &amp; 0xf];</a>
+<a name="ln1763">  }</a>
+<a name="ln1764">}</a>
+<a name="ln1765"> </a>
+<a name="ln1766">string b2a_bin(const string&amp; b, bool byte_order_msb) {</a>
+<a name="ln1767">  string result;</a>
+<a name="ln1768">  for (char c : b) {</a>
+<a name="ln1769">    for (int bit_offset = 0; bit_offset &lt; 8; ++bit_offset) {</a>
+<a name="ln1770">      int x = (byte_order_msb) ? 7-bit_offset : bit_offset;</a>
+<a name="ln1771">      result.append(1, (c &amp; (1 &lt;&lt; x)) ? '1' : '0');</a>
+<a name="ln1772">    }</a>
+<a name="ln1773">  }</a>
+<a name="ln1774">  return result;</a>
+<a name="ln1775">}</a>
+<a name="ln1776"> </a>
+<a name="ln1777">void b2a_hex(const unsigned char* b, char* a, int num) {</a>
+<a name="ln1778">  b2a_hex_t&lt;char*&gt;(b, a, num);</a>
+<a name="ln1779">}</a>
+<a name="ln1780"> </a>
+<a name="ln1781">void a2b_hex(const char* a, unsigned char* b, int num) {</a>
+<a name="ln1782">  a2b_hex_t&lt;unsigned char*&gt;(a, b, num);</a>
+<a name="ln1783">}</a>
+<a name="ln1784"> </a>
+<a name="ln1785">void a2b_hex(const char* a, char* b, int num) {</a>
+<a name="ln1786">  a2b_hex_t&lt;char*&gt;(a, b, num);</a>
+<a name="ln1787">}</a>
+<a name="ln1788"> </a>
+<a name="ln1789">string b2a_hex(const char* b, int len) {</a>
+<a name="ln1790">  string result;</a>
+<a name="ln1791">  result.resize(len &lt;&lt; 1);</a>
+<a name="ln1792">  b2a_hex_t&lt;string&amp;&gt;(reinterpret_cast&lt;const unsigned char*&gt;(b), result, len);</a>
+<a name="ln1793">  return result;</a>
+<a name="ln1794">}</a>
+<a name="ln1795"> </a>
+<a name="ln1796">string b2a_hex(const GStringPiece&amp; b) {</a>
+<a name="ln1797">  return b2a_hex(b.data(), b.size());</a>
+<a name="ln1798">}</a>
+<a name="ln1799"> </a>
+<a name="ln1800">string a2b_hex(const string&amp; a) {</a>
+<a name="ln1801">  string result;</a>
+<a name="ln1802">  a2b_hex(a.c_str(), &amp;result, a.size()/2);</a>
+<a name="ln1803"> </a>
+<a name="ln1804">  return result;</a>
+<a name="ln1805">}</a>
+<a name="ln1806"> </a>
+<a name="ln1807">void b2a_hex(const unsigned char* from, string* to, int num) {</a>
+<a name="ln1808">  to-&gt;resize(num &lt;&lt; 1);</a>
+<a name="ln1809">  b2a_hex_t&lt;string&amp;&gt;(from, *to, num);</a>
+<a name="ln1810">}</a>
+<a name="ln1811"> </a>
+<a name="ln1812">void a2b_hex(const char* from, string* to, int num) {</a>
+<a name="ln1813">  to-&gt;resize(num);</a>
+<a name="ln1814">  a2b_hex_t&lt;string&amp;&gt;(from, *to, num);</a>
+<a name="ln1815">}</a>
+<a name="ln1816"> </a>
+<a name="ln1817">const char* kDontNeedShellEscapeChars =</a>
+<a name="ln1818">&quot;ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.=/:,@&quot;;</a>
+<a name="ln1819"> </a>
+<a name="ln1820">string ShellEscape(GStringPiece src) {</a>
+<a name="ln1821">  if (!src.empty() &amp;&amp;  // empty string needs quotes</a>
+<a name="ln1822">      src.find_first_not_of(kDontNeedShellEscapeChars) == GStringPiece::npos) {</a>
+<a name="ln1823">    // only contains chars that don't need quotes; it's fine</a>
+<a name="ln1824">    return src.ToString();</a>
+<a name="ln1825">  } else if (src.find('\'') == GStringPiece::npos) {</a>
+<a name="ln1826">    // no single quotes; just wrap it in single quotes</a>
+<a name="ln1827">    return StrCat(&quot;'&quot;, src, &quot;'&quot;);</a>
+<a name="ln1828">  } else {</a>
+<a name="ln1829">    // needs double quote escaping</a>
+<a name="ln1830">    string result = &quot;\&quot;&quot;;</a>
+<a name="ln1831">    for (char c : src) {</a>
+<a name="ln1832">      switch (c) {</a>
+<a name="ln1833">        case '\\':</a>
+<a name="ln1834">        case '$':</a>
+<a name="ln1835">        case '&quot;':</a>
+<a name="ln1836">        case '`':</a>
+<a name="ln1837">          result.push_back('\\');</a>
+<a name="ln1838">      };</a>
+<a name="ln1839">      result.push_back(c);</a>
+<a name="ln1840">    }</a>
+<a name="ln1841">    result.push_back('&quot;');</a>
+<a name="ln1842">    return result;</a>
+<a name="ln1843">  }</a>
+<a name="ln1844">}</a>
+<a name="ln1845"> </a>
+<a name="ln1846">static const char kHexTable[513]=</a>
+<a name="ln1847">  &quot;000102030405060708090a0b0c0d0e0f&quot;</a>
+<a name="ln1848">  &quot;101112131415161718191a1b1c1d1e1f&quot;</a>
+<a name="ln1849">  &quot;202122232425262728292a2b2c2d2e2f&quot;</a>
+<a name="ln1850">  &quot;303132333435363738393a3b3c3d3e3f&quot;</a>
+<a name="ln1851">  &quot;404142434445464748494a4b4c4d4e4f&quot;</a>
+<a name="ln1852">  &quot;505152535455565758595a5b5c5d5e5f&quot;</a>
+<a name="ln1853">  &quot;606162636465666768696a6b6c6d6e6f&quot;</a>
+<a name="ln1854">  &quot;707172737475767778797a7b7c7d7e7f&quot;</a>
+<a name="ln1855">  &quot;808182838485868788898a8b8c8d8e8f&quot;</a>
+<a name="ln1856">  &quot;909192939495969798999a9b9c9d9e9f&quot;</a>
+<a name="ln1857">  &quot;a0a1a2a3a4a5a6a7a8a9aaabacadaeaf&quot;</a>
+<a name="ln1858">  &quot;b0b1b2b3b4b5b6b7b8b9babbbcbdbebf&quot;</a>
+<a name="ln1859">  &quot;c0c1c2c3c4c5c6c7c8c9cacbcccdcecf&quot;</a>
+<a name="ln1860">  &quot;d0d1d2d3d4d5d6d7d8d9dadbdcdddedf&quot;</a>
+<a name="ln1861">  &quot;e0e1e2e3e4e5e6e7e8e9eaebecedeeef&quot;</a>
+<a name="ln1862">  &quot;f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff&quot;;</a>
+<a name="ln1863"> </a>
+<a name="ln1864">//------------------------------------------------------------------------</a>
+<a name="ln1865">// ByteStringToAscii</a>
+<a name="ln1866">//  Reads at most bytes_to_read from binary_string and prints it to</a>
+<a name="ln1867">//  ascii_string in downcased hex.</a>
+<a name="ln1868">//------------------------------------------------------------------------</a>
+<a name="ln1869">void ByteStringToAscii(string const &amp;binary_string, int bytes_to_read,</a>
+<a name="ln1870">                       string * ascii_string ) {</a>
+<a name="ln1871">  if (binary_string.size() &lt; bytes_to_read) {</a>
+<a name="ln1872">    bytes_to_read = binary_string.size();</a>
+<a name="ln1873">  }</a>
+<a name="ln1874"> </a>
+<a name="ln1875">  CHECK_GE(bytes_to_read, 0);</a>
+<a name="ln1876">  ascii_string-&gt;resize(bytes_to_read*2);</a>
+<a name="ln1877"> </a>
+<a name="ln1878">  string::const_iterator in = binary_string.begin();</a>
+<a name="ln1879">  string::iterator out = ascii_string-&gt;begin();</a>
+<a name="ln1880"> </a>
+<a name="ln1881">  for (int i = 0; i &lt; bytes_to_read; i++) {</a>
+<a name="ln1882">    *out++ = kHexTable[(*in)*2];</a>
+<a name="ln1883">    *out++ = kHexTable[(*in)*2 + 1];</a>
+<a name="ln1884">    ++in;</a>
+<a name="ln1885">  }</a>
+<a name="ln1886">}</a>
+<a name="ln1887"> </a>
+<a name="ln1888">//------------------------------------------------------------------------</a>
+<a name="ln1889">// ByteStringFromAscii</a>
+<a name="ln1890">//  Converts the hex from ascii_string into binary data and</a>
+<a name="ln1891">//  writes the binary data into binary_string.</a>
+<a name="ln1892">//  Empty input successfully converts to empty output.</a>
+<a name="ln1893">//  Returns false and may modify output if it is</a>
+<a name="ln1894">//  unable to parse the hex string.</a>
+<a name="ln1895">//------------------------------------------------------------------------</a>
+<a name="ln1896">bool ByteStringFromAscii(string const &amp; hex_string, string * binary_string) {</a>
+<a name="ln1897">  binary_string-&gt;clear();</a>
+<a name="ln1898"> </a>
+<a name="ln1899">  if ((hex_string.size()%2) != 0) {</a>
+<a name="ln1900">    return false;</a>
+<a name="ln1901">  }</a>
+<a name="ln1902"> </a>
+<a name="ln1903">  int value = 0;</a>
+<a name="ln1904">  for (int i = 0; i &lt; hex_string.size(); i++) {</a>
+<a name="ln1905">    char c = hex_string[i];</a>
+<a name="ln1906"> </a>
+<a name="ln1907">    if (!ascii_isxdigit(c)) {</a>
+<a name="ln1908">      return false;</a>
+<a name="ln1909">    }</a>
+<a name="ln1910"> </a>
+<a name="ln1911">    if (ascii_isdigit(c)) {</a>
+<a name="ln1912">      value += c - '0';</a>
+<a name="ln1913">    } else if (ascii_islower(c)) {</a>
+<a name="ln1914">      value += 10 + c - 'a';</a>
+<a name="ln1915">    } else {</a>
+<a name="ln1916">      value += 10 + c - 'A';</a>
+<a name="ln1917">    }</a>
+<a name="ln1918"> </a>
+<a name="ln1919">    if (i &amp; 1) {</a>
+<a name="ln1920">      binary_string-&gt;push_back(value);</a>
+<a name="ln1921">      value = 0;</a>
+<a name="ln1922">    } else {</a>
+<a name="ln1923">      value &lt;&lt;= 4;</a>
+<a name="ln1924">    }</a>
+<a name="ln1925">  }</a>
+<a name="ln1926"> </a>
+<a name="ln1927">  return true;</a>
+<a name="ln1928">}</a>
+<a name="ln1929"> </a>
+<a name="ln1930">// ----------------------------------------------------------------------</a>
+<a name="ln1931">// CleanStringLineEndings()</a>
+<a name="ln1932">//   Clean up a multi-line string to conform to Unix line endings.</a>
+<a name="ln1933">//   Reads from src and appends to dst, so usually dst should be empty.</a>
+<a name="ln1934">//</a>
+<a name="ln1935">//   If there is no line ending at the end of a non-empty string, it can</a>
+<a name="ln1936">//   be added automatically.</a>
+<a name="ln1937">//</a>
+<a name="ln1938">//   Four different types of input are correctly handled:</a>
+<a name="ln1939">//</a>
+<a name="ln1940">//     - Unix/Linux files: line ending is LF, pass through unchanged</a>
+<a name="ln1941">//</a>
+<a name="ln1942">//     - DOS/Windows files: line ending is CRLF: convert to LF</a>
+<a name="ln1943">//</a>
+<a name="ln1944">//     - Legacy Mac files: line ending is CR: convert to LF</a>
+<a name="ln1945">//</a>
+<a name="ln1946">//     - Garbled files: random line endings, covert gracefully</a>
+<a name="ln1947">//                      lonely CR, lonely LF, CRLF: convert to LF</a>
+<a name="ln1948">//</a>
+<a name="ln1949">//   @param src The multi-line string to convert</a>
+<a name="ln1950">//   @param dst The converted string is appended to this string</a>
+<a name="ln1951">//   @param auto_end_last_line Automatically terminate the last line</a>
+<a name="ln1952">//</a>
+<a name="ln1953">//   Limitations:</a>
+<a name="ln1954">//</a>
+<a name="ln1955">//     This does not do the right thing for CRCRLF files created by</a>
+<a name="ln1956">//     broken programs that do another Unix-&gt;DOS conversion on files</a>
+<a name="ln1957">//     that are already in CRLF format.  For this, a two-pass approach</a>
+<a name="ln1958">//     brute-force would be needed that</a>
+<a name="ln1959">//</a>
+<a name="ln1960">//       (1) determines the presence of LF (first one is ok)</a>
+<a name="ln1961">//       (2) if yes, removes any CR, else convert every CR to LF</a>
+<a name="ln1962"> </a>
+<a name="ln1963">void CleanStringLineEndings(const string&amp; src, string* dst,</a>
+<a name="ln1964">                            bool auto_end_last_line) {</a>
+<a name="ln1965">  if (dst-&gt;empty()) {</a>
+<a name="ln1966">    dst-&gt;append(src);</a>
+<a name="ln1967">    CleanStringLineEndings(dst, auto_end_last_line);</a>
+<a name="ln1968">  } else {</a>
+<a name="ln1969">    string tmp = src;</a>
+<a name="ln1970">    CleanStringLineEndings(&amp;tmp, auto_end_last_line);</a>
+<a name="ln1971">    dst-&gt;append(tmp);</a>
+<a name="ln1972">  }</a>
+<a name="ln1973">}</a>
+<a name="ln1974"> </a>
+<a name="ln1975">void CleanStringLineEndings(string* str, bool auto_end_last_line) {</a>
+<a name="ln1976">  int output_pos = 0;</a>
+<a name="ln1977">  bool r_seen = false;</a>
+<a name="ln1978">  int len = str-&gt;size();</a>
+<a name="ln1979"> </a>
+<a name="ln1980">  char* p = string_as_array(str);</a>
+<a name="ln1981"> </a>
+<a name="ln1982">  for (int input_pos = 0; input_pos &lt; len;) {</a>
+<a name="ln1983">    if (!r_seen &amp;&amp; input_pos + 8 &lt; len) {</a>
+<a name="ln1984">      uint64 v = UNALIGNED_LOAD64(p + input_pos);</a>
+<a name="ln1985">      // Loop over groups of 8 bytes at a time until we come across</a>
+<a name="ln1986">      // a word that has a byte whose value is less than or equal to</a>
+<a name="ln1987">      // '\r' (i.e. could contain a \n (0x0a) or a \r (0x0d) ).</a>
+<a name="ln1988">      //</a>
+<a name="ln1989">      // We use a has_less macro that quickly tests a whole 64-bit</a>
+<a name="ln1990">      // word to see if any of the bytes has a value &lt; N.</a>
+<a name="ln1991">      //</a>
+<a name="ln1992">      // For more details, see:</a>
+<a name="ln1993">      //   http://graphics.stanford.edu/~seander/bithacks.html#HasLessInWord</a>
+<a name="ln1994">#define has_less(x, n) (((x)-~0ULL/255*(n))&amp;~(x)&amp;~0ULL/255*128)</a>
+<a name="ln1995">      if (!has_less(v, '\r' + 1)) {</a>
+<a name="ln1996">#undef has_less</a>
+<a name="ln1997">        // No byte in this word has a value that could be a \r or a \n</a>
+<a name="ln1998">        if (output_pos != input_pos)</a>
+<a name="ln1999">          UNALIGNED_STORE64(p + output_pos, v);</a>
+<a name="ln2000">        input_pos += 8;</a>
+<a name="ln2001">        output_pos += 8;</a>
+<a name="ln2002">        continue;</a>
+<a name="ln2003">      }</a>
+<a name="ln2004">    }</a>
+<a name="ln2005">    string::const_reference in = p[input_pos];</a>
+<a name="ln2006">    if (in == '\r') {</a>
+<a name="ln2007">      if (r_seen)</a>
+<a name="ln2008">        p[output_pos++] = '\n';</a>
+<a name="ln2009">      r_seen = true;</a>
+<a name="ln2010">    } else if (in == '\n') {</a>
+<a name="ln2011">      if (input_pos != output_pos)</a>
+<a name="ln2012">        p[output_pos++] = '\n';</a>
+<a name="ln2013">      else</a>
+<a name="ln2014">        output_pos++;</a>
+<a name="ln2015">      r_seen = false;</a>
+<a name="ln2016">    } else {</a>
+<a name="ln2017">      if (r_seen)</a>
+<a name="ln2018">        p[output_pos++] = '\n';</a>
+<a name="ln2019">      r_seen = false;</a>
+<a name="ln2020">      if (input_pos != output_pos)</a>
+<a name="ln2021">        p[output_pos++] = in;</a>
+<a name="ln2022">      else</a>
+<a name="ln2023">        output_pos++;</a>
+<a name="ln2024">    }</a>
+<a name="ln2025">    input_pos++;</a>
+<a name="ln2026">  }</a>
+<a name="ln2027">  if (r_seen || (auto_end_last_line</a>
+<a name="ln2028">                 &amp;&amp; output_pos &gt; 0</a>
+<a name="ln2029">                 &amp;&amp; p[output_pos - 1] != '\n')) {</a>
+<a name="ln2030">    str-&gt;resize(output_pos + 1);</a>
+<a name="ln2031">    str-&gt;operator[](output_pos) = '\n';</a>
+<a name="ln2032">  } else if (output_pos &lt; len) {</a>
+<a name="ln2033">    str-&gt;resize(output_pos);</a>
+<a name="ln2034">  }</a>
+<a name="ln2035">}</a>
+<a name="ln2036"> </a>
+<a name="ln2037"> </a>
+<a name="ln2038">}  // namespace strings</a>
+
+</code></pre>
+<div class="balloon" rel="238"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="239"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1004/" target="_blank">V1004</a> The 'dest' pointer was used unsafely after it was verified against nullptr. Check lines: 238, 239.</p></div>
+<div class="balloon" rel="1290"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

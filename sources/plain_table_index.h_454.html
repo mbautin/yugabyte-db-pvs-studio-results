@@ -1,0 +1,292 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>plain_table_index.h</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20"> </a>
+<a name="ln21">#ifndef YB_ROCKSDB_TABLE_PLAIN_TABLE_INDEX_H</a>
+<a name="ln22">#define YB_ROCKSDB_TABLE_PLAIN_TABLE_INDEX_H</a>
+<a name="ln23"> </a>
+<a name="ln24">#pragma once</a>
+<a name="ln25"> </a>
+<a name="ln26">#ifndef ROCKSDB_LITE</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &lt;string&gt;</a>
+<a name="ln29">#include &lt;vector&gt;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &quot;yb/rocksdb/db/dbformat.h&quot;</a>
+<a name="ln32">#include &quot;yb/rocksdb/options.h&quot;</a>
+<a name="ln33">#include &quot;yb/rocksdb/util/murmurhash.h&quot;</a>
+<a name="ln34">#include &quot;yb/rocksdb/util/hash.h&quot;</a>
+<a name="ln35">#include &quot;yb/rocksdb/util/arena.h&quot;</a>
+<a name="ln36">#include &quot;yb/rocksdb/util/histogram.h&quot;</a>
+<a name="ln37"> </a>
+<a name="ln38">namespace rocksdb {</a>
+<a name="ln39"> </a>
+<a name="ln40">// PlainTableIndex contains buckets size of index_size_, each is a</a>
+<a name="ln41">// 32-bit integer. The lower 31 bits contain an offset value (explained below)</a>
+<a name="ln42">// and the first bit of the integer indicates type of the offset.</a>
+<a name="ln43">//</a>
+<a name="ln44">// +--------------+------------------------------------------------------+</a>
+<a name="ln45">// | Flag (1 bit) | Offset to binary search buffer or file (31 bits)     +</a>
+<a name="ln46">// +--------------+------------------------------------------------------+</a>
+<a name="ln47">//</a>
+<a name="ln48">// Explanation for the &quot;flag bit&quot;:</a>
+<a name="ln49">//</a>
+<a name="ln50">// 0 indicates that the bucket contains only one prefix (no conflict when</a>
+<a name="ln51">//   hashing this prefix), whose first row starts from this offset of the</a>
+<a name="ln52">// file.</a>
+<a name="ln53">// 1 indicates that the bucket contains more than one prefixes, or there</a>
+<a name="ln54">//   are too many rows for one prefix so we need a binary search for it. In</a>
+<a name="ln55">//   this case, the offset indicates the offset of sub_index_ holding the</a>
+<a name="ln56">//   binary search indexes of keys for those rows. Those binary search indexes</a>
+<a name="ln57">//   are organized in this way:</a>
+<a name="ln58">//</a>
+<a name="ln59">// The first 4 bytes, indicate how many indexes (N) are stored after it. After</a>
+<a name="ln60">// it, there are N 32-bit integers, each points of an offset of the file,</a>
+<a name="ln61">// which</a>
+<a name="ln62">// points to starting of a row. Those offsets need to be guaranteed to be in</a>
+<a name="ln63">// ascending order so the keys they are pointing to are also in ascending</a>
+<a name="ln64">// order</a>
+<a name="ln65">// to make sure we can use them to do binary searches. Below is visual</a>
+<a name="ln66">// presentation of a bucket.</a>
+<a name="ln67">//</a>
+<a name="ln68">// &lt;begin&gt;</a>
+<a name="ln69">//   number_of_records:  varint32</a>
+<a name="ln70">//   record 1 file offset:  fixedint32</a>
+<a name="ln71">//   record 2 file offset:  fixedint32</a>
+<a name="ln72">//    ....</a>
+<a name="ln73">//   record N file offset:  fixedint32</a>
+<a name="ln74">// &lt;end&gt;</a>
+<a name="ln75">class PlainTableIndex {</a>
+<a name="ln76"> public:</a>
+<a name="ln77">  enum IndexSearchResult {</a>
+<a name="ln78">    kNoPrefixForBucket = 0,</a>
+<a name="ln79">    kDirectToFile = 1,</a>
+<a name="ln80">    kSubindex = 2</a>
+<a name="ln81">  };</a>
+<a name="ln82"> </a>
+<a name="ln83">  explicit PlainTableIndex(Slice data) { CHECK_OK(InitFromRawData(data)); }</a>
+<a name="ln84"> </a>
+<a name="ln85">  PlainTableIndex()</a>
+<a name="ln86">      : index_size_(0),</a>
+<a name="ln87">        sub_index_size_(0),</a>
+<a name="ln88">        num_prefixes_(0),</a>
+<a name="ln89">        index_(nullptr),</a>
+<a name="ln90">        sub_index_(nullptr) {}</a>
+<a name="ln91"> </a>
+<a name="ln92">  IndexSearchResult GetOffset(uint32_t prefix_hash,</a>
+<a name="ln93">                              uint32_t* bucket_value) const;</a>
+<a name="ln94"> </a>
+<a name="ln95">  Status InitFromRawData(Slice data);</a>
+<a name="ln96"> </a>
+<a name="ln97">  const char* GetSubIndexBasePtrAndUpperBound(uint32_t offset,</a>
+<a name="ln98">                                              uint32_t* upper_bound) const {</a>
+<a name="ln99">    const char* index_ptr = &amp;sub_index_[offset];</a>
+<a name="ln100">    return GetVarint32Ptr(index_ptr, index_ptr + 4, upper_bound);</a>
+<a name="ln101">  }</a>
+<a name="ln102"> </a>
+<a name="ln103">  uint32_t GetIndexSize() const { return index_size_; }</a>
+<a name="ln104"> </a>
+<a name="ln105">  uint32_t GetSubIndexSize() const { return sub_index_size_; }</a>
+<a name="ln106"> </a>
+<a name="ln107">  uint32_t GetNumPrefixes() const { return num_prefixes_; }</a>
+<a name="ln108"> </a>
+<a name="ln109">  static const uint64_t kMaxFileSize = (1u &lt;&lt; 31) - 1;</a>
+<a name="ln110">  static const uint32_t kSubIndexMask = 0x80000000;</a>
+<a name="ln111">  static const size_t kOffsetLen = sizeof(uint32_t);</a>
+<a name="ln112"> </a>
+<a name="ln113"> private:</a>
+<a name="ln114">  uint32_t index_size_;</a>
+<a name="ln115">  uint32_t sub_index_size_;</a>
+<a name="ln116">  uint32_t num_prefixes_;</a>
+<a name="ln117"> </a>
+<a name="ln118">  uint32_t* index_;</a>
+<a name="ln119">  char* sub_index_;</a>
+<a name="ln120">};</a>
+<a name="ln121"> </a>
+<a name="ln122">// PlainTableIndexBuilder is used to create plain table index.</a>
+<a name="ln123">// After calling Finish(), it returns Slice, which is usually</a>
+<a name="ln124">// used either to initialize PlainTableIndex or</a>
+<a name="ln125">// to save index to sst file.</a>
+<a name="ln126">// For more details about the  index, please refer to:</a>
+<a name="ln127">// https://github.com/facebook/rocksdb/wiki/PlainTable-Format</a>
+<a name="ln128">// #wiki-in-memory-index-format</a>
+<a name="ln129">class PlainTableIndexBuilder {</a>
+<a name="ln130"> public:</a>
+<a name="ln131">  PlainTableIndexBuilder(Arena* arena, const ImmutableCFOptions&amp; ioptions,</a>
+<a name="ln132">                         size_t index_sparseness, double hash_table_ratio,</a>
+<a name="ln133">                         size_t huge_page_tlb_size)</a>
+<a name="ln134">      : arena_(arena),</a>
+<a name="ln135">        ioptions_(ioptions),</a>
+<a name="ln136">        record_list_(kRecordsPerGroup),</a>
+<a name="ln137">        is_first_record_(true),</a>
+<a name="ln138">        due_index_(false),</a>
+<a name="ln139">        num_prefixes_(0),</a>
+<a name="ln140">        num_keys_per_prefix_(0),</a>
+<a name="ln141">        prev_key_prefix_hash_(0),</a>
+<a name="ln142">        index_sparseness_(index_sparseness),</a>
+<a name="ln143">        prefix_extractor_(ioptions.prefix_extractor),</a>
+<a name="ln144">        hash_table_ratio_(hash_table_ratio),</a>
+<a name="ln145">        huge_page_tlb_size_(huge_page_tlb_size) {}</a>
+<a name="ln146"> </a>
+<a name="ln147">  void AddKeyPrefix(Slice key_prefix_slice, uint32_t key_offset);</a>
+<a name="ln148"> </a>
+<a name="ln149">  Slice Finish();</a>
+<a name="ln150"> </a>
+<a name="ln151">  uint32_t GetTotalSize() const {</a>
+<a name="ln152">    return VarintLength(index_size_) + VarintLength(num_prefixes_) +</a>
+<a name="ln153">           PlainTableIndex::kOffsetLen * index_size_ + sub_index_size_;</a>
+<a name="ln154">  }</a>
+<a name="ln155"> </a>
+<a name="ln156">  static const std::string kPlainTableIndexBlock;</a>
+<a name="ln157"> </a>
+<a name="ln158"> private:</a>
+<a name="ln159">  struct IndexRecord {</a>
+<a name="ln160">    uint32_t hash;    // hash of the prefix</a>
+<a name="ln161">    uint32_t offset;  // offset of a row</a>
+<a name="ln162">    IndexRecord* next;</a>
+<a name="ln163">  };</a>
+<a name="ln164"> </a>
+<a name="ln165">  // Helper class to track all the index records</a>
+<a name="ln166">  class IndexRecordList {</a>
+<a name="ln167">   public:</a>
+<a name="ln168">    explicit IndexRecordList(size_t num_records_per_group)</a>
+<a name="ln169">        : kNumRecordsPerGroup(num_records_per_group),</a>
+<a name="ln170">          current_group_(nullptr),</a>
+<a name="ln171">          num_records_in_current_group_(num_records_per_group) {}</a>
+<a name="ln172"> </a>
+<a name="ln173">    ~IndexRecordList() {</a>
+<a name="ln174">      for (size_t i = 0; i &lt; groups_.size(); i++) {</a>
+<a name="ln175">        delete[] groups_[i];</a>
+<a name="ln176">      }</a>
+<a name="ln177">    }</a>
+<a name="ln178"> </a>
+<a name="ln179">    void AddRecord(uint32_t hash, uint32_t offset);</a>
+<a name="ln180"> </a>
+<a name="ln181">    size_t GetNumRecords() const {</a>
+<a name="ln182">      return (groups_.size() - 1) * kNumRecordsPerGroup +</a>
+<a name="ln183">             num_records_in_current_group_;</a>
+<a name="ln184">    }</a>
+<a name="ln185">    IndexRecord* At(size_t index) {</a>
+<a name="ln186">      return &amp;(groups_[index / kNumRecordsPerGroup]</a>
+<a name="ln187">                      [index % kNumRecordsPerGroup]);</a>
+<a name="ln188">    }</a>
+<a name="ln189"> </a>
+<a name="ln190">   private:</a>
+<a name="ln191">    IndexRecord* AllocateNewGroup() {</a>
+<a name="ln192">      IndexRecord* result = new IndexRecord[kNumRecordsPerGroup];</a>
+<a name="ln193">      groups_.push_back(result);</a>
+<a name="ln194">      return result;</a>
+<a name="ln195">    }</a>
+<a name="ln196"> </a>
+<a name="ln197">    // Each group in `groups_` contains fix-sized records (determined by</a>
+<a name="ln198">    // kNumRecordsPerGroup). Which can help us minimize the cost if resizing</a>
+<a name="ln199">    // occurs.</a>
+<a name="ln200">    const size_t kNumRecordsPerGroup;</a>
+<a name="ln201">    IndexRecord* current_group_;</a>
+<a name="ln202">    // List of arrays allocated</a>
+<a name="ln203">    std::vector&lt;IndexRecord*&gt; groups_;</a>
+<a name="ln204">    size_t num_records_in_current_group_;</a>
+<a name="ln205">  };</a>
+<a name="ln206"> </a>
+<a name="ln207">  void AllocateIndex();</a>
+<a name="ln208"> </a>
+<a name="ln209">  // Internal helper function to bucket index record list to hash buckets.</a>
+<a name="ln210">  void BucketizeIndexes(std::vector&lt;IndexRecord*&gt;* hash_to_offsets,</a>
+<a name="ln211">                        std::vector&lt;uint32_t&gt;* entries_per_bucket);</a>
+<a name="ln212"> </a>
+<a name="ln213">  // Internal helper class to fill the indexes and bloom filters to internal</a>
+<a name="ln214">  // data structures.</a>
+<a name="ln215">  Slice FillIndexes(const std::vector&lt;IndexRecord*&gt;&amp; hash_to_offsets,</a>
+<a name="ln216">                    const std::vector&lt;uint32_t&gt;&amp; entries_per_bucket);</a>
+<a name="ln217"> </a>
+<a name="ln218">  Arena* arena_;</a>
+<a name="ln219">  const ImmutableCFOptions ioptions_;</a>
+<a name="ln220">  HistogramImpl keys_per_prefix_hist_;</a>
+<a name="ln221">  IndexRecordList record_list_;</a>
+<a name="ln222">  bool is_first_record_;</a>
+<a name="ln223">  bool due_index_;</a>
+<a name="ln224">  uint32_t num_prefixes_;</a>
+<a name="ln225">  uint32_t num_keys_per_prefix_;</a>
+<a name="ln226"> </a>
+<a name="ln227">  uint32_t prev_key_prefix_hash_;</a>
+<a name="ln228">  size_t index_sparseness_;</a>
+<a name="ln229">  uint32_t index_size_;</a>
+<a name="ln230">  uint32_t sub_index_size_;</a>
+<a name="ln231"> </a>
+<a name="ln232">  const SliceTransform* prefix_extractor_;</a>
+<a name="ln233">  double hash_table_ratio_;</a>
+<a name="ln234">  size_t huge_page_tlb_size_;</a>
+<a name="ln235"> </a>
+<a name="ln236">  std::string prev_key_prefix_;</a>
+<a name="ln237"> </a>
+<a name="ln238">  static const size_t kRecordsPerGroup = 256;</a>
+<a name="ln239">};</a>
+<a name="ln240"> </a>
+<a name="ln241">};  // namespace rocksdb</a>
+<a name="ln242"> </a>
+<a name="ln243">#endif  // ROCKSDB_LITE</a>
+<a name="ln244"> </a>
+<a name="ln245">#endif // YB_ROCKSDB_TABLE_PLAIN_TABLE_INDEX_H</a>
+
+</code></pre>
+<div class="balloon" rel="83"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="131"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: index_size_, sub_index_size_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

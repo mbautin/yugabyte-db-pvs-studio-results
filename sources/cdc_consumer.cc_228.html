@@ -1,0 +1,426 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>cdc_consumer.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &lt;shared_mutex&gt;</a>
+<a name="ln15">#include &lt;chrono&gt;</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &quot;yb/rpc/messenger.h&quot;</a>
+<a name="ln18">#include &quot;yb/rpc/rpc.h&quot;</a>
+<a name="ln19">#include &quot;yb/rpc/secure_stream.h&quot;</a>
+<a name="ln20">#include &quot;yb/tserver/cdc_consumer.h&quot;</a>
+<a name="ln21">#include &quot;yb/tserver/twodc_output_client.h&quot;</a>
+<a name="ln22">#include &quot;yb/tserver/tablet_server.h&quot;</a>
+<a name="ln23">#include &quot;yb/tserver/cdc_poller.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;yb/cdc/cdc_consumer.pb.h&quot;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln30">#include &quot;yb/server/secure.h&quot;</a>
+<a name="ln31">#include &quot;yb/util/shared_lock.h&quot;</a>
+<a name="ln32">#include &quot;yb/util/string_util.h&quot;</a>
+<a name="ln33">#include &quot;yb/util/thread.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">DECLARE_int32(cdc_read_rpc_timeout_ms);</a>
+<a name="ln36">DECLARE_int32(cdc_write_rpc_timeout_ms);</a>
+<a name="ln37">DECLARE_bool(use_node_to_node_encryption);</a>
+<a name="ln38">DECLARE_string(certs_for_cdc_dir);</a>
+<a name="ln39"> </a>
+<a name="ln40">using namespace std::chrono_literals;</a>
+<a name="ln41"> </a>
+<a name="ln42">namespace yb {</a>
+<a name="ln43"> </a>
+<a name="ln44">namespace tserver {</a>
+<a name="ln45">namespace enterprise {</a>
+<a name="ln46"> </a>
+<a name="ln47">CDCClient::~CDCClient() {</a>
+<a name="ln48">  if (messenger) {</a>
+<a name="ln49">    messenger-&gt;Shutdown();</a>
+<a name="ln50">  }</a>
+<a name="ln51">}</a>
+<a name="ln52"> </a>
+<a name="ln53">void CDCClient::Shutdown() {</a>
+<a name="ln54">  client-&gt;Shutdown();</a>
+<a name="ln55">  rpcs-&gt;Shutdown();</a>
+<a name="ln56">}</a>
+<a name="ln57"> </a>
+<a name="ln58">Result&lt;std::unique_ptr&lt;CDCConsumer&gt;&gt; CDCConsumer::Create(</a>
+<a name="ln59">    std::function&lt;bool(const std::string&amp;)&gt; is_leader_for_tablet,</a>
+<a name="ln60">    rpc::ProxyCache* proxy_cache,</a>
+<a name="ln61">    TabletServer* tserver) {</a>
+<a name="ln62">  LOG(INFO) &lt;&lt; &quot;Creating CDC Consumer&quot;;</a>
+<a name="ln63">  auto master_addrs = tserver-&gt;options().GetMasterAddresses();</a>
+<a name="ln64">  std::vector&lt;std::string&gt; hostport_strs;</a>
+<a name="ln65">  hostport_strs.reserve(master_addrs-&gt;size());</a>
+<a name="ln66">  for (const auto&amp; hp : *master_addrs) {</a>
+<a name="ln67">    hostport_strs.push_back(HostPort::ToCommaSeparatedString(hp));</a>
+<a name="ln68">  }</a>
+<a name="ln69"> </a>
+<a name="ln70">  auto local_client = std::make_unique&lt;CDCClient&gt;();</a>
+<a name="ln71">  if (FLAGS_use_node_to_node_encryption) {</a>
+<a name="ln72">    rpc::MessengerBuilder messenger_builder(&quot;cdc-consumer&quot;);</a>
+<a name="ln73"> </a>
+<a name="ln74">    local_client-&gt;secure_context = VERIFY_RESULT(server::SetupSecureContext(</a>
+<a name="ln75">        &quot;&quot;, &quot;&quot;, server::SecureContextType::kServerToServer, &amp;messenger_builder));</a>
+<a name="ln76"> </a>
+<a name="ln77">    local_client-&gt;messenger = VERIFY_RESULT(messenger_builder.Build());</a>
+<a name="ln78">  }</a>
+<a name="ln79"> </a>
+<a name="ln80">  local_client-&gt;client = VERIFY_RESULT(client::YBClientBuilder()</a>
+<a name="ln81">      .master_server_addrs(hostport_strs)</a>
+<a name="ln82">      .set_client_name(&quot;CDCConsumerLocal&quot;)</a>
+<a name="ln83">      .default_rpc_timeout(MonoDelta::FromMilliseconds(FLAGS_cdc_write_rpc_timeout_ms))</a>
+<a name="ln84">      .Build(local_client-&gt;messenger.get()));</a>
+<a name="ln85"> </a>
+<a name="ln86">  local_client-&gt;client-&gt;SetLocalTabletServer(tserver-&gt;permanent_uuid(), tserver-&gt;proxy(), tserver);</a>
+<a name="ln87">  auto cdc_consumer = std::make_unique&lt;CDCConsumer&gt;(std::move(is_leader_for_tablet), proxy_cache,</a>
+<a name="ln88">      tserver-&gt;permanent_uuid(), std::move(local_client));</a>
+<a name="ln89"> </a>
+<a name="ln90">  // TODO(NIC): Unify cdc_consumer thread_pool &amp; remote_client_ threadpools</a>
+<a name="ln91">  RETURN_NOT_OK(yb::Thread::Create(</a>
+<a name="ln92">      &quot;CDCConsumer&quot;, &quot;Poll&quot;, &amp;CDCConsumer::RunThread, cdc_consumer.get(),</a>
+<a name="ln93">      &amp;cdc_consumer-&gt;run_trigger_poll_thread_));</a>
+<a name="ln94">  RETURN_NOT_OK(ThreadPoolBuilder(&quot;CDCConsumerHandler&quot;).Build(&amp;cdc_consumer-&gt;thread_pool_));</a>
+<a name="ln95">  return cdc_consumer;</a>
+<a name="ln96">}</a>
+<a name="ln97"> </a>
+<a name="ln98">CDCConsumer::CDCConsumer(std::function&lt;bool(const std::string&amp;)&gt; is_leader_for_tablet,</a>
+<a name="ln99">                         rpc::ProxyCache* proxy_cache,</a>
+<a name="ln100">                         const string&amp; ts_uuid,</a>
+<a name="ln101">                         std::unique_ptr&lt;CDCClient&gt; local_client) :</a>
+<a name="ln102">  is_leader_for_tablet_(std::move(is_leader_for_tablet)),</a>
+<a name="ln103">  log_prefix_(Format(&quot;[TS $0]: &quot;, ts_uuid)),</a>
+<a name="ln104">  local_client_(std::move(local_client)) {}</a>
+<a name="ln105"> </a>
+<a name="ln106">CDCConsumer::~CDCConsumer() {</a>
+<a name="ln107">  Shutdown();</a>
+<a name="ln108">}</a>
+<a name="ln109"> </a>
+<a name="ln110">void CDCConsumer::Shutdown() {</a>
+<a name="ln111">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Shutting down CDC Consumer&quot;;</a>
+<a name="ln112">  {</a>
+<a name="ln113">    std::lock_guard&lt;std::mutex&gt; l(should_run_mutex_);</a>
+<a name="ln114">    should_run_ = false;</a>
+<a name="ln115">  }</a>
+<a name="ln116">  cond_.notify_all();</a>
+<a name="ln117"> </a>
+<a name="ln118">  {</a>
+<a name="ln119">    std::lock_guard&lt;rw_spinlock&gt; write_lock(master_data_mutex_);</a>
+<a name="ln120">    producer_consumer_tablet_map_from_master_.clear();</a>
+<a name="ln121">    uuid_master_addrs_.clear();</a>
+<a name="ln122">    {</a>
+<a name="ln123">      SharedLock&lt;rw_spinlock&gt; read_lock(producer_pollers_map_mutex_);</a>
+<a name="ln124">      for (auto &amp;uuid_and_client : remote_clients_) {</a>
+<a name="ln125">        uuid_and_client.second-&gt;Shutdown();</a>
+<a name="ln126">      }</a>
+<a name="ln127">    }</a>
+<a name="ln128">    local_client_-&gt;client-&gt;Shutdown();</a>
+<a name="ln129">  }</a>
+<a name="ln130"> </a>
+<a name="ln131">  if (run_trigger_poll_thread_) {</a>
+<a name="ln132">    WARN_NOT_OK(ThreadJoiner(run_trigger_poll_thread_.get()).Join(), &quot;Could not join thread&quot;);</a>
+<a name="ln133">  }</a>
+<a name="ln134"> </a>
+<a name="ln135">  if (thread_pool_) {</a>
+<a name="ln136">    thread_pool_-&gt;Shutdown();</a>
+<a name="ln137">  }</a>
+<a name="ln138">}</a>
+<a name="ln139"> </a>
+<a name="ln140">void CDCConsumer::RunThread() {</a>
+<a name="ln141">  while (true) {</a>
+<a name="ln142">    std::unique_lock&lt;std::mutex&gt; l(should_run_mutex_);</a>
+<a name="ln143">    if (!should_run_) {</a>
+<a name="ln144">      return;</a>
+<a name="ln145">    }</a>
+<a name="ln146">    cond_.wait_for(l, 1000ms);</a>
+<a name="ln147">    if (!should_run_) {</a>
+<a name="ln148">      return;</a>
+<a name="ln149">    }</a>
+<a name="ln150">    TriggerPollForNewTablets();</a>
+<a name="ln151">  }</a>
+<a name="ln152">}</a>
+<a name="ln153"> </a>
+<a name="ln154">void CDCConsumer::RefreshWithNewRegistryFromMaster(const cdc::ConsumerRegistryPB* consumer_registry,</a>
+<a name="ln155">                                                   int32_t cluster_config_version) {</a>
+<a name="ln156">  UpdateInMemoryState(consumer_registry, cluster_config_version);</a>
+<a name="ln157">  cond_.notify_all();</a>
+<a name="ln158">}</a>
+<a name="ln159"> </a>
+<a name="ln160">std::vector&lt;std::string&gt; CDCConsumer::TEST_producer_tablets_running() {</a>
+<a name="ln161">  SharedLock&lt;rw_spinlock&gt; read_lock(producer_pollers_map_mutex_);</a>
+<a name="ln162"> </a>
+<a name="ln163">  std::vector&lt;string&gt; tablets;</a>
+<a name="ln164">  for (const auto&amp; producer : producer_pollers_map_) {</a>
+<a name="ln165">    tablets.push_back(producer.first.tablet_id);</a>
+<a name="ln166">  }</a>
+<a name="ln167">  return tablets;</a>
+<a name="ln168">}</a>
+<a name="ln169"> </a>
+<a name="ln170">// NOTE: This happens on TS.heartbeat, so it needs to finish quickly</a>
+<a name="ln171">void CDCConsumer::UpdateInMemoryState(const cdc::ConsumerRegistryPB* consumer_registry,</a>
+<a name="ln172">    int32_t cluster_config_version) {</a>
+<a name="ln173">  std::lock_guard&lt;rw_spinlock&gt; write_lock_master(master_data_mutex_);</a>
+<a name="ln174"> </a>
+<a name="ln175">  // Only update it if the version is newer.</a>
+<a name="ln176">  if (cluster_config_version &lt;= cluster_config_version_.load(std::memory_order_acquire)) {</a>
+<a name="ln177">    return;</a>
+<a name="ln178">  }</a>
+<a name="ln179"> </a>
+<a name="ln180">  cluster_config_version_.store(cluster_config_version, std::memory_order_release);</a>
+<a name="ln181">  producer_consumer_tablet_map_from_master_.clear();</a>
+<a name="ln182">  decltype(uuid_master_addrs_) old_uuid_master_addrs;</a>
+<a name="ln183">  uuid_master_addrs_.swap(old_uuid_master_addrs);</a>
+<a name="ln184"> </a>
+<a name="ln185">  if (!consumer_registry) {</a>
+<a name="ln186">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Given empty CDC consumer registry: removing Pollers&quot;;</a>
+<a name="ln187">    cond_.notify_all();</a>
+<a name="ln188">    return;</a>
+<a name="ln189">  }</a>
+<a name="ln190"> </a>
+<a name="ln191">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Updating CDC consumer registry: &quot; &lt;&lt; consumer_registry-&gt;DebugString();</a>
+<a name="ln192"> </a>
+<a name="ln193">  for (const auto&amp; producer_map : DCHECK_NOTNULL(consumer_registry)-&gt;producer_map()) {</a>
+<a name="ln194">    const auto&amp; producer_entry_pb = producer_map.second;</a>
+<a name="ln195">    if (producer_entry_pb.disable_stream()) {</a>
+<a name="ln196">      continue;</a>
+<a name="ln197">    }</a>
+<a name="ln198">    // recreate the UUID connection information</a>
+<a name="ln199">    if (!ContainsKey(uuid_master_addrs_, producer_map.first)) {</a>
+<a name="ln200">      std::vector&lt;HostPort&gt; hp;</a>
+<a name="ln201">      HostPortsFromPBs(producer_map.second.master_addrs(), &amp;hp);</a>
+<a name="ln202">      uuid_master_addrs_[producer_map.first] = HostPort::ToCommaSeparatedString(hp);</a>
+<a name="ln203"> </a>
+<a name="ln204">      // If master addresses changed, mark for YBClient update.</a>
+<a name="ln205">      if (ContainsKey(old_uuid_master_addrs, producer_map.first) &amp;&amp;</a>
+<a name="ln206">          uuid_master_addrs_[producer_map.first] != old_uuid_master_addrs[producer_map.first]) {</a>
+<a name="ln207">        changed_master_addrs_.insert(producer_map.first);</a>
+<a name="ln208">      }</a>
+<a name="ln209">    }</a>
+<a name="ln210">    // recreate the set of CDCPollers</a>
+<a name="ln211">    for (const auto&amp; stream_entry : producer_entry_pb.stream_map()) {</a>
+<a name="ln212">      const auto&amp; stream_entry_pb = stream_entry.second;</a>
+<a name="ln213">      if (stream_entry_pb.same_num_producer_consumer_tablets()) {</a>
+<a name="ln214">        LOG_WITH_PREFIX(INFO) &lt;&lt; Format(&quot;Stream $0 will use local tserver optimization&quot;,</a>
+<a name="ln215">                                        stream_entry.first);</a>
+<a name="ln216">        streams_with_same_num_producer_consumer_tablets_.insert(stream_entry.first);</a>
+<a name="ln217">      }</a>
+<a name="ln218">      for (const auto&amp; tablet_entry : stream_entry_pb.consumer_producer_tablet_map()) {</a>
+<a name="ln219">        const auto&amp; consumer_tablet_id = tablet_entry.first;</a>
+<a name="ln220">        for (const auto&amp; producer_tablet_id : tablet_entry.second.tablets()) {</a>
+<a name="ln221">          cdc::ProducerTabletInfo producer_tablet_info(</a>
+<a name="ln222">              {producer_map.first, stream_entry.first, producer_tablet_id});</a>
+<a name="ln223">          cdc::ConsumerTabletInfo consumer_tablet_info(</a>
+<a name="ln224">              {consumer_tablet_id, stream_entry_pb.consumer_table_id()});</a>
+<a name="ln225">          producer_consumer_tablet_map_from_master_[producer_tablet_info] = consumer_tablet_info;</a>
+<a name="ln226">        }</a>
+<a name="ln227">      }</a>
+<a name="ln228">    }</a>
+<a name="ln229">  }</a>
+<a name="ln230">  cond_.notify_all();</a>
+<a name="ln231">}</a>
+<a name="ln232"> </a>
+<a name="ln233">void CDCConsumer::TriggerPollForNewTablets() {</a>
+<a name="ln234">  std::lock_guard&lt;rw_spinlock&gt; write_lock_master(master_data_mutex_);</a>
+<a name="ln235"> </a>
+<a name="ln236">  for (const auto&amp; entry : producer_consumer_tablet_map_from_master_) {</a>
+<a name="ln237">    auto uuid = entry.first.universe_uuid;</a>
+<a name="ln238">    bool start_polling;</a>
+<a name="ln239">    {</a>
+<a name="ln240">      SharedLock&lt;rw_spinlock&gt; read_lock_pollers(producer_pollers_map_mutex_);</a>
+<a name="ln241">      start_polling = producer_pollers_map_.find(entry.first) == producer_pollers_map_.end() &amp;&amp;</a>
+<a name="ln242">                      is_leader_for_tablet_(entry.second.tablet_id);</a>
+<a name="ln243"> </a>
+<a name="ln244">      // Update the Master Addresses, if altered after setup.</a>
+<a name="ln245">      if (ContainsKey(remote_clients_, uuid) &amp;&amp; changed_master_addrs_.count(uuid) &gt; 0) {</a>
+<a name="ln246">        auto status = remote_clients_[uuid]-&gt;client-&gt;SetMasterAddresses(uuid_master_addrs_[uuid]);</a>
+<a name="ln247">        if (status.ok()) {</a>
+<a name="ln248">          changed_master_addrs_.erase(uuid);</a>
+<a name="ln249">        } else {</a>
+<a name="ln250">          LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Problem Setting Master Addresses for &quot; &lt;&lt; uuid</a>
+<a name="ln251">                                   &lt;&lt; &quot;: &quot; &lt;&lt; status.ToString();</a>
+<a name="ln252">        }</a>
+<a name="ln253">      }</a>
+<a name="ln254">    }</a>
+<a name="ln255">    if (start_polling) {</a>
+<a name="ln256">      std::lock_guard &lt;rw_spinlock&gt; write_lock_pollers(producer_pollers_map_mutex_);</a>
+<a name="ln257"> </a>
+<a name="ln258">      // Check again, since we unlocked.</a>
+<a name="ln259">      start_polling = producer_pollers_map_.find(entry.first) == producer_pollers_map_.end() &amp;&amp;</a>
+<a name="ln260">          is_leader_for_tablet_(entry.second.tablet_id);</a>
+<a name="ln261">      if (start_polling) {</a>
+<a name="ln262">        // This is a new tablet, trigger a poll.</a>
+<a name="ln263">        // See if we need to create a new client connection</a>
+<a name="ln264">        if (!ContainsKey(remote_clients_, uuid)) {</a>
+<a name="ln265">          CHECK(ContainsKey(uuid_master_addrs_, uuid));</a>
+<a name="ln266"> </a>
+<a name="ln267">          auto remote_client = std::make_unique&lt;CDCClient&gt;();</a>
+<a name="ln268">          std::string dir;</a>
+<a name="ln269">          if (FLAGS_use_node_to_node_encryption) {</a>
+<a name="ln270">            rpc::MessengerBuilder messenger_builder(&quot;cdc-consumer&quot;);</a>
+<a name="ln271">            if (!FLAGS_certs_for_cdc_dir.empty()) {</a>
+<a name="ln272">              dir = JoinPathSegments(FLAGS_certs_for_cdc_dir, uuid);</a>
+<a name="ln273">            }</a>
+<a name="ln274"> </a>
+<a name="ln275">            auto secure_context_result = server::SetupSecureContext(</a>
+<a name="ln276">                dir, &quot;&quot;, &quot;&quot;, server::SecureContextType::kServerToServer, &amp;messenger_builder);</a>
+<a name="ln277">            if (!secure_context_result.ok()) {</a>
+<a name="ln278">              LOG(WARNING) &lt;&lt; &quot;Could not create secure context for &quot; &lt;&lt; uuid</a>
+<a name="ln279">                         &lt;&lt; &quot;: &quot; &lt;&lt; secure_context_result.status().ToString();</a>
+<a name="ln280">              return; // Don't finish creation.  Try again on the next heartbeat.</a>
+<a name="ln281">            }</a>
+<a name="ln282">            remote_client-&gt;secure_context = std::move(*secure_context_result);</a>
+<a name="ln283"> </a>
+<a name="ln284">            auto messenger_result = messenger_builder.Build();</a>
+<a name="ln285">            if (!messenger_result.ok()) {</a>
+<a name="ln286">              LOG(WARNING) &lt;&lt; &quot;Could not build messenger for &quot; &lt;&lt; uuid</a>
+<a name="ln287">                         &lt;&lt; &quot;: &quot; &lt;&lt; secure_context_result.status().ToString();</a>
+<a name="ln288">              return; // Don't finish creation.  Try again on the next heartbeat.</a>
+<a name="ln289">            }</a>
+<a name="ln290">            remote_client-&gt;messenger = std::move(*messenger_result);</a>
+<a name="ln291">          }</a>
+<a name="ln292"> </a>
+<a name="ln293">          auto client_result = yb::client::YBClientBuilder()</a>
+<a name="ln294">              .set_client_name(&quot;CDCConsumerRemote&quot;)</a>
+<a name="ln295">              .add_master_server_addr(uuid_master_addrs_[uuid])</a>
+<a name="ln296">              .skip_master_flagfile()</a>
+<a name="ln297">              .default_rpc_timeout(MonoDelta::FromMilliseconds(FLAGS_cdc_read_rpc_timeout_ms))</a>
+<a name="ln298">              .Build(remote_client-&gt;messenger.get());</a>
+<a name="ln299">          if (!client_result.ok()) {</a>
+<a name="ln300">            LOG(WARNING) &lt;&lt; &quot;Could not create a new YBClient for &quot; &lt;&lt; uuid</a>
+<a name="ln301">                         &lt;&lt; &quot;: &quot; &lt;&lt; client_result.status().ToString();</a>
+<a name="ln302">            return; // Don't finish creation.  Try again on the next heartbeat.</a>
+<a name="ln303">          }</a>
+<a name="ln304"> </a>
+<a name="ln305">          remote_client-&gt;client = CHECK_RESULT(client_result);</a>
+<a name="ln306">          remote_clients_[uuid] = std::move(remote_client);</a>
+<a name="ln307">        }</a>
+<a name="ln308"> </a>
+<a name="ln309">        // now create the poller</a>
+<a name="ln310">        bool use_local_tserver =</a>
+<a name="ln311">            streams_with_same_num_producer_consumer_tablets_.find(entry.first.stream_id) !=</a>
+<a name="ln312">            streams_with_same_num_producer_consumer_tablets_.end();</a>
+<a name="ln313">        auto cdc_poller = std::make_shared&lt;CDCPoller&gt;(</a>
+<a name="ln314">            entry.first, entry.second,</a>
+<a name="ln315">            std::bind(&amp;CDCConsumer::ShouldContinuePolling, this, entry.first),</a>
+<a name="ln316">            std::bind(&amp;CDCConsumer::RemoveFromPollersMap, this, entry.first),</a>
+<a name="ln317">            thread_pool_.get(),</a>
+<a name="ln318">            local_client_,</a>
+<a name="ln319">            remote_clients_[uuid],</a>
+<a name="ln320">            this,</a>
+<a name="ln321">            use_local_tserver);</a>
+<a name="ln322">        LOG_WITH_PREFIX(INFO) &lt;&lt; Format(&quot;Start polling for producer tablet $0&quot;,</a>
+<a name="ln323">            entry.first.tablet_id);</a>
+<a name="ln324">        producer_pollers_map_[entry.first] = cdc_poller;</a>
+<a name="ln325">        cdc_poller-&gt;Poll();</a>
+<a name="ln326">      }</a>
+<a name="ln327">    }</a>
+<a name="ln328">  }</a>
+<a name="ln329">}</a>
+<a name="ln330"> </a>
+<a name="ln331">void CDCConsumer::RemoveFromPollersMap(const cdc::ProducerTabletInfo producer_tablet_info) {</a>
+<a name="ln332">  LOG_WITH_PREFIX(INFO) &lt;&lt; Format(&quot;Stop polling for producer tablet $0&quot;,</a>
+<a name="ln333">                                  producer_tablet_info.tablet_id);</a>
+<a name="ln334">  std::shared_ptr&lt;CDCClient&gt; client_to_delete; // decrement refcount to 0 outside lock</a>
+<a name="ln335">  {</a>
+<a name="ln336">    SharedLock&lt;rw_spinlock&gt; read_lock_master(master_data_mutex_);</a>
+<a name="ln337">    std::lock_guard&lt;rw_spinlock&gt; write_lock_pollers(producer_pollers_map_mutex_);</a>
+<a name="ln338">    producer_pollers_map_.erase(producer_tablet_info);</a>
+<a name="ln339">    // Check if no more objects with this UUID exist after registry refresh.</a>
+<a name="ln340">    if (!ContainsKey(uuid_master_addrs_, producer_tablet_info.universe_uuid)) {</a>
+<a name="ln341">      auto it = remote_clients_.find(producer_tablet_info.universe_uuid);</a>
+<a name="ln342">      if (it != remote_clients_.end()) {</a>
+<a name="ln343">        client_to_delete = it-&gt;second;</a>
+<a name="ln344">        remote_clients_.erase(it);</a>
+<a name="ln345">      }</a>
+<a name="ln346">    }</a>
+<a name="ln347">  }</a>
+<a name="ln348">  if (client_to_delete != nullptr) {</a>
+<a name="ln349">    client_to_delete-&gt;Shutdown();</a>
+<a name="ln350">  }</a>
+<a name="ln351">}</a>
+<a name="ln352"> </a>
+<a name="ln353">bool CDCConsumer::ShouldContinuePolling(const cdc::ProducerTabletInfo producer_tablet_info) {</a>
+<a name="ln354">  std::lock_guard&lt;std::mutex&gt; l(should_run_mutex_);</a>
+<a name="ln355">  if (!should_run_) {</a>
+<a name="ln356">    return false;</a>
+<a name="ln357">  }</a>
+<a name="ln358"> </a>
+<a name="ln359">  SharedLock&lt;rw_spinlock&gt; read_lock_master(master_data_mutex_);</a>
+<a name="ln360"> </a>
+<a name="ln361">  const auto&amp; it = producer_consumer_tablet_map_from_master_.find(producer_tablet_info);</a>
+<a name="ln362">  if (it == producer_consumer_tablet_map_from_master_.end()) {</a>
+<a name="ln363">    // We no longer care about this tablet, abort the cycle.</a>
+<a name="ln364">    return false;</a>
+<a name="ln365">  }</a>
+<a name="ln366">  return is_leader_for_tablet_(it-&gt;second.tablet_id);</a>
+<a name="ln367">}</a>
+<a name="ln368"> </a>
+<a name="ln369">std::string CDCConsumer::LogPrefix() {</a>
+<a name="ln370">  return log_prefix_;</a>
+<a name="ln371">}</a>
+<a name="ln372"> </a>
+<a name="ln373">int32_t CDCConsumer::cluster_config_version() const {</a>
+<a name="ln374">  return cluster_config_version_.load(std::memory_order_acquire);</a>
+<a name="ln375">}</a>
+<a name="ln376"> </a>
+<a name="ln377">} // namespace enterprise</a>
+<a name="ln378">} // namespace tserver</a>
+<a name="ln379">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="265"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="305"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

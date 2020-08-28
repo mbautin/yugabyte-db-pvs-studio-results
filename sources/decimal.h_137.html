@@ -1,0 +1,287 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>decimal.h</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#ifndef YB_UTIL_DECIMAL_H</a>
+<a name="ln15">#define YB_UTIL_DECIMAL_H</a>
+<a name="ln16"> </a>
+<a name="ln17">#include &lt;vector&gt;</a>
+<a name="ln18">#include &lt;limits&gt;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/util/result.h&quot;</a>
+<a name="ln21">#include &quot;yb/util/slice.h&quot;</a>
+<a name="ln22">#include &quot;yb/util/varint.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">namespace yb {</a>
+<a name="ln25">namespace util {</a>
+<a name="ln26"> </a>
+<a name="ln27">// The Decimal class can represent decimal numbers (including fractions) of arbitrary length.</a>
+<a name="ln28">//</a>
+<a name="ln29">// The API</a>
+<a name="ln30">// -------</a>
+<a name="ln31">// Typically Decimals should be used for parsing from String or Double, convert to String or Double,</a>
+<a name="ln32">// Serialize or Deserialize. The default constructor (With digit arrays, exponent, sign need not</a>
+<a name="ln33">// be used). It is not necessary to keep a decimal object in memory for long time. The encoded</a>
+<a name="ln34">// string should serve the same purpose, and it is easy to get the decimal from serialized string.</a>
+<a name="ln35">//</a>
+<a name="ln36">// The Serialization format specifications</a>
+<a name="ln37">// -------</a>
+<a name="ln38">// Both serialization formats are unique from a given decimal.</a>
+<a name="ln39">// 1) Comparable Serialization:</a>
+<a name="ln40">//  This is used by our storage layer. The lexicographical byte comparison of this encoding is the</a>
+<a name="ln41">//  same as numerical comparison of numbers. Also it is possible to find the end of the encoding</a>
+<a name="ln42">//  by looking at it. So Decode(slice) gives back the length of the encoding.</a>
+<a name="ln43">//</a>
+<a name="ln44">// 2) BigDecimal Serialization:</a>
+<a name="ln45">//  This gives a serialization to Cassandra's way to serializing Java BigDecimal. The scale</a>
+<a name="ln46">//  component is coded with 4 byte two's complement representation. Then it is followed by a byte</a>
+<a name="ln47">//  array for the corresponding BigInt's serialization.</a>
+<a name="ln48">//  See:</a>
+<a name="ln49">//    https://github.com/apache/cassandra/blob/trunk/doc/native_protocol_v4.spec</a>
+<a name="ln50">//    https://github.com/apache/cassandra/blob/81f6c784ce967fadb6ed7f58de1328e713eaf53c/</a>
+<a name="ln51">//    src/java/org/apache/cassandra/serializers/DecimalSerializer.java</a>
+<a name="ln52">//  Note that the byte buffer for Java BigInt doesn't have a size prefix or something similar. So</a>
+<a name="ln53">//  the length is not known. The Decode(slice) function expects the whole slice to encode the</a>
+<a name="ln54">//  decimal.</a>
+<a name="ln55">//</a>
+<a name="ln56">//  The internal representation in the Decimal class</a>
+<a name="ln57">//  -------</a>
+<a name="ln58">//  A decimal contains a sign bit (bool is_positive_), the exponent part (VarInt exponent_), and</a>
+<a name="ln59">//  a digit (0-9) array (vector&lt;int8_t&gt; digits_). The corresponding number is</a>
+<a name="ln60">//        +- 10^exp// 0.d1d2...dk .</a>
+<a name="ln61">//  A representation is called canonical if and only if d1 != 0 and dk != 0. (If number is zero,</a>
+<a name="ln62">//  then sign must be positive, and digit array empty). Note that every number can have only one</a>
+<a name="ln63">//  canonical representation.</a>
+<a name="ln64">//  Examples: 23.4 = ( is_positive_ = true, exponent_ = 2, digits_ = {2, 3, 4} )</a>
+<a name="ln65">//          -0.0004372 is ( is_positive = false, exponent = -3, digits_ = {4, 3, 7, 2} )</a>
+<a name="ln66">//          2378000 is ( is_positive = true, exponent = 7, digits_ = {2, 3, 7, 8} ).</a>
+<a name="ln67">//  We ensure the state is always canonical, enforced by the make_canonical() function, after</a>
+<a name="ln68">//  converting from String, double, constructor, or decode() the resulting representation must be</a>
+<a name="ln69">//  canonical.</a>
+<a name="ln70">//</a>
+<a name="ln71">//  Converting to string</a>
+<a name="ln72">//  -------</a>
+<a name="ln73">//  There are two ways to convert to string,</a>
+<a name="ln74">//    - PointString Format      (-0.0004372 or 2378000)</a>
+<a name="ln75">//    - Scientific Notation     (-4.372e-4 or 2.378e+6)</a>
+<a name="ln76">//  We have implemented both. Note that the pointstring format is infeasible if the exponent is too</a>
+<a name="ln77">//  large or too small, so scientific notation is used.</a>
+<a name="ln78">//    - The default ToString() function uses PointString format if the output has 10 bytes or less</a>
+<a name="ln79">//    and Scientific notation otherwise (this is a constant defined as kDefaultMaxLength).</a>
+<a name="ln80"> </a>
+<a name="ln81">class Decimal {</a>
+<a name="ln82"> public:</a>
+<a name="ln83">  static constexpr int kDefaultMaxLength = 20; // Enough for MIN_BIGINT=-9223372036854775808.</a>
+<a name="ln84">  static constexpr int kUnlimitedMaxLength = std::numeric_limits&lt;int&gt;::max();</a>
+<a name="ln85"> </a>
+<a name="ln86">  Decimal() {}</a>
+<a name="ln87">  Decimal(const std::vector&lt;uint8_t&gt;&amp; digits,</a>
+<a name="ln88">          const VarInt&amp; exponent = VarInt(0),</a>
+<a name="ln89">          bool is_positive = true)</a>
+<a name="ln90">      : digits_(digits), exponent_(exponent), is_positive_(is_positive) { make_canonical(); }</a>
+<a name="ln91">  Decimal(const Decimal&amp; other) : Decimal(other.digits_, other.exponent_, other.is_positive_) {}</a>
+<a name="ln92"> </a>
+<a name="ln93">  // Ensure the type conversion is possible if you use these constructors. Use FromX() otherwise.</a>
+<a name="ln94">  explicit Decimal(const std::string&amp; string_val) { CHECK_OK(FromString(string_val)); }</a>
+<a name="ln95">  explicit Decimal(double double_val) { CHECK_OK(FromDouble(double_val)); }</a>
+<a name="ln96">  explicit Decimal(const VarInt&amp; varint_val) { CHECK_OK(FromVarInt(varint_val)); }</a>
+<a name="ln97"> </a>
+<a name="ln98">  void clear();</a>
+<a name="ln99"> </a>
+<a name="ln100">  std::string ToDebugString() const;</a>
+<a name="ln101">  CHECKED_STATUS ToPointString(std::string* string_val, int max_length = kDefaultMaxLength) const;</a>
+<a name="ln102">  std::string ToScientificString() const;</a>
+<a name="ln103">  std::string ToString() const;</a>
+<a name="ln104">  // Note: We are using decimal -&gt; string -&gt; double using std::stod() function.</a>
+<a name="ln105">  // In future, it may be better to write a direct conversion function.</a>
+<a name="ln106">  Result&lt;long double&gt; ToDouble() const;</a>
+<a name="ln107"> </a>
+<a name="ln108">  Result&lt;VarInt&gt; ToVarInt() const;</a>
+<a name="ln109"> </a>
+<a name="ln110">  // The FromX() functions always create a canonical Decimal,</a>
+<a name="ln111">  // but the (digits, varint, sign) constructor doesn't.</a>
+<a name="ln112"> </a>
+<a name="ln113">  // The input is expected to be of the form [+-]?[0-9]*('.'[0-9]*)?([eE][+-]?[0-9]+)?,</a>
+<a name="ln114">  // whitespace is not allowed. Use this after removing whitespace.</a>
+<a name="ln115">  CHECKED_STATUS FromString(const Slice &amp;slice);</a>
+<a name="ln116"> </a>
+<a name="ln117">  // Note: We are using double -&gt; string -&gt; decimal using std::to_string() function.</a>
+<a name="ln118">  // In future, it may be better to write a direct conversion function.</a>
+<a name="ln119">  CHECKED_STATUS FromDouble(double double_val);</a>
+<a name="ln120">  CHECKED_STATUS FromVarInt(const VarInt&amp; varint_val);</a>
+<a name="ln121"> </a>
+<a name="ln122">  // Checks if this is a whole number. Assumes canonical.</a>
+<a name="ln123">  bool is_integer() const;</a>
+<a name="ln124"> </a>
+<a name="ln125">  // &lt;0, =0, &gt;0 if this &lt;,=,&gt; other numerically. Assumes canonical.</a>
+<a name="ln126">  int CompareTo(const Decimal&amp; other) const;</a>
+<a name="ln127"> </a>
+<a name="ln128">  bool operator==(const Decimal&amp; other) const { return CompareTo(other) == 0; }</a>
+<a name="ln129">  bool operator!=(const Decimal&amp; other) const { return CompareTo(other) != 0; }</a>
+<a name="ln130">  bool operator&lt;(const Decimal&amp; other) const { return CompareTo(other) &lt; 0; }</a>
+<a name="ln131">  bool operator&lt;=(const Decimal&amp; other) const { return CompareTo(other) &lt;= 0; }</a>
+<a name="ln132">  bool operator&gt;(const Decimal&amp; other) const { return CompareTo(other) &gt; 0; }</a>
+<a name="ln133">  bool operator&gt;=(const Decimal&amp; other) const { return CompareTo(other) &gt;= 0; }</a>
+<a name="ln134">  Decimal operator-() const { return Decimal(digits_, exponent_, !is_positive_); }</a>
+<a name="ln135">  Decimal operator+() const { return Decimal(digits_, exponent_, is_positive_); }</a>
+<a name="ln136">  Decimal operator+(const Decimal&amp; other) const;</a>
+<a name="ln137"> </a>
+<a name="ln138">  // Encodes the decimal by using comparable encoding, as described above.</a>
+<a name="ln139">  std::string EncodeToComparable() const;</a>
+<a name="ln140"> </a>
+<a name="ln141">  // Decodes a Decimal from a given Slice. Sets num_decoded_bytes = number of bytes decoded.</a>
+<a name="ln142">  CHECKED_STATUS DecodeFromComparable(const Slice&amp; slice, size_t *num_decoded_bytes);</a>
+<a name="ln143">  CHECKED_STATUS DecodeFromComparable(const std::string&amp; string, size_t* num_decoded_bytes) {</a>
+<a name="ln144">    return DecodeFromComparable(Slice(string), num_decoded_bytes);</a>
+<a name="ln145">  }</a>
+<a name="ln146"> </a>
+<a name="ln147">  CHECKED_STATUS DecodeFromComparable(const Slice&amp; string);</a>
+<a name="ln148">  CHECKED_STATUS DecodeFromComparable(const std::string&amp; string);</a>
+<a name="ln149"> </a>
+<a name="ln150">  // Encode the decimal by using to Cassandra serialization format, as described above.</a>
+<a name="ln151">  std::string EncodeToSerializedBigDecimal(bool* is_out_of_range) const;</a>
+<a name="ln152"> </a>
+<a name="ln153">  CHECKED_STATUS DecodeFromSerializedBigDecimal(Slice slice);</a>
+<a name="ln154"> </a>
+<a name="ln155">  const Decimal&amp; Negate() { is_positive_ = !is_positive_; return *this; }</a>
+<a name="ln156"> </a>
+<a name="ln157"> private:</a>
+<a name="ln158">  friend class DecimalTest;</a>
+<a name="ln159"> </a>
+<a name="ln160">  // Checks the representation by components, For testing purposes. For Decimal, == is the same as</a>
+<a name="ln161">  // IsIdenticalTo, because we guarantee canonical-ness at all times, but the checking method is</a>
+<a name="ln162">  // different.</a>
+<a name="ln163">  bool IsIdenticalTo(const Decimal &amp;other) const;</a>
+<a name="ln164"> </a>
+<a name="ln165">  bool is_canonical() const;</a>
+<a name="ln166">  void make_canonical();</a>
+<a name="ln167"> </a>
+<a name="ln168">  std::vector&lt;uint8_t&gt; digits_;</a>
+<a name="ln169">  VarInt exponent_;</a>
+<a name="ln170">  bool is_positive_;</a>
+<a name="ln171">};</a>
+<a name="ln172"> </a>
+<a name="ln173">Decimal DecimalFromComparable(const Slice&amp; slice);</a>
+<a name="ln174">Decimal DecimalFromComparable(const std::string&amp; string);</a>
+<a name="ln175"> </a>
+<a name="ln176">std::ostream&amp; operator&lt;&lt;(ostream&amp; os, const Decimal&amp; d);</a>
+<a name="ln177"> </a>
+<a name="ln178">template &lt;typename T&gt;</a>
+<a name="ln179">inline T BitMask(int32_t a, int32_t b) {</a>
+<a name="ln180">  T r = 0l;</a>
+<a name="ln181">  for (int i = a; i &lt; b; i++) {</a>
+<a name="ln182">    r |= (1l &lt;&lt; i);</a>
+<a name="ln183">  }</a>
+<a name="ln184">  return r;</a>
+<a name="ln185">}</a>
+<a name="ln186"> </a>
+<a name="ln187">inline int GetFloatFraction(float f) {</a>
+<a name="ln188">  return BitMask&lt;int32_t&gt;(0, 23) &amp; *(reinterpret_cast&lt;int32_t *&gt;(&amp;f));</a>
+<a name="ln189">}</a>
+<a name="ln190"> </a>
+<a name="ln191">inline int GetFloatExp(float f) {</a>
+<a name="ln192">  return (BitMask&lt;int32_t&gt;(23, 31) &amp; (*(reinterpret_cast&lt;int32_t *&gt;(&amp;f)))) &gt;&gt; 23;</a>
+<a name="ln193">}</a>
+<a name="ln194"> </a>
+<a name="ln195">inline int64_t GetDoubleFraction(double d) {</a>
+<a name="ln196">  return BitMask&lt;int64_t&gt;(0, 52) &amp; *(reinterpret_cast&lt;int64_t *&gt;(&amp;d));</a>
+<a name="ln197">}</a>
+<a name="ln198"> </a>
+<a name="ln199">inline int64_t GetDoubleExp(double d) {</a>
+<a name="ln200">  return (BitMask&lt;int64_t&gt;(52, 63) &amp; (*(reinterpret_cast&lt;int64_t *&gt;(&amp;d)))) &gt;&gt; 52;</a>
+<a name="ln201">}</a>
+<a name="ln202"> </a>
+<a name="ln203">inline float CreateFloat(int32_t sign, int32_t exponent, int32_t fraction) {</a>
+<a name="ln204">  int32_t f = (sign &lt;&lt; 31) | (exponent &lt;&lt; 23) | fraction;</a>
+<a name="ln205">  return *reinterpret_cast&lt;float *&gt;(&amp;f);</a>
+<a name="ln206">}</a>
+<a name="ln207"> </a>
+<a name="ln208">inline double CreateDouble(int64_t sign, int64_t exp, int64_t fraction) {</a>
+<a name="ln209">  int64_t d = (sign &lt;&lt; 63) | (exp &lt;&lt; 52) | fraction;</a>
+<a name="ln210">  return *reinterpret_cast&lt;double *&gt;(&amp;d);</a>
+<a name="ln211">}</a>
+<a name="ln212"> </a>
+<a name="ln213">inline bool IsNanFloat(float f) {</a>
+<a name="ln214">  return (GetFloatExp(f) == 0b11111111) &amp;&amp; GetFloatFraction(f);</a>
+<a name="ln215">}</a>
+<a name="ln216"> </a>
+<a name="ln217">inline bool IsNanDouble(double d) {</a>
+<a name="ln218">  return (GetDoubleExp(d) == 0b11111111111) &amp;&amp; GetDoubleFraction(d);</a>
+<a name="ln219">}</a>
+<a name="ln220"> </a>
+<a name="ln221">inline float CanonicalizeFloat(float f) {</a>
+<a name="ln222">  if (IsNanFloat(f)) {</a>
+<a name="ln223">    return CreateFloat(0, 0b11111111, (1 &lt;&lt; 22));</a>
+<a name="ln224">  }</a>
+<a name="ln225">  return f;</a>
+<a name="ln226">}</a>
+<a name="ln227"> </a>
+<a name="ln228">inline double CanonicalizeDouble(double d) {</a>
+<a name="ln229">  if (IsNanDouble(d)) {</a>
+<a name="ln230">    return CreateDouble(0, 0b11111111111, (1l &lt;&lt; 51));</a>
+<a name="ln231">  }</a>
+<a name="ln232">  return d;</a>
+<a name="ln233">}</a>
+<a name="ln234"> </a>
+<a name="ln235">} // namespace util</a>
+<a name="ln236">} // namespace yb</a>
+<a name="ln237"> </a>
+<a name="ln238">#endif // YB_UTIL_DECIMAL_H</a>
+
+</code></pre>
+<div class="balloon" rel="94"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="95"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="96"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="86"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: is_positive_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

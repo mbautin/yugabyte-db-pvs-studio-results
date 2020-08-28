@@ -1,0 +1,812 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>load_generator.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/integration-tests/load_generator.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;memory&gt;</a>
+<a name="ln17">#include &lt;queue&gt;</a>
+<a name="ln18">#include &lt;random&gt;</a>
+<a name="ln19">#include &lt;thread&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;gflags/gflags_declare.h&gt;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln24">#include &quot;yb/client/error.h&quot;</a>
+<a name="ln25">#include &quot;yb/client/session.h&quot;</a>
+<a name="ln26">#include &quot;yb/client/table_handle.h&quot;</a>
+<a name="ln27">#include &quot;yb/client/yb_op.h&quot;</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &quot;yb/common/common.pb.h&quot;</a>
+<a name="ln30">#include &quot;yb/common/partial_row.h&quot;</a>
+<a name="ln31">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/gutil/strings/join.h&quot;</a>
+<a name="ln34">#include &quot;yb/gutil/strings/split.h&quot;</a>
+<a name="ln35">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &quot;yb/yql/redis/redisserver/redis_client.h&quot;</a>
+<a name="ln38"> </a>
+<a name="ln39">#include &quot;yb/util/atomic.h&quot;</a>
+<a name="ln40">#include &quot;yb/util/debug/leakcheck_disabler.h&quot;</a>
+<a name="ln41">#include &quot;yb/util/env.h&quot;</a>
+<a name="ln42">#include &quot;yb/util/flags.h&quot;</a>
+<a name="ln43">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln44">#include &quot;yb/util/net/sockaddr.h&quot;</a>
+<a name="ln45">#include &quot;yb/util/stopwatch.h&quot;</a>
+<a name="ln46">#include &quot;yb/util/subprocess.h&quot;</a>
+<a name="ln47">#include &quot;yb/util/threadlocal.h&quot;</a>
+<a name="ln48"> </a>
+<a name="ln49">using namespace std::literals;</a>
+<a name="ln50"> </a>
+<a name="ln51">using std::atomic;</a>
+<a name="ln52">using std::atomic_bool;</a>
+<a name="ln53">using std::unique_ptr;</a>
+<a name="ln54"> </a>
+<a name="ln55">using strings::Substitute;</a>
+<a name="ln56"> </a>
+<a name="ln57">using std::shared_ptr;</a>
+<a name="ln58">using yb::Status;</a>
+<a name="ln59">using yb::ThreadPool;</a>
+<a name="ln60">using yb::ThreadPoolBuilder;</a>
+<a name="ln61">using yb::MonoDelta;</a>
+<a name="ln62">using yb::MemoryOrder;</a>
+<a name="ln63">using yb::ConditionVariable;</a>
+<a name="ln64">using yb::Mutex;</a>
+<a name="ln65">using yb::MutexLock;</a>
+<a name="ln66">using yb::CountDownLatch;</a>
+<a name="ln67">using yb::Slice;</a>
+<a name="ln68">using yb::YBPartialRow;</a>
+<a name="ln69">using yb::TableType;</a>
+<a name="ln70"> </a>
+<a name="ln71">using yb::client::YBClient;</a>
+<a name="ln72">using yb::client::YBError;</a>
+<a name="ln73">using yb::client::YBNoOp;</a>
+<a name="ln74">using yb::client::YBSession;</a>
+<a name="ln75">using yb::client::YBTable;</a>
+<a name="ln76">using yb::client::YBValue;</a>
+<a name="ln77">using yb::redisserver::RedisReply;</a>
+<a name="ln78"> </a>
+<a name="ln79">DEFINE_bool(load_gen_verbose,</a>
+<a name="ln80">            false,</a>
+<a name="ln81">            &quot;Custom verbose log messages for debugging the load test tool&quot;);</a>
+<a name="ln82"> </a>
+<a name="ln83">DEFINE_int32(load_gen_insertion_tracker_delay_ms,</a>
+<a name="ln84">             50,</a>
+<a name="ln85">             &quot;The interval (ms) at which the load generator's \&quot;insertion tracker thread\&quot; &quot;</a>
+<a name="ln86">             &quot;wakes in up &quot;);</a>
+<a name="ln87"> </a>
+<a name="ln88">DEFINE_int32(load_gen_scanner_open_retries,</a>
+<a name="ln89">             10,</a>
+<a name="ln90">             &quot;Number of times to re-try when opening a scanner&quot;);</a>
+<a name="ln91"> </a>
+<a name="ln92">DEFINE_int32(load_gen_wait_time_increment_step_ms,</a>
+<a name="ln93">             100,</a>
+<a name="ln94">             &quot;In retry loops used in the load test we increment the wait time by this number of &quot;</a>
+<a name="ln95">             &quot;milliseconds after every attempt.&quot;);</a>
+<a name="ln96"> </a>
+<a name="ln97">namespace {</a>
+<a name="ln98"> </a>
+<a name="ln99">void ConfigureYBSession(YBSession* session) {</a>
+<a name="ln100">  session-&gt;SetTimeout(60s);</a>
+<a name="ln101">}</a>
+<a name="ln102"> </a>
+<a name="ln103">string FormatWithSize(const string&amp; s) {</a>
+<a name="ln104">  return strings::Substitute(&quot;'$0' ($1 bytes)&quot;, s, s.size());</a>
+<a name="ln105">}</a>
+<a name="ln106"> </a>
+<a name="ln107">}  // namespace</a>
+<a name="ln108"> </a>
+<a name="ln109">namespace yb {</a>
+<a name="ln110">namespace load_generator {</a>
+<a name="ln111"> </a>
+<a name="ln112">string FormatHexForLoadTestKey(uint64_t x) {</a>
+<a name="ln113">  char buf[64];</a>
+<a name="ln114">  snprintf(buf, sizeof(buf) - 1, &quot;%016&quot; PRIx64, x);</a>
+<a name="ln115">  return buf;</a>
+<a name="ln116">}</a>
+<a name="ln117"> </a>
+<a name="ln118">int KeyIndexSet::NumElements() const {</a>
+<a name="ln119">  MutexLock l(mutex_);</a>
+<a name="ln120">  return set_.size();</a>
+<a name="ln121">}</a>
+<a name="ln122"> </a>
+<a name="ln123">void KeyIndexSet::Insert(int64_t key) {</a>
+<a name="ln124">  MutexLock l(mutex_);</a>
+<a name="ln125">  set_.insert(key);</a>
+<a name="ln126">}</a>
+<a name="ln127"> </a>
+<a name="ln128">bool KeyIndexSet::Contains(int64_t key) const {</a>
+<a name="ln129">  MutexLock l(mutex_);</a>
+<a name="ln130">  return set_.find(key) != set_.end();</a>
+<a name="ln131">}</a>
+<a name="ln132"> </a>
+<a name="ln133">bool KeyIndexSet::RemoveIfContains(int64_t key) {</a>
+<a name="ln134">  MutexLock l(mutex_);</a>
+<a name="ln135">  set&lt;int64&gt;::iterator it = set_.find(key);</a>
+<a name="ln136">  if (it == set_.end()) {</a>
+<a name="ln137">    return false;</a>
+<a name="ln138">  } else {</a>
+<a name="ln139">    set_.erase(it);</a>
+<a name="ln140">    return true;</a>
+<a name="ln141">  }</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144">int64_t KeyIndexSet::GetRandomKey(std::mt19937_64* random_number_generator) const {</a>
+<a name="ln145">  MutexLock l(mutex_);</a>
+<a name="ln146">  // The set iterator does not support indexing, so we probabilistically choose a random element</a>
+<a name="ln147">  // by iterating the set.</a>
+<a name="ln148">  int n = set_.size();</a>
+<a name="ln149">  for (int64_t x : set_) {</a>
+<a name="ln150">    if ((*random_number_generator)() % n == 0) return x;</a>
+<a name="ln151">    --n;  // Decrement the number of remaining elements we are considering.</a>
+<a name="ln152">  }</a>
+<a name="ln153">  // This will only happen if the set is empty.</a>
+<a name="ln154">  return -1;</a>
+<a name="ln155">}</a>
+<a name="ln156"> </a>
+<a name="ln157">ostream&amp; operator &lt;&lt;(ostream&amp; out, const KeyIndexSet &amp;key_index_set) {</a>
+<a name="ln158">  MutexLock l(key_index_set.mutex_);</a>
+<a name="ln159">  out &lt;&lt; &quot;[&quot;;</a>
+<a name="ln160">  bool first = true;</a>
+<a name="ln161">  for (auto key : key_index_set.set_) {</a>
+<a name="ln162">    if (!first) {</a>
+<a name="ln163">      out &lt;&lt; &quot;, &quot;;</a>
+<a name="ln164">    }</a>
+<a name="ln165">    first = false;</a>
+<a name="ln166">    out &lt;&lt; key;</a>
+<a name="ln167">  }</a>
+<a name="ln168">  out &lt;&lt; &quot;]&quot;;</a>
+<a name="ln169">  return out;</a>
+<a name="ln170">}</a>
+<a name="ln171"> </a>
+<a name="ln172">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln173">// SessionFactory</a>
+<a name="ln174">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln175"> </a>
+<a name="ln176">YBSessionFactory::YBSessionFactory(client::YBClient* client, client::TableHandle* table)</a>
+<a name="ln177">    : client_(client), table_(table) {}</a>
+<a name="ln178"> </a>
+<a name="ln179">string YBSessionFactory::ClientId() { return client_-&gt;id().ToString(); }</a>
+<a name="ln180"> </a>
+<a name="ln181">SingleThreadedWriter* YBSessionFactory::GetWriter(MultiThreadedWriter* writer, int idx) {</a>
+<a name="ln182">  return new YBSingleThreadedWriter(writer, client_, table_, idx);</a>
+<a name="ln183">}</a>
+<a name="ln184"> </a>
+<a name="ln185">SingleThreadedReader* YBSessionFactory::GetReader(MultiThreadedReader* reader, int idx) {</a>
+<a name="ln186">  return new YBSingleThreadedReader(reader, client_, table_, idx);</a>
+<a name="ln187">}</a>
+<a name="ln188"> </a>
+<a name="ln189">SingleThreadedWriter* NoopSessionFactory::GetWriter(MultiThreadedWriter* writer, int idx) {</a>
+<a name="ln190">  return new NoopSingleThreadedWriter(writer, client_, table_, idx);</a>
+<a name="ln191">}</a>
+<a name="ln192"> </a>
+<a name="ln193">RedisSessionFactory::RedisSessionFactory(const string&amp; redis_server_addresses)</a>
+<a name="ln194">    : redis_server_addresses_(redis_server_addresses) {}</a>
+<a name="ln195"> </a>
+<a name="ln196">string RedisSessionFactory::ClientId() { return &quot;redis_client&quot;; }</a>
+<a name="ln197"> </a>
+<a name="ln198">SingleThreadedWriter* RedisSessionFactory::GetWriter(MultiThreadedWriter* writer, int idx) {</a>
+<a name="ln199">  return new RedisSingleThreadedWriter(writer, redis_server_addresses_, idx);</a>
+<a name="ln200">}</a>
+<a name="ln201"> </a>
+<a name="ln202">SingleThreadedReader* RedisSessionFactory::GetReader(MultiThreadedReader* reader, int idx) {</a>
+<a name="ln203">  return new RedisSingleThreadedReader(reader, redis_server_addresses_, idx);</a>
+<a name="ln204">}</a>
+<a name="ln205"> </a>
+<a name="ln206">SingleThreadedWriter* RedisNoopSessionFactory::GetWriter(MultiThreadedWriter* writer, int idx) {</a>
+<a name="ln207">  return new RedisNoopSingleThreadedWriter(writer, redis_server_addresses_, idx);</a>
+<a name="ln208">}</a>
+<a name="ln209"> </a>
+<a name="ln210">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln211">// MultiThreadedAction</a>
+<a name="ln212">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln213"> </a>
+<a name="ln214">MultiThreadedAction::MultiThreadedAction(</a>
+<a name="ln215">    const string&amp; description, int64_t num_keys, int64_t start_key, int num_action_threads,</a>
+<a name="ln216">    int num_extra_threads, const string&amp; client_id, atomic_bool* stop_requested_flag,</a>
+<a name="ln217">    int value_size)</a>
+<a name="ln218">    : description_(description),</a>
+<a name="ln219">      num_keys_(num_keys),</a>
+<a name="ln220">      start_key_(start_key),</a>
+<a name="ln221">      num_action_threads_(num_action_threads),</a>
+<a name="ln222">      client_id_(client_id),</a>
+<a name="ln223">      running_threads_latch_(num_action_threads),</a>
+<a name="ln224">      stop_requested_(stop_requested_flag),</a>
+<a name="ln225">      value_size_(value_size) {</a>
+<a name="ln226">  CHECK_OK(</a>
+<a name="ln227">      ThreadPoolBuilder(description)</a>
+<a name="ln228">          .set_max_threads(num_action_threads_ + num_extra_threads)</a>
+<a name="ln229">          .Build(&amp;thread_pool_));</a>
+<a name="ln230">}</a>
+<a name="ln231"> </a>
+<a name="ln232">MultiThreadedAction::~MultiThreadedAction() {}</a>
+<a name="ln233"> </a>
+<a name="ln234">string MultiThreadedAction::GetKeyByIndex(int64_t key_index) {</a>
+<a name="ln235">  string key_index_str(Substitute(&quot;key$0&quot;, key_index));</a>
+<a name="ln236">  return Substitute(</a>
+<a name="ln237">      &quot;$0_$1_$2&quot;, FormatHexForLoadTestKey(std::hash&lt;string&gt;()(key_index_str)), key_index_str,</a>
+<a name="ln238">      client_id_);</a>
+<a name="ln239">}</a>
+<a name="ln240"> </a>
+<a name="ln241">// Creates a human-readable string with hex characters to be used as a value in our test. This is</a>
+<a name="ln242">// deterministic based on key_index.</a>
+<a name="ln243">DISABLE_UBSAN</a>
+<a name="ln244">string MultiThreadedAction::GetValueByIndex(int64_t key_index) {</a>
+<a name="ln245">  string value;</a>
+<a name="ln246">  int64_t x = key_index;</a>
+<a name="ln247">  for (int i = 0; i &lt; value_size_; ++i) {</a>
+<a name="ln248">    int val = static_cast&lt;int&gt;(x &amp; 0xf);</a>
+<a name="ln249">    char c = static_cast&lt;char&gt;(val &gt; 9 ? val - 10 + 'a' : val + '0');</a>
+<a name="ln250">    value.push_back(c);</a>
+<a name="ln251">    // Add pseudo-randomness by using the loop index.</a>
+<a name="ln252">    x = (x &gt;&gt; 4) * 31 + i;</a>
+<a name="ln253">  }</a>
+<a name="ln254">  return value;</a>
+<a name="ln255">}</a>
+<a name="ln256"> </a>
+<a name="ln257">void MultiThreadedAction::Start() {</a>
+<a name="ln258">  LOG(INFO) &lt;&lt; &quot;Starting &quot; &lt;&lt; num_action_threads_ &lt;&lt; &quot; &quot; &lt;&lt; description_ &lt;&lt; &quot; threads&quot;;</a>
+<a name="ln259">  CHECK_OK(thread_pool_-&gt;SubmitFunc(std::bind(&amp;MultiThreadedAction::RunStatsThread, this)));</a>
+<a name="ln260">  for (int i = 0; i &lt; num_action_threads_; i++) {</a>
+<a name="ln261">    CHECK_OK(thread_pool_-&gt;SubmitFunc(std::bind(&amp;MultiThreadedAction::RunActionThread, this, i)));</a>
+<a name="ln262">  }</a>
+<a name="ln263">}</a>
+<a name="ln264"> </a>
+<a name="ln265">void MultiThreadedAction::WaitForCompletion() {</a>
+<a name="ln266">  thread_pool_-&gt;Wait();</a>
+<a name="ln267">}</a>
+<a name="ln268"> </a>
+<a name="ln269">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln270">// MultiThreadedWriter</a>
+<a name="ln271">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln272"> </a>
+<a name="ln273">MultiThreadedWriter::MultiThreadedWriter(</a>
+<a name="ln274">    int64_t num_keys, int64_t start_key, int num_writer_threads, SessionFactory* session_factory,</a>
+<a name="ln275">    atomic_bool* stop_flag, int value_size, int max_num_write_errors)</a>
+<a name="ln276">    : MultiThreadedAction(</a>
+<a name="ln277">          &quot;writers&quot;, num_keys, start_key, num_writer_threads, 2, session_factory-&gt;ClientId(),</a>
+<a name="ln278">          stop_flag, value_size),</a>
+<a name="ln279">      session_factory_(session_factory),</a>
+<a name="ln280">      next_key_(start_key),</a>
+<a name="ln281">      inserted_up_to_inclusive_(-1),</a>
+<a name="ln282">      max_num_write_errors_(max_num_write_errors) {}</a>
+<a name="ln283"> </a>
+<a name="ln284">void MultiThreadedWriter::Start() {</a>
+<a name="ln285">  MultiThreadedAction::Start();</a>
+<a name="ln286">  CHECK_OK(</a>
+<a name="ln287">      thread_pool_-&gt;SubmitFunc(std::bind(&amp;MultiThreadedWriter::RunInsertionTrackerThread, this)));</a>
+<a name="ln288">}</a>
+<a name="ln289"> </a>
+<a name="ln290">void MultiThreadedWriter::WaitForCompletion() {</a>
+<a name="ln291">  MultiThreadedAction::WaitForCompletion();</a>
+<a name="ln292">  LOG(INFO) &lt;&lt; &quot;Inserted up to and including &quot; &lt;&lt; inserted_up_to_inclusive_.load();</a>
+<a name="ln293">}</a>
+<a name="ln294"> </a>
+<a name="ln295">void MultiThreadedWriter::RunActionThread(int writer_index) {</a>
+<a name="ln296">  unique_ptr&lt;SingleThreadedWriter&gt; writer(session_factory_-&gt;GetWriter(this, writer_index));</a>
+<a name="ln297">  writer-&gt;set_pause_flag(pause_flag_);</a>
+<a name="ln298">  writer-&gt;Run();</a>
+<a name="ln299"> </a>
+<a name="ln300">  LOG(INFO) &lt;&lt; &quot;Writer thread &quot; &lt;&lt; writer_index &lt;&lt; &quot; finished&quot;;</a>
+<a name="ln301">  running_threads_latch_.CountDown();</a>
+<a name="ln302">}</a>
+<a name="ln303"> </a>
+<a name="ln304">void SingleThreadedWriter::Run() {</a>
+<a name="ln305">  LOG(INFO) &lt;&lt; &quot;Writer thread &quot; &lt;&lt; writer_index_ &lt;&lt; &quot; started&quot;;</a>
+<a name="ln306">  ConfigureSession();</a>
+<a name="ln307">  while (!multi_threaded_writer_-&gt;IsStopRequested()) {</a>
+<a name="ln308">    if (pause_flag_ &amp;&amp; pause_flag_-&gt;load(std::memory_order_acquire)) {</a>
+<a name="ln309">      std::this_thread::sleep_for(10ms);</a>
+<a name="ln310">      continue;</a>
+<a name="ln311">    }</a>
+<a name="ln312">    int64_t key_index = multi_threaded_writer_-&gt;next_key_++;</a>
+<a name="ln313">    if (key_index &gt;= multi_threaded_writer_-&gt;num_keys_) {</a>
+<a name="ln314">      break;</a>
+<a name="ln315">    }</a>
+<a name="ln316"> </a>
+<a name="ln317">    string key_str(multi_threaded_writer_-&gt;GetKeyByIndex(key_index));</a>
+<a name="ln318">    string value_str(multi_threaded_writer_-&gt;GetValueByIndex(key_index));</a>
+<a name="ln319"> </a>
+<a name="ln320">    if (Write(key_index, key_str, value_str)) {</a>
+<a name="ln321">      multi_threaded_writer_-&gt;inserted_keys_.Insert(key_index);</a>
+<a name="ln322">    } else {</a>
+<a name="ln323">      multi_threaded_writer_-&gt;failed_keys_.Insert(key_index);</a>
+<a name="ln324">      HandleInsertionFailure(key_index, key_str);</a>
+<a name="ln325">      if (multi_threaded_writer_-&gt;num_write_errors() &gt;</a>
+<a name="ln326">          multi_threaded_writer_-&gt;max_num_write_errors_) {</a>
+<a name="ln327">        LOG(ERROR) &lt;&lt; &quot;Exceeded the maximum number of write errors &quot;</a>
+<a name="ln328">                   &lt;&lt; multi_threaded_writer_-&gt;max_num_write_errors_ &lt;&lt; &quot;, stopping the test.&quot;;</a>
+<a name="ln329">        multi_threaded_writer_-&gt;Stop();</a>
+<a name="ln330">        break;</a>
+<a name="ln331">      }</a>
+<a name="ln332">    }</a>
+<a name="ln333">  }</a>
+<a name="ln334">  CloseSession();</a>
+<a name="ln335">}</a>
+<a name="ln336"> </a>
+<a name="ln337">void ConfigureRedisSessions(</a>
+<a name="ln338">    const string&amp; redis_server_addresses, vector&lt;shared_ptr&lt;RedisClient&gt; &gt;* clients) {</a>
+<a name="ln339">  std::vector&lt;string&gt; addresses;</a>
+<a name="ln340">  SplitStringUsing(redis_server_addresses, &quot;,&quot;, &amp;addresses);</a>
+<a name="ln341">  for (auto&amp; addr : addresses) {</a>
+<a name="ln342">    auto remote = CHECK_RESULT(ParseEndpoint(addr, 6379));</a>
+<a name="ln343">    clients-&gt;push_back(std::make_shared&lt;RedisClient&gt;(</a>
+<a name="ln344">        remote.address().to_string(), remote.port()));</a>
+<a name="ln345">  }</a>
+<a name="ln346">}</a>
+<a name="ln347"> </a>
+<a name="ln348">void RedisSingleThreadedWriter::ConfigureSession() {</a>
+<a name="ln349">  ConfigureRedisSessions(redis_server_addresses_, &amp;clients_);</a>
+<a name="ln350">}</a>
+<a name="ln351"> </a>
+<a name="ln352">bool RedisSingleThreadedWriter::Write(</a>
+<a name="ln353">    int64_t key_index, const string&amp; key_str, const string&amp; value_str) {</a>
+<a name="ln354">  bool success = false;</a>
+<a name="ln355">  auto writer_index = writer_index_;</a>
+<a name="ln356">  int64_t idx = key_index % clients_.size();</a>
+<a name="ln357">  clients_[idx]-&gt;Send(</a>
+<a name="ln358">      {&quot;SET&quot;, key_str, value_str}, [&amp;success, key_index, writer_index](const RedisReply&amp; reply) {</a>
+<a name="ln359">        if (&quot;OK&quot; == reply.as_string()) {</a>
+<a name="ln360">          VLOG(2) &lt;&lt; &quot;Writer &quot; &lt;&lt; writer_index &lt;&lt; &quot; Successfully inserted key #&quot; &lt;&lt; key_index</a>
+<a name="ln361">                  &lt;&lt; &quot; into redis &quot;;</a>
+<a name="ln362">          success = true;</a>
+<a name="ln363">        } else {</a>
+<a name="ln364">          VLOG(1) &lt;&lt; &quot;Failed Insersion key #&quot; &lt;&lt; key_index &lt;&lt; reply.as_string();</a>
+<a name="ln365">          success = false;</a>
+<a name="ln366">        }</a>
+<a name="ln367">      });</a>
+<a name="ln368">  clients_[idx]-&gt;Commit();</a>
+<a name="ln369"> </a>
+<a name="ln370">  return success;</a>
+<a name="ln371">}</a>
+<a name="ln372"> </a>
+<a name="ln373">void RedisSingleThreadedWriter::HandleInsertionFailure(int64_t key_index, const string&amp; key_str) {</a>
+<a name="ln374">  // Nothing special to do for Redis failures.</a>
+<a name="ln375">}</a>
+<a name="ln376"> </a>
+<a name="ln377">void RedisSingleThreadedWriter::CloseSession() {</a>
+<a name="ln378">  for (auto client : clients_) {</a>
+<a name="ln379">    client-&gt;Disconnect();</a>
+<a name="ln380">  }</a>
+<a name="ln381">}</a>
+<a name="ln382"> </a>
+<a name="ln383">bool RedisNoopSingleThreadedWriter::Write(</a>
+<a name="ln384">    int64_t key_index, const string&amp; key_str, const string&amp; value_str) {</a>
+<a name="ln385">  bool success = false;</a>
+<a name="ln386">  auto writer_index = writer_index_;</a>
+<a name="ln387">  int64_t idx = key_index % clients_.size();</a>
+<a name="ln388">  clients_[idx]-&gt;Send({&quot;ECHO&quot;, &quot;OK&quot;}, [&amp;success, key_index, writer_index](const RedisReply&amp; reply) {</a>
+<a name="ln389">    if (&quot;OK&quot; == reply.as_string()) {</a>
+<a name="ln390">      VLOG(2) &lt;&lt; &quot;Writer &quot; &lt;&lt; writer_index &lt;&lt; &quot; Successfully inserted key #&quot; &lt;&lt; key_index</a>
+<a name="ln391">              &lt;&lt; &quot; into redis &quot;;</a>
+<a name="ln392">      success = true;</a>
+<a name="ln393">    } else {</a>
+<a name="ln394">      VLOG(1) &lt;&lt; &quot;Failed Insersion key #&quot; &lt;&lt; key_index &lt;&lt; reply.as_string();</a>
+<a name="ln395">      success = false;</a>
+<a name="ln396">    }</a>
+<a name="ln397">  });</a>
+<a name="ln398">  clients_[idx]-&gt;Commit();</a>
+<a name="ln399"> </a>
+<a name="ln400">  return success;</a>
+<a name="ln401">}</a>
+<a name="ln402"> </a>
+<a name="ln403">void YBSingleThreadedWriter::ConfigureSession() {</a>
+<a name="ln404">  session_ = client_-&gt;NewSession();</a>
+<a name="ln405">  ConfigureYBSession(session_.get());</a>
+<a name="ln406">}</a>
+<a name="ln407"> </a>
+<a name="ln408">bool YBSingleThreadedWriter::Write(</a>
+<a name="ln409">    int64_t key_index, const string&amp; key_str, const string&amp; value_str) {</a>
+<a name="ln410">  auto insert = table_-&gt;NewInsertOp();</a>
+<a name="ln411">  // Generate a Put for key_str, value_str</a>
+<a name="ln412">  QLAddStringHashValue(insert-&gt;mutable_request(), key_str);</a>
+<a name="ln413">  table_-&gt;AddStringColumnValue(insert-&gt;mutable_request(), &quot;v&quot;, value_str);</a>
+<a name="ln414">  // submit a the put to apply.</a>
+<a name="ln415">  // If successful, add to inserted</a>
+<a name="ln416">  Status apply_status = session_-&gt;Apply(insert);</a>
+<a name="ln417">  if (!apply_status.ok()) {</a>
+<a name="ln418">    LOG(WARNING) &lt;&lt; &quot;Error inserting key '&quot; &lt;&lt; key_str &lt;&lt; &quot;': &quot;</a>
+<a name="ln419">                 &lt;&lt; &quot;Apply() failed&quot;</a>
+<a name="ln420">                 &lt;&lt; &quot; (&quot; &lt;&lt; apply_status.ToString() &lt;&lt; &quot;)&quot;;</a>
+<a name="ln421">    return false;</a>
+<a name="ln422">  }</a>
+<a name="ln423">  Status flush_status = session_-&gt;Flush();</a>
+<a name="ln424">  if (!flush_status.ok()) {</a>
+<a name="ln425">    for (const auto&amp; error : session_-&gt;GetPendingErrors()) {</a>
+<a name="ln426">      // It means that key was actually written successfully, but our retry failed because</a>
+<a name="ln427">      // it was detected as duplicate request.</a>
+<a name="ln428">      if (error-&gt;status().IsAlreadyPresent()) {</a>
+<a name="ln429">        return true;</a>
+<a name="ln430">      }</a>
+<a name="ln431">      LOG(WARNING) &lt;&lt; &quot;Error inserting key '&quot; &lt;&lt; key_str &lt;&lt; &quot;': &quot; &lt;&lt; error-&gt;status();</a>
+<a name="ln432">    }</a>
+<a name="ln433"> </a>
+<a name="ln434">    LOG(WARNING) &lt;&lt; &quot;Error inserting key '&quot; &lt;&lt; key_str &lt;&lt; &quot;': &quot;</a>
+<a name="ln435">                 &lt;&lt; &quot;Flush() failed (&quot; &lt;&lt; flush_status &lt;&lt; &quot;)&quot;;</a>
+<a name="ln436">    return false;</a>
+<a name="ln437">  }</a>
+<a name="ln438">  if (insert-&gt;response().status() != QLResponsePB::YQL_STATUS_OK) {</a>
+<a name="ln439">    LOG(WARNING) &lt;&lt; &quot;Error inserting key '&quot; &lt;&lt; key_str &lt;&lt; &quot;': &quot;</a>
+<a name="ln440">                 &lt;&lt; insert-&gt;response().error_message();</a>
+<a name="ln441">    return false;</a>
+<a name="ln442">  }</a>
+<a name="ln443"> </a>
+<a name="ln444">  multi_threaded_writer_-&gt;inserted_keys_.Insert(key_index);</a>
+<a name="ln445">  VLOG(2) &lt;&lt; &quot;Successfully inserted key #&quot; &lt;&lt; key_index &lt;&lt; &quot; at hybrid_time &quot;</a>
+<a name="ln446">          &lt;&lt; client_-&gt;GetLatestObservedHybridTime() &lt;&lt; &quot; or earlier&quot;;</a>
+<a name="ln447"> </a>
+<a name="ln448">  return true;</a>
+<a name="ln449">}</a>
+<a name="ln450"> </a>
+<a name="ln451">void YBSingleThreadedWriter::HandleInsertionFailure(int64_t key_index, const string&amp; key_str) {</a>
+<a name="ln452">  if (session_ != nullptr) {</a>
+<a name="ln453">    for (const auto&amp; error : session_-&gt;GetPendingErrors()) {</a>
+<a name="ln454">      LOG(WARNING) &lt;&lt; &quot;Explicit error while inserting: &quot; &lt;&lt; error-&gt;status().ToString();</a>
+<a name="ln455">    }</a>
+<a name="ln456">  }</a>
+<a name="ln457">}</a>
+<a name="ln458"> </a>
+<a name="ln459">void YBSingleThreadedWriter::CloseSession() { CHECK_OK(session_-&gt;Close()); }</a>
+<a name="ln460"> </a>
+<a name="ln461">void MultiThreadedWriter::RunStatsThread() {</a>
+<a name="ln462">  MicrosecondsInt64 prev_time = GetMonoTimeMicros();</a>
+<a name="ln463">  int64_t prev_writes = 0;</a>
+<a name="ln464">  while (!IsStopRequested() &amp;&amp; running_threads_latch_.count() &gt; 0) {</a>
+<a name="ln465">    running_threads_latch_.WaitFor(MonoDelta::FromSeconds(5));</a>
+<a name="ln466">    int64_t num_writes = this-&gt;num_writes();</a>
+<a name="ln467">    MicrosecondsInt64 current_time = GetMonoTimeMicros();</a>
+<a name="ln468">    LOG(INFO) &lt;&lt; &quot;Wrote &quot; &lt;&lt; num_writes &lt;&lt; &quot; rows (&quot;</a>
+<a name="ln469">              &lt;&lt; (num_writes - prev_writes) * 1000000.0 / (current_time - prev_time)</a>
+<a name="ln470">              &lt;&lt; &quot; writes/sec), contiguous insertion point: &quot; &lt;&lt; inserted_up_to_inclusive_.load()</a>
+<a name="ln471">              &lt;&lt; &quot;, write errors: &quot; &lt;&lt; failed_keys_.NumElements();</a>
+<a name="ln472">    prev_writes = num_writes;</a>
+<a name="ln473">    prev_time = current_time;</a>
+<a name="ln474">  }</a>
+<a name="ln475">}</a>
+<a name="ln476"> </a>
+<a name="ln477">void MultiThreadedWriter::RunInsertionTrackerThread() {</a>
+<a name="ln478">  LOG(INFO) &lt;&lt; &quot;Insertion tracker thread started&quot;;</a>
+<a name="ln479">  int64_t current_key = 0;  // the first key to be inserted</a>
+<a name="ln480">  while (!IsStopRequested() &amp;&amp; running_threads_latch_.count() &gt; 0) {</a>
+<a name="ln481">    while (failed_keys_.Contains(current_key) || inserted_keys_.RemoveIfContains(current_key)) {</a>
+<a name="ln482">      VLOG(2) &lt;&lt; &quot;Advancing insertion tracker to key #&quot; &lt;&lt; current_key;</a>
+<a name="ln483">      inserted_up_to_inclusive_.store(current_key);</a>
+<a name="ln484">      current_key++;</a>
+<a name="ln485">    }</a>
+<a name="ln486">    SleepFor(MonoDelta::FromMilliseconds(FLAGS_load_gen_insertion_tracker_delay_ms));</a>
+<a name="ln487">  }</a>
+<a name="ln488">  LOG(INFO) &lt;&lt; &quot;Insertion tracker thread stopped&quot;;</a>
+<a name="ln489">}</a>
+<a name="ln490"> </a>
+<a name="ln491">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln492">// SingleThreadedScanner</a>
+<a name="ln493">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln494"> </a>
+<a name="ln495">SingleThreadedScanner::SingleThreadedScanner(client::TableHandle* table) : table_(table) {}</a>
+<a name="ln496"> </a>
+<a name="ln497">int64_t SingleThreadedScanner::CountRows() {</a>
+<a name="ln498">  auto result = boost::size(client::TableRange(*table_));</a>
+<a name="ln499"> </a>
+<a name="ln500">  LOG(INFO) &lt;&lt; &quot; num read rows = &quot; &lt;&lt; result;</a>
+<a name="ln501">  return result;</a>
+<a name="ln502">}</a>
+<a name="ln503"> </a>
+<a name="ln504">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln505">// MultiThreadedReader</a>
+<a name="ln506">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln507"> </a>
+<a name="ln508">MultiThreadedReader::MultiThreadedReader(int64_t num_keys, int num_reader_threads,</a>
+<a name="ln509">                                         SessionFactory* session_factory,</a>
+<a name="ln510">                                         atomic&lt;int64_t&gt;* insertion_point,</a>
+<a name="ln511">                                         const KeyIndexSet* inserted_keys,</a>
+<a name="ln512">                                         const KeyIndexSet* failed_keys, atomic_bool* stop_flag,</a>
+<a name="ln513">                                         int value_size, int max_num_read_errors,</a>
+<a name="ln514">                                         bool stop_on_empty_read)</a>
+<a name="ln515">    : MultiThreadedAction(</a>
+<a name="ln516">          &quot;readers&quot;, num_keys, 0, num_reader_threads, 1, session_factory-&gt;ClientId(),</a>
+<a name="ln517">          stop_flag, value_size),</a>
+<a name="ln518">      session_factory_(session_factory),</a>
+<a name="ln519">      insertion_point_(insertion_point),</a>
+<a name="ln520">      inserted_keys_(inserted_keys),</a>
+<a name="ln521">      failed_keys_(failed_keys),</a>
+<a name="ln522">      num_reads_(0),</a>
+<a name="ln523">      num_read_errors_(0),</a>
+<a name="ln524">      max_num_read_errors_(max_num_read_errors),</a>
+<a name="ln525">      stop_on_empty_read_(stop_on_empty_read) {}</a>
+<a name="ln526"> </a>
+<a name="ln527">void MultiThreadedReader::RunActionThread(int reader_index) {</a>
+<a name="ln528">  unique_ptr&lt;SingleThreadedReader&gt; reader_loop(session_factory_-&gt;GetReader(this, reader_index));</a>
+<a name="ln529">  reader_loop-&gt;Run();</a>
+<a name="ln530"> </a>
+<a name="ln531">  LOG(INFO) &lt;&lt; &quot;Reader thread &quot; &lt;&lt; reader_index &lt;&lt; &quot; finished&quot;;</a>
+<a name="ln532">  running_threads_latch_.CountDown();</a>
+<a name="ln533">}</a>
+<a name="ln534"> </a>
+<a name="ln535">void MultiThreadedReader::RunStatsThread() {</a>
+<a name="ln536">  MicrosecondsInt64 prev_time = GetMonoTimeMicros();</a>
+<a name="ln537">  int64_t prev_rows_read = 0;</a>
+<a name="ln538">  while (!IsStopRequested() &amp;&amp; running_threads_latch_.count() &gt; 0) {</a>
+<a name="ln539">    running_threads_latch_.WaitFor(MonoDelta::FromSeconds(5));</a>
+<a name="ln540">    MicrosecondsInt64 current_time = GetMonoTimeMicros();</a>
+<a name="ln541">    int64_t num_rows_read = num_reads_.load();</a>
+<a name="ln542">    LOG(INFO) &lt;&lt; &quot;Read &quot; &lt;&lt; num_rows_read &lt;&lt; &quot; rows (&quot;</a>
+<a name="ln543">              &lt;&lt; (num_rows_read - prev_rows_read) * 1000000.0 / (current_time - prev_time)</a>
+<a name="ln544">              &lt;&lt; &quot; reads/sec), read errors: &quot; &lt;&lt; num_read_errors_.load();</a>
+<a name="ln545">    prev_rows_read = num_rows_read;</a>
+<a name="ln546">    prev_time = current_time;</a>
+<a name="ln547">  }</a>
+<a name="ln548">}</a>
+<a name="ln549"> </a>
+<a name="ln550">void MultiThreadedReader::IncrementReadErrorCount(ReadStatus read_status) {</a>
+<a name="ln551">  DCHECK(read_status != ReadStatus::OK);</a>
+<a name="ln552"> </a>
+<a name="ln553">  if (++num_read_errors_ &gt; max_num_read_errors_) {</a>
+<a name="ln554">    LOG(ERROR) &lt;&lt; &quot;Exceeded the maximum number of read errors (&quot; &lt;&lt; max_num_read_errors_ &lt;&lt; &quot;)!&quot;;</a>
+<a name="ln555">    Stop();</a>
+<a name="ln556">  }</a>
+<a name="ln557"> </a>
+<a name="ln558">  if (stop_on_empty_read_ &amp;&amp; read_status == ReadStatus::NO_ROWS) {</a>
+<a name="ln559">    LOG(ERROR) &lt;&lt; &quot;No empty reads allowed!&quot;;</a>
+<a name="ln560">    Stop();</a>
+<a name="ln561">  }</a>
+<a name="ln562">}</a>
+<a name="ln563"> </a>
+<a name="ln564">void RedisSingleThreadedReader::ConfigureSession() {</a>
+<a name="ln565">  ConfigureRedisSessions(redis_server_addresses_, &amp;clients_);</a>
+<a name="ln566">}</a>
+<a name="ln567"> </a>
+<a name="ln568">void RedisSingleThreadedReader::CloseSession() {</a>
+<a name="ln569">  for (auto client : clients_) {</a>
+<a name="ln570">    client-&gt;Disconnect();</a>
+<a name="ln571">  }</a>
+<a name="ln572">}</a>
+<a name="ln573"> </a>
+<a name="ln574">void YBSingleThreadedReader::ConfigureSession() {</a>
+<a name="ln575">  session_ = client_-&gt;NewSession();</a>
+<a name="ln576">  ConfigureYBSession(session_.get());</a>
+<a name="ln577">}</a>
+<a name="ln578"> </a>
+<a name="ln579">bool NoopSingleThreadedWriter::Write(</a>
+<a name="ln580">    int64_t key_index, const string&amp; key_str, const string&amp; value_str) {</a>
+<a name="ln581">  YBNoOp noop(table_-&gt;get());</a>
+<a name="ln582">  gscoped_ptr&lt;YBPartialRow&gt; row(table_-&gt;schema().NewRow());</a>
+<a name="ln583">  CHECK_OK(row-&gt;SetBinary(&quot;k&quot;, key_str));</a>
+<a name="ln584">  Status s = noop.Execute(*row);</a>
+<a name="ln585">  if (s.ok()) {</a>
+<a name="ln586">    return true;</a>
+<a name="ln587">  }</a>
+<a name="ln588">  LOG(ERROR) &lt;&lt; &quot;NoOp failed&quot; &lt;&lt; s.CodeAsString();</a>
+<a name="ln589">  return false;</a>
+<a name="ln590">}</a>
+<a name="ln591"> </a>
+<a name="ln592">ReadStatus YBSingleThreadedReader::PerformRead(</a>
+<a name="ln593">    int64_t key_index, const string&amp; key_str, const string&amp; expected_value_str) {</a>
+<a name="ln594">  uint64_t read_ts = client_-&gt;GetLatestObservedHybridTime();</a>
+<a name="ln595"> </a>
+<a name="ln596">  for (int i = 1;; ++i) {</a>
+<a name="ln597">    auto read_op = table_-&gt;NewReadOp();</a>
+<a name="ln598">    QLAddStringHashValue(read_op-&gt;mutable_request(), key_str);</a>
+<a name="ln599">    table_-&gt;AddColumns({&quot;k&quot;, &quot;v&quot;}, read_op-&gt;mutable_request());</a>
+<a name="ln600">    auto status = session_-&gt;ApplyAndFlush(read_op);</a>
+<a name="ln601">    boost::optional&lt;QLRowBlock&gt; row_block;</a>
+<a name="ln602">    if (status.ok()) {</a>
+<a name="ln603">      auto result = read_op-&gt;MakeRowBlock();</a>
+<a name="ln604">      if (!result.ok()) {</a>
+<a name="ln605">        status = std::move(result.status());</a>
+<a name="ln606">      } else {</a>
+<a name="ln607">        row_block = std::move(*result);</a>
+<a name="ln608">      }</a>
+<a name="ln609">    }</a>
+<a name="ln610">    if (!status.ok()) {</a>
+<a name="ln611">      LOG(ERROR) &lt;&lt; &quot;Failed to read: &quot; &lt;&lt; status &lt;&lt; &quot;, re-trying.&quot;;</a>
+<a name="ln612">      if (i &gt;= FLAGS_load_gen_scanner_open_retries) {</a>
+<a name="ln613">        CHECK_OK(status);</a>
+<a name="ln614">      }</a>
+<a name="ln615">      SleepFor(MonoDelta::FromMilliseconds(FLAGS_load_gen_wait_time_increment_step_ms * i));</a>
+<a name="ln616">      continue;</a>
+<a name="ln617">    }</a>
+<a name="ln618">    if (row_block-&gt;row_count() == 0) {</a>
+<a name="ln619">      LOG(ERROR) &lt;&lt; &quot;No rows found for key #&quot; &lt;&lt; key_index</a>
+<a name="ln620">                 &lt;&lt; &quot; (read hybrid_time: &quot; &lt;&lt; read_ts &lt;&lt; &quot;)&quot;;</a>
+<a name="ln621">      return ReadStatus::NO_ROWS;</a>
+<a name="ln622">    }</a>
+<a name="ln623">    if (row_block-&gt;row_count() != 1) {</a>
+<a name="ln624">      LOG(ERROR) &lt;&lt; &quot;Found an invalid number of rows for key #&quot; &lt;&lt; key_index &lt;&lt; &quot;: &quot;</a>
+<a name="ln625">                 &lt;&lt; row_block-&gt;row_count() &lt;&lt; &quot; (expected to find 1 row), read hybrid_time: &quot;</a>
+<a name="ln626">                 &lt;&lt; read_ts;</a>
+<a name="ln627">      multi_threaded_reader_-&gt;IncrementReadErrorCount(ReadStatus::OTHER_ERROR);</a>
+<a name="ln628">      return ReadStatus::OTHER_ERROR;</a>
+<a name="ln629">    }</a>
+<a name="ln630">    auto row = row_block-&gt;rows()[0];</a>
+<a name="ln631">    if (row.column(0).binary_value() != key_str) {</a>
+<a name="ln632">      LOG(ERROR) &lt;&lt; &quot;Invalid key returned by the read operation: '&quot; &lt;&lt; row.column(0).binary_value()</a>
+<a name="ln633">                 &lt;&lt; &quot;', expected: '&quot; &lt;&lt; key_str &lt;&lt; &quot;', read hybrid_time: &quot; &lt;&lt; read_ts;</a>
+<a name="ln634">      multi_threaded_reader_-&gt;IncrementReadErrorCount(ReadStatus::OTHER_ERROR);</a>
+<a name="ln635">      return ReadStatus::OTHER_ERROR;</a>
+<a name="ln636">    }</a>
+<a name="ln637">    auto returned_value = row.column(1).binary_value();</a>
+<a name="ln638">    if (returned_value != expected_value_str) {</a>
+<a name="ln639">      LOG(ERROR) &lt;&lt; &quot;Invalid value returned by the read operation for key '&quot; &lt;&lt; key_str</a>
+<a name="ln640">                 &lt;&lt; &quot;': &quot; &lt;&lt; FormatWithSize(returned_value)</a>
+<a name="ln641">                 &lt;&lt; &quot;, expected: &quot; &lt;&lt; FormatWithSize(expected_value_str)</a>
+<a name="ln642">                 &lt;&lt; &quot;, read hybrid_time: &quot; &lt;&lt; read_ts;</a>
+<a name="ln643">      multi_threaded_reader_-&gt;IncrementReadErrorCount(ReadStatus::OTHER_ERROR);</a>
+<a name="ln644">      return ReadStatus::OTHER_ERROR;</a>
+<a name="ln645">    }</a>
+<a name="ln646">    break;</a>
+<a name="ln647">  }</a>
+<a name="ln648"> </a>
+<a name="ln649">  return ReadStatus::OK;</a>
+<a name="ln650">}</a>
+<a name="ln651"> </a>
+<a name="ln652">void YBSingleThreadedReader::CloseSession() { CHECK_OK(session_-&gt;Close()); }</a>
+<a name="ln653"> </a>
+<a name="ln654">ReadStatus RedisSingleThreadedReader::PerformRead(</a>
+<a name="ln655">    int64_t key_index, const string&amp; key_str, const string&amp; expected_value_str) {</a>
+<a name="ln656">  string value_str;</a>
+<a name="ln657">  int64_t idx = key_index % clients_.size();</a>
+<a name="ln658">  clients_[idx]-&gt;Send({&quot;GET&quot;, key_str}, [&amp;value_str](const RedisReply&amp; reply) {</a>
+<a name="ln659">    value_str = reply.as_string();</a>
+<a name="ln660">  });</a>
+<a name="ln661">  VLOG(3) &lt;&lt; &quot;Trying to read key #&quot; &lt;&lt; key_index &lt;&lt; &quot; from redis &quot;</a>
+<a name="ln662">          &lt;&lt; &quot; key : &quot; &lt;&lt; key_str;</a>
+<a name="ln663">  clients_[idx]-&gt;Commit();</a>
+<a name="ln664"> </a>
+<a name="ln665">  if (expected_value_str != value_str) {</a>
+<a name="ln666">    LOG(INFO) &lt;&lt; &quot;Read the wrong value for #&quot; &lt;&lt; key_index &lt;&lt; &quot; from redis &quot;</a>
+<a name="ln667">              &lt;&lt; &quot; key : &quot; &lt;&lt; key_str &lt;&lt; &quot; value : &quot; &lt;&lt; value_str</a>
+<a name="ln668">              &lt;&lt; &quot; expected : &quot; &lt;&lt; expected_value_str;</a>
+<a name="ln669">    return ReadStatus::OTHER_ERROR;</a>
+<a name="ln670">  }</a>
+<a name="ln671"> </a>
+<a name="ln672">  VLOG(2) &lt;&lt; &quot;Reader &quot; &lt;&lt; reader_index_ &lt;&lt; &quot; Successfully read key #&quot; &lt;&lt; key_index &lt;&lt; &quot; from redis &quot;</a>
+<a name="ln673">          &lt;&lt; &quot; key : &quot; &lt;&lt; key_str &lt;&lt; &quot; value : &quot; &lt;&lt; value_str;</a>
+<a name="ln674">  return ReadStatus::OK;</a>
+<a name="ln675">}</a>
+<a name="ln676"> </a>
+<a name="ln677">void SingleThreadedReader::Run() {</a>
+<a name="ln678">  std::mt19937_64 random_number_generator(reader_index_);</a>
+<a name="ln679"> </a>
+<a name="ln680">  LOG(INFO) &lt;&lt; &quot;Reader thread &quot; &lt;&lt; reader_index_ &lt;&lt; &quot; started&quot;;</a>
+<a name="ln681">  ConfigureSession();</a>
+<a name="ln682"> </a>
+<a name="ln683">  // Wait until at least one row has been inserted (keys are numbered starting from 1).</a>
+<a name="ln684">  while (!multi_threaded_reader_-&gt;IsStopRequested() &amp;&amp;</a>
+<a name="ln685">         multi_threaded_reader_-&gt;insertion_point_-&gt;load() &lt; 0) {</a>
+<a name="ln686">    VLOG(1) &lt;&lt; &quot;Reader thread &quot; &lt;&lt; reader_index_ &lt;&lt; &quot; Sleeping until load() &gt;= 0&quot;;</a>
+<a name="ln687">    SleepFor(MonoDelta::FromMilliseconds(10));</a>
+<a name="ln688">  }</a>
+<a name="ln689"> </a>
+<a name="ln690">  while (!multi_threaded_reader_-&gt;IsStopRequested()) {</a>
+<a name="ln691">    const int64_t key_index = NextKeyIndexToRead(&amp;random_number_generator);</a>
+<a name="ln692"> </a>
+<a name="ln693">    ++multi_threaded_reader_-&gt;num_reads_;</a>
+<a name="ln694">    const string key_str(multi_threaded_reader_-&gt;GetKeyByIndex(key_index));</a>
+<a name="ln695">    const string expected_value_str(multi_threaded_reader_-&gt;GetValueByIndex(key_index));</a>
+<a name="ln696">    const ReadStatus read_status = PerformRead(key_index, key_str, expected_value_str);</a>
+<a name="ln697"> </a>
+<a name="ln698">    // Read operation returning zero rows is treated as a read error.</a>
+<a name="ln699">    // See: https://yugabyte.atlassian.net/browse/ENG-1272</a>
+<a name="ln700">    if (read_status == ReadStatus::NO_ROWS) {</a>
+<a name="ln701">      multi_threaded_reader_-&gt;IncrementReadErrorCount(read_status);</a>
+<a name="ln702">    }</a>
+<a name="ln703">  }</a>
+<a name="ln704"> </a>
+<a name="ln705">  CloseSession();</a>
+<a name="ln706">}</a>
+<a name="ln707"> </a>
+<a name="ln708">int64_t SingleThreadedReader::NextKeyIndexToRead(std::mt19937_64* random_number_generator) const {</a>
+<a name="ln709">  int64_t key_index = 0;</a>
+<a name="ln710">  VLOG(3) &lt;&lt; &quot;Reader thread &quot; &lt;&lt; reader_index_ &lt;&lt; &quot; waiting to load insertion point&quot;;</a>
+<a name="ln711">  int64_t written_up_to = multi_threaded_reader_-&gt;insertion_point_-&gt;load();</a>
+<a name="ln712">  do {</a>
+<a name="ln713">    VLOG(3) &lt;&lt; &quot;Reader thread &quot; &lt;&lt; reader_index_ &lt;&lt; &quot; coin toss&quot;;</a>
+<a name="ln714">    switch ((*random_number_generator)() % 3) {</a>
+<a name="ln715">      case 0:</a>
+<a name="ln716">        // Read the latest value that the insertion tracker knows we've written up to.</a>
+<a name="ln717">        key_index = written_up_to;</a>
+<a name="ln718">        break;</a>
+<a name="ln719">      case 1:</a>
+<a name="ln720">        // Read one of the keys that have been successfully inserted but have not been processed</a>
+<a name="ln721">        // by the insertion tracker thread yet.</a>
+<a name="ln722">        key_index =</a>
+<a name="ln723">            multi_threaded_reader_-&gt;inserted_keys_-&gt;GetRandomKey(random_number_generator);</a>
+<a name="ln724">        if (key_index == -1) {</a>
+<a name="ln725">          // The set is empty.</a>
+<a name="ln726">          key_index = written_up_to;</a>
+<a name="ln727">        }</a>
+<a name="ln728">        break;</a>
+<a name="ln729"> </a>
+<a name="ln730">      default:</a>
+<a name="ln731">        // We're assuming the total number of keys is &lt; RAND_MAX (~2 billion) here.</a>
+<a name="ln732">        key_index = (*random_number_generator)() % (written_up_to + 1);</a>
+<a name="ln733">        break;</a>
+<a name="ln734">    }</a>
+<a name="ln735">    // Ensure we don't try to read a key for which a write failed.</a>
+<a name="ln736">  } while (multi_threaded_reader_-&gt;failed_keys_-&gt;Contains(key_index) &amp;&amp;</a>
+<a name="ln737">           !multi_threaded_reader_-&gt;IsStopRequested());</a>
+<a name="ln738"> </a>
+<a name="ln739">  VLOG(1) &lt;&lt; &quot;Reader thread &quot; &lt;&lt; reader_index_ &lt;&lt; &quot; saw written_up_to=&quot; &lt;&lt; written_up_to</a>
+<a name="ln740">          &lt;&lt; &quot; and picked key #&quot; &lt;&lt; key_index;</a>
+<a name="ln741">  return key_index;</a>
+<a name="ln742">}</a>
+<a name="ln743"> </a>
+<a name="ln744">}  // namespace load_generator</a>
+<a name="ln745">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="226"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="259"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="261"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="286"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="342"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="360"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="364"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="390"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="394"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="445"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="459"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="482"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="551"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="583"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="613"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="652"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="661"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="672"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="686"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="710"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="713"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="739"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

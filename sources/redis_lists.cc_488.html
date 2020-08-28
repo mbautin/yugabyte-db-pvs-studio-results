@@ -1,0 +1,617 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>redis_lists.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright 2013 Facebook</a>
+<a name="ln2">//</a>
+<a name="ln3">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln4">//</a>
+<a name="ln5">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln6">//</a>
+<a name="ln7">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln8">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln9">//</a>
+<a name="ln10">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln11">//</a>
+<a name="ln12">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln13">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln14">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln15">// under the License.</a>
+<a name="ln16">//</a>
+<a name="ln17">/**</a>
+<a name="ln18"> * A (persistent) Redis API built using the rocksdb backend.</a>
+<a name="ln19"> * Implements Redis Lists as described on: http://redis.io/commands#list</a>
+<a name="ln20"> *</a>
+<a name="ln21"> * @throws All functions may throw a RedisListException on error/corruption.</a>
+<a name="ln22"> *</a>
+<a name="ln23"> * @notes Internally, the set of lists is stored in a rocksdb database,</a>
+<a name="ln24"> *        mapping keys to values. Each &quot;value&quot; is the list itself, storing</a>
+<a name="ln25"> *        some kind of internal representation of the data. All the</a>
+<a name="ln26"> *        representation details are handled by the RedisListIterator class.</a>
+<a name="ln27"> *        The present file should be oblivious to the representation details,</a>
+<a name="ln28"> *        handling only the client (Redis) API, and the calls to rocksdb.</a>
+<a name="ln29"> *</a>
+<a name="ln30"> * @TODO  Presently, all operations take at least O(NV) time where</a>
+<a name="ln31"> *        N is the number of elements in the list, and V is the average</a>
+<a name="ln32"> *        number of bytes per value in the list. So maybe, with merge operator</a>
+<a name="ln33"> *        we can improve this to an optimal O(V) amortized time, since we</a>
+<a name="ln34"> *        wouldn't have to read and re-write the entire list.</a>
+<a name="ln35"> *</a>
+<a name="ln36"> * @author Deon Nicholas (dnicholas@fb.com)</a>
+<a name="ln37"> */</a>
+<a name="ln38"> </a>
+<a name="ln39">#ifndef ROCKSDB_LITE</a>
+<a name="ln40">#include &quot;yb/rocksdb/utilities/redis/redis_lists.h&quot;</a>
+<a name="ln41"> </a>
+<a name="ln42">#include &lt;iostream&gt;</a>
+<a name="ln43">#include &lt;memory&gt;</a>
+<a name="ln44">#include &lt;cmath&gt;</a>
+<a name="ln45"> </a>
+<a name="ln46">#include &quot;yb/util/slice.h&quot;</a>
+<a name="ln47">#include &quot;yb/rocksdb/util/coding.h&quot;</a>
+<a name="ln48"> </a>
+<a name="ln49">namespace rocksdb {</a>
+<a name="ln50"> </a>
+<a name="ln51">/// Constructors</a>
+<a name="ln52"> </a>
+<a name="ln53">RedisLists::RedisLists(const std::string&amp; db_path,</a>
+<a name="ln54">                       Options options, bool destructive)</a>
+<a name="ln55">    : put_option_(),</a>
+<a name="ln56">      get_option_() {</a>
+<a name="ln57"> </a>
+<a name="ln58">  // Store the name of the database</a>
+<a name="ln59">  db_name_ = db_path;</a>
+<a name="ln60"> </a>
+<a name="ln61">  // If destructive, destroy the DB before re-opening it.</a>
+<a name="ln62">  if (destructive) {</a>
+<a name="ln63">    CHECK_OK(DestroyDB(db_name_, Options()));</a>
+<a name="ln64">  }</a>
+<a name="ln65"> </a>
+<a name="ln66">  // Now open and deal with the db</a>
+<a name="ln67">  DB* db;</a>
+<a name="ln68">  Status s = DB::Open(options, db_name_, &amp;db);</a>
+<a name="ln69">  if (!s.ok()) {</a>
+<a name="ln70">    std::cerr &lt;&lt; &quot;ERROR &quot; &lt;&lt; s.ToString() &lt;&lt; std::endl;</a>
+<a name="ln71">    assert(false);</a>
+<a name="ln72">  }</a>
+<a name="ln73"> </a>
+<a name="ln74">  db_ = std::unique_ptr&lt;DB&gt;(db);</a>
+<a name="ln75">}</a>
+<a name="ln76"> </a>
+<a name="ln77"> </a>
+<a name="ln78">/// Accessors</a>
+<a name="ln79"> </a>
+<a name="ln80">// Number of elements in the list associated with key</a>
+<a name="ln81">//   : throws RedisListException</a>
+<a name="ln82">int RedisLists::Length(const std::string&amp; key) {</a>
+<a name="ln83">  // Extract the string data representing the list.</a>
+<a name="ln84">  std::string data = Get(key);</a>
+<a name="ln85"> </a>
+<a name="ln86">  // Return the length</a>
+<a name="ln87">  RedisListIterator it(data);</a>
+<a name="ln88">  return it.Length();</a>
+<a name="ln89">}</a>
+<a name="ln90"> </a>
+<a name="ln91">// Get the element at the specified index in the (list: key)</a>
+<a name="ln92">// Returns &lt;empty&gt; (&quot;&quot;) on out-of-bounds</a>
+<a name="ln93">//   : throws RedisListException</a>
+<a name="ln94">bool RedisLists::Index(const std::string&amp; key, int32_t index,</a>
+<a name="ln95">                       std::string* result) {</a>
+<a name="ln96">  // Extract the string data representing the list.</a>
+<a name="ln97">  std::string data = Get(key);</a>
+<a name="ln98"> </a>
+<a name="ln99">  // Handle REDIS negative indices (from the end); fast iff Length() takes O(1)</a>
+<a name="ln100">  if (index &lt; 0) {</a>
+<a name="ln101">    index = Length(key) - (-index);  // replace (-i) with (N-i).</a>
+<a name="ln102">  }</a>
+<a name="ln103"> </a>
+<a name="ln104">  // Iterate through the list until the desired index is found.</a>
+<a name="ln105">  int curIndex = 0;</a>
+<a name="ln106">  RedisListIterator it(data);</a>
+<a name="ln107">  while(curIndex &lt; index &amp;&amp; !it.Done()) {</a>
+<a name="ln108">    ++curIndex;</a>
+<a name="ln109">    it.Skip();</a>
+<a name="ln110">  }</a>
+<a name="ln111"> </a>
+<a name="ln112">  // If we actually found the index</a>
+<a name="ln113">  if (curIndex == index &amp;&amp; !it.Done()) {</a>
+<a name="ln114">    Slice elem;</a>
+<a name="ln115">    it.GetCurrent(&amp;elem);</a>
+<a name="ln116">    if (result != NULL) {</a>
+<a name="ln117">      *result = elem.ToString();</a>
+<a name="ln118">    }</a>
+<a name="ln119"> </a>
+<a name="ln120">    return true;</a>
+<a name="ln121">  } else {</a>
+<a name="ln122">    return false;</a>
+<a name="ln123">  }</a>
+<a name="ln124">}</a>
+<a name="ln125"> </a>
+<a name="ln126">// Return a truncated version of the list.</a>
+<a name="ln127">// First, negative values for first/last are interpreted as &quot;end of list&quot;.</a>
+<a name="ln128">// So, if first == -1, then it is re-set to index: (Length(key) - 1)</a>
+<a name="ln129">// Then, return exactly those indices i such that first &lt;= i &lt;= last.</a>
+<a name="ln130">//   : throws RedisListException</a>
+<a name="ln131">std::vector&lt;std::string&gt; RedisLists::Range(const std::string&amp; key,</a>
+<a name="ln132">                                           int32_t first, int32_t last) {</a>
+<a name="ln133">  // Extract the string data representing the list.</a>
+<a name="ln134">  std::string data = Get(key);</a>
+<a name="ln135"> </a>
+<a name="ln136">  // Handle negative bounds (-1 means last element, etc.)</a>
+<a name="ln137">  int listLen = Length(key);</a>
+<a name="ln138">  if (first &lt; 0) {</a>
+<a name="ln139">    first = listLen - (-first);           // Replace (-x) with (N-x)</a>
+<a name="ln140">  }</a>
+<a name="ln141">  if (last &lt; 0) {</a>
+<a name="ln142">    last = listLen - (-last);</a>
+<a name="ln143">  }</a>
+<a name="ln144"> </a>
+<a name="ln145">  // Verify bounds (and truncate the range so that it is valid)</a>
+<a name="ln146">  first = std::max(first, 0);</a>
+<a name="ln147">  last = std::min(last, listLen-1);</a>
+<a name="ln148">  int len = std::max(last-first+1, 0);</a>
+<a name="ln149"> </a>
+<a name="ln150">  // Initialize the resulting list</a>
+<a name="ln151">  std::vector&lt;std::string&gt; result(len);</a>
+<a name="ln152"> </a>
+<a name="ln153">  // Traverse the list and update the vector</a>
+<a name="ln154">  int curIdx = 0;</a>
+<a name="ln155">  Slice elem;</a>
+<a name="ln156">  for (RedisListIterator it(data); !it.Done() &amp;&amp; curIdx &lt;= last; it.Skip()) {</a>
+<a name="ln157">    if (first &lt;= curIdx &amp;&amp; curIdx &lt;= last) {</a>
+<a name="ln158">      it.GetCurrent(&amp;elem);</a>
+<a name="ln159">      result[curIdx - first].assign(elem.cdata(), elem.size());</a>
+<a name="ln160">    }</a>
+<a name="ln161"> </a>
+<a name="ln162">    ++curIdx;</a>
+<a name="ln163">  }</a>
+<a name="ln164"> </a>
+<a name="ln165">  // Return the result. Might be empty</a>
+<a name="ln166">  return result;</a>
+<a name="ln167">}</a>
+<a name="ln168"> </a>
+<a name="ln169">// Print the (list: key) out to stdout. For debugging mostly. Public for now.</a>
+<a name="ln170">void RedisLists::Print(const std::string&amp; key) {</a>
+<a name="ln171">  // Extract the string data representing the list.</a>
+<a name="ln172">  std::string data = Get(key);</a>
+<a name="ln173"> </a>
+<a name="ln174">  // Iterate through the list and print the items</a>
+<a name="ln175">  Slice elem;</a>
+<a name="ln176">  for (RedisListIterator it(data); !it.Done(); it.Skip()) {</a>
+<a name="ln177">    it.GetCurrent(&amp;elem);</a>
+<a name="ln178">    std::cout &lt;&lt; &quot;ITEM &quot; &lt;&lt; elem.ToString() &lt;&lt; std::endl;</a>
+<a name="ln179">  }</a>
+<a name="ln180"> </a>
+<a name="ln181">  // Now print the byte data</a>
+<a name="ln182">  RedisListIterator it(data);</a>
+<a name="ln183">  std::cout &lt;&lt; &quot;==Printing data==&quot; &lt;&lt; std::endl;</a>
+<a name="ln184">  std::cout &lt;&lt; data.size() &lt;&lt; std::endl;</a>
+<a name="ln185">  std::cout &lt;&lt; it.Size() &lt;&lt; &quot; &quot; &lt;&lt; it.Length() &lt;&lt; std::endl;</a>
+<a name="ln186">  Slice result = it.WriteResult();</a>
+<a name="ln187">  std::cout &lt;&lt; result.data() &lt;&lt; std::endl;</a>
+<a name="ln188">  if (true) {</a>
+<a name="ln189">    std::cout &lt;&lt; &quot;size: &quot; &lt;&lt; result.size() &lt;&lt; std::endl;</a>
+<a name="ln190">    const char* val = result.cdata();</a>
+<a name="ln191">    for(size_t i = 0; i &lt; result.size(); ++i) {</a>
+<a name="ln192">      std::cout &lt;&lt; static_cast&lt;int&gt;(val[i]) &lt;&lt; &quot; &quot; &lt;&lt; (val[i] &gt;= 32 ? val[i] : ' ') &lt;&lt; std::endl;</a>
+<a name="ln193">    }</a>
+<a name="ln194">    std::cout &lt;&lt; std::endl;</a>
+<a name="ln195">  }</a>
+<a name="ln196">}</a>
+<a name="ln197"> </a>
+<a name="ln198">/// Insert/Update Functions</a>
+<a name="ln199">/// Note: The &quot;real&quot; insert function is private. See below.</a>
+<a name="ln200"> </a>
+<a name="ln201">// InsertBefore and InsertAfter are simply wrappers around the Insert function.</a>
+<a name="ln202">int RedisLists::InsertBefore(const std::string&amp; key, const std::string&amp; pivot,</a>
+<a name="ln203">                             const std::string&amp; value) {</a>
+<a name="ln204">  return Insert(key, pivot, value, false);</a>
+<a name="ln205">}</a>
+<a name="ln206"> </a>
+<a name="ln207">int RedisLists::InsertAfter(const std::string&amp; key, const std::string&amp; pivot,</a>
+<a name="ln208">                            const std::string&amp; value) {</a>
+<a name="ln209">  return Insert(key, pivot, value, true);</a>
+<a name="ln210">}</a>
+<a name="ln211"> </a>
+<a name="ln212">std::string RedisLists::Get(const std::string&amp; key) {</a>
+<a name="ln213">  std::string data;</a>
+<a name="ln214">  auto get_status = db_-&gt;Get(get_option_, key, &amp;data);</a>
+<a name="ln215">  if (!get_status.ok() &amp;&amp; !get_status.IsNotFound()) {</a>
+<a name="ln216">    CHECK_OK(get_status);</a>
+<a name="ln217">  }</a>
+<a name="ln218">  return data;</a>
+<a name="ln219">}</a>
+<a name="ln220"> </a>
+<a name="ln221">// Prepend value onto beginning of (list: key)</a>
+<a name="ln222">//   : throws RedisListException</a>
+<a name="ln223">int RedisLists::PushLeft(const std::string&amp; key, const std::string&amp; value) {</a>
+<a name="ln224">  // Get the original list data</a>
+<a name="ln225">  std::string data = Get(key);</a>
+<a name="ln226"> </a>
+<a name="ln227">  // Construct the result</a>
+<a name="ln228">  RedisListIterator it(data);</a>
+<a name="ln229">  it.Reserve(it.Size() + it.SizeOf(value));</a>
+<a name="ln230">  it.InsertElement(value);</a>
+<a name="ln231"> </a>
+<a name="ln232">  // Push the data back to the db and return the length</a>
+<a name="ln233">  CHECK_OK(db_-&gt;Put(put_option_, key, it.WriteResult()));</a>
+<a name="ln234">  return it.Length();</a>
+<a name="ln235">}</a>
+<a name="ln236"> </a>
+<a name="ln237">// Append value onto end of (list: key)</a>
+<a name="ln238">// TODO: Make this O(1) time. Might require MergeOperator.</a>
+<a name="ln239">//   : throws RedisListException</a>
+<a name="ln240">int RedisLists::PushRight(const std::string&amp; key, const std::string&amp; value) {</a>
+<a name="ln241">  // Get the original list data</a>
+<a name="ln242">  std::string data = Get(key);</a>
+<a name="ln243"> </a>
+<a name="ln244">  // Create an iterator to the data and seek to the end.</a>
+<a name="ln245">  RedisListIterator it(data);</a>
+<a name="ln246">  it.Reserve(it.Size() + it.SizeOf(value));</a>
+<a name="ln247">  while (!it.Done()) {</a>
+<a name="ln248">    it.Push();    // Write each element as we go</a>
+<a name="ln249">  }</a>
+<a name="ln250"> </a>
+<a name="ln251">  // Insert the new element at the current position (the end)</a>
+<a name="ln252">  it.InsertElement(value);</a>
+<a name="ln253"> </a>
+<a name="ln254">  // Push it back to the db, and return length</a>
+<a name="ln255">  CHECK_OK(db_-&gt;Put(put_option_, key, it.WriteResult()));</a>
+<a name="ln256">  return it.Length();</a>
+<a name="ln257">}</a>
+<a name="ln258"> </a>
+<a name="ln259">// Set (list: key)[idx] = val. Return true on success, false on fail.</a>
+<a name="ln260">//   : throws RedisListException</a>
+<a name="ln261">bool RedisLists::Set(const std::string&amp; key, int32_t index,</a>
+<a name="ln262">                     const std::string&amp; value) {</a>
+<a name="ln263">  // Get the original list data</a>
+<a name="ln264">  std::string data = Get(key);</a>
+<a name="ln265"> </a>
+<a name="ln266">  // Handle negative index for REDIS (meaning -index from end of list)</a>
+<a name="ln267">  if (index &lt; 0) {</a>
+<a name="ln268">    index = Length(key) - (-index);</a>
+<a name="ln269">  }</a>
+<a name="ln270"> </a>
+<a name="ln271">  // Iterate through the list until we find the element we want</a>
+<a name="ln272">  int curIndex = 0;</a>
+<a name="ln273">  RedisListIterator it(data);</a>
+<a name="ln274">  it.Reserve(it.Size() + it.SizeOf(value));  // Over-estimate is fine</a>
+<a name="ln275">  while(curIndex &lt; index &amp;&amp; !it.Done()) {</a>
+<a name="ln276">    it.Push();</a>
+<a name="ln277">    ++curIndex;</a>
+<a name="ln278">  }</a>
+<a name="ln279"> </a>
+<a name="ln280">  // If not found, return false (this occurs when index was invalid)</a>
+<a name="ln281">  if (it.Done() || curIndex != index) {</a>
+<a name="ln282">    return false;</a>
+<a name="ln283">  }</a>
+<a name="ln284"> </a>
+<a name="ln285">  // Write the new element value, and drop the previous element value</a>
+<a name="ln286">  it.InsertElement(value);</a>
+<a name="ln287">  it.Skip();</a>
+<a name="ln288"> </a>
+<a name="ln289">  // Write the data to the database</a>
+<a name="ln290">  // Check status, since it needs to return true/false guarantee</a>
+<a name="ln291">  Status s = db_-&gt;Put(put_option_, key, it.WriteResult());</a>
+<a name="ln292"> </a>
+<a name="ln293">  // Success</a>
+<a name="ln294">  return s.ok();</a>
+<a name="ln295">}</a>
+<a name="ln296"> </a>
+<a name="ln297">/// Delete / Remove / Pop functions</a>
+<a name="ln298"> </a>
+<a name="ln299">// Trim (list: key) so that it will only contain the indices from start..stop</a>
+<a name="ln300">//  Invalid indices will not generate an error, just empty,</a>
+<a name="ln301">//  or the portion of the list that fits in this interval</a>
+<a name="ln302">//   : throws RedisListException</a>
+<a name="ln303">bool RedisLists::Trim(const std::string&amp; key, int32_t start, int32_t stop) {</a>
+<a name="ln304">  // Get the original list data</a>
+<a name="ln305">  std::string data = Get(key);</a>
+<a name="ln306"> </a>
+<a name="ln307">  // Handle negative indices in REDIS</a>
+<a name="ln308">  int listLen = Length(key);</a>
+<a name="ln309">  if (start &lt; 0) {</a>
+<a name="ln310">    start = listLen - (-start);</a>
+<a name="ln311">  }</a>
+<a name="ln312">  if (stop &lt; 0) {</a>
+<a name="ln313">    stop = listLen - (-stop);</a>
+<a name="ln314">  }</a>
+<a name="ln315"> </a>
+<a name="ln316">  // Truncate bounds to only fit in the list</a>
+<a name="ln317">  start = std::max(start, 0);</a>
+<a name="ln318">  stop = std::min(stop, listLen-1);</a>
+<a name="ln319"> </a>
+<a name="ln320">  // Construct an iterator for the list. Drop all undesired elements.</a>
+<a name="ln321">  int curIndex = 0;</a>
+<a name="ln322">  RedisListIterator it(data);</a>
+<a name="ln323">  it.Reserve(it.Size());          // Over-estimate</a>
+<a name="ln324">  while(!it.Done()) {</a>
+<a name="ln325">    // If not within the range, just skip the item (drop it).</a>
+<a name="ln326">    // Otherwise, continue as usual.</a>
+<a name="ln327">    if (start &lt;= curIndex &amp;&amp; curIndex &lt;= stop) {</a>
+<a name="ln328">      it.Push();</a>
+<a name="ln329">    } else {</a>
+<a name="ln330">      it.Skip();</a>
+<a name="ln331">    }</a>
+<a name="ln332"> </a>
+<a name="ln333">    // Increment the current index</a>
+<a name="ln334">    ++curIndex;</a>
+<a name="ln335">  }</a>
+<a name="ln336"> </a>
+<a name="ln337">  // Write the (possibly empty) result to the database</a>
+<a name="ln338">  Status s = db_-&gt;Put(put_option_, key, it.WriteResult());</a>
+<a name="ln339"> </a>
+<a name="ln340">  // Return true as long as the write succeeded</a>
+<a name="ln341">  return s.ok();</a>
+<a name="ln342">}</a>
+<a name="ln343"> </a>
+<a name="ln344">// Return and remove the first element in the list (or &quot;&quot; if empty)</a>
+<a name="ln345">//   : throws RedisListException</a>
+<a name="ln346">bool RedisLists::PopLeft(const std::string&amp; key, std::string* result) {</a>
+<a name="ln347">  // Get the original list data</a>
+<a name="ln348">  std::string data = Get(key);</a>
+<a name="ln349"> </a>
+<a name="ln350">  // Point to first element in the list (if it exists), and get its value/size</a>
+<a name="ln351">  RedisListIterator it(data);</a>
+<a name="ln352">  if (it.Length() &gt; 0) {            // Proceed only if list is non-empty</a>
+<a name="ln353">    Slice elem;</a>
+<a name="ln354">    it.GetCurrent(&amp;elem);           // Store the value of the first element</a>
+<a name="ln355">    it.Reserve(it.Size() - it.SizeOf(elem));</a>
+<a name="ln356">    it.Skip();                      // DROP the first item and move to next</a>
+<a name="ln357"> </a>
+<a name="ln358">    // Update the db</a>
+<a name="ln359">    CHECK_OK(db_-&gt;Put(put_option_, key, it.WriteResult()));</a>
+<a name="ln360"> </a>
+<a name="ln361">    // Return the value</a>
+<a name="ln362">    if (result != NULL) {</a>
+<a name="ln363">      *result = elem.ToString();</a>
+<a name="ln364">    }</a>
+<a name="ln365">    return true;</a>
+<a name="ln366">  } else {</a>
+<a name="ln367">    return false;</a>
+<a name="ln368">  }</a>
+<a name="ln369">}</a>
+<a name="ln370"> </a>
+<a name="ln371">// Remove and return the last element in the list (or &quot;&quot; if empty)</a>
+<a name="ln372">// TODO: Make this O(1). Might require MergeOperator.</a>
+<a name="ln373">//   : throws RedisListException</a>
+<a name="ln374">bool RedisLists::PopRight(const std::string&amp; key, std::string* result) {</a>
+<a name="ln375">  // Extract the original list data</a>
+<a name="ln376">  std::string data = Get(key);</a>
+<a name="ln377"> </a>
+<a name="ln378">  // Construct an iterator to the data and move to last element</a>
+<a name="ln379">  RedisListIterator it(data);</a>
+<a name="ln380">  it.Reserve(it.Size());</a>
+<a name="ln381">  int len = it.Length();</a>
+<a name="ln382">  int curIndex = 0;</a>
+<a name="ln383">  while(curIndex &lt; (len-1) &amp;&amp; !it.Done()) {</a>
+<a name="ln384">    it.Push();</a>
+<a name="ln385">    ++curIndex;</a>
+<a name="ln386">  }</a>
+<a name="ln387"> </a>
+<a name="ln388">  // Extract and drop/skip the last element</a>
+<a name="ln389">  if (curIndex == len-1) {</a>
+<a name="ln390">    assert(!it.Done());         // Sanity check. Should not have ended here.</a>
+<a name="ln391"> </a>
+<a name="ln392">    // Extract and pop the element</a>
+<a name="ln393">    Slice elem;</a>
+<a name="ln394">    it.GetCurrent(&amp;elem);       // Save value of element.</a>
+<a name="ln395">    it.Skip();                  // Skip the element</a>
+<a name="ln396"> </a>
+<a name="ln397">    // Write the result to the database</a>
+<a name="ln398">    CHECK_OK(db_-&gt;Put(put_option_, key, it.WriteResult()));</a>
+<a name="ln399"> </a>
+<a name="ln400">    // Return the value</a>
+<a name="ln401">    if (result != NULL) {</a>
+<a name="ln402">      *result = elem.ToString();</a>
+<a name="ln403">    }</a>
+<a name="ln404">    return true;</a>
+<a name="ln405">  } else {</a>
+<a name="ln406">    // Must have been an empty list</a>
+<a name="ln407">    assert(it.Done() &amp;&amp; len == 0 &amp;&amp; curIndex == 0);</a>
+<a name="ln408">    return false;</a>
+<a name="ln409">  }</a>
+<a name="ln410">}</a>
+<a name="ln411"> </a>
+<a name="ln412">// Remove the (first or last) &quot;num&quot; occurrences of value in (list: key)</a>
+<a name="ln413">//   : throws RedisListException</a>
+<a name="ln414">int RedisLists::Remove(const std::string&amp; key, int32_t num,</a>
+<a name="ln415">                       const std::string&amp; value) {</a>
+<a name="ln416">  // Negative num ==&gt; RemoveLast; Positive num ==&gt; Remove First</a>
+<a name="ln417">  if (num &lt; 0) {</a>
+<a name="ln418">    return RemoveLast(key, -num, value);</a>
+<a name="ln419">  } else if (num &gt; 0) {</a>
+<a name="ln420">    return RemoveFirst(key, num, value);</a>
+<a name="ln421">  } else {</a>
+<a name="ln422">    return RemoveFirst(key, Length(key), value);</a>
+<a name="ln423">  }</a>
+<a name="ln424">}</a>
+<a name="ln425"> </a>
+<a name="ln426">// Remove the first &quot;num&quot; occurrences of value in (list: key).</a>
+<a name="ln427">//   : throws RedisListException</a>
+<a name="ln428">int RedisLists::RemoveFirst(const std::string&amp; key, int32_t num,</a>
+<a name="ln429">                            const std::string&amp; value) {</a>
+<a name="ln430">  // Ensure that the number is positive</a>
+<a name="ln431">  assert(num &gt;= 0);</a>
+<a name="ln432"> </a>
+<a name="ln433">  // Extract the original list data</a>
+<a name="ln434">  std::string data = Get(key);</a>
+<a name="ln435"> </a>
+<a name="ln436">  // Traverse the list, appending all but the desired occurrences of value</a>
+<a name="ln437">  int numSkipped = 0;         // Keep track of the number of times value is seen</a>
+<a name="ln438">  Slice elem;</a>
+<a name="ln439">  RedisListIterator it(data);</a>
+<a name="ln440">  it.Reserve(it.Size());</a>
+<a name="ln441">  while (!it.Done()) {</a>
+<a name="ln442">    it.GetCurrent(&amp;elem);</a>
+<a name="ln443"> </a>
+<a name="ln444">    if (elem == value &amp;&amp; numSkipped &lt; num) {</a>
+<a name="ln445">      // Drop this item if desired</a>
+<a name="ln446">      it.Skip();</a>
+<a name="ln447">      ++numSkipped;</a>
+<a name="ln448">    } else {</a>
+<a name="ln449">      // Otherwise keep the item and proceed as normal</a>
+<a name="ln450">      it.Push();</a>
+<a name="ln451">    }</a>
+<a name="ln452">  }</a>
+<a name="ln453"> </a>
+<a name="ln454">  // Put the result back to the database</a>
+<a name="ln455">  CHECK_OK(db_-&gt;Put(put_option_, key, it.WriteResult()));</a>
+<a name="ln456"> </a>
+<a name="ln457">  // Return the number of elements removed</a>
+<a name="ln458">  return numSkipped;</a>
+<a name="ln459">}</a>
+<a name="ln460"> </a>
+<a name="ln461"> </a>
+<a name="ln462">// Remove the last &quot;num&quot; occurrences of value in (list: key).</a>
+<a name="ln463">// TODO: I traverse the list 2x. Make faster. Might require MergeOperator.</a>
+<a name="ln464">//   : throws RedisListException</a>
+<a name="ln465">int RedisLists::RemoveLast(const std::string&amp; key, int32_t num,</a>
+<a name="ln466">                           const std::string&amp; value) {</a>
+<a name="ln467">  // Ensure that the number is positive</a>
+<a name="ln468">  assert(num &gt;= 0);</a>
+<a name="ln469"> </a>
+<a name="ln470">  // Extract the original list data</a>
+<a name="ln471">  std::string data = Get(key);</a>
+<a name="ln472"> </a>
+<a name="ln473">  // Temporary variable to hold the &quot;current element&quot; in the blocks below</a>
+<a name="ln474">  Slice elem;</a>
+<a name="ln475"> </a>
+<a name="ln476">  // Count the total number of occurrences of value</a>
+<a name="ln477">  int totalOccs = 0;</a>
+<a name="ln478">  for (RedisListIterator it(data); !it.Done(); it.Skip()) {</a>
+<a name="ln479">    it.GetCurrent(&amp;elem);</a>
+<a name="ln480">    if (elem == value) {</a>
+<a name="ln481">      ++totalOccs;</a>
+<a name="ln482">    }</a>
+<a name="ln483">  }</a>
+<a name="ln484"> </a>
+<a name="ln485">  // Construct an iterator to the data. Reserve enough space for the result.</a>
+<a name="ln486">  RedisListIterator it(data);</a>
+<a name="ln487">  int bytesRemoved = std::min(num, totalOccs) * it.SizeOf(value);</a>
+<a name="ln488">  it.Reserve(it.Size() - bytesRemoved);</a>
+<a name="ln489"> </a>
+<a name="ln490">  // Traverse the list, appending all but the desired occurrences of value.</a>
+<a name="ln491">  // Note: &quot;Drop the last k occurrences&quot; is equivalent to</a>
+<a name="ln492">  //  &quot;keep only the first n-k occurrences&quot;, where n is total occurrences.</a>
+<a name="ln493">  int numKept = 0;          // Keep track of the number of times value is kept</a>
+<a name="ln494">  while(!it.Done()) {</a>
+<a name="ln495">    it.GetCurrent(&amp;elem);</a>
+<a name="ln496"> </a>
+<a name="ln497">    // If we are within the deletion range and equal to value, drop it.</a>
+<a name="ln498">    // Otherwise, append/keep/push it.</a>
+<a name="ln499">    if (elem == value) {</a>
+<a name="ln500">      if (numKept &lt; totalOccs - num) {</a>
+<a name="ln501">        it.Push();</a>
+<a name="ln502">        ++numKept;</a>
+<a name="ln503">      } else {</a>
+<a name="ln504">        it.Skip();</a>
+<a name="ln505">      }</a>
+<a name="ln506">    } else {</a>
+<a name="ln507">      // Always append the others</a>
+<a name="ln508">      it.Push();</a>
+<a name="ln509">    }</a>
+<a name="ln510">  }</a>
+<a name="ln511"> </a>
+<a name="ln512">  // Put the result back to the database</a>
+<a name="ln513">  CHECK_OK(db_-&gt;Put(put_option_, key, it.WriteResult()));</a>
+<a name="ln514"> </a>
+<a name="ln515">  // Return the number of elements removed</a>
+<a name="ln516">  return totalOccs - numKept;</a>
+<a name="ln517">}</a>
+<a name="ln518"> </a>
+<a name="ln519">/// Private functions</a>
+<a name="ln520"> </a>
+<a name="ln521">// Insert element value into (list: key), right before/after</a>
+<a name="ln522">//  the first occurrence of pivot</a>
+<a name="ln523">//   : throws RedisListException</a>
+<a name="ln524">int RedisLists::Insert(const std::string&amp; key, const std::string&amp; pivot,</a>
+<a name="ln525">                       const std::string&amp; value, bool insert_after) {</a>
+<a name="ln526">  // Get the original list data</a>
+<a name="ln527">  std::string data = Get(key);</a>
+<a name="ln528"> </a>
+<a name="ln529">  // Construct an iterator to the data and reserve enough space for result.</a>
+<a name="ln530">  RedisListIterator it(data);</a>
+<a name="ln531">  it.Reserve(it.Size() + it.SizeOf(value));</a>
+<a name="ln532"> </a>
+<a name="ln533">  // Iterate through the list until we find the element we want</a>
+<a name="ln534">  Slice elem;</a>
+<a name="ln535">  bool found = false;</a>
+<a name="ln536">  while(!it.Done() &amp;&amp; !found) {</a>
+<a name="ln537">    it.GetCurrent(&amp;elem);</a>
+<a name="ln538"> </a>
+<a name="ln539">    // When we find the element, insert the element and mark found</a>
+<a name="ln540">    if (elem == pivot) {                // Found it!</a>
+<a name="ln541">      found = true;</a>
+<a name="ln542">      if (insert_after == true) {       // Skip one more, if inserting after it</a>
+<a name="ln543">        it.Push();</a>
+<a name="ln544">      }</a>
+<a name="ln545">      it.InsertElement(value);</a>
+<a name="ln546">    } else {</a>
+<a name="ln547">      it.Push();</a>
+<a name="ln548">    }</a>
+<a name="ln549"> </a>
+<a name="ln550">  }</a>
+<a name="ln551"> </a>
+<a name="ln552">  // Put the data (string) into the database</a>
+<a name="ln553">  if (found) {</a>
+<a name="ln554">    CHECK_OK(db_-&gt;Put(put_option_, key, it.WriteResult()));</a>
+<a name="ln555">  }</a>
+<a name="ln556"> </a>
+<a name="ln557">  // Returns the new (possibly unchanged) length of the list</a>
+<a name="ln558">  return it.Length();</a>
+<a name="ln559">}</a>
+<a name="ln560"> </a>
+<a name="ln561">}  // namespace rocksdb</a>
+<a name="ln562">#endif  // ROCKSDB_LITE</a>
+
+</code></pre>
+<div class="balloon" rel="63"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="157"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v560/" target="_blank">V560</a> A part of conditional expression is always true: curIdx <= last.</p></div>
+<div class="balloon" rel="216"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="233"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="255"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="359"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="398"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="455"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="513"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="554"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

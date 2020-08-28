@@ -1,0 +1,524 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>tablet_rpc.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/client/tablet_rpc.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/consensus/consensus_error.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln23">#include &quot;yb/client/meta_cache.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;yb/tserver/tserver_service.proxy.h&quot;</a>
+<a name="ln26">#include &quot;yb/tserver/tserver_error.h&quot;</a>
+<a name="ln27">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln28">#include &quot;yb/util/scope_exit.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">DEFINE_test_flag(bool, assert_local_op, false,</a>
+<a name="ln31">                 &quot;When set, we crash if we received an operation that cannot be served locally.&quot;);</a>
+<a name="ln32">DEFINE_int32(force_lookup_cache_refresh_secs, 0, &quot;When non-zero, specifies how often we send a &quot;</a>
+<a name="ln33">             &quot;GetTabletLocations request to the master leader to update the tablet replicas cache. &quot;</a>
+<a name="ln34">             &quot;This request is only sent if we are processing a ConsistentPrefix read.&quot;);</a>
+<a name="ln35"> </a>
+<a name="ln36">using namespace std::placeholders;</a>
+<a name="ln37"> </a>
+<a name="ln38">namespace yb {</a>
+<a name="ln39">namespace client {</a>
+<a name="ln40">namespace internal {</a>
+<a name="ln41"> </a>
+<a name="ln42">TabletInvoker::TabletInvoker(const bool local_tserver_only,</a>
+<a name="ln43">                             const bool consistent_prefix,</a>
+<a name="ln44">                             YBClient* client,</a>
+<a name="ln45">                             rpc::RpcCommand* command,</a>
+<a name="ln46">                             TabletRpc* rpc,</a>
+<a name="ln47">                             RemoteTablet* tablet,</a>
+<a name="ln48">                             rpc::RpcRetrier* retrier,</a>
+<a name="ln49">                             Trace* trace)</a>
+<a name="ln50">      : client_(client),</a>
+<a name="ln51">        command_(command),</a>
+<a name="ln52">        rpc_(rpc),</a>
+<a name="ln53">        tablet_(tablet),</a>
+<a name="ln54">        tablet_id_(tablet != nullptr ? tablet-&gt;tablet_id() : std::string()),</a>
+<a name="ln55">        retrier_(retrier),</a>
+<a name="ln56">        trace_(trace),</a>
+<a name="ln57">        local_tserver_only_(local_tserver_only),</a>
+<a name="ln58">        consistent_prefix_(consistent_prefix) {}</a>
+<a name="ln59"> </a>
+<a name="ln60">TabletInvoker::~TabletInvoker() {}</a>
+<a name="ln61"> </a>
+<a name="ln62">void TabletInvoker::SelectTabletServerWithConsistentPrefix() {</a>
+<a name="ln63">  TRACE_TO(trace_, &quot;SelectTabletServerWithConsistentPrefix()&quot;);</a>
+<a name="ln64"> </a>
+<a name="ln65">  std::vector&lt;RemoteTabletServer*&gt; candidates;</a>
+<a name="ln66">  current_ts_ = client_-&gt;data_-&gt;SelectTServer(tablet_.get(),</a>
+<a name="ln67">                                              YBClient::ReplicaSelection::CLOSEST_REPLICA, {},</a>
+<a name="ln68">                                              &amp;candidates);</a>
+<a name="ln69">  VLOG(1) &lt;&lt; &quot;Using tserver: &quot; &lt;&lt; yb::ToString(current_ts_);</a>
+<a name="ln70">}</a>
+<a name="ln71"> </a>
+<a name="ln72">void TabletInvoker::SelectLocalTabletServer() {</a>
+<a name="ln73">  TRACE_TO(trace_, &quot;SelectLocalTabletServer()&quot;);</a>
+<a name="ln74"> </a>
+<a name="ln75">  current_ts_ = client_-&gt;data_-&gt;meta_cache_-&gt;local_tserver();</a>
+<a name="ln76">  VLOG(1) &lt;&lt; &quot;Using local tserver: &quot; &lt;&lt; current_ts_-&gt;ToString();</a>
+<a name="ln77">}</a>
+<a name="ln78"> </a>
+<a name="ln79">void TabletInvoker::SelectTabletServer()  {</a>
+<a name="ln80">  TRACE_TO(trace_, &quot;SelectTabletServer()&quot;);</a>
+<a name="ln81"> </a>
+<a name="ln82">  assign_new_leader_ = false;</a>
+<a name="ln83">  // Choose a destination TS according to the following algorithm:</a>
+<a name="ln84">  // 1. Select the leader, provided:</a>
+<a name="ln85">  //    a. One exists, and</a>
+<a name="ln86">  //    b. It hasn't failed, and</a>
+<a name="ln87">  //    c. It isn't currently marked as a follower.</a>
+<a name="ln88">  // 2. If there's no good leader select another replica, provided:</a>
+<a name="ln89">  //    a. It hasn't failed, and</a>
+<a name="ln90">  //    b. It hasn't rejected our write due to being a follower.</a>
+<a name="ln91">  // 3. If we're out of appropriate replicas, force a lookup to the master</a>
+<a name="ln92">  //    to fetch new consensus configuration information.</a>
+<a name="ln93">  // 4. When the lookup finishes, forget which replicas were followers and</a>
+<a name="ln94">  //    retry the write (i.e. goto 1).</a>
+<a name="ln95">  // 5. If we issue the write and it fails because the destination was a</a>
+<a name="ln96">  //    follower, remember that fact and retry the write (i.e. goto 1).</a>
+<a name="ln97">  // 6. Repeat steps 1-5 until the write succeeds, fails for other reasons,</a>
+<a name="ln98">  //    or the write's deadline expires.</a>
+<a name="ln99">  current_ts_ = tablet_-&gt;LeaderTServer();</a>
+<a name="ln100">  if (current_ts_ &amp;&amp; ContainsKey(followers_, current_ts_)) {</a>
+<a name="ln101">    VLOG(2) &lt;&lt; &quot;Tablet &quot; &lt;&lt; tablet_id_ &lt;&lt; &quot;: We have a follower for a leader: &quot;</a>
+<a name="ln102">            &lt;&lt; current_ts_-&gt;ToString();</a>
+<a name="ln103"> </a>
+<a name="ln104">    // Mark the node as a follower in the cache so that on the next go-round,</a>
+<a name="ln105">    // LeaderTServer() will not return it as a leader unless a full metadata</a>
+<a name="ln106">    // refresh has occurred. This also avoids LookupTabletByKey() going into</a>
+<a name="ln107">    // &quot;fast path&quot; mode and not actually performing a metadata refresh from the</a>
+<a name="ln108">    // Master when it needs to.</a>
+<a name="ln109">    tablet_-&gt;MarkTServerAsFollower(current_ts_);</a>
+<a name="ln110">    current_ts_ = nullptr;</a>
+<a name="ln111">  }</a>
+<a name="ln112">  if (!current_ts_) {</a>
+<a name="ln113">    // Try to &quot;guess&quot; the next leader.</a>
+<a name="ln114">    vector&lt;RemoteTabletServer*&gt; replicas;</a>
+<a name="ln115">    tablet_-&gt;GetRemoteTabletServers(&amp;replicas);</a>
+<a name="ln116">    for (RemoteTabletServer* ts : replicas) {</a>
+<a name="ln117">      if (!ContainsKey(followers_, ts)) {</a>
+<a name="ln118">        current_ts_ = ts;</a>
+<a name="ln119">        break;</a>
+<a name="ln120">      }</a>
+<a name="ln121">    }</a>
+<a name="ln122">    if (current_ts_) {</a>
+<a name="ln123">      assign_new_leader_ = true;</a>
+<a name="ln124">    } else {</a>
+<a name="ln125">      YB_LOG_EVERY_N_SECS(INFO, 1)</a>
+<a name="ln126">          &lt;&lt; &quot;Unable to pick leader for &quot; &lt;&lt; tablet_id_ &lt;&lt; &quot;, replicas: &quot; &lt;&lt; AsString(replicas)</a>
+<a name="ln127">          &lt;&lt; &quot;, followers: &quot; &lt;&lt; AsString(followers_) &lt;&lt; THROTTLE_MSG;</a>
+<a name="ln128">    }</a>
+<a name="ln129">  } else {</a>
+<a name="ln130">    VLOG(4) &lt;&lt; &quot;Selected TServer &quot; &lt;&lt; current_ts_-&gt;ToString() &lt;&lt; &quot; as leader for &quot; &lt;&lt; tablet_id_;</a>
+<a name="ln131">  }</a>
+<a name="ln132">}</a>
+<a name="ln133"> </a>
+<a name="ln134">void TabletInvoker::Execute(const std::string&amp; tablet_id, bool leader_only) {</a>
+<a name="ln135">  if (tablet_id_.empty()) {</a>
+<a name="ln136">    if (!tablet_id.empty()) {</a>
+<a name="ln137">      tablet_id_ = tablet_id;</a>
+<a name="ln138">    } else {</a>
+<a name="ln139">      tablet_id_ = CHECK_NOTNULL(tablet_.get())-&gt;tablet_id();</a>
+<a name="ln140">    }</a>
+<a name="ln141">  }</a>
+<a name="ln142"> </a>
+<a name="ln143">  if (!tablet_) {</a>
+<a name="ln144">    client_-&gt;LookupTabletById(tablet_id_, retrier_-&gt;deadline(),</a>
+<a name="ln145">                              std::bind(&amp;TabletInvoker::InitialLookupTabletDone, this, _1),</a>
+<a name="ln146">                              UseCache::kTrue);</a>
+<a name="ln147">    return;</a>
+<a name="ln148">  }</a>
+<a name="ln149"> </a>
+<a name="ln150">  // Sets current_ts_.</a>
+<a name="ln151">  if (local_tserver_only_) {</a>
+<a name="ln152">    SelectLocalTabletServer();</a>
+<a name="ln153">  } else if (consistent_prefix_ &amp;&amp; !leader_only) {</a>
+<a name="ln154">    SelectTabletServerWithConsistentPrefix();</a>
+<a name="ln155">  } else {</a>
+<a name="ln156">    SelectTabletServer();</a>
+<a name="ln157">  }</a>
+<a name="ln158"> </a>
+<a name="ln159">  // If we've tried all replicas, force a lookup to the master to find the</a>
+<a name="ln160">  // new leader. This relies on some properties of LookupTabletByKey():</a>
+<a name="ln161">  // 1. The fast path only works when there's a non-failed leader (which we</a>
+<a name="ln162">  //    know is untrue here).</a>
+<a name="ln163">  // 2. The slow path always fetches consensus configuration information and</a>
+<a name="ln164">  //    updates the looked-up tablet.</a>
+<a name="ln165">  // Put another way, we don't care about the lookup results at all; we're</a>
+<a name="ln166">  // just using it to fetch the latest consensus configuration information.</a>
+<a name="ln167">  //</a>
+<a name="ln168">  // TODO: When we support tablet splits, we should let the lookup shift</a>
+<a name="ln169">  // the write to another tablet (i.e. if it's since been split).</a>
+<a name="ln170">  if (!current_ts_) {</a>
+<a name="ln171">    client_-&gt;LookupTabletById(tablet_id_,</a>
+<a name="ln172">                              retrier_-&gt;deadline(),</a>
+<a name="ln173">                              std::bind(&amp;TabletInvoker::LookupTabletCb, this, _1),</a>
+<a name="ln174">                              UseCache::kTrue);</a>
+<a name="ln175">    return;</a>
+<a name="ln176">  } else if (consistent_prefix_ &amp;&amp;</a>
+<a name="ln177">             FLAGS_force_lookup_cache_refresh_secs &gt; 0 &amp;&amp;</a>
+<a name="ln178">             MonoTime::Now().GetDeltaSince(tablet_-&gt;refresh_time()).ToSeconds() &gt;</a>
+<a name="ln179">                 FLAGS_force_lookup_cache_refresh_secs) {</a>
+<a name="ln180"> </a>
+<a name="ln181">    VLOG(1) &lt;&lt; &quot;Updating tablet &quot; &lt;&lt; tablet_-&gt;tablet_id() &lt;&lt; &quot; replicas cache for tablet &quot;</a>
+<a name="ln182">            &lt;&lt; &quot; after &quot; &lt;&lt; MonoTime::Now().GetDeltaSince(tablet_-&gt;refresh_time()).ToSeconds()</a>
+<a name="ln183">            &lt;&lt; &quot; seconds since the last update. Replicas: &quot;</a>
+<a name="ln184">            &lt;&lt; tablet_-&gt;ReplicasAsString();</a>
+<a name="ln185"> </a>
+<a name="ln186">    client_-&gt;LookupTabletById(tablet_id_,</a>
+<a name="ln187">                              retrier_-&gt;deadline(),</a>
+<a name="ln188">                              std::bind(&amp;TabletInvoker::LookupTabletCb, this, _1),</a>
+<a name="ln189">                              UseCache::kFalse);</a>
+<a name="ln190">    return;</a>
+<a name="ln191">  }</a>
+<a name="ln192"> </a>
+<a name="ln193">  // Make sure we have a working proxy before sending out the RPC.</a>
+<a name="ln194">  auto status = current_ts_-&gt;InitProxy(client_);</a>
+<a name="ln195"> </a>
+<a name="ln196">  // Fail to a replica in the event of a DNS resolution failure.</a>
+<a name="ln197">  if (!status.ok()) {</a>
+<a name="ln198">    status = FailToNewReplica(status);</a>
+<a name="ln199">    if (!status.ok()) {</a>
+<a name="ln200">      command_-&gt;Finished(status);</a>
+<a name="ln201">    }</a>
+<a name="ln202">    return;</a>
+<a name="ln203">  }</a>
+<a name="ln204"> </a>
+<a name="ln205">  VLOG(2) &lt;&lt; &quot;Tablet &quot; &lt;&lt; tablet_id_ &lt;&lt; &quot;: Writing batch to replica &quot;</a>
+<a name="ln206">          &lt;&lt; current_ts_-&gt;ToString();</a>
+<a name="ln207"> </a>
+<a name="ln208">  rpc_-&gt;SendRpcToTserver(retrier_-&gt;attempt_num());</a>
+<a name="ln209">}</a>
+<a name="ln210"> </a>
+<a name="ln211">Status TabletInvoker::FailToNewReplica(const Status&amp; reason,</a>
+<a name="ln212">                                       const tserver::TabletServerErrorPB* error_code) {</a>
+<a name="ln213">  if (ErrorCode(error_code) == tserver::TabletServerErrorPB::STALE_FOLLOWER) {</a>
+<a name="ln214">    VLOG(1) &lt;&lt; &quot;Stale follower for &quot; &lt;&lt; command_-&gt;ToString() &lt;&lt; &quot; just retry&quot;;</a>
+<a name="ln215">  } else if (ErrorCode(error_code) == tserver::TabletServerErrorPB::NOT_THE_LEADER) {</a>
+<a name="ln216">    VLOG(1) &lt;&lt; &quot;Not the leader for &quot; &lt;&lt; command_-&gt;ToString()</a>
+<a name="ln217">            &lt;&lt; &quot; retrying with a different replica&quot;;</a>
+<a name="ln218">    // In the past we were marking a replica as failed whenever an error was returned. The problem</a>
+<a name="ln219">    // with this approach is that not all type of errors mean that the replica has failed. Some</a>
+<a name="ln220">    // errors like NOT_THE_LEADER are only specific to certain type of requests (Write and</a>
+<a name="ln221">    // UpdateTransaction RPCs), but other type of requests don't need to be sent to the leader</a>
+<a name="ln222">    // (consistent prefix reads). So instead of marking a replica as failed for all the RPCs (since</a>
+<a name="ln223">    // the RemoteTablet object is shared across all the rpcs in the same batcher), this remote</a>
+<a name="ln224">    // tablet server is marked as a follower so that it's not used during a retry for requests that</a>
+<a name="ln225">    // need to contact the leader only. This has the same effect as marking the replica as failed</a>
+<a name="ln226">    // for this specific RPC, but without affecting other RPCs.</a>
+<a name="ln227">    followers_.emplace(current_ts_, FollowerData {</a>
+<a name="ln228">      .status = STATUS(IllegalState, &quot;Not the leader&quot;),</a>
+<a name="ln229">      .time = CoarseMonoClock::now()</a>
+<a name="ln230">    });</a>
+<a name="ln231">  } else {</a>
+<a name="ln232">    VLOG(1) &lt;&lt; &quot;Failing &quot; &lt;&lt; command_-&gt;ToString() &lt;&lt; &quot; to a new replica: &quot; &lt;&lt; reason</a>
+<a name="ln233">            &lt;&lt; &quot;, old replica: &quot; &lt;&lt; yb::ToString(current_ts_);</a>
+<a name="ln234"> </a>
+<a name="ln235">    bool found = !tablet_ || tablet_-&gt;MarkReplicaFailed(current_ts_, reason);</a>
+<a name="ln236">    if (!found) {</a>
+<a name="ln237">      // Its possible that current_ts_ is not part of replicas if RemoteTablet.Refresh() is invoked</a>
+<a name="ln238">      // which updates the set of replicas.</a>
+<a name="ln239">      LOG(WARNING) &lt;&lt; &quot;Tablet &quot; &lt;&lt; tablet_id_ &lt;&lt; &quot;: Unable to mark replica &quot;</a>
+<a name="ln240">                   &lt;&lt; current_ts_-&gt;ToString()</a>
+<a name="ln241">                   &lt;&lt; &quot; as failed. Replicas: &quot; &lt;&lt; tablet_-&gt;ReplicasAsString();</a>
+<a name="ln242">    }</a>
+<a name="ln243">  }</a>
+<a name="ln244"> </a>
+<a name="ln245">  auto status = retrier_-&gt;DelayedRetry(command_, reason);</a>
+<a name="ln246">  if (!status.ok()) {</a>
+<a name="ln247">    LOG(WARNING) &lt;&lt; &quot;Failed to schedule retry on new replica: &quot; &lt;&lt; status;</a>
+<a name="ln248">  }</a>
+<a name="ln249">  return status;</a>
+<a name="ln250">}</a>
+<a name="ln251"> </a>
+<a name="ln252">bool TabletInvoker::Done(Status* status) {</a>
+<a name="ln253">  TRACE_TO(trace_, &quot;Done($0)&quot;, status-&gt;ToString(false));</a>
+<a name="ln254">  ADOPT_TRACE(trace_);</a>
+<a name="ln255"> </a>
+<a name="ln256">  bool assign_new_leader = assign_new_leader_;</a>
+<a name="ln257">  assign_new_leader_ = false;</a>
+<a name="ln258"> </a>
+<a name="ln259">  if (status-&gt;IsAborted() || retrier_-&gt;finished()) {</a>
+<a name="ln260">    return true;</a>
+<a name="ln261">  }</a>
+<a name="ln262"> </a>
+<a name="ln263">  // Prefer early failures over controller failures.</a>
+<a name="ln264">  if (status-&gt;ok() &amp;&amp; retrier_-&gt;HandleResponse(command_, status)) {</a>
+<a name="ln265">    return false;</a>
+<a name="ln266">  }</a>
+<a name="ln267"> </a>
+<a name="ln268">  // Failover to a replica in the event of any network failure.</a>
+<a name="ln269">  //</a>
+<a name="ln270">  // TODO: This is probably too harsh; some network failures should be</a>
+<a name="ln271">  // retried on the current replica.</a>
+<a name="ln272">  if (status-&gt;IsNetworkError()) {</a>
+<a name="ln273">    // The whole operation is completed if we can't schedule a retry.</a>
+<a name="ln274">    return !FailToNewReplica(*status).ok();</a>
+<a name="ln275">  }</a>
+<a name="ln276"> </a>
+<a name="ln277">  // Prefer controller failures over response failures.</a>
+<a name="ln278">  auto rsp_err = rpc_-&gt;response_error();</a>
+<a name="ln279">  {</a>
+<a name="ln280">    Status resp_error_status = ErrorStatus(rsp_err);</a>
+<a name="ln281">    if (status-&gt;ok() &amp;&amp; !resp_error_status.ok()) {</a>
+<a name="ln282">      *status = resp_error_status;</a>
+<a name="ln283">    } else if (status-&gt;IsRemoteError()) {</a>
+<a name="ln284">      if (!resp_error_status.ok()) {</a>
+<a name="ln285">        *status = resp_error_status;</a>
+<a name="ln286">      } else {</a>
+<a name="ln287">        const auto* error = retrier_-&gt;controller().error_response();</a>
+<a name="ln288">        if (error &amp;&amp;</a>
+<a name="ln289">            (error-&gt;code() == rpc::ErrorStatusPB::FATAL_SERVER_SHUTTING_DOWN ||</a>
+<a name="ln290">             error-&gt;code() == rpc::ErrorStatusPB::ERROR_NO_SUCH_SERVICE)) {</a>
+<a name="ln291">          *status = STATUS(ServiceUnavailable, error-&gt;message());</a>
+<a name="ln292">        }</a>
+<a name="ln293">      }</a>
+<a name="ln294">    }</a>
+<a name="ln295">  }</a>
+<a name="ln296"> </a>
+<a name="ln297">  if (ErrorCode(rsp_err) == tserver::TabletServerErrorPB::TABLET_SPLIT) {</a>
+<a name="ln298">    // Replace status error with TryAgain, so upper layer retry request after refreshing</a>
+<a name="ln299">    // table partitioning metadata.</a>
+<a name="ln300">    *status = STATUS(TryAgain, status-&gt;message());</a>
+<a name="ln301">    tablet_-&gt;MarkAsSplit();</a>
+<a name="ln302">    rpc_-&gt;Failed(*status);</a>
+<a name="ln303">    return true;</a>
+<a name="ln304">  }</a>
+<a name="ln305"> </a>
+<a name="ln306">  // Oops, we failed over to a replica that wasn't a LEADER. Unlikely as</a>
+<a name="ln307">  // we're using consensus configuration information from the master, but still possible</a>
+<a name="ln308">  // (e.g. leader restarted and became a FOLLOWER). Try again.</a>
+<a name="ln309">  //</a>
+<a name="ln310">  // TODO: IllegalState is obviously way too broad an error category for</a>
+<a name="ln311">  // this case.</a>
+<a name="ln312">  if (status-&gt;IsIllegalState() || status-&gt;IsServiceUnavailable() || status-&gt;IsAborted() ||</a>
+<a name="ln313">      status-&gt;IsLeaderNotReadyToServe() || status-&gt;IsLeaderHasNoLease() ||</a>
+<a name="ln314">      TabletNotFoundOnTServer(rsp_err, *status) ||</a>
+<a name="ln315">      (status-&gt;IsTimedOut() &amp;&amp; CoarseMonoClock::Now() &lt; retrier_-&gt;deadline())) {</a>
+<a name="ln316">    VLOG(4) &lt;&lt; &quot;Retryable failure: &quot; &lt;&lt; *status</a>
+<a name="ln317">            &lt;&lt; &quot;, response: &quot; &lt;&lt; yb::ToString(rsp_err);</a>
+<a name="ln318"> </a>
+<a name="ln319">    const bool leader_is_not_ready =</a>
+<a name="ln320">        ErrorCode(rsp_err) ==</a>
+<a name="ln321">            tserver::TabletServerErrorPB::LEADER_NOT_READY_TO_SERVE ||</a>
+<a name="ln322">        status-&gt;IsLeaderNotReadyToServe();</a>
+<a name="ln323"> </a>
+<a name="ln324">    // If the leader just is not ready - let's retry the same tserver.</a>
+<a name="ln325">    // Else the leader became a follower and must be reset on retry.</a>
+<a name="ln326">    if (!leader_is_not_ready) {</a>
+<a name="ln327">      followers_.emplace(current_ts_, FollowerData {</a>
+<a name="ln328">        .status = *status,</a>
+<a name="ln329">        .time = CoarseMonoClock::now()</a>
+<a name="ln330">      });</a>
+<a name="ln331">    }</a>
+<a name="ln332"> </a>
+<a name="ln333">    if (PREDICT_FALSE(FLAGS_TEST_assert_local_op) &amp;&amp; current_ts_-&gt;IsLocal() &amp;&amp;</a>
+<a name="ln334">        status-&gt;IsIllegalState()) {</a>
+<a name="ln335">      CHECK(false) &lt;&lt; &quot;Operation is not local&quot;;</a>
+<a name="ln336">    }</a>
+<a name="ln337"> </a>
+<a name="ln338">    // If only local tserver is requested and it is not the leader, respond error and done.</a>
+<a name="ln339">    // Otherwise, continue below to retry.</a>
+<a name="ln340">    if (local_tserver_only_ &amp;&amp; current_ts_-&gt;IsLocal() &amp;&amp; status-&gt;IsIllegalState()) {</a>
+<a name="ln341">      rpc_-&gt;Failed(*status);</a>
+<a name="ln342">      return true;</a>
+<a name="ln343">    }</a>
+<a name="ln344"> </a>
+<a name="ln345">    if (status-&gt;IsIllegalState() || TabletNotFoundOnTServer(rsp_err, *status)) {</a>
+<a name="ln346">      // The whole operation is completed if we can't schedule a retry.</a>
+<a name="ln347">      return !FailToNewReplica(*status, rsp_err).ok();</a>
+<a name="ln348">    } else {</a>
+<a name="ln349">      tserver::TabletServerDelay delay(*status);</a>
+<a name="ln350">      auto retry_status = delay.value().Initialized()</a>
+<a name="ln351">          ? retrier_-&gt;DelayedRetry(command_, *status, delay.value())</a>
+<a name="ln352">          : retrier_-&gt;DelayedRetry(command_, *status);</a>
+<a name="ln353">      if (!retry_status.ok()) {</a>
+<a name="ln354">        command_-&gt;Finished(retry_status);</a>
+<a name="ln355">      }</a>
+<a name="ln356">    }</a>
+<a name="ln357">    return false;</a>
+<a name="ln358">  }</a>
+<a name="ln359"> </a>
+<a name="ln360">  if (!status-&gt;ok()) {</a>
+<a name="ln361">    if (status-&gt;IsTimedOut()) {</a>
+<a name="ln362">      VLOG(1) &lt;&lt; &quot;Call to &quot; &lt;&lt; yb::ToString(tablet_) &lt;&lt; &quot; timed out. Marking replica &quot;</a>
+<a name="ln363">              &lt;&lt; yb::ToString(current_ts_) &lt;&lt; &quot; as failed.&quot;;</a>
+<a name="ln364">      if (tablet_ != nullptr &amp;&amp; current_ts_ != nullptr) {</a>
+<a name="ln365">        tablet_-&gt;MarkReplicaFailed(current_ts_, *status);</a>
+<a name="ln366">      }</a>
+<a name="ln367">    }</a>
+<a name="ln368">    std::string current_ts_string;</a>
+<a name="ln369">    if (current_ts_) {</a>
+<a name="ln370">      current_ts_string = Format(&quot;on tablet server $0&quot;, *current_ts_);</a>
+<a name="ln371">    } else {</a>
+<a name="ln372">      current_ts_string = &quot;(no tablet server available)&quot;;</a>
+<a name="ln373">    }</a>
+<a name="ln374">    Status log_status = status-&gt;CloneAndPrepend(</a>
+<a name="ln375">        Format(&quot;Failed $0 to tablet $1 $2 after $3 attempt(s)&quot;,</a>
+<a name="ln376">               command_-&gt;ToString(),</a>
+<a name="ln377">               tablet_id_,</a>
+<a name="ln378">               current_ts_string,</a>
+<a name="ln379">               retrier_-&gt;attempt_num()));</a>
+<a name="ln380">    if (status-&gt;IsTryAgain() || status-&gt;IsExpired() || status-&gt;IsAlreadyPresent()) {</a>
+<a name="ln381">      YB_LOG_EVERY_N_SECS(INFO, 1) &lt;&lt; log_status;</a>
+<a name="ln382">    } else {</a>
+<a name="ln383">      YB_LOG_EVERY_N_SECS(WARNING, 1) &lt;&lt; log_status;</a>
+<a name="ln384">    }</a>
+<a name="ln385">    rpc_-&gt;Failed(*status);</a>
+<a name="ln386">  } else if (assign_new_leader &amp;&amp; current_ts_) {</a>
+<a name="ln387">    bool assigned = tablet_-&gt;MarkTServerAsLeader(current_ts_);</a>
+<a name="ln388">    LOG_IF(INFO, !assigned)</a>
+<a name="ln389">        &lt;&lt; &quot;Unable to mark as leader: &quot; &lt;&lt; current_ts_-&gt;ToString() &lt;&lt; &quot; for &quot;</a>
+<a name="ln390">        &lt;&lt; tablet_-&gt;ToString();</a>
+<a name="ln391">  }</a>
+<a name="ln392"> </a>
+<a name="ln393">  return true;</a>
+<a name="ln394">}</a>
+<a name="ln395"> </a>
+<a name="ln396">void TabletInvoker::InitialLookupTabletDone(const Result&lt;RemoteTabletPtr&gt;&amp; result) {</a>
+<a name="ln397">  VLOG(1) &lt;&lt; &quot;InitialLookupTabletDone(&quot; &lt;&lt; result &lt;&lt; &quot;)&quot;;</a>
+<a name="ln398"> </a>
+<a name="ln399">  if (result.ok()) {</a>
+<a name="ln400">    tablet_ = *result;</a>
+<a name="ln401">    Execute(std::string());</a>
+<a name="ln402">  } else {</a>
+<a name="ln403">    command_-&gt;Finished(result.status());</a>
+<a name="ln404">  }</a>
+<a name="ln405">}</a>
+<a name="ln406"> </a>
+<a name="ln407">bool TabletInvoker::IsLocalCall() const {</a>
+<a name="ln408">  return current_ts_ != nullptr &amp;&amp; current_ts_-&gt;IsLocal();</a>
+<a name="ln409">}</a>
+<a name="ln410"> </a>
+<a name="ln411">std::shared_ptr&lt;tserver::TabletServerServiceProxy&gt; TabletInvoker::proxy() const {</a>
+<a name="ln412">  return current_ts_-&gt;proxy();</a>
+<a name="ln413">}</a>
+<a name="ln414"> </a>
+<a name="ln415">::yb::HostPort TabletInvoker::ProxyEndpoint() const {</a>
+<a name="ln416">  return current_ts_-&gt;ProxyEndpoint();</a>
+<a name="ln417">}</a>
+<a name="ln418"> </a>
+<a name="ln419">void TabletInvoker::LookupTabletCb(const Result&lt;RemoteTabletPtr&gt;&amp; result) {</a>
+<a name="ln420">  VLOG(1) &lt;&lt; &quot;LookupTabletCb(&quot; &lt;&lt; yb::ToString(result) &lt;&lt; &quot;)&quot;;</a>
+<a name="ln421"> </a>
+<a name="ln422">  if (result.ok()) {</a>
+<a name="ln423">#ifndef DEBUG</a>
+<a name="ln424">    TRACE_TO(trace_, Format(&quot;LookupTabletCb($0)&quot;, *result));</a>
+<a name="ln425">#else</a>
+<a name="ln426">    TRACE_TO(trace_, &quot;LookupTabletCb(OK)&quot;);</a>
+<a name="ln427">#endif</a>
+<a name="ln428">  } else {</a>
+<a name="ln429">    TRACE_TO(trace_, &quot;LookupTabletCb($0)&quot;, result.status().ToString(false));</a>
+<a name="ln430">  }</a>
+<a name="ln431"> </a>
+<a name="ln432">  // We should retry the RPC regardless of the outcome of the lookup, as</a>
+<a name="ln433">  // leader election doesn't depend on the existence of a master at all.</a>
+<a name="ln434">  // Unless we know that this status is persistent.</a>
+<a name="ln435">  // For instance if tablet was deleted, we would always receive &quot;Not found&quot;.</a>
+<a name="ln436">  if (!result.ok() &amp;&amp; result.status().IsNotFound()) {</a>
+<a name="ln437">    command_-&gt;Finished(result.status());</a>
+<a name="ln438">    return;</a>
+<a name="ln439">  }</a>
+<a name="ln440"> </a>
+<a name="ln441">  // Retry() imposes a slight delay, which is desirable in a lookup loop,</a>
+<a name="ln442">  // but unnecessary the first time through. Seeing as leader failures are</a>
+<a name="ln443">  // rare, perhaps this doesn't matter.</a>
+<a name="ln444">  followers_.clear();</a>
+<a name="ln445">  auto retry_status = retrier_-&gt;DelayedRetry(</a>
+<a name="ln446">      command_, result.ok() ? Status::OK() : result.status());</a>
+<a name="ln447">  if (!retry_status.ok()) {</a>
+<a name="ln448">    command_-&gt;Finished(!result.ok() ? result.status() : retry_status);</a>
+<a name="ln449">  }</a>
+<a name="ln450">}</a>
+<a name="ln451"> </a>
+<a name="ln452">Status ErrorStatus(const tserver::TabletServerErrorPB* error) {</a>
+<a name="ln453">  return error == nullptr ? Status::OK()</a>
+<a name="ln454">                          : StatusFromPB(error-&gt;status());</a>
+<a name="ln455">}</a>
+<a name="ln456"> </a>
+<a name="ln457">tserver::TabletServerErrorPB_Code ErrorCode(const tserver::TabletServerErrorPB* error) {</a>
+<a name="ln458">  return error == nullptr ? tserver::TabletServerErrorPB::UNKNOWN_ERROR</a>
+<a name="ln459">                          : error-&gt;code();</a>
+<a name="ln460">}</a>
+<a name="ln461"> </a>
+<a name="ln462">} // namespace internal</a>
+<a name="ln463">} // namespace client</a>
+<a name="ln464">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="69"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="76"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="101"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="130"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="181"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="205"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="214"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="216"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="232"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="316"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="335"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="362"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="388"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="397"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="420"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

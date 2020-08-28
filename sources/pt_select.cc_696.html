@@ -1,0 +1,943 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>pt_select.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15">// Treenode definitions for SELECT statements.</a>
+<a name="ln16">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/yql/cql/ql/ptree/pt_select.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &lt;functional&gt;</a>
+<a name="ln21"> </a>
+<a name="ln22">#include &quot;yb/client/client.h&quot;</a>
+<a name="ln23">#include &quot;yb/client/table.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;yb/common/index.h&quot;</a>
+<a name="ln26">#include &quot;yb/yql/cql/ql/ptree/sem_context.h&quot;</a>
+<a name="ln27">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln28"> </a>
+<a name="ln29">DEFINE_bool(enable_uncovered_index_select, true,</a>
+<a name="ln30">            &quot;Enable executing select statements using uncovered index&quot;);</a>
+<a name="ln31">TAG_FLAG(enable_uncovered_index_select, advanced);</a>
+<a name="ln32"> </a>
+<a name="ln33">namespace yb {</a>
+<a name="ln34">namespace ql {</a>
+<a name="ln35"> </a>
+<a name="ln36">using std::make_shared;</a>
+<a name="ln37">using std::string;</a>
+<a name="ln38">using std::unordered_map;</a>
+<a name="ln39">using std::vector;</a>
+<a name="ln40">using yb::bfql::TSOpcode;</a>
+<a name="ln41"> </a>
+<a name="ln42">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln43"> </a>
+<a name="ln44">namespace {</a>
+<a name="ln45"> </a>
+<a name="ln46">// Selectivity of a column operator.</a>
+<a name="ln47">YB_DEFINE_ENUM(OpSelectivity, (kEqual)(kRange)(kNone));</a>
+<a name="ln48"> </a>
+<a name="ln49">// Returns the selectivity of a column operator.</a>
+<a name="ln50">OpSelectivity GetOperatorSelectivity(const QLOperator op) {</a>
+<a name="ln51">  switch (op) {</a>
+<a name="ln52">    case QL_OP_EQUAL: FALLTHROUGH_INTENDED;</a>
+<a name="ln53">    case QL_OP_IN:</a>
+<a name="ln54">      return OpSelectivity::kEqual;</a>
+<a name="ln55">    case QL_OP_GREATER_THAN: FALLTHROUGH_INTENDED;</a>
+<a name="ln56">    case QL_OP_GREATER_THAN_EQUAL: FALLTHROUGH_INTENDED;</a>
+<a name="ln57">    case QL_OP_LESS_THAN: FALLTHROUGH_INTENDED;</a>
+<a name="ln58">    case QL_OP_LESS_THAN_EQUAL:</a>
+<a name="ln59">      return OpSelectivity::kRange;</a>
+<a name="ln60">    case QL_OP_NOOP: FALLTHROUGH_INTENDED;</a>
+<a name="ln61">    case QL_OP_NOT_IN:</a>
+<a name="ln62">      break;</a>
+<a name="ln63">    default:</a>
+<a name="ln64">      // Should have been caught beforehand (as this is called in pt_select after analyzing the</a>
+<a name="ln65">      // where clause).</a>
+<a name="ln66">      break;</a>
+<a name="ln67">  }</a>
+<a name="ln68">  return OpSelectivity::kNone;</a>
+<a name="ln69">}</a>
+<a name="ln70"> </a>
+<a name="ln71">// Class to compare selectivity of an index for a SELECT statement.</a>
+<a name="ln72">class Selectivity {</a>
+<a name="ln73"> public:</a>
+<a name="ln74">  // Selectivity of the indexed table.</a>
+<a name="ln75">  Selectivity(MemoryContext *memctx, const PTSelectStmt&amp; stmt)</a>
+<a name="ln76">      : is_local_(true),</a>
+<a name="ln77">        covers_fully_(true) {</a>
+<a name="ln78">    const client::YBSchema&amp; schema = stmt.table()-&gt;schema();</a>
+<a name="ln79">    MCIdToIndexMap id_to_idx(memctx);</a>
+<a name="ln80">    for (size_t i = 0; i &lt; schema.num_key_columns(); i++) {</a>
+<a name="ln81">      id_to_idx.emplace(schema.ColumnId(i), i);</a>
+<a name="ln82">    }</a>
+<a name="ln83">    Analyze(memctx, stmt, id_to_idx, schema.num_key_columns(), schema.num_hash_key_columns());</a>
+<a name="ln84">  }</a>
+<a name="ln85"> </a>
+<a name="ln86">  // Selectivity of an index.</a>
+<a name="ln87">  Selectivity(MemoryContext *memctx, const PTSelectStmt&amp; stmt, const IndexInfo&amp; index_info)</a>
+<a name="ln88">      : index_id_(index_info.table_id()),</a>
+<a name="ln89">        is_local_(index_info.is_local()),</a>
+<a name="ln90">        covers_fully_(stmt.CoversFully(index_info)),</a>
+<a name="ln91">        index_info_(&amp;index_info) {</a>
+<a name="ln92"> </a>
+<a name="ln93">    MCIdToIndexMap id_to_idx(memctx);</a>
+<a name="ln94">    for (size_t i = 0; i &lt; index_info.key_column_count(); i++) {</a>
+<a name="ln95">      // Map the column id if the index expression is just a column-ref.</a>
+<a name="ln96">      if (index_info.column(i).colexpr.expr_case() == QLExpressionPB::ExprCase::EXPR_NOT_SET ||</a>
+<a name="ln97">          index_info.column(i).colexpr.expr_case() == QLExpressionPB::ExprCase::kColumnId) {</a>
+<a name="ln98">        id_to_idx.emplace(index_info.column(i).indexed_column_id, i);</a>
+<a name="ln99">      }</a>
+<a name="ln100">    }</a>
+<a name="ln101">    Analyze(memctx, stmt, id_to_idx, index_info.key_column_count(), index_info.hash_column_count());</a>
+<a name="ln102">  }</a>
+<a name="ln103"> </a>
+<a name="ln104">  bool covers_fully() const { return covers_fully_; }</a>
+<a name="ln105"> </a>
+<a name="ln106">  const TableId&amp; index_id() const { return index_id_; }</a>
+<a name="ln107"> </a>
+<a name="ln108">  // Comparison operator to sort the selectivity of an index.</a>
+<a name="ln109">  bool operator&gt;(const Selectivity&amp; other) const {</a>
+<a name="ln110">    // If one is a single-key read and the other is not, prefer the one that is.</a>
+<a name="ln111">    if (single_key_read_ != other.single_key_read_) {</a>
+<a name="ln112">      return single_key_read_ &gt; other.single_key_read_;</a>
+<a name="ln113">    }</a>
+<a name="ln114"> </a>
+<a name="ln115">    // If one is a full-table scan and the other is not, prefer the one that is not.</a>
+<a name="ln116">    if (full_table_scan_ != other.full_table_scan_) {</a>
+<a name="ln117">      return full_table_scan_ &lt; other.full_table_scan_;</a>
+<a name="ln118">    }</a>
+<a name="ln119"> </a>
+<a name="ln120">    // When neither is a full table scan, compare the scan ranges.</a>
+<a name="ln121">    if (!full_table_scan_ &amp;&amp; !other.full_table_scan_) {</a>
+<a name="ln122"> </a>
+<a name="ln123">      // If the fully-specified prefixes are different, prefer the one with longer prefix.</a>
+<a name="ln124">      if (prefix_length_ != other.prefix_length_) {</a>
+<a name="ln125">        return prefix_length_ &gt; other.prefix_length_;</a>
+<a name="ln126">      }</a>
+<a name="ln127"> </a>
+<a name="ln128">      // If one has a range clause after the fully specified prefix and the other does not, prefer</a>
+<a name="ln129">      // the one that does.</a>
+<a name="ln130">      if (ends_with_range_ != other.ends_with_range_) {</a>
+<a name="ln131">        return ends_with_range_ &gt; other.ends_with_range_;</a>
+<a name="ln132">      }</a>
+<a name="ln133"> </a>
+<a name="ln134">      // If the numbers of non-primary-key column operators needs to be evaluated are different,</a>
+<a name="ln135">      // prefer the one with less.</a>
+<a name="ln136">      if (num_non_key_ops_ != other.num_non_key_ops_) {</a>
+<a name="ln137">        return num_non_key_ops_ &lt; other.num_non_key_ops_;</a>
+<a name="ln138">      }</a>
+<a name="ln139">    }</a>
+<a name="ln140"> </a>
+<a name="ln141">    // If one covers the read fully and the other does not, prefer the one that does.</a>
+<a name="ln142">    if (covers_fully_ != other.covers_fully_) {</a>
+<a name="ln143">      return covers_fully_ &gt; other.covers_fully_;</a>
+<a name="ln144">    }</a>
+<a name="ln145"> </a>
+<a name="ln146">    // If one is local read and the other is not, prefer the one that is.</a>
+<a name="ln147">    if (is_local_ != other.is_local_) {</a>
+<a name="ln148">      return is_local_ &gt; other.is_local_;</a>
+<a name="ln149">    }</a>
+<a name="ln150"> </a>
+<a name="ln151">    // When all the above are equal, prefer the indexed table over the index.</a>
+<a name="ln152">    return index_id_.empty() &gt; other.index_id_.empty();</a>
+<a name="ln153">  }</a>
+<a name="ln154"> </a>
+<a name="ln155">  string ToString() const {</a>
+<a name="ln156">    return strings::Substitute(&quot;Selectivity: index_id $0 is_local $1 prefix_length $2 &quot;</a>
+<a name="ln157">                               &quot;single_key_read $3 full_table_scan $4 ends_with_range $5 &quot;</a>
+<a name="ln158">                               &quot;covers_fully $6&quot;, index_id_, is_local_, prefix_length_,</a>
+<a name="ln159">                               single_key_read_, full_table_scan_, ends_with_range_,</a>
+<a name="ln160">                               covers_fully_);</a>
+<a name="ln161">  }</a>
+<a name="ln162"> </a>
+<a name="ln163"> private:</a>
+<a name="ln164">  // Analyze selectivity, currently defined as length of longest fully specified prefix and</a>
+<a name="ln165">  // whether there is a range operator immediately after the prefix.</a>
+<a name="ln166">  using MCIdToIndexMap = MCUnorderedMap&lt;int, size_t&gt;;</a>
+<a name="ln167">  void Analyze(MemoryContext *memctx,</a>
+<a name="ln168">               const PTSelectStmt&amp; stmt,</a>
+<a name="ln169">               const MCIdToIndexMap&amp; id_to_idx,</a>
+<a name="ln170">               const size_t num_key_columns,</a>
+<a name="ln171">               const size_t num_hash_key_columns) {</a>
+<a name="ln172"> </a>
+<a name="ln173">    // NOTE: Instead of &quot;id_to_idx&quot; mapping, we can also use &quot;index_info_-&gt;FindKeyIndex()&quot; for</a>
+<a name="ln174">    // ColumnRef expressions, the same way as JsonRef and SubscriptRef expressions.  However,</a>
+<a name="ln175">    // &quot;id_to_idx&quot; mapping is more efficient, so don't remove this map.</a>
+<a name="ln176"> </a>
+<a name="ln177">    // The operator on each column, in the order of the columns in the table or index we analyze.</a>
+<a name="ln178">    MCVector&lt;OpSelectivity&gt; ops(id_to_idx.size(), OpSelectivity::kNone, memctx);</a>
+<a name="ln179">    for (const ColumnOp&amp; col_op : stmt.key_where_ops()) {</a>
+<a name="ln180">      const auto iter = id_to_idx.find(col_op.desc()-&gt;id());</a>
+<a name="ln181">      if (iter != id_to_idx.end()) {</a>
+<a name="ln182">        ops[iter-&gt;second] = GetOperatorSelectivity(col_op.yb_op());</a>
+<a name="ln183">      } else {</a>
+<a name="ln184">        num_non_key_ops_++;</a>
+<a name="ln185">      }</a>
+<a name="ln186">    }</a>
+<a name="ln187">    for (const ColumnOp&amp; col_op : stmt.where_ops()) {</a>
+<a name="ln188">      const auto iter = id_to_idx.find(col_op.desc()-&gt;id());</a>
+<a name="ln189">      if (iter != id_to_idx.end()) {</a>
+<a name="ln190">        ops[iter-&gt;second] = GetOperatorSelectivity(col_op.yb_op());</a>
+<a name="ln191">      } else {</a>
+<a name="ln192">        num_non_key_ops_++;</a>
+<a name="ln193">      }</a>
+<a name="ln194">    }</a>
+<a name="ln195"> </a>
+<a name="ln196">    if (index_info_) {</a>
+<a name="ln197">      for (const JsonColumnOp&amp; col_op : stmt.json_col_where_ops()) {</a>
+<a name="ln198">        int32_t idx = index_info_-&gt;FindKeyIndex(col_op.IndexExprToColumnName());</a>
+<a name="ln199">        if (idx &gt;= 0) {</a>
+<a name="ln200">          ops[idx] = GetOperatorSelectivity(col_op.yb_op());</a>
+<a name="ln201">        } else {</a>
+<a name="ln202">          num_non_key_ops_++;</a>
+<a name="ln203">        }</a>
+<a name="ln204">      }</a>
+<a name="ln205"> </a>
+<a name="ln206">      // Enable the following code-block when allowing INDEX of collection fields.</a>
+<a name="ln207">      if (false) {</a>
+<a name="ln208">        for (const SubscriptedColumnOp&amp; col_op : stmt.subscripted_col_where_ops()) {</a>
+<a name="ln209">          int32_t idx = index_info_-&gt;FindKeyIndex(col_op.IndexExprToColumnName());</a>
+<a name="ln210">          if (idx &gt;= 0) {</a>
+<a name="ln211">            ops[idx] = GetOperatorSelectivity(col_op.yb_op());</a>
+<a name="ln212">          } else {</a>
+<a name="ln213">            num_non_key_ops_++;</a>
+<a name="ln214">          }</a>
+<a name="ln215">        }</a>
+<a name="ln216">      }</a>
+<a name="ln217">    }</a>
+<a name="ln218"> </a>
+<a name="ln219">    // Find the length of fully specified prefix in index or indexed table.</a>
+<a name="ln220">    while (prefix_length_ &lt; ops.size() &amp;&amp; ops[prefix_length_] == OpSelectivity::kEqual) {</a>
+<a name="ln221">      prefix_length_++;</a>
+<a name="ln222">    }</a>
+<a name="ln223"> </a>
+<a name="ln224">    // Determine if it is a single-key read, a full-table scan, if there is a range clause after</a>
+<a name="ln225">    // prefix.</a>
+<a name="ln226">    single_key_read_ = prefix_length_ &gt;= num_key_columns;</a>
+<a name="ln227">    full_table_scan_ = prefix_length_ &lt; num_hash_key_columns;</a>
+<a name="ln228">    ends_with_range_ = prefix_length_ &lt; ops.size() &amp;&amp; ops[prefix_length_] == OpSelectivity::kRange;</a>
+<a name="ln229">  }</a>
+<a name="ln230"> </a>
+<a name="ln231">  TableId index_id_;      // Index table id (null for indexed table).</a>
+<a name="ln232">  bool is_local_ = false; // Is the index local? (true for indexed table)</a>
+<a name="ln233">  size_t prefix_length_ = 0;     // Length of fully-specified prefix in index or indexed table.</a>
+<a name="ln234">  bool single_key_read_ = false; // Will this be a single-key read?</a>
+<a name="ln235">  bool full_table_scan_ = false; // Will this be a full table scan?</a>
+<a name="ln236">  bool ends_with_range_ = false; // Is there a range clause after prefix?</a>
+<a name="ln237">  size_t num_non_key_ops_ = 0; // How many non-primary-key column operators needs to be evaluated?</a>
+<a name="ln238">  bool covers_fully_ = false;  // Does the index cover the read fully? (true for indexed table)</a>
+<a name="ln239">  const IndexInfo* index_info_ = nullptr;</a>
+<a name="ln240">};</a>
+<a name="ln241"> </a>
+<a name="ln242">} // namespace</a>
+<a name="ln243"> </a>
+<a name="ln244">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln245"> </a>
+<a name="ln246">PTSelectStmt::PTSelectStmt(MemoryContext *memctx,</a>
+<a name="ln247">                           YBLocation::SharedPtr loc,</a>
+<a name="ln248">                           const bool distinct,</a>
+<a name="ln249">                           PTExprListNode::SharedPtr selected_exprs,</a>
+<a name="ln250">                           PTTableRefListNode::SharedPtr from_clause,</a>
+<a name="ln251">                           PTExpr::SharedPtr where_clause,</a>
+<a name="ln252">                           PTExpr::SharedPtr if_clause,</a>
+<a name="ln253">                           PTListNode::SharedPtr group_by_clause,</a>
+<a name="ln254">                           PTListNode::SharedPtr having_clause,</a>
+<a name="ln255">                           PTOrderByListNode::SharedPtr order_by_clause,</a>
+<a name="ln256">                           PTExpr::SharedPtr limit_clause,</a>
+<a name="ln257">                           PTExpr::SharedPtr offset_clause)</a>
+<a name="ln258">    : PTDmlStmt(memctx, loc, where_clause, if_clause),</a>
+<a name="ln259">      distinct_(distinct),</a>
+<a name="ln260">      selected_exprs_(selected_exprs),</a>
+<a name="ln261">      from_clause_(from_clause),</a>
+<a name="ln262">      group_by_clause_(group_by_clause),</a>
+<a name="ln263">      having_clause_(having_clause),</a>
+<a name="ln264">      order_by_clause_(order_by_clause),</a>
+<a name="ln265">      limit_clause_(limit_clause),</a>
+<a name="ln266">      offset_clause_(offset_clause),</a>
+<a name="ln267">      covering_exprs_(memctx),</a>
+<a name="ln268">      referenced_index_colnames_(memctx) {</a>
+<a name="ln269">}</a>
+<a name="ln270"> </a>
+<a name="ln271">// Construct a nested select tnode to select from the index. Only the syntactic information</a>
+<a name="ln272">// populated by the parser should be cloned or set here. Semantic information should be left in</a>
+<a name="ln273">// the initial state to be populated when this tnode is analyzed.</a>
+<a name="ln274">// NOTE:</a>
+<a name="ln275">//   Only copy and execute IF clause on IndexTable if all expressions are fully covered.</a>
+<a name="ln276">PTSelectStmt::PTSelectStmt(MemoryContext *memctx,</a>
+<a name="ln277">                           const PTSelectStmt&amp; other,</a>
+<a name="ln278">                           PTExprListNode::SharedPtr selected_exprs,</a>
+<a name="ln279">                           const TableId&amp; index_id,</a>
+<a name="ln280">                           const bool covers_fully)</a>
+<a name="ln281">    : PTDmlStmt(memctx, other, covers_fully),</a>
+<a name="ln282">      distinct_(other.distinct_),</a>
+<a name="ln283">      selected_exprs_(selected_exprs),</a>
+<a name="ln284">      from_clause_(other.from_clause_),</a>
+<a name="ln285">      group_by_clause_(other.group_by_clause_),</a>
+<a name="ln286">      having_clause_(other.having_clause_),</a>
+<a name="ln287">      order_by_clause_(other.order_by_clause_),</a>
+<a name="ln288">      limit_clause_(other.limit_clause_),</a>
+<a name="ln289">      offset_clause_(other.offset_clause_),</a>
+<a name="ln290">      covering_exprs_(memctx),</a>
+<a name="ln291">      index_id_(index_id),</a>
+<a name="ln292">      covers_fully_(covers_fully),</a>
+<a name="ln293">      referenced_index_colnames_(memctx) {</a>
+<a name="ln294">}</a>
+<a name="ln295"> </a>
+<a name="ln296">PTSelectStmt::~PTSelectStmt() {</a>
+<a name="ln297">}</a>
+<a name="ln298"> </a>
+<a name="ln299">Status PTSelectStmt::LookupIndex(SemContext *sem_context) {</a>
+<a name="ln300">  VLOG(3) &lt;&lt; &quot;Loading table descriptor for index &quot; &lt;&lt; index_id_;</a>
+<a name="ln301">  table_ = sem_context-&gt;GetTableDesc(index_id_);</a>
+<a name="ln302">  if (!table_ || !table_-&gt;IsIndex() ||</a>
+<a name="ln303">      // Only looking for CQL Indexes.</a>
+<a name="ln304">      (table_-&gt;table_type() != client::YBTableType::YQL_TABLE_TYPE)) {</a>
+<a name="ln305">    return sem_context-&gt;Error(table_loc(), ErrorCode::OBJECT_NOT_FOUND);</a>
+<a name="ln306">  }</a>
+<a name="ln307"> </a>
+<a name="ln308">  VLOG(3) &lt;&lt; &quot;Found index. name = &quot; &lt;&lt; table_-&gt;name().ToString() &lt;&lt; &quot;, id = &quot; &lt;&lt; index_id_;</a>
+<a name="ln309">  LoadSchema(sem_context, table_, &amp;column_map_, true /* is_index */);</a>
+<a name="ln310">  return Status::OK();</a>
+<a name="ln311">}</a>
+<a name="ln312"> </a>
+<a name="ln313">CHECKED_STATUS PTSelectStmt::Analyze(SemContext *sem_context) {</a>
+<a name="ln314">  // If use_cassandra_authentication is set, permissions are checked in PTDmlStmt::Analyze.</a>
+<a name="ln315">  RETURN_NOT_OK(PTDmlStmt::Analyze(sem_context));</a>
+<a name="ln316"> </a>
+<a name="ln317">  if (index_id_.empty()) {</a>
+<a name="ln318">    // Get the table descriptor.</a>
+<a name="ln319">    if (from_clause_-&gt;size() &gt; 1) {</a>
+<a name="ln320">      return sem_context-&gt;Error(from_clause_, &quot;Only one selected table is allowed&quot;,</a>
+<a name="ln321">                                ErrorCode::CQL_STATEMENT_INVALID);</a>
+<a name="ln322">    }</a>
+<a name="ln323">    RETURN_NOT_OK(from_clause_-&gt;Analyze(sem_context));</a>
+<a name="ln324"> </a>
+<a name="ln325">    // Collect table's schema for semantic analysis.</a>
+<a name="ln326">    Status s = LookupTable(sem_context);</a>
+<a name="ln327">    if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln328">      // If it is a system table and it does not exist, do not analyze further. We will return</a>
+<a name="ln329">      // void result when the SELECT statement is executed.</a>
+<a name="ln330">      return (is_system() &amp;&amp; table_ == nullptr) ? Status::OK() : s;</a>
+<a name="ln331">    }</a>
+<a name="ln332">  } else {</a>
+<a name="ln333">    RETURN_NOT_OK(LookupIndex(sem_context));</a>
+<a name="ln334">  }</a>
+<a name="ln335"> </a>
+<a name="ln336">  // Analyze clauses in select statements and check that references to columns in selected_exprs</a>
+<a name="ln337">  // are valid and used appropriately.</a>
+<a name="ln338">  SemState sem_state(sem_context);</a>
+<a name="ln339">  sem_state.set_allowing_aggregate(true);</a>
+<a name="ln340">  sem_state.set_allowing_column_refs(true);</a>
+<a name="ln341"> </a>
+<a name="ln342">  RETURN_NOT_OK(selected_exprs_-&gt;Analyze(sem_context));</a>
+<a name="ln343"> </a>
+<a name="ln344">  sem_state.set_allowing_aggregate(false);</a>
+<a name="ln345">  sem_state.set_allowing_column_refs(false);</a>
+<a name="ln346"> </a>
+<a name="ln347">  if (distinct_) {</a>
+<a name="ln348">    RETURN_NOT_OK(AnalyzeDistinctClause(sem_context));</a>
+<a name="ln349">  }</a>
+<a name="ln350"> </a>
+<a name="ln351">  // Collect covering expression.</a>
+<a name="ln352">  for (auto expr_node : selected_exprs_-&gt;node_list()) {</a>
+<a name="ln353">    covering_exprs_.push_back(expr_node.get());</a>
+<a name="ln354">  }</a>
+<a name="ln355"> </a>
+<a name="ln356">  // Check if this is an aggregate read.</a>
+<a name="ln357">  bool has_aggregate_expr = false;</a>
+<a name="ln358">  bool has_singular_expr = false;</a>
+<a name="ln359">  for (auto expr_node : selected_exprs_-&gt;node_list()) {</a>
+<a name="ln360">    if (expr_node-&gt;IsAggregateCall()) {</a>
+<a name="ln361">      has_aggregate_expr = true;</a>
+<a name="ln362">    } else {</a>
+<a name="ln363">      has_singular_expr = true;</a>
+<a name="ln364">    }</a>
+<a name="ln365">  }</a>
+<a name="ln366">  if (has_aggregate_expr &amp;&amp; has_singular_expr) {</a>
+<a name="ln367">    return sem_context-&gt;Error(</a>
+<a name="ln368">        selected_exprs_,</a>
+<a name="ln369">        &quot;Selecting aggregate together with rows of non-aggregate values is not allowed&quot;,</a>
+<a name="ln370">        ErrorCode::CQL_STATEMENT_INVALID);</a>
+<a name="ln371">  }</a>
+<a name="ln372">  is_aggregate_ = has_aggregate_expr;</a>
+<a name="ln373"> </a>
+<a name="ln374">  // Run error checking on the WHERE conditions.</a>
+<a name="ln375">  RETURN_NOT_OK(AnalyzeWhereClause(sem_context));</a>
+<a name="ln376"> </a>
+<a name="ln377">  // Run error checking on the IF conditions.</a>
+<a name="ln378">  RETURN_NOT_OK(AnalyzeIfClause(sem_context));</a>
+<a name="ln379"> </a>
+<a name="ln380">  // Check if there is an index to use. If there is and it covers the query fully, we will query</a>
+<a name="ln381">  // just the index and that is it.</a>
+<a name="ln382">  if (index_id_.empty()) {</a>
+<a name="ln383">    // Validate the ordering expressions without processing ORDER BY clause. This check is to</a>
+<a name="ln384">    // verify that ordering column exists, and the column's datatype allows comparison. The entire</a>
+<a name="ln385">    // ORDER BY clause can only be analyzed after an INDEX is chosen.</a>
+<a name="ln386">    RETURN_NOT_OK(ValidateOrderByExprs(sem_context));</a>
+<a name="ln387"> </a>
+<a name="ln388">    // TODO(neil) Remove this construction if &quot;referenced_index_colnames_&quot; is no longer needed.</a>
+<a name="ln389">    //</a>
+<a name="ln390">    // Constructing a list of index column names that is being referenced.</a>
+<a name="ln391">    // - This is similar to the list &quot;column_refs_&quot;, but this is a list of column names instead of</a>
+<a name="ln392">    //   column ids. When indexing by expression, a mangled-name of the expression is used to</a>
+<a name="ln393">    //   represent the column, so column id cannot be used to identify coverage.</a>
+<a name="ln394">    //</a>
+<a name="ln395">    // - This list is to support a quick fix for github #4881. Once column and expression names</a>
+<a name="ln396">    //   are mangled correctly, this code should be removed.</a>
+<a name="ln397">    //</a>
+<a name="ln398">    // - In CQL semantics, ORDER BY must used only indexed column, so not need to check for its</a>
+<a name="ln399">    //   coverage. Neither &quot;column_refs_&quot; nor &quot;referenced_index_colnames_&quot; has ORDER BY columns.</a>
+<a name="ln400">    for (const PTExpr *expr : covering_exprs_) {</a>
+<a name="ln401">      if (!expr-&gt;HaveColumnRef()) {</a>
+<a name="ln402">        continue;</a>
+<a name="ln403">      }</a>
+<a name="ln404">      if (expr-&gt;opcode() == TreeNodeOpcode::kPTAllColumns) {</a>
+<a name="ln405">        for (const ColumnDesc&amp; coldesc : static_cast&lt;const PTAllColumns*&gt;(expr)-&gt;columns()) {</a>
+<a name="ln406">          referenced_index_colnames_.insert(coldesc.MangledName());</a>
+<a name="ln407">        }</a>
+<a name="ln408">      } else {</a>
+<a name="ln409">        expr-&gt;CollectReferencedIndexColnames(&amp;referenced_index_colnames_);</a>
+<a name="ln410">      }</a>
+<a name="ln411">    }</a>
+<a name="ln412">    for (const PTExpr *expr : filtering_exprs_) {</a>
+<a name="ln413">      expr-&gt;CollectReferencedIndexColnames(&amp;referenced_index_colnames_);</a>
+<a name="ln414">    }</a>
+<a name="ln415"> </a>
+<a name="ln416">    RETURN_NOT_OK(AnalyzeIndexes(sem_context));</a>
+<a name="ln417">    if (child_select_ &amp;&amp; child_select_-&gt;covers_fully_) {</a>
+<a name="ln418">      return Status::OK();</a>
+<a name="ln419">    }</a>
+<a name="ln420">  }</a>
+<a name="ln421"> </a>
+<a name="ln422">  // Run error checking on order by for the chosen INDEX.</a>
+<a name="ln423">  RETURN_NOT_OK(AnalyzeOrderByClause(sem_context));</a>
+<a name="ln424"> </a>
+<a name="ln425">  // Run error checking on the LIMIT clause.</a>
+<a name="ln426">  RETURN_NOT_OK(AnalyzeLimitClause(sem_context));</a>
+<a name="ln427"> </a>
+<a name="ln428">  // Run error checking on the OFFSET clause.</a>
+<a name="ln429">  RETURN_NOT_OK(AnalyzeOffsetClause(sem_context));</a>
+<a name="ln430"> </a>
+<a name="ln431">  // Constructing the schema of the result set.</a>
+<a name="ln432">  RETURN_NOT_OK(ConstructSelectedSchema());</a>
+<a name="ln433"> </a>
+<a name="ln434">  return Status::OK();</a>
+<a name="ln435">}</a>
+<a name="ln436"> </a>
+<a name="ln437">void PTSelectStmt::PrintSemanticAnalysisResult(SemContext *sem_context) {</a>
+<a name="ln438">  VLOG(3) &lt;&lt; &quot;SEMANTIC ANALYSIS RESULT (&quot; &lt;&lt; *loc_ &lt;&lt; &quot;):\n&quot; &lt;&lt; &quot;Not yet avail&quot;;</a>
+<a name="ln439">}</a>
+<a name="ln440"> </a>
+<a name="ln441">ExplainPlanPB PTSelectStmt::AnalysisResultToPB() {</a>
+<a name="ln442">  ExplainPlanPB explain_plan;</a>
+<a name="ln443">  SelectPlanPB *select_plan = explain_plan.mutable_select_plan();</a>
+<a name="ln444">  // Determines scan_type, child_select_ != null means an index is being used.</a>
+<a name="ln445">  if (child_select_) {</a>
+<a name="ln446">    string index_type = (child_select_-&gt;covers_fully() ? &quot;Index Only&quot; : &quot;Index&quot;);</a>
+<a name="ln447">    string lookup_type = (child_select_-&gt;select_has_primary_keys_set_ ? &quot;Key Lookup&quot; : &quot;Scan&quot;);</a>
+<a name="ln448">    select_plan-&gt;set_select_type(index_type + &quot; &quot; + lookup_type + &quot; using &quot; +</a>
+<a name="ln449">      child_select()-&gt;table()-&gt;name().ToString() + &quot; on &quot; + table_name().ToString());</a>
+<a name="ln450">  // Index is not being used, query only uses main table.</a>
+<a name="ln451">  } else if (select_has_primary_keys_set_) {</a>
+<a name="ln452">    select_plan-&gt;set_select_type(&quot;Primary Key Lookup on &quot; + table_name().ToString());</a>
+<a name="ln453">  } else if (!(key_where_ops().empty() &amp;&amp; partition_key_ops().empty())) {</a>
+<a name="ln454">    select_plan-&gt;set_select_type(&quot;Range Scan on &quot; + table_name().ToString());</a>
+<a name="ln455">  } else {</a>
+<a name="ln456">    select_plan-&gt;set_select_type(&quot;Seq Scan on &quot; + table_name().ToString());</a>
+<a name="ln457">  }</a>
+<a name="ln458">  string key_conditions = &quot;  Key Conditions: &quot;;</a>
+<a name="ln459">  string filter = &quot;  Filter: &quot;;</a>
+<a name="ln460">  size_t longest = 0;</a>
+<a name="ln461">  // If overarching information( &quot;Aggregate&quot; | &quot;Limit&quot;) then rest of the explain plan output needs</a>
+<a name="ln462">  // to be indented.</a>
+<a name="ln463">  if (is_aggregate() || limit_clause_) {</a>
+<a name="ln464">    string aggr = (is_aggregate()) ? &quot;Aggregate&quot; : &quot;Limit&quot;;</a>
+<a name="ln465">    select_plan-&gt;set_aggregate(aggr);</a>
+<a name="ln466">    key_conditions = &quot;      &quot; + key_conditions;</a>
+<a name="ln467">    filter = &quot;      &quot; + filter;</a>
+<a name="ln468">    select_plan-&gt;set_select_type(&quot;  -&gt;  &quot; + select_plan-&gt;select_type());</a>
+<a name="ln469">    longest = max(longest, aggr.length());</a>
+<a name="ln470">  }</a>
+<a name="ln471">  longest = max(longest, select_plan-&gt;select_type().length());</a>
+<a name="ln472">  // If index is being used, change the split of key conditions and filters to that of the index.</a>
+<a name="ln473">  const auto&amp; keys = child_select_ ? child_select_-&gt;key_where_ops() : key_where_ops();</a>
+<a name="ln474">  const auto&amp; filters = child_select_ ? child_select_-&gt;where_ops() : where_ops();</a>
+<a name="ln475">  // Rebuild the conditions and filter into strings from internal format.</a>
+<a name="ln476">  string filled_key_conds = conditionsToString&lt;MCVector&lt;ColumnOp&gt;&gt;(keys);</a>
+<a name="ln477">  string filled_filter = conditionsToString&lt;MCList&lt;ColumnOp&gt;&gt;(filters);</a>
+<a name="ln478"> </a>
+<a name="ln479">  filled_key_conds += partitionkeyToString(partition_key_ops());</a>
+<a name="ln480"> </a>
+<a name="ln481">  // If the query has key conditions or filters on either the index or the main table, then output</a>
+<a name="ln482">  // to query plan.</a>
+<a name="ln483">  if (!filled_key_conds.empty()) {</a>
+<a name="ln484">    key_conditions += filled_key_conds;</a>
+<a name="ln485">    longest = max(longest, key_conditions.length());</a>
+<a name="ln486">    select_plan-&gt;set_key_conditions(key_conditions);</a>
+<a name="ln487">  }</a>
+<a name="ln488">  if (!filled_filter.empty()) {</a>
+<a name="ln489">    filter += filled_filter;</a>
+<a name="ln490">    longest = max(longest, filter.length());</a>
+<a name="ln491">    select_plan-&gt;set_filter(filter);</a>
+<a name="ln492">  }</a>
+<a name="ln493"> </a>
+<a name="ln494">  // Set the output_width that has been calculated throughout the construction of the query plan.</a>
+<a name="ln495">  select_plan-&gt;set_output_width(longest);</a>
+<a name="ln496">  return explain_plan;</a>
+<a name="ln497">}</a>
+<a name="ln498">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln499"> </a>
+<a name="ln500">// Check whether we can use an index.</a>
+<a name="ln501">CHECKED_STATUS PTSelectStmt::AnalyzeIndexes(SemContext *sem_context) {</a>
+<a name="ln502">  VLOG(3) &lt;&lt; &quot;AnalyzeIndexes: &quot; &lt;&lt; sem_context-&gt;stmt();</a>
+<a name="ln503">  // Skip if there is no index, or the query involves token() since the query by partition key is</a>
+<a name="ln504">  // more efficient on the indexed table.</a>
+<a name="ln505">  if (table_-&gt;index_map().empty() || !partition_key_ops_.empty()) {</a>
+<a name="ln506">    return Status::OK();</a>
+<a name="ln507">  }</a>
+<a name="ln508"> </a>
+<a name="ln509">  // We can now find the best index for this query vs the indexed table. See Selectivity's</a>
+<a name="ln510">  // comparison operator for the criterias for the best index.</a>
+<a name="ln511">  MCVector&lt;Selectivity&gt; selectivities(sem_context-&gt;PTempMem());</a>
+<a name="ln512">  selectivities.reserve(table_-&gt;index_map().size() + 1);</a>
+<a name="ln513">  selectivities.emplace_back(sem_context-&gt;PTempMem(), *this);</a>
+<a name="ln514">  for (const std::pair&lt;TableId, IndexInfo&gt; index : table_-&gt;index_map()) {</a>
+<a name="ln515">    if (index.second.HasReadPermission()) {</a>
+<a name="ln516">      selectivities.emplace_back(sem_context-&gt;PTempMem(), *this, index.second);</a>
+<a name="ln517">    }</a>
+<a name="ln518">  }</a>
+<a name="ln519">  std::sort(selectivities.begin(), selectivities.end(), std::greater&lt;Selectivity&gt;());</a>
+<a name="ln520">  if (VLOG_IS_ON(3)) {</a>
+<a name="ln521">    for (const auto&amp; selectivity : selectivities) {</a>
+<a name="ln522">      VLOG(3) &lt;&lt; selectivity.ToString();</a>
+<a name="ln523">    }</a>
+<a name="ln524">  }</a>
+<a name="ln525"> </a>
+<a name="ln526">  // Find the best selectivity.</a>
+<a name="ln527">  for (const Selectivity&amp; selectivity : selectivities) {</a>
+<a name="ln528">    if (!FLAGS_enable_uncovered_index_select &amp;&amp; !selectivity.covers_fully()) {</a>
+<a name="ln529">      continue;</a>
+<a name="ln530">    }</a>
+<a name="ln531"> </a>
+<a name="ln532">    VLOG(3) &lt;&lt; &quot;Selected = &quot; &lt;&lt; selectivity.ToString();</a>
+<a name="ln533"> </a>
+<a name="ln534">    // If an index can be used, analyze the select on the index.</a>
+<a name="ln535">    if (!selectivity.index_id().empty()) {</a>
+<a name="ln536">      MemoryContext* memctx = sem_context-&gt;PTreeMem();</a>
+<a name="ln537">      auto selected_exprs = selected_exprs_;</a>
+<a name="ln538"> </a>
+<a name="ln539">      // If the index does not cover the query fully, select the primary key from the index.</a>
+<a name="ln540">      if (!selectivity.covers_fully()) {</a>
+<a name="ln541">        const auto&amp; loc = selected_exprs_-&gt;loc_ptr();</a>
+<a name="ln542">        selected_exprs = PTExprListNode::MakeShared(memctx, loc);</a>
+<a name="ln543">        for (int i = 0; i &lt; num_key_columns(); i++) {</a>
+<a name="ln544">          const client::YBColumnSchema&amp; column = table_-&gt;schema().Column(i);</a>
+<a name="ln545">          auto column_name_str = MCMakeShared&lt;MCString&gt;(memctx, column.name().c_str());</a>
+<a name="ln546">          auto column_name = PTQualifiedName::MakeShared(memctx, loc, column_name_str);</a>
+<a name="ln547">          selected_exprs-&gt;Append(PTRef::MakeShared(memctx, loc, column_name));</a>
+<a name="ln548">        }</a>
+<a name="ln549"> </a>
+<a name="ln550">        // Clear the primary key operations. They be filled after the primary key is fetched from</a>
+<a name="ln551">        // the index.</a>
+<a name="ln552">        key_where_ops_.clear();</a>
+<a name="ln553">        std::remove_if(where_ops_.begin(), where_ops_.end(),</a>
+<a name="ln554">                       [](const ColumnOp&amp; op) { return op.desc()-&gt;is_primary(); });</a>
+<a name="ln555">        const client::YBSchema&amp; schema = table_-&gt;schema();</a>
+<a name="ln556">        for (size_t i = 0; i &lt; schema.num_key_columns(); i++) {</a>
+<a name="ln557">          column_refs_.insert(schema.ColumnId(i));</a>
+<a name="ln558">        }</a>
+<a name="ln559">      }</a>
+<a name="ln560"> </a>
+<a name="ln561">      // Create a child select statement to query the index.</a>
+<a name="ln562">      child_select_ = MakeShared(memctx, *this, selected_exprs,</a>
+<a name="ln563">                                 selectivity.index_id(), selectivity.covers_fully());</a>
+<a name="ln564"> </a>
+<a name="ln565">      // If an index will be used, the limit and offset clauses should be used by the select from</a>
+<a name="ln566">      // the index only.</a>
+<a name="ln567">      order_by_clause_ = nullptr;</a>
+<a name="ln568">      limit_clause_ = nullptr;</a>
+<a name="ln569">      offset_clause_ = nullptr;</a>
+<a name="ln570"> </a>
+<a name="ln571">      // Now analyze the select from the index.</a>
+<a name="ln572">      SemState select_state(sem_context);</a>
+<a name="ln573">      select_state.set_selecting_from_index(true);</a>
+<a name="ln574">      return child_select_-&gt;Analyze(sem_context);</a>
+<a name="ln575">    }</a>
+<a name="ln576">    break;</a>
+<a name="ln577">  }</a>
+<a name="ln578"> </a>
+<a name="ln579">  return Status::OK();</a>
+<a name="ln580">}</a>
+<a name="ln581"> </a>
+<a name="ln582">// Return whether the index covers the read fully.</a>
+<a name="ln583">// INDEXes that were created before v2.0 are defined by column IDs instead of mangled_names.</a>
+<a name="ln584">// - Returns TRUE if a list of column refs of a statement is a subset of INDEX columns.</a>
+<a name="ln585">// - Use ColumnID to check if a column in a query is covered by the index.</a>
+<a name="ln586">// - The list &quot;column_refs_&quot; contains IDs of all columns that are referred to by SELECT.</a>
+<a name="ln587">// - The list &quot;IndexInfo::columns_&quot; contains the IDs of all columns in the INDEX.</a>
+<a name="ln588">bool PTSelectStmt::CoversFully(const IndexInfo&amp; index_info) const {</a>
+<a name="ln589">  // First, check covering by ID.</a>
+<a name="ln590">  bool all_ref_id_covered = true;</a>
+<a name="ln591">  for (const int32 table_col_id : column_refs_) {</a>
+<a name="ln592">    if (!index_info.IsColumnCovered(ColumnId(table_col_id))) {</a>
+<a name="ln593">      all_ref_id_covered = false;</a>
+<a name="ln594">    }</a>
+<a name="ln595">  }</a>
+<a name="ln596"> </a>
+<a name="ln597">  // Return result if name-resolution for covering is NOT needed.</a>
+<a name="ln598">  // - If all column references are found by ID, return true without further resolution.</a>
+<a name="ln599">  // - Index is not by expression, so name resolution for covering is not needed.</a>
+<a name="ln600">  // - Index uses older Protobuf versions, which doesn't use column name (id only).</a>
+<a name="ln601">  if (all_ref_id_covered ||</a>
+<a name="ln602">      !index_info.has_index_by_expr() ||</a>
+<a name="ln603">      !index_info.use_mangled_column_name()) {</a>
+<a name="ln604">    return all_ref_id_covered;</a>
+<a name="ln605">  }</a>
+<a name="ln606"> </a>
+<a name="ln607">  // Now, check for covering by column names to support index by expression.</a>
+<a name="ln608">  //</a>
+<a name="ln609">  // TODO(neil) We use a quick fix for now, but eventually we should mangle column name correctly</a>
+<a name="ln610">  // and remove the following quick fix and its associated code. See github #4881 for the bug</a>
+<a name="ln611">  // in column name mangling.</a>
+<a name="ln612">  //</a>
+<a name="ln613">  // Iterating names in &quot;referenced_index_colnames_&quot;, which consists of names of all columns that</a>
+<a name="ln614">  // are referenced by SELECT and check if the name is covered in the index.</a>
+<a name="ln615">  for (const string &amp;column_name : referenced_index_colnames_) {</a>
+<a name="ln616">    if (!index_info.IsColumnCovered(column_name)) {</a>
+<a name="ln617">      return false;</a>
+<a name="ln618">    }</a>
+<a name="ln619">  }</a>
+<a name="ln620"> </a>
+<a name="ln621">  // TODO(neil) Change INDEX's metadata for column name-mangling to support the following code.</a>
+<a name="ln622">  // As shown in github #4881, the following is not working correctly.</a>
+<a name="ln623">  //   CREATE INDEX idx ON a_table(v);</a>
+<a name="ln624">  //   - Index column &quot;v&quot; is named as &quot;$C_v&quot;</a>
+<a name="ln625">  //   - Index column &quot;v1&quot; is named as &quot;$C_v1&quot;</a>
+<a name="ln626">  // As a result, IsExprCovered(&quot;$C_v1&quot;) would return true as it thought &quot;$C_v1&quot; is just an</a>
+<a name="ln627">  // expression for &quot;$C_v&quot; column.</a>
+<a name="ln628"> </a>
+<a name="ln629">  // Correct fix for #4881 would be adding a postfix when mangling column name. For example:</a>
+<a name="ln630">  // - column name &quot;v&quot; is mangled to &quot;$C_v_E$&quot;</a>
+<a name="ln631">  // - column name &quot;v1&quot; is mangled to &quot;$C_v1_E$&quot;</a>
+<a name="ln632">  // That way, IsExprCovered() would know that &quot;$C_v1_E$&quot; is NOT an expression of &quot;$C_v_E$&quot;.</a>
+<a name="ln633">  // However, this changes metadata for INDEX, so compatible flag must be added to distinguish</a>
+<a name="ln634">  // between different mangling method, such as</a>
+<a name="ln635">  //   &quot;use_mangled_column_name&quot; versus &quot;use_mangled_column_name_2&quot;</a>
+<a name="ln636">  if (false) {</a>
+<a name="ln637">    // Check all ColumnRef in selected list.</a>
+<a name="ln638">    for (const PTExpr *expr : covering_exprs_) {</a>
+<a name="ln639">      // If this expression does not have column reference, it is considered &quot;coverred&quot;.</a>
+<a name="ln640">      if (!expr-&gt;HaveColumnRef()) {</a>
+<a name="ln641">        continue;</a>
+<a name="ln642">      }</a>
+<a name="ln643"> </a>
+<a name="ln644">      if (expr-&gt;opcode() == TreeNodeOpcode::kPTAllColumns) {</a>
+<a name="ln645">        for (const ColumnDesc&amp; coldesc : static_cast&lt;const PTAllColumns*&gt;(expr)-&gt;columns()) {</a>
+<a name="ln646">          if (index_info.IsExprCovered(coldesc.MangledName()) &lt; 0) {</a>
+<a name="ln647">            return false;</a>
+<a name="ln648">          }</a>
+<a name="ln649">        }</a>
+<a name="ln650">      } else if (index_info.IsExprCovered(expr-&gt;MangledName()) &lt; 0) {</a>
+<a name="ln651">        return false;</a>
+<a name="ln652">      }</a>
+<a name="ln653">    }</a>
+<a name="ln654"> </a>
+<a name="ln655">    // Check all ColumnRef in filtering list.</a>
+<a name="ln656">    for (const PTExpr *expr : filtering_exprs_) {</a>
+<a name="ln657">      if (index_info.IsExprCovered(expr-&gt;MangledName()) &lt; 0) {</a>
+<a name="ln658">        return false;</a>
+<a name="ln659">      }</a>
+<a name="ln660">    }</a>
+<a name="ln661">  }</a>
+<a name="ln662"> </a>
+<a name="ln663">  // All referenced columns are covered.</a>
+<a name="ln664">  return true;</a>
+<a name="ln665">}</a>
+<a name="ln666"> </a>
+<a name="ln667">// -------------------------------------------------------------------------------------------------</a>
+<a name="ln668"> </a>
+<a name="ln669">CHECKED_STATUS PTSelectStmt::AnalyzeDistinctClause(SemContext *sem_context) {</a>
+<a name="ln670">  // Only partition and static columns are allowed to be used with distinct clause.</a>
+<a name="ln671">  int key_count = 0;</a>
+<a name="ln672">  for (const auto&amp; pair : column_map_) {</a>
+<a name="ln673">    const ColumnDesc&amp; desc = pair.second;</a>
+<a name="ln674">    if (desc.is_hash()) {</a>
+<a name="ln675">      if (column_refs_.find(desc.id()) != column_refs_.end()) {</a>
+<a name="ln676">        key_count++;</a>
+<a name="ln677">      }</a>
+<a name="ln678">    } else if (!desc.is_static()) {</a>
+<a name="ln679">      if (column_refs_.find(desc.id()) != column_refs_.end()) {</a>
+<a name="ln680">        return sem_context-&gt;Error(</a>
+<a name="ln681">            selected_exprs_,</a>
+<a name="ln682">            &quot;Selecting distinct must request only partition keys and static columns&quot;,</a>
+<a name="ln683">            ErrorCode::CQL_STATEMENT_INVALID);</a>
+<a name="ln684">      }</a>
+<a name="ln685">    }</a>
+<a name="ln686">  }</a>
+<a name="ln687"> </a>
+<a name="ln688">  if (key_count != 0 &amp;&amp; key_count != num_hash_key_columns()) {</a>
+<a name="ln689">    return sem_context-&gt;Error(selected_exprs_,</a>
+<a name="ln690">                              &quot;Selecting distinct must request all or none of partition keys&quot;,</a>
+<a name="ln691">                              ErrorCode::CQL_STATEMENT_INVALID);</a>
+<a name="ln692">  }</a>
+<a name="ln693">  return Status::OK();</a>
+<a name="ln694">}</a>
+<a name="ln695"> </a>
+<a name="ln696">bool PTSelectStmt::IsReadableByAllSystemTable() const {</a>
+<a name="ln697">  const client::YBTableName t = table_name();</a>
+<a name="ln698">  const string&amp; keyspace = t.namespace_name();</a>
+<a name="ln699">  const string&amp; table = t.table_name();</a>
+<a name="ln700">  if (keyspace == master::kSystemSchemaNamespaceName) {</a>
+<a name="ln701">    return true;</a>
+<a name="ln702">  } else if (keyspace == master::kSystemNamespaceName) {</a>
+<a name="ln703">    if (table == master::kSystemLocalTableName ||</a>
+<a name="ln704">        table == master::kSystemPeersTableName ||</a>
+<a name="ln705">        table == master::kSystemPeersV2TableName ||</a>
+<a name="ln706">        table == master::kSystemPartitionsTableName) {</a>
+<a name="ln707">      return true;</a>
+<a name="ln708">    }</a>
+<a name="ln709">  }</a>
+<a name="ln710">  return false;</a>
+<a name="ln711">}</a>
+<a name="ln712"> </a>
+<a name="ln713">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln714"> </a>
+<a name="ln715">namespace {</a>
+<a name="ln716"> </a>
+<a name="ln717">PTOrderBy::Direction directionFromSortingType(ColumnSchema::SortingType sorting_type) {</a>
+<a name="ln718">  return sorting_type == ColumnSchema::SortingType::kDescending ?</a>
+<a name="ln719">      PTOrderBy::Direction::kDESC : PTOrderBy::Direction::kASC;</a>
+<a name="ln720">}</a>
+<a name="ln721"> </a>
+<a name="ln722">} // namespace</a>
+<a name="ln723"> </a>
+<a name="ln724">CHECKED_STATUS PTSelectStmt::ValidateOrderByExprs(SemContext *sem_context) {</a>
+<a name="ln725">  if (order_by_clause_ != nullptr) {</a>
+<a name="ln726">    for (auto&amp; order_by : order_by_clause_-&gt;node_list()) {</a>
+<a name="ln727">      RETURN_NOT_OK(order_by-&gt;ValidateExpr(sem_context));</a>
+<a name="ln728">    }</a>
+<a name="ln729">  }</a>
+<a name="ln730">  return Status::OK();</a>
+<a name="ln731">}</a>
+<a name="ln732"> </a>
+<a name="ln733">CHECKED_STATUS PTSelectStmt::AnalyzeOrderByClause(SemContext *sem_context) {</a>
+<a name="ln734">  if (order_by_clause_ != nullptr) {</a>
+<a name="ln735">    if (key_where_ops_.empty()) {</a>
+<a name="ln736">      return sem_context-&gt;Error(</a>
+<a name="ln737">          order_by_clause_,</a>
+<a name="ln738">          &quot;All hash columns must be set if order by clause is present.&quot;,</a>
+<a name="ln739">          ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln740">    }</a>
+<a name="ln741"> </a>
+<a name="ln742">    unordered_map&lt;string, PTOrderBy::Direction&gt; order_by_map;</a>
+<a name="ln743">    for (auto&amp; order_by : order_by_clause_-&gt;node_list()) {</a>
+<a name="ln744">      RETURN_NOT_OK(order_by-&gt;Analyze(sem_context));</a>
+<a name="ln745">      order_by_map[order_by-&gt;order_expr()-&gt;MetadataName()] = order_by-&gt;direction();</a>
+<a name="ln746">    }</a>
+<a name="ln747">    const auto&amp; schema = table_-&gt;schema();</a>
+<a name="ln748">    vector&lt;bool&gt; is_column_forward;</a>
+<a name="ln749">    is_column_forward.reserve(schema.num_range_key_columns());</a>
+<a name="ln750">    bool last_column_order_specified = true;</a>
+<a name="ln751">    for (size_t i = schema.num_hash_key_columns(); i &lt; schema.num_key_columns(); i++) {</a>
+<a name="ln752">      const auto&amp; column = schema.Column(i);</a>
+<a name="ln753">      if (order_by_map.find(column.name()) != order_by_map.end()) {</a>
+<a name="ln754">        if (!last_column_order_specified) {</a>
+<a name="ln755">          return sem_context-&gt;Error(</a>
+<a name="ln756">              order_by_clause_,</a>
+<a name="ln757">              &quot;Order by currently only support the ordering of columns following their declared&quot;</a>
+<a name="ln758">                  &quot; order in the PRIMARY KEY&quot;, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln759">        }</a>
+<a name="ln760">        is_column_forward.push_back(</a>
+<a name="ln761">            directionFromSortingType(column.sorting_type()) == order_by_map[column.name()]);</a>
+<a name="ln762">        order_by_map.erase(column.name());</a>
+<a name="ln763">      } else {</a>
+<a name="ln764">        last_column_order_specified = false;</a>
+<a name="ln765">        is_column_forward.push_back(is_column_forward.empty() || is_column_forward.back());</a>
+<a name="ln766">      }</a>
+<a name="ln767">    }</a>
+<a name="ln768">    if (!order_by_map.empty()) {</a>
+<a name="ln769">      return sem_context-&gt;Error(</a>
+<a name="ln770">          order_by_clause_,</a>
+<a name="ln771">          (&quot;Order by is should only contain clustering columns, got &quot; + order_by_map.begin()-&gt;first)</a>
+<a name="ln772">              .c_str(), ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln773">    }</a>
+<a name="ln774">    is_forward_scan_ = is_column_forward[0];</a>
+<a name="ln775">    for (auto&amp;&amp; b : is_column_forward) {</a>
+<a name="ln776">      if (b != is_forward_scan_) {</a>
+<a name="ln777">        return sem_context-&gt;Error(</a>
+<a name="ln778">            order_by_clause_,</a>
+<a name="ln779">            &quot;Unsupported order by relation&quot;, ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln780">      }</a>
+<a name="ln781">    }</a>
+<a name="ln782">  }</a>
+<a name="ln783">  return Status::OK();</a>
+<a name="ln784">}</a>
+<a name="ln785"> </a>
+<a name="ln786">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln787"> </a>
+<a name="ln788">CHECKED_STATUS PTSelectStmt::AnalyzeLimitClause(SemContext *sem_context) {</a>
+<a name="ln789">  if (limit_clause_ == nullptr) {</a>
+<a name="ln790">    return Status::OK();</a>
+<a name="ln791">  }</a>
+<a name="ln792"> </a>
+<a name="ln793">  RETURN_NOT_OK(limit_clause_-&gt;CheckRhsExpr(sem_context));</a>
+<a name="ln794"> </a>
+<a name="ln795">  SemState sem_state(sem_context, QLType::Create(INT32), InternalType::kInt32Value);</a>
+<a name="ln796">  sem_state.set_bindvar_name(PTBindVar::limit_bindvar_name());</a>
+<a name="ln797">  RETURN_NOT_OK(limit_clause_-&gt;Analyze(sem_context));</a>
+<a name="ln798"> </a>
+<a name="ln799">  return Status::OK();</a>
+<a name="ln800">}</a>
+<a name="ln801"> </a>
+<a name="ln802">CHECKED_STATUS PTSelectStmt::AnalyzeOffsetClause(SemContext *sem_context) {</a>
+<a name="ln803">  if (offset_clause_ == nullptr) {</a>
+<a name="ln804">    return Status::OK();</a>
+<a name="ln805">  }</a>
+<a name="ln806"> </a>
+<a name="ln807">  RETURN_NOT_OK(offset_clause_-&gt;CheckRhsExpr(sem_context));</a>
+<a name="ln808"> </a>
+<a name="ln809">  SemState sem_state(sem_context, QLType::Create(INT32), InternalType::kInt32Value);</a>
+<a name="ln810">  sem_state.set_bindvar_name(PTBindVar::offset_bindvar_name());</a>
+<a name="ln811">  RETURN_NOT_OK(offset_clause_-&gt;Analyze(sem_context));</a>
+<a name="ln812"> </a>
+<a name="ln813">  return Status::OK();</a>
+<a name="ln814">}</a>
+<a name="ln815"> </a>
+<a name="ln816">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln817"> </a>
+<a name="ln818">CHECKED_STATUS PTSelectStmt::ConstructSelectedSchema() {</a>
+<a name="ln819">  const MCList&lt;PTExpr::SharedPtr&gt;&amp; exprs = selected_exprs();</a>
+<a name="ln820">  selected_schemas_ = make_shared&lt;vector&lt;ColumnSchema&gt;&gt;();</a>
+<a name="ln821">  selected_schemas_-&gt;reserve(exprs.size());</a>
+<a name="ln822">  for (auto expr : exprs) {</a>
+<a name="ln823">    if (expr-&gt;opcode() == TreeNodeOpcode::kPTAllColumns) {</a>
+<a name="ln824">      const PTAllColumns *ref = static_cast&lt;const PTAllColumns*&gt;(expr.get());</a>
+<a name="ln825">      for (const auto&amp; col_desc : ref-&gt;columns()) {</a>
+<a name="ln826">        selected_schemas_-&gt;emplace_back(col_desc.name(), col_desc.ql_type());</a>
+<a name="ln827">      }</a>
+<a name="ln828">    } else {</a>
+<a name="ln829">      selected_schemas_-&gt;emplace_back(expr-&gt;QLName(), expr-&gt;ql_type());</a>
+<a name="ln830">    }</a>
+<a name="ln831">  }</a>
+<a name="ln832">  return Status::OK();</a>
+<a name="ln833">}</a>
+<a name="ln834"> </a>
+<a name="ln835">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln836"> </a>
+<a name="ln837">PTOrderBy::PTOrderBy(MemoryContext *memctx,</a>
+<a name="ln838">                     YBLocation::SharedPtr loc,</a>
+<a name="ln839">                     const PTExpr::SharedPtr&amp; order_expr,</a>
+<a name="ln840">                     const Direction direction,</a>
+<a name="ln841">                     const NullPlacement null_placement)</a>
+<a name="ln842">  : TreeNode(memctx, loc),</a>
+<a name="ln843">    order_expr_(order_expr),</a>
+<a name="ln844">    direction_(direction),</a>
+<a name="ln845">    null_placement_(null_placement) {</a>
+<a name="ln846">}</a>
+<a name="ln847"> </a>
+<a name="ln848">Status PTOrderBy::ValidateExpr(SemContext *sem_context) {</a>
+<a name="ln849">  RETURN_NOT_OK(order_expr_-&gt;Analyze(sem_context));</a>
+<a name="ln850">  return Status::OK();</a>
+<a name="ln851">}</a>
+<a name="ln852"> </a>
+<a name="ln853">Status PTOrderBy::Analyze(SemContext *sem_context) {</a>
+<a name="ln854">  RETURN_NOT_OK(order_expr_-&gt;Analyze(sem_context));</a>
+<a name="ln855">  if (order_expr_-&gt;expr_op() != ExprOperator::kRef &amp;&amp; !order_expr_-&gt;index_desc()) {</a>
+<a name="ln856">    return sem_context-&gt;Error(</a>
+<a name="ln857">        this,</a>
+<a name="ln858">        &quot;Order By clause contains invalid expression&quot;,</a>
+<a name="ln859">        ErrorCode::INVALID_ARGUMENTS);</a>
+<a name="ln860">  }</a>
+<a name="ln861">  return Status::OK();</a>
+<a name="ln862">}</a>
+<a name="ln863"> </a>
+<a name="ln864">PTOrderBy::~PTOrderBy() {</a>
+<a name="ln865">}</a>
+<a name="ln866"> </a>
+<a name="ln867">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln868"> </a>
+<a name="ln869">PTTableRef::PTTableRef(MemoryContext *memctx,</a>
+<a name="ln870">                       YBLocation::SharedPtr loc,</a>
+<a name="ln871">                       const PTQualifiedName::SharedPtr&amp; name,</a>
+<a name="ln872">                       MCSharedPtr&lt;MCString&gt; alias)</a>
+<a name="ln873">    : TreeNode(memctx, loc),</a>
+<a name="ln874">      name_(name),</a>
+<a name="ln875">      alias_(alias) {</a>
+<a name="ln876">}</a>
+<a name="ln877"> </a>
+<a name="ln878">PTTableRef::~PTTableRef() {</a>
+<a name="ln879">}</a>
+<a name="ln880"> </a>
+<a name="ln881">CHECKED_STATUS PTTableRef::Analyze(SemContext *sem_context) {</a>
+<a name="ln882">  if (alias_ != nullptr) {</a>
+<a name="ln883">    return sem_context-&gt;Error(this, &quot;Alias is not allowed&quot;, ErrorCode::CQL_STATEMENT_INVALID);</a>
+<a name="ln884">  }</a>
+<a name="ln885">  return name_-&gt;AnalyzeName(sem_context, OBJECT_TABLE);</a>
+<a name="ln886">}</a>
+<a name="ln887"> </a>
+<a name="ln888">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln889"> </a>
+<a name="ln890">}  // namespace ql</a>
+<a name="ln891">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="300"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="308"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="438"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="502"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="522"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="532"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="553"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v530/" target="_blank">V530</a> The return value of function 'remove_if' is required to be utilized.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

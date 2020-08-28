@@ -1,0 +1,607 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>log_cache.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32"> </a>
+<a name="ln33">#include &quot;yb/consensus/log_cache.h&quot;</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;algorithm&gt;</a>
+<a name="ln36">#include &lt;map&gt;</a>
+<a name="ln37">#include &lt;mutex&gt;</a>
+<a name="ln38">#include &lt;vector&gt;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln41">#include &lt;google/protobuf/wire_format_lite.h&gt;</a>
+<a name="ln42">#include &lt;google/protobuf/wire_format_lite_inl.h&gt;</a>
+<a name="ln43"> </a>
+<a name="ln44">#include &quot;yb/consensus/log.h&quot;</a>
+<a name="ln45">#include &quot;yb/consensus/log_reader.h&quot;</a>
+<a name="ln46">#include &quot;yb/consensus/consensus_util.h&quot;</a>
+<a name="ln47"> </a>
+<a name="ln48">#include &quot;yb/gutil/bind.h&quot;</a>
+<a name="ln49">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln50">#include &quot;yb/gutil/stl_util.h&quot;</a>
+<a name="ln51">#include &quot;yb/gutil/strings/human_readable.h&quot;</a>
+<a name="ln52">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln53">#include &quot;yb/util/debug-util.h&quot;</a>
+<a name="ln54">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln55">#include &quot;yb/util/mem_tracker.h&quot;</a>
+<a name="ln56">#include &quot;yb/util/metrics.h&quot;</a>
+<a name="ln57">#include &quot;yb/util/locks.h&quot;</a>
+<a name="ln58">#include &quot;yb/util/logging.h&quot;</a>
+<a name="ln59">#include &quot;yb/util/size_literals.h&quot;</a>
+<a name="ln60"> </a>
+<a name="ln61">using namespace std::literals;</a>
+<a name="ln62"> </a>
+<a name="ln63">DEFINE_int32(log_cache_size_limit_mb, 128,</a>
+<a name="ln64">             &quot;The total per-tablet size of consensus entries which may be kept in memory. &quot;</a>
+<a name="ln65">             &quot;The log cache attempts to keep all entries which have not yet been replicated &quot;</a>
+<a name="ln66">             &quot;to all followers in memory, but if the total size of those entries exceeds &quot;</a>
+<a name="ln67">             &quot;this limit within an individual tablet, the oldest will be evicted.&quot;);</a>
+<a name="ln68">TAG_FLAG(log_cache_size_limit_mb, advanced);</a>
+<a name="ln69"> </a>
+<a name="ln70">DEFINE_int32(global_log_cache_size_limit_mb, 1024,</a>
+<a name="ln71">             &quot;Server-wide version of 'log_cache_size_limit_mb'. The total memory used for &quot;</a>
+<a name="ln72">             &quot;caching log entries across all tablets is kept under this threshold.&quot;);</a>
+<a name="ln73">TAG_FLAG(global_log_cache_size_limit_mb, advanced);</a>
+<a name="ln74"> </a>
+<a name="ln75">DEFINE_test_flag(bool, log_cache_skip_eviction, false,</a>
+<a name="ln76">                 &quot;Don't evict log entries in tests.&quot;);</a>
+<a name="ln77"> </a>
+<a name="ln78">using strings::Substitute;</a>
+<a name="ln79"> </a>
+<a name="ln80">METRIC_DEFINE_gauge_int64(tablet, log_cache_num_ops, &quot;Log Cache Operation Count&quot;,</a>
+<a name="ln81">                          yb::MetricUnit::kOperations,</a>
+<a name="ln82">                          &quot;Number of operations in the log cache.&quot;);</a>
+<a name="ln83">METRIC_DEFINE_gauge_int64(tablet, log_cache_size, &quot;Log Cache Memory Usage&quot;,</a>
+<a name="ln84">                          yb::MetricUnit::kBytes,</a>
+<a name="ln85">                          &quot;Amount of memory in use for caching the local log.&quot;);</a>
+<a name="ln86">METRIC_DEFINE_counter(tablet, log_cache_disk_reads, &quot;Log Cache Disk Reads&quot;,</a>
+<a name="ln87">                      yb::MetricUnit::kEntries,</a>
+<a name="ln88">                      &quot;Amount of operations read from disk.&quot;);</a>
+<a name="ln89"> </a>
+<a name="ln90">namespace yb {</a>
+<a name="ln91">namespace consensus {</a>
+<a name="ln92"> </a>
+<a name="ln93">namespace {</a>
+<a name="ln94"> </a>
+<a name="ln95">const std::string kParentMemTrackerId = &quot;log_cache&quot;s;</a>
+<a name="ln96"> </a>
+<a name="ln97">}</a>
+<a name="ln98"> </a>
+<a name="ln99">typedef vector&lt;const ReplicateMsg*&gt;::const_iterator MsgIter;</a>
+<a name="ln100"> </a>
+<a name="ln101">LogCache::LogCache(const scoped_refptr&lt;MetricEntity&gt;&amp; metric_entity,</a>
+<a name="ln102">                   const scoped_refptr&lt;log::Log&gt;&amp; log,</a>
+<a name="ln103">                   const MemTrackerPtr&amp; server_tracker,</a>
+<a name="ln104">                   const string&amp; local_uuid,</a>
+<a name="ln105">                   const string&amp; tablet_id)</a>
+<a name="ln106">  : log_(log),</a>
+<a name="ln107">    local_uuid_(local_uuid),</a>
+<a name="ln108">    tablet_id_(tablet_id),</a>
+<a name="ln109">    next_sequential_op_index_(0),</a>
+<a name="ln110">    min_pinned_op_index_(0),</a>
+<a name="ln111">    metrics_(metric_entity) {</a>
+<a name="ln112"> </a>
+<a name="ln113">  const int64_t max_ops_size_bytes = FLAGS_log_cache_size_limit_mb * 1_MB;</a>
+<a name="ln114"> </a>
+<a name="ln115">  // Set up (or reuse) a tracker with the global limit. It is parented directly to the root tracker</a>
+<a name="ln116">  // so that it's always global.</a>
+<a name="ln117">  parent_tracker_ = GetServerMemTracker(server_tracker);</a>
+<a name="ln118"> </a>
+<a name="ln119">  // And create a child tracker with the per-tablet limit.</a>
+<a name="ln120">  tracker_ = MemTracker::CreateTracker(</a>
+<a name="ln121">      max_ops_size_bytes, Format(&quot;$0-$1&quot;, kParentMemTrackerId, tablet_id), parent_tracker_,</a>
+<a name="ln122">      AddToParent::kTrue, CreateMetrics::kFalse);</a>
+<a name="ln123">  tracker_-&gt;SetMetricEntity(metric_entity, kParentMemTrackerId);</a>
+<a name="ln124"> </a>
+<a name="ln125">  // Put a fake message at index 0, since this simplifies a lot of our code paths elsewhere.</a>
+<a name="ln126">  auto zero_op = std::make_shared&lt;ReplicateMsg&gt;();</a>
+<a name="ln127">  *zero_op-&gt;mutable_id() = MinimumOpId();</a>
+<a name="ln128">  InsertOrDie(&amp;cache_, 0, { zero_op, zero_op-&gt;SpaceUsed() });</a>
+<a name="ln129">}</a>
+<a name="ln130"> </a>
+<a name="ln131">MemTrackerPtr LogCache::GetServerMemTracker(const MemTrackerPtr&amp; server_tracker) {</a>
+<a name="ln132">  const int64_t global_max_ops_size_bytes = FLAGS_global_log_cache_size_limit_mb * 1_MB;</a>
+<a name="ln133">  return MemTracker::FindOrCreateTracker(</a>
+<a name="ln134">      global_max_ops_size_bytes, kParentMemTrackerId, server_tracker);</a>
+<a name="ln135">}</a>
+<a name="ln136"> </a>
+<a name="ln137">LogCache::~LogCache() {</a>
+<a name="ln138">  tracker_-&gt;Release(tracker_-&gt;consumption());</a>
+<a name="ln139">  cache_.clear();</a>
+<a name="ln140"> </a>
+<a name="ln141">  tracker_-&gt;UnregisterFromParent();</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144">void LogCache::Init(const OpIdPB&amp; preceding_op) {</a>
+<a name="ln145">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln146">  CHECK_EQ(cache_.size(), 1) &lt;&lt; &quot;Cache should have only our special '0' op&quot;;</a>
+<a name="ln147">  next_sequential_op_index_ = preceding_op.index() + 1;</a>
+<a name="ln148">  min_pinned_op_index_ = next_sequential_op_index_;</a>
+<a name="ln149">}</a>
+<a name="ln150"> </a>
+<a name="ln151">Result&lt;LogCache::PrepareAppendResult&gt; LogCache::PrepareAppendOperations(const ReplicateMsgs&amp; msgs) {</a>
+<a name="ln152">  // SpaceUsed is relatively expensive, so do calculations outside the lock</a>
+<a name="ln153">  PrepareAppendResult result;</a>
+<a name="ln154">  std::vector&lt;CacheEntry&gt; entries_to_insert;</a>
+<a name="ln155">  entries_to_insert.reserve(msgs.size());</a>
+<a name="ln156">  for (const auto&amp; msg : msgs) {</a>
+<a name="ln157">    CacheEntry e = { msg, static_cast&lt;int64_t&gt;(msg-&gt;SpaceUsedLong()) };</a>
+<a name="ln158">    result.mem_required += e.mem_usage;</a>
+<a name="ln159">    entries_to_insert.emplace_back(std::move(e));</a>
+<a name="ln160">  }</a>
+<a name="ln161"> </a>
+<a name="ln162">  int64_t first_idx_in_batch = msgs.front()-&gt;id().index();</a>
+<a name="ln163">  result.last_idx_in_batch = msgs.back()-&gt;id().index();</a>
+<a name="ln164"> </a>
+<a name="ln165">  std::unique_lock&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln166">  // If we're not appending a consecutive op we're likely overwriting and need to replace operations</a>
+<a name="ln167">  // in the cache.</a>
+<a name="ln168">  if (first_idx_in_batch != next_sequential_op_index_) {</a>
+<a name="ln169">    // If the index is not consecutive then it must be lower than or equal to the last index, i.e.</a>
+<a name="ln170">    // we're overwriting.</a>
+<a name="ln171">    CHECK_LE(first_idx_in_batch, next_sequential_op_index_);</a>
+<a name="ln172"> </a>
+<a name="ln173">    // Now remove the overwritten operations.</a>
+<a name="ln174">    for (int64_t i = first_idx_in_batch; i &lt; next_sequential_op_index_; ++i) {</a>
+<a name="ln175">      auto it = cache_.find(i);</a>
+<a name="ln176">      if (it != cache_.end()) {</a>
+<a name="ln177">        AccountForMessageRemovalUnlocked(it-&gt;second);</a>
+<a name="ln178">        cache_.erase(it);</a>
+<a name="ln179">      }</a>
+<a name="ln180">    }</a>
+<a name="ln181">  }</a>
+<a name="ln182"> </a>
+<a name="ln183">  for (auto&amp; e : entries_to_insert) {</a>
+<a name="ln184">    auto index = e.msg-&gt;id().index();</a>
+<a name="ln185">    EmplaceOrDie(&amp;cache_, index, std::move(e));</a>
+<a name="ln186">    next_sequential_op_index_ = index + 1;</a>
+<a name="ln187">  }</a>
+<a name="ln188"> </a>
+<a name="ln189">  return result;</a>
+<a name="ln190">}</a>
+<a name="ln191"> </a>
+<a name="ln192">Status LogCache::AppendOperations(const ReplicateMsgs&amp; msgs, const yb::OpId&amp; committed_op_id,</a>
+<a name="ln193">                                  RestartSafeCoarseTimePoint batch_mono_time,</a>
+<a name="ln194">                                  const StatusCallback&amp; callback) {</a>
+<a name="ln195">  PrepareAppendResult prepare_result;</a>
+<a name="ln196">  if (!msgs.empty()) {</a>
+<a name="ln197">    prepare_result = VERIFY_RESULT(PrepareAppendOperations(msgs));</a>
+<a name="ln198">  }</a>
+<a name="ln199"> </a>
+<a name="ln200">  Status log_status = log_-&gt;AsyncAppendReplicates(</a>
+<a name="ln201">    msgs, committed_op_id, batch_mono_time,</a>
+<a name="ln202">    Bind(&amp;LogCache::LogCallback, Unretained(this), prepare_result.last_idx_in_batch, callback));</a>
+<a name="ln203"> </a>
+<a name="ln204">  if (!log_status.ok()) {</a>
+<a name="ln205">    LOG_WITH_PREFIX_UNLOCKED(WARNING) &lt;&lt; &quot;Couldn't append to log: &quot; &lt;&lt; log_status;</a>
+<a name="ln206">    return log_status;</a>
+<a name="ln207">  }</a>
+<a name="ln208"> </a>
+<a name="ln209">  metrics_.size-&gt;IncrementBy(prepare_result.mem_required);</a>
+<a name="ln210">  metrics_.num_ops-&gt;IncrementBy(msgs.size());</a>
+<a name="ln211"> </a>
+<a name="ln212">  return Status::OK();</a>
+<a name="ln213">}</a>
+<a name="ln214"> </a>
+<a name="ln215">void LogCache::LogCallback(int64_t last_idx_in_batch,</a>
+<a name="ln216">                           const StatusCallback&amp; user_callback,</a>
+<a name="ln217">                           const Status&amp; log_status) {</a>
+<a name="ln218">  if (log_status.ok()) {</a>
+<a name="ln219">    std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln220">    if (min_pinned_op_index_ &lt;= last_idx_in_batch) {</a>
+<a name="ln221">      VLOG_WITH_PREFIX_UNLOCKED(1) &lt;&lt; &quot;Updating pinned index to &quot; &lt;&lt; (last_idx_in_batch + 1);</a>
+<a name="ln222">      min_pinned_op_index_ = last_idx_in_batch + 1;</a>
+<a name="ln223">    }</a>
+<a name="ln224">  }</a>
+<a name="ln225">  user_callback.Run(log_status);</a>
+<a name="ln226">}</a>
+<a name="ln227"> </a>
+<a name="ln228">int64_t LogCache::earliest_op_index() const {</a>
+<a name="ln229">  auto ret = log_-&gt;GetLogReader()-&gt;GetMinReplicateIndex();</a>
+<a name="ln230">  if (ret == -1) { // No finalized log files yet.  Query the active log.</a>
+<a name="ln231">    ret = log_-&gt;GetMinReplicateIndex();</a>
+<a name="ln232">  }</a>
+<a name="ln233">  return ret;</a>
+<a name="ln234">}</a>
+<a name="ln235"> </a>
+<a name="ln236">bool LogCache::HasOpBeenWritten(int64_t index) const {</a>
+<a name="ln237">  std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln238">  return index &lt; next_sequential_op_index_;</a>
+<a name="ln239">}</a>
+<a name="ln240"> </a>
+<a name="ln241">Result&lt;yb::OpId&gt; LogCache::LookupOpId(int64_t op_index) const {</a>
+<a name="ln242">  // First check the log cache itself.</a>
+<a name="ln243">  {</a>
+<a name="ln244">    std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln245"> </a>
+<a name="ln246">    // We sometimes try to look up OpIds that have never been written on the local node. In that</a>
+<a name="ln247">    // case, don't try to read the op from the log reader, since it might actually race against the</a>
+<a name="ln248">    // writing of the op.</a>
+<a name="ln249">    if (op_index &gt;= next_sequential_op_index_) {</a>
+<a name="ln250">      return STATUS(Incomplete, Substitute(&quot;Op with index $0 is ahead of the local log &quot;</a>
+<a name="ln251">                                           &quot;(next sequential op: $1)&quot;,</a>
+<a name="ln252">                                           op_index, next_sequential_op_index_));</a>
+<a name="ln253">    }</a>
+<a name="ln254">    auto iter = cache_.find(op_index);</a>
+<a name="ln255">    if (iter != cache_.end()) {</a>
+<a name="ln256">      return yb::OpId::FromPB(iter-&gt;second.msg-&gt;id());</a>
+<a name="ln257">    }</a>
+<a name="ln258">  }</a>
+<a name="ln259"> </a>
+<a name="ln260">  // If it misses, read from the log.</a>
+<a name="ln261">  return log_-&gt;GetLogReader()-&gt;LookupOpId(op_index);</a>
+<a name="ln262">}</a>
+<a name="ln263"> </a>
+<a name="ln264">namespace {</a>
+<a name="ln265"> </a>
+<a name="ln266">// Calculate the total byte size that will be used on the wire to replicate this message as part of</a>
+<a name="ln267">// a consensus update request. This accounts for the length delimiting and tagging of the message.</a>
+<a name="ln268">int64_t TotalByteSizeForMessage(const ReplicateMsg&amp; msg) {</a>
+<a name="ln269">  int msg_size = google::protobuf::internal::WireFormatLite::LengthDelimitedSize(</a>
+<a name="ln270">    msg.ByteSize());</a>
+<a name="ln271">  msg_size += 1; // for the type tag</a>
+<a name="ln272">  return msg_size;</a>
+<a name="ln273">}</a>
+<a name="ln274"> </a>
+<a name="ln275">} // anonymous namespace</a>
+<a name="ln276"> </a>
+<a name="ln277">Result&lt;ReadOpsResult&gt; LogCache::ReadOps(int64_t after_op_index,</a>
+<a name="ln278">                                        int max_size_bytes) {</a>
+<a name="ln279">  return ReadOps(after_op_index, 0 /* to_op_index */, max_size_bytes);</a>
+<a name="ln280">}</a>
+<a name="ln281"> </a>
+<a name="ln282">Result&lt;ReadOpsResult&gt; LogCache::ReadOps(int64_t after_op_index,</a>
+<a name="ln283">                                        int64_t to_op_index,</a>
+<a name="ln284">                                        int max_size_bytes) {</a>
+<a name="ln285">  DCHECK_GE(after_op_index, 0);</a>
+<a name="ln286"> </a>
+<a name="ln287">  VLOG_WITH_PREFIX_UNLOCKED(4) &lt;&lt; &quot;ReadOps, after_op_index: &quot; &lt;&lt; after_op_index</a>
+<a name="ln288">                               &lt;&lt; &quot;, to_op_index: &quot; &lt;&lt; to_op_index</a>
+<a name="ln289">                               &lt;&lt; &quot;, max_size_bytes: &quot; &lt;&lt; max_size_bytes;</a>
+<a name="ln290"> </a>
+<a name="ln291">  ReadOpsResult result;</a>
+<a name="ln292">  result.preceding_op = VERIFY_RESULT(LookupOpId(after_op_index));</a>
+<a name="ln293"> </a>
+<a name="ln294">  std::unique_lock&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln295">  int64_t next_index = after_op_index + 1;</a>
+<a name="ln296">  int64_t to_index = to_op_index &gt; 0</a>
+<a name="ln297">      ? std::min(to_op_index + 1, next_sequential_op_index_)</a>
+<a name="ln298">      : next_sequential_op_index_;</a>
+<a name="ln299"> </a>
+<a name="ln300">  // Return as many operations as we can, up to the limit.</a>
+<a name="ln301">  int64_t remaining_space = max_size_bytes;</a>
+<a name="ln302">  while (remaining_space &gt; 0 &amp;&amp; next_index &lt; to_index) {</a>
+<a name="ln303">    // If the messages the peer needs haven't been loaded into the queue yet, load them.</a>
+<a name="ln304">    MessageCache::const_iterator iter = cache_.lower_bound(next_index);</a>
+<a name="ln305">    if (iter == cache_.end() || iter-&gt;first != next_index) {</a>
+<a name="ln306">      int64_t up_to;</a>
+<a name="ln307">      if (iter == cache_.end()) {</a>
+<a name="ln308">        // Read all the way to the current op.</a>
+<a name="ln309">        up_to = to_index - 1;</a>
+<a name="ln310">      } else {</a>
+<a name="ln311">        // Read up to the next entry that's in the cache or to_index whichever is lesser.</a>
+<a name="ln312">        up_to = std::min(iter-&gt;first - 1, static_cast&lt;uint64_t&gt;(to_index - 1));</a>
+<a name="ln313">      }</a>
+<a name="ln314"> </a>
+<a name="ln315">      l.unlock();</a>
+<a name="ln316"> </a>
+<a name="ln317">      ReplicateMsgs raw_replicate_ptrs;</a>
+<a name="ln318">      RETURN_NOT_OK_PREPEND(</a>
+<a name="ln319">        log_-&gt;GetLogReader()-&gt;ReadReplicatesInRange(</a>
+<a name="ln320">            next_index, up_to, remaining_space, &amp;raw_replicate_ptrs),</a>
+<a name="ln321">        Substitute(&quot;Failed to read ops $0..$1&quot;, next_index, up_to));</a>
+<a name="ln322">      metrics_.disk_reads-&gt;IncrementBy(raw_replicate_ptrs.size());</a>
+<a name="ln323">      LOG_WITH_PREFIX_UNLOCKED(INFO)</a>
+<a name="ln324">          &lt;&lt; &quot;Successfully read &quot; &lt;&lt; raw_replicate_ptrs.size() &lt;&lt; &quot; ops from disk.&quot;;</a>
+<a name="ln325">      l.lock();</a>
+<a name="ln326"> </a>
+<a name="ln327">      for (auto&amp; msg : raw_replicate_ptrs) {</a>
+<a name="ln328">        CHECK_EQ(next_index, msg-&gt;id().index());</a>
+<a name="ln329"> </a>
+<a name="ln330">        auto current_message_size = TotalByteSizeForMessage(*msg);</a>
+<a name="ln331">        remaining_space -= current_message_size;</a>
+<a name="ln332">        if (remaining_space &gt;= 0 || result.messages.empty()) {</a>
+<a name="ln333">          result.messages.push_back(msg);</a>
+<a name="ln334">          result.read_from_disk_size += current_message_size;</a>
+<a name="ln335">          next_index++;</a>
+<a name="ln336">        } else {</a>
+<a name="ln337">          result.have_more_messages = true;</a>
+<a name="ln338">        }</a>
+<a name="ln339">      }</a>
+<a name="ln340"> </a>
+<a name="ln341">    } else {</a>
+<a name="ln342">      // Pull contiguous messages from the cache until the size limit is achieved.</a>
+<a name="ln343">      for (; iter != cache_.end(); ++iter) {</a>
+<a name="ln344">        if (to_op_index &gt; 0 &amp;&amp; next_index &gt; to_op_index) {</a>
+<a name="ln345">          break;</a>
+<a name="ln346">        }</a>
+<a name="ln347">        const ReplicateMsgPtr&amp; msg = iter-&gt;second.msg;</a>
+<a name="ln348">        int64_t index = msg-&gt;id().index();</a>
+<a name="ln349">        if (index != next_index) {</a>
+<a name="ln350">          continue;</a>
+<a name="ln351">        }</a>
+<a name="ln352"> </a>
+<a name="ln353">        auto current_message_size = TotalByteSizeForMessage(*msg);</a>
+<a name="ln354">        remaining_space -= current_message_size;</a>
+<a name="ln355">        if (remaining_space &lt; 0 &amp;&amp; !result.messages.empty()) {</a>
+<a name="ln356">          result.have_more_messages = true;</a>
+<a name="ln357">          break;</a>
+<a name="ln358">        }</a>
+<a name="ln359"> </a>
+<a name="ln360">        result.messages.push_back(msg);</a>
+<a name="ln361">        next_index++;</a>
+<a name="ln362">      }</a>
+<a name="ln363">    }</a>
+<a name="ln364">  }</a>
+<a name="ln365"> </a>
+<a name="ln366">  return result;</a>
+<a name="ln367">}</a>
+<a name="ln368"> </a>
+<a name="ln369">size_t LogCache::EvictThroughOp(int64_t index, int64_t bytes_to_evict) {</a>
+<a name="ln370">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln371">  return EvictSomeUnlocked(index, bytes_to_evict);</a>
+<a name="ln372">}</a>
+<a name="ln373"> </a>
+<a name="ln374">size_t LogCache::EvictSomeUnlocked(int64_t stop_after_index, int64_t bytes_to_evict) {</a>
+<a name="ln375">  DCHECK(lock_.is_locked());</a>
+<a name="ln376">  VLOG_WITH_PREFIX_UNLOCKED(2) &lt;&lt; &quot;Evicting log cache index &lt;= &quot;</a>
+<a name="ln377">                      &lt;&lt; stop_after_index</a>
+<a name="ln378">                      &lt;&lt; &quot; or &quot; &lt;&lt; HumanReadableNumBytes::ToString(bytes_to_evict)</a>
+<a name="ln379">                      &lt;&lt; &quot;: before state: &quot; &lt;&lt; ToStringUnlocked();</a>
+<a name="ln380"> </a>
+<a name="ln381">  if (ANNOTATE_UNPROTECTED_READ(FLAGS_TEST_log_cache_skip_eviction)) {</a>
+<a name="ln382">    return 0;</a>
+<a name="ln383">  }</a>
+<a name="ln384"> </a>
+<a name="ln385">  int64_t bytes_evicted = 0;</a>
+<a name="ln386">  for (auto iter = cache_.begin(); iter != cache_.end();) {</a>
+<a name="ln387">    const CacheEntry&amp; entry = iter-&gt;second;</a>
+<a name="ln388">    const ReplicateMsgPtr&amp; msg = entry.msg;</a>
+<a name="ln389">    VLOG_WITH_PREFIX_UNLOCKED(2) &lt;&lt; &quot;considering for eviction: &quot; &lt;&lt; msg-&gt;id();</a>
+<a name="ln390">    int64_t msg_index = msg-&gt;id().index();</a>
+<a name="ln391">    if (msg_index == 0) {</a>
+<a name="ln392">      // Always keep our special '0' op.</a>
+<a name="ln393">      ++iter;</a>
+<a name="ln394">      continue;</a>
+<a name="ln395">    }</a>
+<a name="ln396"> </a>
+<a name="ln397">    if (msg_index &gt; stop_after_index || msg_index &gt;= min_pinned_op_index_) {</a>
+<a name="ln398">      break;</a>
+<a name="ln399">    }</a>
+<a name="ln400"> </a>
+<a name="ln401">    VLOG_WITH_PREFIX_UNLOCKED(2) &lt;&lt; &quot;Evicting cache. Removing: &quot; &lt;&lt; msg-&gt;id();</a>
+<a name="ln402">    AccountForMessageRemovalUnlocked(entry);</a>
+<a name="ln403">    bytes_evicted += entry.mem_usage;</a>
+<a name="ln404">    cache_.erase(iter++);</a>
+<a name="ln405"> </a>
+<a name="ln406">    if (bytes_evicted &gt;= bytes_to_evict) {</a>
+<a name="ln407">      break;</a>
+<a name="ln408">    }</a>
+<a name="ln409">  }</a>
+<a name="ln410">  VLOG_WITH_PREFIX_UNLOCKED(1) &lt;&lt; &quot;Evicting log cache: after state: &quot; &lt;&lt; ToStringUnlocked();</a>
+<a name="ln411"> </a>
+<a name="ln412">  return bytes_evicted;</a>
+<a name="ln413">}</a>
+<a name="ln414"> </a>
+<a name="ln415">Status LogCache::FlushIndex() {</a>
+<a name="ln416">  return log_-&gt;FlushIndex();</a>
+<a name="ln417">}</a>
+<a name="ln418"> </a>
+<a name="ln419">CHECKED_STATUS LogCache::CopyLogTo(const std::string&amp; dest_dir) {</a>
+<a name="ln420">  return log_-&gt;CopyTo(dest_dir);</a>
+<a name="ln421">}</a>
+<a name="ln422"> </a>
+<a name="ln423">void LogCache::AccountForMessageRemovalUnlocked(const CacheEntry&amp; entry) {</a>
+<a name="ln424">  if (entry.tracked) {</a>
+<a name="ln425">    tracker_-&gt;Release(entry.mem_usage);</a>
+<a name="ln426">  }</a>
+<a name="ln427">  metrics_.size-&gt;DecrementBy(entry.mem_usage);</a>
+<a name="ln428">  metrics_.num_ops-&gt;Decrement();</a>
+<a name="ln429">}</a>
+<a name="ln430"> </a>
+<a name="ln431">int64_t LogCache::BytesUsed() const {</a>
+<a name="ln432">  return tracker_-&gt;consumption();</a>
+<a name="ln433">}</a>
+<a name="ln434"> </a>
+<a name="ln435">string LogCache::StatsString() const {</a>
+<a name="ln436">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln437">  return StatsStringUnlocked();</a>
+<a name="ln438">}</a>
+<a name="ln439"> </a>
+<a name="ln440">string LogCache::StatsStringUnlocked() const {</a>
+<a name="ln441">  return Substitute(&quot;LogCacheStats(num_ops=$0, bytes=$1, disk_reads=$2)&quot;,</a>
+<a name="ln442">                    metrics_.num_ops-&gt;value(),</a>
+<a name="ln443">                    metrics_.size-&gt;value(),</a>
+<a name="ln444">                    metrics_.disk_reads-&gt;value());</a>
+<a name="ln445">}</a>
+<a name="ln446"> </a>
+<a name="ln447">std::string LogCache::ToString() const {</a>
+<a name="ln448">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln449">  return ToStringUnlocked();</a>
+<a name="ln450">}</a>
+<a name="ln451"> </a>
+<a name="ln452">std::string LogCache::ToStringUnlocked() const {</a>
+<a name="ln453">  return Substitute(&quot;Pinned index: $0, $1&quot;,</a>
+<a name="ln454">                    min_pinned_op_index_,</a>
+<a name="ln455">                    StatsStringUnlocked());</a>
+<a name="ln456">}</a>
+<a name="ln457"> </a>
+<a name="ln458">std::string LogCache::LogPrefixUnlocked() const {</a>
+<a name="ln459">  return MakeTabletLogPrefix(tablet_id_, local_uuid_);</a>
+<a name="ln460">}</a>
+<a name="ln461"> </a>
+<a name="ln462">void LogCache::DumpToLog() const {</a>
+<a name="ln463">  vector&lt;string&gt; strings;</a>
+<a name="ln464">  DumpToStrings(&amp;strings);</a>
+<a name="ln465">  for (const string&amp; s : strings) {</a>
+<a name="ln466">    LOG_WITH_PREFIX_UNLOCKED(INFO) &lt;&lt; s;</a>
+<a name="ln467">  }</a>
+<a name="ln468">}</a>
+<a name="ln469"> </a>
+<a name="ln470">void LogCache::DumpToStrings(vector&lt;string&gt;* lines) const {</a>
+<a name="ln471">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln472">  int counter = 0;</a>
+<a name="ln473">  lines-&gt;push_back(ToStringUnlocked());</a>
+<a name="ln474">  lines-&gt;push_back(&quot;Messages:&quot;);</a>
+<a name="ln475">  for (const auto&amp; entry : cache_) {</a>
+<a name="ln476">    const ReplicateMsgPtr msg = entry.second.msg;</a>
+<a name="ln477">    lines-&gt;push_back(</a>
+<a name="ln478">      Substitute(&quot;Message[$0] $1.$2 : REPLICATE. Type: $3, Size: $4&quot;,</a>
+<a name="ln479">                 counter++, msg-&gt;id().term(), msg-&gt;id().index(),</a>
+<a name="ln480">                 OperationType_Name(msg-&gt;op_type()),</a>
+<a name="ln481">                 msg-&gt;ByteSize()));</a>
+<a name="ln482">  }</a>
+<a name="ln483">}</a>
+<a name="ln484"> </a>
+<a name="ln485">void LogCache::DumpToHtml(std::ostream&amp; out) const {</a>
+<a name="ln486">  using std::endl;</a>
+<a name="ln487"> </a>
+<a name="ln488">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln489">  out &lt;&lt; &quot;&lt;h3&gt;Messages:&lt;/h3&gt;&quot; &lt;&lt; endl;</a>
+<a name="ln490">  out &lt;&lt; &quot;&lt;table&gt;&quot; &lt;&lt; endl;</a>
+<a name="ln491">  out &lt;&lt; &quot;&lt;tr&gt;&lt;th&gt;Entry&lt;/th&gt;&lt;th&gt;OpId&lt;/th&gt;&lt;th&gt;Type&lt;/th&gt;&lt;th&gt;Size&lt;/th&gt;&lt;th&gt;Status&lt;/th&gt;&lt;/tr&gt;&quot; &lt;&lt; endl;</a>
+<a name="ln492"> </a>
+<a name="ln493">  int counter = 0;</a>
+<a name="ln494">  for (const auto&amp; entry : cache_) {</a>
+<a name="ln495">    const ReplicateMsgPtr msg = entry.second.msg;</a>
+<a name="ln496">    out &lt;&lt; Substitute(&quot;&lt;tr&gt;&lt;th&gt;$0&lt;/th&gt;&lt;th&gt;$1.$2&lt;/th&gt;&lt;td&gt;REPLICATE $3&lt;/td&gt;&quot;</a>
+<a name="ln497">                      &quot;&lt;td&gt;$4&lt;/td&gt;&lt;td&gt;$5&lt;/td&gt;&lt;/tr&gt;&quot;,</a>
+<a name="ln498">                      counter++, msg-&gt;id().term(), msg-&gt;id().index(),</a>
+<a name="ln499">                      OperationType_Name(msg-&gt;op_type()),</a>
+<a name="ln500">                      msg-&gt;ByteSize(), msg-&gt;id().ShortDebugString()) &lt;&lt; endl;</a>
+<a name="ln501">  }</a>
+<a name="ln502">  out &lt;&lt; &quot;&lt;/table&gt;&quot;;</a>
+<a name="ln503">}</a>
+<a name="ln504"> </a>
+<a name="ln505">void LogCache::TrackOperationsMemory(const OpIds&amp; op_ids) {</a>
+<a name="ln506">  if (op_ids.empty()) {</a>
+<a name="ln507">    return;</a>
+<a name="ln508">  }</a>
+<a name="ln509"> </a>
+<a name="ln510">  std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln511"> </a>
+<a name="ln512">  int mem_required = 0;</a>
+<a name="ln513">  for (const auto&amp; op_id : op_ids) {</a>
+<a name="ln514">    auto it = cache_.find(op_id.index);</a>
+<a name="ln515">    if (it != cache_.end() &amp;&amp; it-&gt;second.msg-&gt;id().term() == op_id.term) {</a>
+<a name="ln516">      mem_required += it-&gt;second.mem_usage;</a>
+<a name="ln517">      it-&gt;second.tracked = true;</a>
+<a name="ln518">    }</a>
+<a name="ln519">  }</a>
+<a name="ln520"> </a>
+<a name="ln521">  if (mem_required == 0) {</a>
+<a name="ln522">    return;</a>
+<a name="ln523">  }</a>
+<a name="ln524"> </a>
+<a name="ln525">  // Try to consume the memory. If it can't be consumed, we may need to evict.</a>
+<a name="ln526">  if (!tracker_-&gt;TryConsume(mem_required)) {</a>
+<a name="ln527">    int spare = tracker_-&gt;SpareCapacity();</a>
+<a name="ln528">    int need_to_free = mem_required - spare;</a>
+<a name="ln529">    VLOG_WITH_PREFIX_UNLOCKED(1)</a>
+<a name="ln530">        &lt;&lt; &quot;Memory limit would be exceeded trying to append &quot;</a>
+<a name="ln531">        &lt;&lt; HumanReadableNumBytes::ToString(mem_required)</a>
+<a name="ln532">        &lt;&lt; &quot; to log cache (available=&quot;</a>
+<a name="ln533">        &lt;&lt; HumanReadableNumBytes::ToString(spare)</a>
+<a name="ln534">        &lt;&lt; &quot;): attempting to evict some operations...&quot;;</a>
+<a name="ln535"> </a>
+<a name="ln536">    tracker_-&gt;Consume(mem_required);</a>
+<a name="ln537"> </a>
+<a name="ln538">    // TODO: we should also try to evict from other tablets - probably better to evict really old</a>
+<a name="ln539">    // ops from another tablet than evict recent ops from this one.</a>
+<a name="ln540">    EvictSomeUnlocked(min_pinned_op_index_, need_to_free);</a>
+<a name="ln541">  }</a>
+<a name="ln542">}</a>
+<a name="ln543"> </a>
+<a name="ln544">#define INSTANTIATE_METRIC(x, ...) \</a>
+<a name="ln545">  x(BOOST_PP_CAT(METRIC_log_cache_, x).Instantiate(metric_entity, ## __VA_ARGS__))</a>
+<a name="ln546">LogCache::Metrics::Metrics(const scoped_refptr&lt;MetricEntity&gt;&amp; metric_entity)</a>
+<a name="ln547">  : INSTANTIATE_METRIC(num_ops, 0),</a>
+<a name="ln548">    INSTANTIATE_METRIC(size, 0),</a>
+<a name="ln549">    INSTANTIATE_METRIC(disk_reads) {</a>
+<a name="ln550">}</a>
+<a name="ln551">#undef INSTANTIATE_METRIC</a>
+<a name="ln552"> </a>
+<a name="ln553">} // namespace consensus</a>
+<a name="ln554">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="221"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="287"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="375"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="376"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="389"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="401"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="410"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="529"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,982 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>spatial_db.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln2">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20"> </a>
+<a name="ln21">#ifndef ROCKSDB_LITE</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/rocksdb/utilities/spatial_db.h&quot;</a>
+<a name="ln24"> </a>
+<a name="ln25">#ifndef __STDC_FORMAT_MACROS</a>
+<a name="ln26">#define __STDC_FORMAT_MACROS</a>
+<a name="ln27">#endif</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &lt;inttypes.h&gt;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &lt;algorithm&gt;</a>
+<a name="ln32">#include &lt;condition_variable&gt;</a>
+<a name="ln33">#include &lt;string&gt;</a>
+<a name="ln34">#include &lt;vector&gt;</a>
+<a name="ln35">#include &lt;mutex&gt;</a>
+<a name="ln36">#include &lt;thread&gt;</a>
+<a name="ln37">#include &lt;set&gt;</a>
+<a name="ln38">#include &lt;unordered_set&gt;</a>
+<a name="ln39"> </a>
+<a name="ln40">#include &quot;yb/rocksdb/cache.h&quot;</a>
+<a name="ln41">#include &quot;yb/rocksdb/options.h&quot;</a>
+<a name="ln42">#include &quot;yb/rocksdb/memtablerep.h&quot;</a>
+<a name="ln43">#include &quot;yb/rocksdb/slice_transform.h&quot;</a>
+<a name="ln44">#include &quot;yb/rocksdb/statistics.h&quot;</a>
+<a name="ln45">#include &quot;yb/rocksdb/table.h&quot;</a>
+<a name="ln46">#include &quot;yb/rocksdb/db.h&quot;</a>
+<a name="ln47">#include &quot;yb/rocksdb/utilities/stackable_db.h&quot;</a>
+<a name="ln48">#include &quot;yb/rocksdb/util/coding.h&quot;</a>
+<a name="ln49">#include &quot;yb/rocksdb/utilities/spatialdb/utils.h&quot;</a>
+<a name="ln50"> </a>
+<a name="ln51">namespace rocksdb {</a>
+<a name="ln52">namespace spatial {</a>
+<a name="ln53"> </a>
+<a name="ln54">// Column families are used to store element's data and spatial indexes. We use</a>
+<a name="ln55">// [default] column family to store the element data. This is the format of</a>
+<a name="ln56">// [default] column family:</a>
+<a name="ln57">// * id (fixed 64 big endian) -&gt; blob (length prefixed slice) feature_set</a>
+<a name="ln58">// (serialized)</a>
+<a name="ln59">// We have one additional column family for each spatial index. The name of the</a>
+<a name="ln60">// column family is [spatial$&lt;spatial_index_name&gt;]. The format is:</a>
+<a name="ln61">// * quad_key (fixed 64 bit big endian) id (fixed 64 bit big endian) -&gt; &quot;&quot;</a>
+<a name="ln62">// We store information about indexes in [metadata] column family. Format is:</a>
+<a name="ln63">// * spatial$&lt;spatial_index_name&gt; -&gt; bbox (4 double encodings) tile_bits</a>
+<a name="ln64">// (varint32)</a>
+<a name="ln65"> </a>
+<a name="ln66">namespace {</a>
+<a name="ln67">const std::string kMetadataColumnFamilyName(&quot;metadata&quot;);</a>
+<a name="ln68">inline std::string GetSpatialIndexColumnFamilyName(</a>
+<a name="ln69">    const std::string&amp; spatial_index_name) {</a>
+<a name="ln70">  return &quot;spatial$&quot; + spatial_index_name;</a>
+<a name="ln71">}</a>
+<a name="ln72">inline bool GetSpatialIndexName(const std::string&amp; column_family_name,</a>
+<a name="ln73">                                Slice* dst) {</a>
+<a name="ln74">  *dst = Slice(column_family_name);</a>
+<a name="ln75">  if (dst-&gt;starts_with(&quot;spatial$&quot;)) {</a>
+<a name="ln76">    dst-&gt;remove_prefix(8);  // strlen(&quot;spatial$&quot;)</a>
+<a name="ln77">    return true;</a>
+<a name="ln78">  }</a>
+<a name="ln79">  return false;</a>
+<a name="ln80">}</a>
+<a name="ln81"> </a>
+<a name="ln82">}  // namespace</a>
+<a name="ln83"> </a>
+<a name="ln84">void Variant::Init(const Variant&amp; v, Data&amp; d) {</a>
+<a name="ln85">  switch (v.type_) {</a>
+<a name="ln86">    case kNull:</a>
+<a name="ln87">      break;</a>
+<a name="ln88">    case kBool:</a>
+<a name="ln89">      d.b = v.data_.b;</a>
+<a name="ln90">      break;</a>
+<a name="ln91">    case kInt:</a>
+<a name="ln92">      d.i = v.data_.i;</a>
+<a name="ln93">      break;</a>
+<a name="ln94">    case kDouble:</a>
+<a name="ln95">      d.d = v.data_.d;</a>
+<a name="ln96">      break;</a>
+<a name="ln97">    case kString:</a>
+<a name="ln98">      new (d.s) std::string(*GetStringPtr(v.data_));</a>
+<a name="ln99">      break;</a>
+<a name="ln100">    default:</a>
+<a name="ln101">      assert(false);</a>
+<a name="ln102">  }</a>
+<a name="ln103">}</a>
+<a name="ln104"> </a>
+<a name="ln105">Variant&amp; Variant::operator=(const Variant&amp; v) {</a>
+<a name="ln106">  // Construct first a temp so exception from a string ctor</a>
+<a name="ln107">  // does not change this object</a>
+<a name="ln108">  Data tmp;</a>
+<a name="ln109">  Init(v, tmp);</a>
+<a name="ln110"> </a>
+<a name="ln111">  Type thisType = type_;</a>
+<a name="ln112">  // Boils down to copying bits so safe</a>
+<a name="ln113">  std::swap(tmp, data_);</a>
+<a name="ln114">  type_ = v.type_;</a>
+<a name="ln115"> </a>
+<a name="ln116">  Destroy(thisType, tmp);</a>
+<a name="ln117"> </a>
+<a name="ln118">  return *this;</a>
+<a name="ln119">}</a>
+<a name="ln120"> </a>
+<a name="ln121">Variant&amp; Variant::operator=(Variant&amp;&amp; rhs) {</a>
+<a name="ln122">  Destroy(type_, data_);</a>
+<a name="ln123">  if (rhs.type_ == kString) {</a>
+<a name="ln124">    new (data_.s) std::string(std::move(*GetStringPtr(rhs.data_)));</a>
+<a name="ln125">  } else {</a>
+<a name="ln126">    data_ = rhs.data_;</a>
+<a name="ln127">  }</a>
+<a name="ln128">  type_ = rhs.type_;</a>
+<a name="ln129">  rhs.type_ = kNull;</a>
+<a name="ln130">  return *this;</a>
+<a name="ln131">}</a>
+<a name="ln132"> </a>
+<a name="ln133">bool Variant::operator==(const Variant&amp; rhs) const {</a>
+<a name="ln134">  if (type_ != rhs.type_) {</a>
+<a name="ln135">    return false;</a>
+<a name="ln136">  }</a>
+<a name="ln137"> </a>
+<a name="ln138">  switch (type_) {</a>
+<a name="ln139">    case kNull:</a>
+<a name="ln140">      return true;</a>
+<a name="ln141">    case kBool:</a>
+<a name="ln142">      return data_.b == rhs.data_.b;</a>
+<a name="ln143">    case kInt:</a>
+<a name="ln144">      return data_.i == rhs.data_.i;</a>
+<a name="ln145">    case kDouble:</a>
+<a name="ln146">      return data_.d == rhs.data_.d;</a>
+<a name="ln147">    case kString:</a>
+<a name="ln148">      return *GetStringPtr(data_) == *GetStringPtr(rhs.data_);</a>
+<a name="ln149">    default:</a>
+<a name="ln150">      assert(false);</a>
+<a name="ln151">  }</a>
+<a name="ln152">  // it will never reach here, but otherwise the compiler complains</a>
+<a name="ln153">  return false;</a>
+<a name="ln154">}</a>
+<a name="ln155"> </a>
+<a name="ln156">FeatureSet* FeatureSet::Set(const std::string&amp; key, const Variant&amp; value) {</a>
+<a name="ln157">  map_.insert({key, value});</a>
+<a name="ln158">  return this;</a>
+<a name="ln159">}</a>
+<a name="ln160"> </a>
+<a name="ln161">bool FeatureSet::Contains(const std::string&amp; key) const {</a>
+<a name="ln162">  return map_.find(key) != map_.end();</a>
+<a name="ln163">}</a>
+<a name="ln164"> </a>
+<a name="ln165">const Variant&amp; FeatureSet::Get(const std::string&amp; key) const {</a>
+<a name="ln166">  auto itr = map_.find(key);</a>
+<a name="ln167">  assert(itr != map_.end());</a>
+<a name="ln168">  return itr-&gt;second;</a>
+<a name="ln169">}</a>
+<a name="ln170"> </a>
+<a name="ln171">FeatureSet::iterator FeatureSet::Find(const std::string&amp; key) const {</a>
+<a name="ln172">  return iterator(map_.find(key));</a>
+<a name="ln173">}</a>
+<a name="ln174"> </a>
+<a name="ln175">void FeatureSet::Clear() { map_.clear(); }</a>
+<a name="ln176"> </a>
+<a name="ln177">void FeatureSet::Serialize(std::string* output) const {</a>
+<a name="ln178">  for (const auto&amp; iter : map_) {</a>
+<a name="ln179">    PutLengthPrefixedSlice(output, iter.first);</a>
+<a name="ln180">    output-&gt;push_back(static_cast&lt;char&gt;(iter.second.type()));</a>
+<a name="ln181">    switch (iter.second.type()) {</a>
+<a name="ln182">      case Variant::kNull:</a>
+<a name="ln183">        break;</a>
+<a name="ln184">      case Variant::kBool:</a>
+<a name="ln185">        output-&gt;push_back(static_cast&lt;char&gt;(iter.second.get_bool()));</a>
+<a name="ln186">        break;</a>
+<a name="ln187">      case Variant::kInt:</a>
+<a name="ln188">        PutVarint64(output, iter.second.get_int());</a>
+<a name="ln189">        break;</a>
+<a name="ln190">      case Variant::kDouble: {</a>
+<a name="ln191">        PutDouble(output, iter.second.get_double());</a>
+<a name="ln192">        break;</a>
+<a name="ln193">      }</a>
+<a name="ln194">      case Variant::kString:</a>
+<a name="ln195">        PutLengthPrefixedSlice(output, iter.second.get_string());</a>
+<a name="ln196">        break;</a>
+<a name="ln197">      default:</a>
+<a name="ln198">        assert(false);</a>
+<a name="ln199">    }</a>
+<a name="ln200">  }</a>
+<a name="ln201">}</a>
+<a name="ln202"> </a>
+<a name="ln203">bool FeatureSet::Deserialize(const Slice&amp; input) {</a>
+<a name="ln204">  assert(map_.empty());</a>
+<a name="ln205">  Slice s(input);</a>
+<a name="ln206">  while (s.size()) {</a>
+<a name="ln207">    Slice key;</a>
+<a name="ln208">    if (!GetLengthPrefixedSlice(&amp;s, &amp;key) || s.size() == 0) {</a>
+<a name="ln209">      return false;</a>
+<a name="ln210">    }</a>
+<a name="ln211">    char type = s[0];</a>
+<a name="ln212">    s.remove_prefix(1);</a>
+<a name="ln213">    switch (type) {</a>
+<a name="ln214">      case Variant::kNull: {</a>
+<a name="ln215">        map_.insert({key.ToString(), Variant()});</a>
+<a name="ln216">        break;</a>
+<a name="ln217">      }</a>
+<a name="ln218">      case Variant::kBool: {</a>
+<a name="ln219">        if (s.size() == 0) {</a>
+<a name="ln220">          return false;</a>
+<a name="ln221">        }</a>
+<a name="ln222">        map_.insert({key.ToString(), Variant(static_cast&lt;bool&gt;(s[0]))});</a>
+<a name="ln223">        s.remove_prefix(1);</a>
+<a name="ln224">        break;</a>
+<a name="ln225">      }</a>
+<a name="ln226">      case Variant::kInt: {</a>
+<a name="ln227">        uint64_t v;</a>
+<a name="ln228">        if (!GetVarint64(&amp;s, &amp;v)) {</a>
+<a name="ln229">          return false;</a>
+<a name="ln230">        }</a>
+<a name="ln231">        map_.insert({key.ToString(), Variant(v)});</a>
+<a name="ln232">        break;</a>
+<a name="ln233">      }</a>
+<a name="ln234">      case Variant::kDouble: {</a>
+<a name="ln235">        double d;</a>
+<a name="ln236">        if (!GetDouble(&amp;s, &amp;d)) {</a>
+<a name="ln237">          return false;</a>
+<a name="ln238">        }</a>
+<a name="ln239">        map_.insert({key.ToString(), Variant(d)});</a>
+<a name="ln240">        break;</a>
+<a name="ln241">      }</a>
+<a name="ln242">      case Variant::kString: {</a>
+<a name="ln243">        Slice str;</a>
+<a name="ln244">        if (!GetLengthPrefixedSlice(&amp;s, &amp;str)) {</a>
+<a name="ln245">          return false;</a>
+<a name="ln246">        }</a>
+<a name="ln247">        map_.insert({key.ToString(), str.ToString()});</a>
+<a name="ln248">        break;</a>
+<a name="ln249">      }</a>
+<a name="ln250">      default:</a>
+<a name="ln251">        return false;</a>
+<a name="ln252">    }</a>
+<a name="ln253">  }</a>
+<a name="ln254">  return true;</a>
+<a name="ln255">}</a>
+<a name="ln256"> </a>
+<a name="ln257">std::string FeatureSet::DebugString() const {</a>
+<a name="ln258">  std::string out = &quot;{&quot;;</a>
+<a name="ln259">  bool comma = false;</a>
+<a name="ln260">  for (const auto&amp; iter : map_) {</a>
+<a name="ln261">    if (comma) {</a>
+<a name="ln262">      out.append(&quot;, &quot;);</a>
+<a name="ln263">    } else {</a>
+<a name="ln264">      comma = true;</a>
+<a name="ln265">    }</a>
+<a name="ln266">    out.append(&quot;\&quot;&quot; + iter.first + &quot;\&quot;: &quot;);</a>
+<a name="ln267">    switch (iter.second.type()) {</a>
+<a name="ln268">      case Variant::kNull:</a>
+<a name="ln269">        out.append(&quot;null&quot;);</a>
+<a name="ln270">        break;</a>
+<a name="ln271">      case Variant::kBool:</a>
+<a name="ln272">        if (iter.second.get_bool()) {</a>
+<a name="ln273">          out.append(&quot;true&quot;);</a>
+<a name="ln274">        } else {</a>
+<a name="ln275">          out.append(&quot;false&quot;);</a>
+<a name="ln276">        }</a>
+<a name="ln277">        break;</a>
+<a name="ln278">      case Variant::kInt: {</a>
+<a name="ln279">        char buf[32];</a>
+<a name="ln280">        snprintf(buf, sizeof(buf), &quot;%&quot; PRIu64, iter.second.get_int());</a>
+<a name="ln281">        out.append(buf);</a>
+<a name="ln282">        break;</a>
+<a name="ln283">      }</a>
+<a name="ln284">      case Variant::kDouble: {</a>
+<a name="ln285">        char buf[32];</a>
+<a name="ln286">        snprintf(buf, sizeof(buf), &quot;%lf&quot;, iter.second.get_double());</a>
+<a name="ln287">        out.append(buf);</a>
+<a name="ln288">        break;</a>
+<a name="ln289">      }</a>
+<a name="ln290">      case Variant::kString:</a>
+<a name="ln291">        out.append(&quot;\&quot;&quot; + iter.second.get_string() + &quot;\&quot;&quot;);</a>
+<a name="ln292">        break;</a>
+<a name="ln293">      default:</a>
+<a name="ln294">        assert(false);</a>
+<a name="ln295">    }</a>
+<a name="ln296">  }</a>
+<a name="ln297">  return out + &quot;}&quot;;</a>
+<a name="ln298">}</a>
+<a name="ln299"> </a>
+<a name="ln300">class ValueGetter {</a>
+<a name="ln301"> public:</a>
+<a name="ln302">  ValueGetter() {}</a>
+<a name="ln303">  virtual ~ValueGetter() {}</a>
+<a name="ln304"> </a>
+<a name="ln305">  virtual bool Get(uint64_t id) = 0;</a>
+<a name="ln306">  virtual const Slice value() const = 0;</a>
+<a name="ln307"> </a>
+<a name="ln308">  virtual Status status() const = 0;</a>
+<a name="ln309">};</a>
+<a name="ln310"> </a>
+<a name="ln311">class ValueGetterFromDB : public ValueGetter {</a>
+<a name="ln312"> public:</a>
+<a name="ln313">  ValueGetterFromDB(DB* db, ColumnFamilyHandle* cf) : db_(db), cf_(cf) {}</a>
+<a name="ln314"> </a>
+<a name="ln315">  bool Get(uint64_t id) override {</a>
+<a name="ln316">    std::string encoded_id;</a>
+<a name="ln317">    PutFixed64BigEndian(&amp;encoded_id, id);</a>
+<a name="ln318">    status_ = db_-&gt;Get(ReadOptions(), cf_, encoded_id, &amp;value_);</a>
+<a name="ln319">    if (status_.IsNotFound()) {</a>
+<a name="ln320">      status_ = STATUS(Corruption, &quot;Index inconsistency&quot;);</a>
+<a name="ln321">      return false;</a>
+<a name="ln322">    }</a>
+<a name="ln323"> </a>
+<a name="ln324">    return true;</a>
+<a name="ln325">  }</a>
+<a name="ln326"> </a>
+<a name="ln327">  const Slice value() const override { return value_; }</a>
+<a name="ln328"> </a>
+<a name="ln329">  Status status() const override { return status_; }</a>
+<a name="ln330"> </a>
+<a name="ln331"> private:</a>
+<a name="ln332">  std::string value_;</a>
+<a name="ln333">  DB* db_;</a>
+<a name="ln334">  ColumnFamilyHandle* cf_;</a>
+<a name="ln335">  Status status_;</a>
+<a name="ln336">};</a>
+<a name="ln337"> </a>
+<a name="ln338">class ValueGetterFromIterator : public ValueGetter {</a>
+<a name="ln339"> public:</a>
+<a name="ln340">  explicit ValueGetterFromIterator(Iterator* iterator) : iterator_(iterator) {}</a>
+<a name="ln341"> </a>
+<a name="ln342">  bool Get(uint64_t id) override {</a>
+<a name="ln343">    std::string encoded_id;</a>
+<a name="ln344">    PutFixed64BigEndian(&amp;encoded_id, id);</a>
+<a name="ln345">    iterator_-&gt;Seek(encoded_id);</a>
+<a name="ln346"> </a>
+<a name="ln347">    if (!iterator_-&gt;Valid() || iterator_-&gt;key() != Slice(encoded_id)) {</a>
+<a name="ln348">      status_ = STATUS(Corruption, &quot;Index inconsistency&quot;);</a>
+<a name="ln349">      return false;</a>
+<a name="ln350">    }</a>
+<a name="ln351"> </a>
+<a name="ln352">    return true;</a>
+<a name="ln353">  }</a>
+<a name="ln354"> </a>
+<a name="ln355">  const Slice value() const override { return iterator_-&gt;value(); }</a>
+<a name="ln356"> </a>
+<a name="ln357">  Status status() const override { return status_; }</a>
+<a name="ln358"> </a>
+<a name="ln359"> private:</a>
+<a name="ln360">  std::unique_ptr&lt;Iterator&gt; iterator_;</a>
+<a name="ln361">  Status status_;</a>
+<a name="ln362">};</a>
+<a name="ln363"> </a>
+<a name="ln364">class SpatialIndexCursor : public Cursor {</a>
+<a name="ln365"> public:</a>
+<a name="ln366">  // tile_box is inclusive</a>
+<a name="ln367">  SpatialIndexCursor(Iterator* spatial_iterator, ValueGetter* value_getter,</a>
+<a name="ln368">                     const BoundingBox&lt;uint64_t&gt;&amp; tile_bbox, uint32_t tile_bits)</a>
+<a name="ln369">      : value_getter_(value_getter), valid_(true) {</a>
+<a name="ln370">    // calculate quad keys we'll need to query</a>
+<a name="ln371">    std::vector&lt;uint64_t&gt; quad_keys;</a>
+<a name="ln372">    quad_keys.reserve((tile_bbox.max_x - tile_bbox.min_x + 1) *</a>
+<a name="ln373">                      (tile_bbox.max_y - tile_bbox.min_y + 1));</a>
+<a name="ln374">    for (uint64_t x = tile_bbox.min_x; x &lt;= tile_bbox.max_x; ++x) {</a>
+<a name="ln375">      for (uint64_t y = tile_bbox.min_y; y &lt;= tile_bbox.max_y; ++y) {</a>
+<a name="ln376">        quad_keys.push_back(GetQuadKeyFromTile(x, y, tile_bits));</a>
+<a name="ln377">      }</a>
+<a name="ln378">    }</a>
+<a name="ln379">    std::sort(quad_keys.begin(), quad_keys.end());</a>
+<a name="ln380"> </a>
+<a name="ln381">    // load primary key ids for all quad keys</a>
+<a name="ln382">    for (auto quad_key : quad_keys) {</a>
+<a name="ln383">      std::string encoded_quad_key;</a>
+<a name="ln384">      PutFixed64BigEndian(&amp;encoded_quad_key, quad_key);</a>
+<a name="ln385">      Slice slice_quad_key(encoded_quad_key);</a>
+<a name="ln386"> </a>
+<a name="ln387">      // If CheckQuadKey is true, there is no need to reseek, since</a>
+<a name="ln388">      // spatial_iterator is already pointing at the correct quad key. This is</a>
+<a name="ln389">      // an optimization.</a>
+<a name="ln390">      if (!CheckQuadKey(spatial_iterator, slice_quad_key)) {</a>
+<a name="ln391">        spatial_iterator-&gt;Seek(slice_quad_key);</a>
+<a name="ln392">      }</a>
+<a name="ln393"> </a>
+<a name="ln394">      while (CheckQuadKey(spatial_iterator, slice_quad_key)) {</a>
+<a name="ln395">        // extract ID from spatial_iterator</a>
+<a name="ln396">        uint64_t id;</a>
+<a name="ln397">        bool ok = GetFixed64BigEndian(</a>
+<a name="ln398">            Slice(spatial_iterator-&gt;key().data() + sizeof(uint64_t),</a>
+<a name="ln399">                  sizeof(uint64_t)),</a>
+<a name="ln400">            &amp;id);</a>
+<a name="ln401">        if (!ok) {</a>
+<a name="ln402">          valid_ = false;</a>
+<a name="ln403">          status_ = STATUS(Corruption, &quot;Spatial index corruption&quot;);</a>
+<a name="ln404">          break;</a>
+<a name="ln405">        }</a>
+<a name="ln406">        primary_key_ids_.insert(id);</a>
+<a name="ln407">        spatial_iterator-&gt;Next();</a>
+<a name="ln408">      }</a>
+<a name="ln409">    }</a>
+<a name="ln410"> </a>
+<a name="ln411">    if (!spatial_iterator-&gt;status().ok()) {</a>
+<a name="ln412">      status_ = spatial_iterator-&gt;status();</a>
+<a name="ln413">      valid_ = false;</a>
+<a name="ln414">    }</a>
+<a name="ln415">    delete spatial_iterator;</a>
+<a name="ln416"> </a>
+<a name="ln417">    valid_ = valid_ &amp;&amp; !primary_key_ids_.empty();</a>
+<a name="ln418"> </a>
+<a name="ln419">    if (valid_) {</a>
+<a name="ln420">      primary_keys_iterator_ = primary_key_ids_.begin();</a>
+<a name="ln421">      ExtractData();</a>
+<a name="ln422">    }</a>
+<a name="ln423">  }</a>
+<a name="ln424"> </a>
+<a name="ln425">  bool Valid() const override { return valid_; }</a>
+<a name="ln426"> </a>
+<a name="ln427">  void Next() override {</a>
+<a name="ln428">    assert(valid_);</a>
+<a name="ln429"> </a>
+<a name="ln430">    ++primary_keys_iterator_;</a>
+<a name="ln431">    if (primary_keys_iterator_ == primary_key_ids_.end()) {</a>
+<a name="ln432">      valid_ = false;</a>
+<a name="ln433">      return;</a>
+<a name="ln434">    }</a>
+<a name="ln435"> </a>
+<a name="ln436">    ExtractData();</a>
+<a name="ln437">  }</a>
+<a name="ln438"> </a>
+<a name="ln439">  const Slice blob() override { return current_blob_; }</a>
+<a name="ln440">  const FeatureSet&amp; feature_set() override {</a>
+<a name="ln441">    return current_feature_set_;</a>
+<a name="ln442">  }</a>
+<a name="ln443"> </a>
+<a name="ln444">  Status status() const override {</a>
+<a name="ln445">    if (!status_.ok()) {</a>
+<a name="ln446">      return status_;</a>
+<a name="ln447">    }</a>
+<a name="ln448">    return value_getter_-&gt;status();</a>
+<a name="ln449">  }</a>
+<a name="ln450"> </a>
+<a name="ln451"> private:</a>
+<a name="ln452">  // * returns true if spatial iterator is on the current quad key and all is</a>
+<a name="ln453">  // well</a>
+<a name="ln454">  // * returns false if spatial iterator is not on current, or iterator is</a>
+<a name="ln455">  // invalid or corruption</a>
+<a name="ln456">  bool CheckQuadKey(Iterator* spatial_iterator, const Slice&amp; quad_key) {</a>
+<a name="ln457">    if (!spatial_iterator-&gt;Valid()) {</a>
+<a name="ln458">      return false;</a>
+<a name="ln459">    }</a>
+<a name="ln460">    if (spatial_iterator-&gt;key().size() != 2 * sizeof(uint64_t)) {</a>
+<a name="ln461">      status_ = STATUS(Corruption, &quot;Invalid spatial index key&quot;);</a>
+<a name="ln462">      valid_ = false;</a>
+<a name="ln463">      return false;</a>
+<a name="ln464">    }</a>
+<a name="ln465">    Slice spatial_iterator_quad_key(spatial_iterator-&gt;key().data(),</a>
+<a name="ln466">                                    sizeof(uint64_t));</a>
+<a name="ln467">    if (spatial_iterator_quad_key != quad_key) {</a>
+<a name="ln468">      // caller needs to reseek</a>
+<a name="ln469">      return false;</a>
+<a name="ln470">    }</a>
+<a name="ln471">    // if we come to here, we have found the quad key</a>
+<a name="ln472">    return true;</a>
+<a name="ln473">  }</a>
+<a name="ln474"> </a>
+<a name="ln475">  void ExtractData() {</a>
+<a name="ln476">    assert(valid_);</a>
+<a name="ln477">    valid_ = value_getter_-&gt;Get(*primary_keys_iterator_);</a>
+<a name="ln478"> </a>
+<a name="ln479">    if (valid_) {</a>
+<a name="ln480">      Slice data = value_getter_-&gt;value();</a>
+<a name="ln481">      current_feature_set_.Clear();</a>
+<a name="ln482">      if (!GetLengthPrefixedSlice(&amp;data, &amp;current_blob_) ||</a>
+<a name="ln483">          !current_feature_set_.Deserialize(data)) {</a>
+<a name="ln484">        status_ = STATUS(Corruption, &quot;Primary key column family corruption&quot;);</a>
+<a name="ln485">        valid_ = false;</a>
+<a name="ln486">      }</a>
+<a name="ln487">    }</a>
+<a name="ln488"> </a>
+<a name="ln489">  }</a>
+<a name="ln490"> </a>
+<a name="ln491">  unique_ptr&lt;ValueGetter&gt; value_getter_;</a>
+<a name="ln492">  bool valid_;</a>
+<a name="ln493">  Status status_;</a>
+<a name="ln494"> </a>
+<a name="ln495">  FeatureSet current_feature_set_;</a>
+<a name="ln496">  Slice current_blob_;</a>
+<a name="ln497"> </a>
+<a name="ln498">  // This is loaded from spatial iterator.</a>
+<a name="ln499">  std::unordered_set&lt;uint64_t&gt; primary_key_ids_;</a>
+<a name="ln500">  std::unordered_set&lt;uint64_t&gt;::iterator primary_keys_iterator_;</a>
+<a name="ln501">};</a>
+<a name="ln502"> </a>
+<a name="ln503">class ErrorCursor : public Cursor {</a>
+<a name="ln504"> public:</a>
+<a name="ln505">  explicit ErrorCursor(Status s) : s_(s) { assert(!s.ok()); }</a>
+<a name="ln506">  Status status() const override { return s_; }</a>
+<a name="ln507">  bool Valid() const override { return false; }</a>
+<a name="ln508">  void Next() override { assert(false); }</a>
+<a name="ln509"> </a>
+<a name="ln510">  const Slice blob() override {</a>
+<a name="ln511">    assert(false);</a>
+<a name="ln512">    return Slice();</a>
+<a name="ln513">  }</a>
+<a name="ln514">  const FeatureSet&amp; feature_set() override {</a>
+<a name="ln515">    assert(false);</a>
+<a name="ln516">    // compiler complains otherwise</a>
+<a name="ln517">    return trash_;</a>
+<a name="ln518">  }</a>
+<a name="ln519"> </a>
+<a name="ln520"> private:</a>
+<a name="ln521">  Status s_;</a>
+<a name="ln522">  FeatureSet trash_;</a>
+<a name="ln523">};</a>
+<a name="ln524"> </a>
+<a name="ln525">class SpatialDBImpl : public SpatialDB {</a>
+<a name="ln526"> public:</a>
+<a name="ln527">  // * db -- base DB that needs to be forwarded to StackableDB</a>
+<a name="ln528">  // * data_column_family -- column family used to store the data</a>
+<a name="ln529">  // * spatial_indexes -- a list of spatial indexes together with column</a>
+<a name="ln530">  // families that correspond to those spatial indexes</a>
+<a name="ln531">  // * next_id -- next ID in auto-incrementing ID. This is usually</a>
+<a name="ln532">  // `max_id_currenty_in_db + 1`</a>
+<a name="ln533">  SpatialDBImpl(</a>
+<a name="ln534">      DB* db, ColumnFamilyHandle* data_column_family,</a>
+<a name="ln535">      const std::vector&lt;std::pair&lt;SpatialIndexOptions, ColumnFamilyHandle*&gt;&gt;&amp;</a>
+<a name="ln536">          spatial_indexes,</a>
+<a name="ln537">      uint64_t next_id, bool read_only)</a>
+<a name="ln538">      : SpatialDB(db),</a>
+<a name="ln539">        data_column_family_(data_column_family),</a>
+<a name="ln540">        next_id_(next_id),</a>
+<a name="ln541">        read_only_(read_only) {</a>
+<a name="ln542">    for (const auto&amp; index : spatial_indexes) {</a>
+<a name="ln543">      name_to_index_.insert(</a>
+<a name="ln544">          {index.first.name, IndexColumnFamily(index.first, index.second)});</a>
+<a name="ln545">    }</a>
+<a name="ln546">  }</a>
+<a name="ln547"> </a>
+<a name="ln548">  ~SpatialDBImpl() {</a>
+<a name="ln549">    for (auto&amp; iter : name_to_index_) {</a>
+<a name="ln550">      delete iter.second.column_family;</a>
+<a name="ln551">    }</a>
+<a name="ln552">    delete data_column_family_;</a>
+<a name="ln553">  }</a>
+<a name="ln554"> </a>
+<a name="ln555">  virtual Status Insert(</a>
+<a name="ln556">      const WriteOptions&amp; write_options, const BoundingBox&lt;double&gt;&amp; bbox,</a>
+<a name="ln557">      const Slice&amp; blob, const FeatureSet&amp; feature_set,</a>
+<a name="ln558">      const std::vector&lt;std::string&gt;&amp; spatial_indexes) override {</a>
+<a name="ln559">    WriteBatch batch;</a>
+<a name="ln560"> </a>
+<a name="ln561">    if (spatial_indexes.size() == 0) {</a>
+<a name="ln562">      return STATUS(InvalidArgument, &quot;Spatial indexes can't be empty&quot;);</a>
+<a name="ln563">    }</a>
+<a name="ln564"> </a>
+<a name="ln565">    const size_t kWriteOutEveryBytes = 1024 * 1024;  // 1MB</a>
+<a name="ln566">    uint64_t id = next_id_.fetch_add(1);</a>
+<a name="ln567"> </a>
+<a name="ln568">    for (const auto&amp; si : spatial_indexes) {</a>
+<a name="ln569">      auto itr = name_to_index_.find(si);</a>
+<a name="ln570">      if (itr == name_to_index_.end()) {</a>
+<a name="ln571">        return STATUS(InvalidArgument, &quot;Can't find index &quot; + si);</a>
+<a name="ln572">      }</a>
+<a name="ln573">      const auto&amp; spatial_index = itr-&gt;second.index;</a>
+<a name="ln574">      if (!spatial_index.bbox.Intersects(bbox)) {</a>
+<a name="ln575">        continue;</a>
+<a name="ln576">      }</a>
+<a name="ln577">      BoundingBox&lt;uint64_t&gt; tile_bbox = GetTileBoundingBox(spatial_index, bbox);</a>
+<a name="ln578"> </a>
+<a name="ln579">      for (uint64_t x = tile_bbox.min_x; x &lt;= tile_bbox.max_x; ++x) {</a>
+<a name="ln580">        for (uint64_t y = tile_bbox.min_y; y &lt;= tile_bbox.max_y; ++y) {</a>
+<a name="ln581">          // see above for format</a>
+<a name="ln582">          std::string key;</a>
+<a name="ln583">          PutFixed64BigEndian(</a>
+<a name="ln584">              &amp;key, GetQuadKeyFromTile(x, y, spatial_index.tile_bits));</a>
+<a name="ln585">          PutFixed64BigEndian(&amp;key, id);</a>
+<a name="ln586">          batch.Put(itr-&gt;second.column_family, key, Slice());</a>
+<a name="ln587">          if (batch.GetDataSize() &gt;= kWriteOutEveryBytes) {</a>
+<a name="ln588">            Status s = Write(write_options, &amp;batch);</a>
+<a name="ln589">            batch.Clear();</a>
+<a name="ln590">            if (!s.ok()) {</a>
+<a name="ln591">              return s;</a>
+<a name="ln592">            }</a>
+<a name="ln593">          }</a>
+<a name="ln594">        }</a>
+<a name="ln595">      }</a>
+<a name="ln596">    }</a>
+<a name="ln597"> </a>
+<a name="ln598">    // see above for format</a>
+<a name="ln599">    std::string data_key;</a>
+<a name="ln600">    PutFixed64BigEndian(&amp;data_key, id);</a>
+<a name="ln601">    std::string data_value;</a>
+<a name="ln602">    PutLengthPrefixedSlice(&amp;data_value, blob);</a>
+<a name="ln603">    feature_set.Serialize(&amp;data_value);</a>
+<a name="ln604">    batch.Put(data_column_family_, data_key, data_value);</a>
+<a name="ln605"> </a>
+<a name="ln606">    return Write(write_options, &amp;batch);</a>
+<a name="ln607">  }</a>
+<a name="ln608"> </a>
+<a name="ln609">  Status Compact(int num_threads) override {</a>
+<a name="ln610">    std::vector&lt;ColumnFamilyHandle*&gt; column_families;</a>
+<a name="ln611">    column_families.push_back(data_column_family_);</a>
+<a name="ln612"> </a>
+<a name="ln613">    for (auto&amp; iter : name_to_index_) {</a>
+<a name="ln614">      column_families.push_back(iter.second.column_family);</a>
+<a name="ln615">    }</a>
+<a name="ln616"> </a>
+<a name="ln617">    std::mutex state_mutex;</a>
+<a name="ln618">    std::condition_variable cv;</a>
+<a name="ln619">    Status s;</a>
+<a name="ln620">    int threads_running = 0;</a>
+<a name="ln621"> </a>
+<a name="ln622">    std::vector&lt;std::thread&gt; threads;</a>
+<a name="ln623"> </a>
+<a name="ln624">    for (auto cfh : column_families) {</a>
+<a name="ln625">      threads.emplace_back([&amp;, cfh] {</a>
+<a name="ln626">          {</a>
+<a name="ln627">            std::unique_lock&lt;std::mutex&gt; lk(state_mutex);</a>
+<a name="ln628">            cv.wait(lk, [&amp;] { return threads_running &lt; num_threads; });</a>
+<a name="ln629">            threads_running++;</a>
+<a name="ln630">          }</a>
+<a name="ln631"> </a>
+<a name="ln632">          Status t = Flush(FlushOptions(), cfh);</a>
+<a name="ln633">          if (t.ok()) {</a>
+<a name="ln634">            t = CompactRange(CompactRangeOptions(), cfh, nullptr, nullptr);</a>
+<a name="ln635">          }</a>
+<a name="ln636"> </a>
+<a name="ln637">          {</a>
+<a name="ln638">            std::unique_lock&lt;std::mutex&gt; lk(state_mutex);</a>
+<a name="ln639">            threads_running--;</a>
+<a name="ln640">            if (s.ok() &amp;&amp; !t.ok()) {</a>
+<a name="ln641">              s = t;</a>
+<a name="ln642">            }</a>
+<a name="ln643">            cv.notify_one();</a>
+<a name="ln644">          }</a>
+<a name="ln645">      });</a>
+<a name="ln646">    }</a>
+<a name="ln647"> </a>
+<a name="ln648">    for (auto&amp; t : threads) {</a>
+<a name="ln649">      t.join();</a>
+<a name="ln650">    }</a>
+<a name="ln651"> </a>
+<a name="ln652">    return s;</a>
+<a name="ln653">  }</a>
+<a name="ln654"> </a>
+<a name="ln655">  virtual Cursor* Query(const ReadOptions&amp; read_options,</a>
+<a name="ln656">                        const BoundingBox&lt;double&gt;&amp; bbox,</a>
+<a name="ln657">                        const std::string&amp; spatial_index) override {</a>
+<a name="ln658">    auto itr = name_to_index_.find(spatial_index);</a>
+<a name="ln659">    if (itr == name_to_index_.end()) {</a>
+<a name="ln660">      return new ErrorCursor(STATUS(InvalidArgument,</a>
+<a name="ln661">          &quot;Spatial index &quot; + spatial_index + &quot; not found&quot;));</a>
+<a name="ln662">    }</a>
+<a name="ln663">    const auto&amp; si = itr-&gt;second.index;</a>
+<a name="ln664">    Iterator* spatial_iterator;</a>
+<a name="ln665">    ValueGetter* value_getter;</a>
+<a name="ln666"> </a>
+<a name="ln667">    if (read_only_) {</a>
+<a name="ln668">      spatial_iterator = NewIterator(read_options, itr-&gt;second.column_family);</a>
+<a name="ln669">      value_getter = new ValueGetterFromDB(this, data_column_family_);</a>
+<a name="ln670">    } else {</a>
+<a name="ln671">      std::vector&lt;Iterator*&gt; iterators;</a>
+<a name="ln672">      Status s = NewIterators(read_options,</a>
+<a name="ln673">                              {data_column_family_, itr-&gt;second.column_family},</a>
+<a name="ln674">                              &amp;iterators);</a>
+<a name="ln675">      if (!s.ok()) {</a>
+<a name="ln676">        return new ErrorCursor(s);</a>
+<a name="ln677">      }</a>
+<a name="ln678"> </a>
+<a name="ln679">      spatial_iterator = iterators[1];</a>
+<a name="ln680">      value_getter = new ValueGetterFromIterator(iterators[0]);</a>
+<a name="ln681">    }</a>
+<a name="ln682">    return new SpatialIndexCursor(spatial_iterator, value_getter,</a>
+<a name="ln683">                                  GetTileBoundingBox(si, bbox), si.tile_bits);</a>
+<a name="ln684">  }</a>
+<a name="ln685"> </a>
+<a name="ln686"> private:</a>
+<a name="ln687">  ColumnFamilyHandle* data_column_family_;</a>
+<a name="ln688">  struct IndexColumnFamily {</a>
+<a name="ln689">    SpatialIndexOptions index;</a>
+<a name="ln690">    ColumnFamilyHandle* column_family;</a>
+<a name="ln691">    IndexColumnFamily(const SpatialIndexOptions&amp; _index,</a>
+<a name="ln692">                      ColumnFamilyHandle* _cf)</a>
+<a name="ln693">        : index(_index), column_family(_cf) {}</a>
+<a name="ln694">  };</a>
+<a name="ln695">  // constant after construction!</a>
+<a name="ln696">  std::unordered_map&lt;std::string, IndexColumnFamily&gt; name_to_index_;</a>
+<a name="ln697"> </a>
+<a name="ln698">  std::atomic&lt;uint64_t&gt; next_id_;</a>
+<a name="ln699">  bool read_only_;</a>
+<a name="ln700">};</a>
+<a name="ln701"> </a>
+<a name="ln702">namespace {</a>
+<a name="ln703">DBOptions GetDBOptionsFromSpatialDBOptions(const SpatialDBOptions&amp; options) {</a>
+<a name="ln704">  DBOptions db_options;</a>
+<a name="ln705">  db_options.max_open_files = 50000;</a>
+<a name="ln706">  db_options.max_background_compactions = 3 * options.num_threads / 4;</a>
+<a name="ln707">  db_options.max_background_flushes =</a>
+<a name="ln708">      options.num_threads - db_options.max_background_compactions;</a>
+<a name="ln709">  db_options.env-&gt;SetBackgroundThreads(db_options.max_background_compactions,</a>
+<a name="ln710">                                       Env::LOW);</a>
+<a name="ln711">  db_options.env-&gt;SetBackgroundThreads(db_options.max_background_flushes,</a>
+<a name="ln712">                                       Env::HIGH);</a>
+<a name="ln713">  db_options.statistics = CreateDBStatistics();</a>
+<a name="ln714">  if (options.bulk_load) {</a>
+<a name="ln715">    db_options.stats_dump_period_sec = 600;</a>
+<a name="ln716">    db_options.disableDataSync = true;</a>
+<a name="ln717">  } else {</a>
+<a name="ln718">    db_options.stats_dump_period_sec = 1800;  // 30min</a>
+<a name="ln719">  }</a>
+<a name="ln720">  return db_options;</a>
+<a name="ln721">}</a>
+<a name="ln722"> </a>
+<a name="ln723">ColumnFamilyOptions GetColumnFamilyOptions(const SpatialDBOptions&amp; options,</a>
+<a name="ln724">                                           std::shared_ptr&lt;Cache&gt; block_cache) {</a>
+<a name="ln725">  ColumnFamilyOptions column_family_options;</a>
+<a name="ln726">  column_family_options.write_buffer_size = 128 * 1024 * 1024;  // 128MB</a>
+<a name="ln727">  column_family_options.max_write_buffer_number = 4;</a>
+<a name="ln728">  column_family_options.max_bytes_for_level_base = 256 * 1024 * 1024;  // 256MB</a>
+<a name="ln729">  column_family_options.target_file_size_base = 64 * 1024 * 1024;      // 64MB</a>
+<a name="ln730">  column_family_options.level0_file_num_compaction_trigger = 2;</a>
+<a name="ln731">  column_family_options.level0_slowdown_writes_trigger = 16;</a>
+<a name="ln732">  column_family_options.level0_slowdown_writes_trigger = 32;</a>
+<a name="ln733">  // only compress levels &gt;= 2</a>
+<a name="ln734">  column_family_options.compression_per_level.resize(</a>
+<a name="ln735">      column_family_options.num_levels);</a>
+<a name="ln736">  for (int i = 0; i &lt; column_family_options.num_levels; ++i) {</a>
+<a name="ln737">    if (i &lt; 2) {</a>
+<a name="ln738">      column_family_options.compression_per_level[i] = kNoCompression;</a>
+<a name="ln739">    } else {</a>
+<a name="ln740">      column_family_options.compression_per_level[i] = kLZ4Compression;</a>
+<a name="ln741">    }</a>
+<a name="ln742">  }</a>
+<a name="ln743">  BlockBasedTableOptions table_options;</a>
+<a name="ln744">  table_options.block_cache = block_cache;</a>
+<a name="ln745">  column_family_options.table_factory.reset(</a>
+<a name="ln746">      NewBlockBasedTableFactory(table_options));</a>
+<a name="ln747">  return column_family_options;</a>
+<a name="ln748">}</a>
+<a name="ln749"> </a>
+<a name="ln750">ColumnFamilyOptions OptimizeOptionsForDataColumnFamily(</a>
+<a name="ln751">    ColumnFamilyOptions options, std::shared_ptr&lt;Cache&gt; block_cache) {</a>
+<a name="ln752">  options.prefix_extractor.reset(NewNoopTransform());</a>
+<a name="ln753">  BlockBasedTableOptions block_based_options;</a>
+<a name="ln754">  block_based_options.index_type = IndexType::kHashSearch;</a>
+<a name="ln755">  block_based_options.block_cache = block_cache;</a>
+<a name="ln756">  options.table_factory.reset(NewBlockBasedTableFactory(block_based_options));</a>
+<a name="ln757">  return options;</a>
+<a name="ln758">}</a>
+<a name="ln759"> </a>
+<a name="ln760">}  // namespace</a>
+<a name="ln761"> </a>
+<a name="ln762">class MetadataStorage {</a>
+<a name="ln763"> public:</a>
+<a name="ln764">  MetadataStorage(DB* db, ColumnFamilyHandle* cf) : db_(db), cf_(cf) {}</a>
+<a name="ln765">  ~MetadataStorage() {}</a>
+<a name="ln766"> </a>
+<a name="ln767">  // format: &lt;min_x double&gt; &lt;min_y double&gt; &lt;max_x double&gt; &lt;max_y double&gt;</a>
+<a name="ln768">  // &lt;tile_bits varint32&gt;</a>
+<a name="ln769">  Status AddIndex(const SpatialIndexOptions&amp; index) {</a>
+<a name="ln770">    std::string encoded_index;</a>
+<a name="ln771">    PutDouble(&amp;encoded_index, index.bbox.min_x);</a>
+<a name="ln772">    PutDouble(&amp;encoded_index, index.bbox.min_y);</a>
+<a name="ln773">    PutDouble(&amp;encoded_index, index.bbox.max_x);</a>
+<a name="ln774">    PutDouble(&amp;encoded_index, index.bbox.max_y);</a>
+<a name="ln775">    PutVarint32(&amp;encoded_index, index.tile_bits);</a>
+<a name="ln776">    return db_-&gt;Put(WriteOptions(), cf_,</a>
+<a name="ln777">                    GetSpatialIndexColumnFamilyName(index.name), encoded_index);</a>
+<a name="ln778">  }</a>
+<a name="ln779"> </a>
+<a name="ln780">  Status GetIndex(const std::string&amp; name, SpatialIndexOptions* dst) {</a>
+<a name="ln781">    std::string value;</a>
+<a name="ln782">    Status s = db_-&gt;Get(ReadOptions(), cf_,</a>
+<a name="ln783">                        GetSpatialIndexColumnFamilyName(name), &amp;value);</a>
+<a name="ln784">    if (!s.ok()) {</a>
+<a name="ln785">      return s;</a>
+<a name="ln786">    }</a>
+<a name="ln787">    dst-&gt;name = name;</a>
+<a name="ln788">    Slice encoded_index(value);</a>
+<a name="ln789">    bool ok = GetDouble(&amp;encoded_index, &amp;(dst-&gt;bbox.min_x));</a>
+<a name="ln790">    ok = ok &amp;&amp; GetDouble(&amp;encoded_index, &amp;(dst-&gt;bbox.min_y));</a>
+<a name="ln791">    ok = ok &amp;&amp; GetDouble(&amp;encoded_index, &amp;(dst-&gt;bbox.max_x));</a>
+<a name="ln792">    ok = ok &amp;&amp; GetDouble(&amp;encoded_index, &amp;(dst-&gt;bbox.max_y));</a>
+<a name="ln793">    ok = ok &amp;&amp; GetVarint32(&amp;encoded_index, &amp;(dst-&gt;tile_bits));</a>
+<a name="ln794">    return ok ? Status::OK() : STATUS(Corruption, &quot;Index encoding corrupted&quot;);</a>
+<a name="ln795">  }</a>
+<a name="ln796"> </a>
+<a name="ln797"> private:</a>
+<a name="ln798">  DB* db_;</a>
+<a name="ln799">  ColumnFamilyHandle* cf_;</a>
+<a name="ln800">};</a>
+<a name="ln801"> </a>
+<a name="ln802">Status SpatialDB::Create(</a>
+<a name="ln803">    const SpatialDBOptions&amp; options, const std::string&amp; name,</a>
+<a name="ln804">    const std::vector&lt;SpatialIndexOptions&gt;&amp; spatial_indexes) {</a>
+<a name="ln805">  DBOptions db_options = GetDBOptionsFromSpatialDBOptions(options);</a>
+<a name="ln806">  db_options.create_if_missing = true;</a>
+<a name="ln807">  db_options.create_missing_column_families = true;</a>
+<a name="ln808">  db_options.error_if_exists = true;</a>
+<a name="ln809"> </a>
+<a name="ln810">  auto block_cache = NewLRUCache(options.cache_size);</a>
+<a name="ln811">  ColumnFamilyOptions column_family_options =</a>
+<a name="ln812">      GetColumnFamilyOptions(options, block_cache);</a>
+<a name="ln813"> </a>
+<a name="ln814">  std::vector&lt;ColumnFamilyDescriptor&gt; column_families;</a>
+<a name="ln815">  column_families.push_back(ColumnFamilyDescriptor(</a>
+<a name="ln816">      kDefaultColumnFamilyName,</a>
+<a name="ln817">      OptimizeOptionsForDataColumnFamily(column_family_options, block_cache)));</a>
+<a name="ln818">  column_families.push_back(</a>
+<a name="ln819">      ColumnFamilyDescriptor(kMetadataColumnFamilyName, column_family_options));</a>
+<a name="ln820"> </a>
+<a name="ln821">  for (const auto&amp; index : spatial_indexes) {</a>
+<a name="ln822">    column_families.emplace_back(GetSpatialIndexColumnFamilyName(index.name),</a>
+<a name="ln823">                                 column_family_options);</a>
+<a name="ln824">  }</a>
+<a name="ln825"> </a>
+<a name="ln826">  std::vector&lt;ColumnFamilyHandle*&gt; handles;</a>
+<a name="ln827">  DB* base_db;</a>
+<a name="ln828">  Status s = DB::Open(db_options, name, column_families, &amp;handles, &amp;base_db);</a>
+<a name="ln829">  if (!s.ok()) {</a>
+<a name="ln830">    return s;</a>
+<a name="ln831">  }</a>
+<a name="ln832">  MetadataStorage metadata(base_db, handles[1]);</a>
+<a name="ln833">  for (const auto&amp; index : spatial_indexes) {</a>
+<a name="ln834">    s = metadata.AddIndex(index);</a>
+<a name="ln835">    if (!s.ok()) {</a>
+<a name="ln836">      break;</a>
+<a name="ln837">    }</a>
+<a name="ln838">  }</a>
+<a name="ln839"> </a>
+<a name="ln840">  for (auto h : handles) {</a>
+<a name="ln841">    delete h;</a>
+<a name="ln842">  }</a>
+<a name="ln843">  delete base_db;</a>
+<a name="ln844"> </a>
+<a name="ln845">  return s;</a>
+<a name="ln846">}</a>
+<a name="ln847"> </a>
+<a name="ln848">Status SpatialDB::Open(const SpatialDBOptions&amp; options, const std::string&amp; name,</a>
+<a name="ln849">                       SpatialDB** db, bool read_only) {</a>
+<a name="ln850">  DBOptions db_options = GetDBOptionsFromSpatialDBOptions(options);</a>
+<a name="ln851">  auto block_cache = NewLRUCache(options.cache_size);</a>
+<a name="ln852">  ColumnFamilyOptions column_family_options =</a>
+<a name="ln853">      GetColumnFamilyOptions(options, block_cache);</a>
+<a name="ln854"> </a>
+<a name="ln855">  Status s;</a>
+<a name="ln856">  std::vector&lt;std::string&gt; existing_column_families;</a>
+<a name="ln857">  std::vector&lt;std::string&gt; spatial_indexes;</a>
+<a name="ln858">  s = DB::ListColumnFamilies(db_options, name, &amp;existing_column_families);</a>
+<a name="ln859">  if (!s.ok()) {</a>
+<a name="ln860">    return s;</a>
+<a name="ln861">  }</a>
+<a name="ln862">  for (const auto&amp; cf_name : existing_column_families) {</a>
+<a name="ln863">    Slice spatial_index;</a>
+<a name="ln864">    if (GetSpatialIndexName(cf_name, &amp;spatial_index)) {</a>
+<a name="ln865">      spatial_indexes.emplace_back(spatial_index.cdata(), spatial_index.size());</a>
+<a name="ln866">    }</a>
+<a name="ln867">  }</a>
+<a name="ln868"> </a>
+<a name="ln869">  std::vector&lt;ColumnFamilyDescriptor&gt; column_families;</a>
+<a name="ln870">  column_families.push_back(ColumnFamilyDescriptor(</a>
+<a name="ln871">      kDefaultColumnFamilyName,</a>
+<a name="ln872">      OptimizeOptionsForDataColumnFamily(column_family_options, block_cache)));</a>
+<a name="ln873">  column_families.push_back(</a>
+<a name="ln874">      ColumnFamilyDescriptor(kMetadataColumnFamilyName, column_family_options));</a>
+<a name="ln875"> </a>
+<a name="ln876">  for (const auto&amp; index : spatial_indexes) {</a>
+<a name="ln877">    column_families.emplace_back(GetSpatialIndexColumnFamilyName(index),</a>
+<a name="ln878">                                 column_family_options);</a>
+<a name="ln879">  }</a>
+<a name="ln880">  std::vector&lt;ColumnFamilyHandle*&gt; handles;</a>
+<a name="ln881">  DB* base_db;</a>
+<a name="ln882">  if (read_only) {</a>
+<a name="ln883">    s = DB::OpenForReadOnly(db_options, name, column_families, &amp;handles,</a>
+<a name="ln884">                            &amp;base_db);</a>
+<a name="ln885">  } else {</a>
+<a name="ln886">    s = DB::Open(db_options, name, column_families, &amp;handles, &amp;base_db);</a>
+<a name="ln887">  }</a>
+<a name="ln888">  if (!s.ok()) {</a>
+<a name="ln889">    return s;</a>
+<a name="ln890">  }</a>
+<a name="ln891"> </a>
+<a name="ln892">  MetadataStorage metadata(base_db, handles[1]);</a>
+<a name="ln893"> </a>
+<a name="ln894">  std::vector&lt;std::pair&lt;SpatialIndexOptions, ColumnFamilyHandle*&gt;&gt; index_cf;</a>
+<a name="ln895">  assert(handles.size() == spatial_indexes.size() + 2);</a>
+<a name="ln896">  for (size_t i = 0; i &lt; spatial_indexes.size(); ++i) {</a>
+<a name="ln897">    SpatialIndexOptions index_options;</a>
+<a name="ln898">    s = metadata.GetIndex(spatial_indexes[i], &amp;index_options);</a>
+<a name="ln899">    if (!s.ok()) {</a>
+<a name="ln900">      break;</a>
+<a name="ln901">    }</a>
+<a name="ln902">    index_cf.emplace_back(index_options, handles[i + 2]);</a>
+<a name="ln903">  }</a>
+<a name="ln904">  uint64_t next_id = 1;</a>
+<a name="ln905">  if (s.ok()) {</a>
+<a name="ln906">    // find next_id</a>
+<a name="ln907">    Iterator* iter = base_db-&gt;NewIterator(ReadOptions(), handles[0]);</a>
+<a name="ln908">    iter-&gt;SeekToLast();</a>
+<a name="ln909">    if (iter-&gt;Valid()) {</a>
+<a name="ln910">      uint64_t last_id = 0;</a>
+<a name="ln911">      if (!GetFixed64BigEndian(iter-&gt;key(), &amp;last_id)) {</a>
+<a name="ln912">        s = STATUS(Corruption, &quot;Invalid key in data column family&quot;);</a>
+<a name="ln913">      } else {</a>
+<a name="ln914">        next_id = last_id + 1;</a>
+<a name="ln915">      }</a>
+<a name="ln916">    }</a>
+<a name="ln917">    delete iter;</a>
+<a name="ln918">  }</a>
+<a name="ln919">  if (!s.ok()) {</a>
+<a name="ln920">    for (auto h : handles) {</a>
+<a name="ln921">      delete h;</a>
+<a name="ln922">    }</a>
+<a name="ln923">    delete base_db;</a>
+<a name="ln924">    return s;</a>
+<a name="ln925">  }</a>
+<a name="ln926"> </a>
+<a name="ln927">  // I don't need metadata column family any more, so delete it</a>
+<a name="ln928">  delete handles[1];</a>
+<a name="ln929">  *db = new SpatialDBImpl(base_db, handles[0], index_cf, next_id, read_only);</a>
+<a name="ln930">  return Status::OK();</a>
+<a name="ln931">}</a>
+<a name="ln932"> </a>
+<a name="ln933">}  // namespace spatial</a>
+<a name="ln934">}  // namespace rocksdb</a>
+<a name="ln935">#endif  // ROCKSDB_LITE</a>
+
+</code></pre>
+<div class="balloon" rel="121"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v794/" target="_blank">V794</a> The assignment operator should be protected from the case of 'this == &rhs'.</p></div>
+<div class="balloon" rel="732"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v519/" target="_blank">V519</a> The variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 731, 732.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,821 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>pgsql_operation.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/docdb/pgsql_operation.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;boost/optional/optional_io.hpp&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/common/partition.h&quot;</a>
+<a name="ln19">#include &quot;yb/common/ql_storage_interface.h&quot;</a>
+<a name="ln20">#include &quot;yb/common/ql_value.h&quot;</a>
+<a name="ln21">#include &quot;yb/common/pg_system_attr.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/docdb/doc_pgsql_scanspec.h&quot;</a>
+<a name="ln24">#include &quot;yb/docdb/doc_rowwise_iterator.h&quot;</a>
+<a name="ln25">#include &quot;yb/docdb/primitive_value_util.h&quot;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln28">#include &quot;yb/util/scope_exit.h&quot;</a>
+<a name="ln29">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln30"> </a>
+<a name="ln31">#include &quot;yb/yql/pggate/util/pg_doc_data.h&quot;</a>
+<a name="ln32"> </a>
+<a name="ln33">DECLARE_bool(trace_docdb_calls);</a>
+<a name="ln34">DECLARE_bool(ysql_disable_index_backfill);</a>
+<a name="ln35"> </a>
+<a name="ln36">DEFINE_double(ysql_scan_timeout_multiplier, 0.5,</a>
+<a name="ln37">              &quot;YSQL read scan timeout multipler of retryable_rpc_single_call_timeout_ms.&quot;);</a>
+<a name="ln38"> </a>
+<a name="ln39">DEFINE_test_flag(int32, slowdown_pgsql_aggregate_read_ms, 0,</a>
+<a name="ln40">                 &quot;If set &gt; 0, slows down the response to pgsql aggregate read by this amount.&quot;);</a>
+<a name="ln41"> </a>
+<a name="ln42">namespace yb {</a>
+<a name="ln43">namespace docdb {</a>
+<a name="ln44"> </a>
+<a name="ln45">namespace {</a>
+<a name="ln46"> </a>
+<a name="ln47">CHECKED_STATUS CreateProjection(const Schema&amp; schema,</a>
+<a name="ln48">                                const PgsqlColumnRefsPB&amp; column_refs,</a>
+<a name="ln49">                                Schema* projection) {</a>
+<a name="ln50">  // Create projection of non-primary key columns. Primary key columns are implicitly read by DocDB.</a>
+<a name="ln51">  // It will also sort the columns before scanning.</a>
+<a name="ln52">  vector&lt;ColumnId&gt; column_ids;</a>
+<a name="ln53">  column_ids.reserve(column_refs.ids_size());</a>
+<a name="ln54">  for (int32_t id : column_refs.ids()) {</a>
+<a name="ln55">    const ColumnId column_id(id);</a>
+<a name="ln56">    if (!schema.is_key_column(column_id)) {</a>
+<a name="ln57">      column_ids.emplace_back(column_id);</a>
+<a name="ln58">    }</a>
+<a name="ln59">  }</a>
+<a name="ln60">  return schema.CreateProjectionByIdsIgnoreMissing(column_ids, projection);</a>
+<a name="ln61">}</a>
+<a name="ln62"> </a>
+<a name="ln63">} // namespace</a>
+<a name="ln64"> </a>
+<a name="ln65">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln66"> </a>
+<a name="ln67">Status PgsqlWriteOperation::Init(PgsqlWriteRequestPB* request, PgsqlResponsePB* response) {</a>
+<a name="ln68">  // Initialize operation inputs.</a>
+<a name="ln69">  request_.Swap(request);</a>
+<a name="ln70">  response_ = response;</a>
+<a name="ln71"> </a>
+<a name="ln72">  // Init DocDB key using either ybctid or partition and range values.</a>
+<a name="ln73">  if (request_.has_ybctid_column_value()) {</a>
+<a name="ln74">    const string&amp; ybctid = request_.ybctid_column_value().value().binary_value();</a>
+<a name="ln75">    SCHECK(!ybctid.empty(), InternalError, &quot;empty ybctid&quot;);</a>
+<a name="ln76">    doc_key_.emplace(schema_);</a>
+<a name="ln77">    RETURN_NOT_OK(doc_key_-&gt;DecodeFrom(ybctid));</a>
+<a name="ln78">  } else {</a>
+<a name="ln79">    vector&lt;PrimitiveValue&gt; hashed_components;</a>
+<a name="ln80">    vector&lt;PrimitiveValue&gt; range_components;</a>
+<a name="ln81">    RETURN_NOT_OK(InitKeyColumnPrimitiveValues(request_.partition_column_values(),</a>
+<a name="ln82">                                               schema_,</a>
+<a name="ln83">                                               0,</a>
+<a name="ln84">                                               &amp;hashed_components));</a>
+<a name="ln85">    RETURN_NOT_OK(InitKeyColumnPrimitiveValues(request_.range_column_values(),</a>
+<a name="ln86">                                               schema_,</a>
+<a name="ln87">                                               schema_.num_hash_key_columns(),</a>
+<a name="ln88">                                               &amp;range_components));</a>
+<a name="ln89">    if (hashed_components.empty()) {</a>
+<a name="ln90">      doc_key_.emplace(schema_, range_components);</a>
+<a name="ln91">    } else {</a>
+<a name="ln92">      doc_key_.emplace(schema_, request_.hash_code(), hashed_components, range_components);</a>
+<a name="ln93">    }</a>
+<a name="ln94">  }</a>
+<a name="ln95">  encoded_doc_key_ = doc_key_-&gt;EncodeAsRefCntPrefix();</a>
+<a name="ln96"> </a>
+<a name="ln97">  return Status::OK();</a>
+<a name="ln98">}</a>
+<a name="ln99"> </a>
+<a name="ln100">Status PgsqlWriteOperation::Apply(const DocOperationApplyData&amp; data) {</a>
+<a name="ln101">  VLOG(4) &lt;&lt; &quot;Write, read time: &quot; &lt;&lt; data.read_time &lt;&lt; &quot;, txn: &quot; &lt;&lt; txn_op_context_;</a>
+<a name="ln102"> </a>
+<a name="ln103">  auto scope_exit = ScopeExit([this] {</a>
+<a name="ln104">    if (!result_buffer_.empty()) {</a>
+<a name="ln105">      NetworkByteOrder::Store64(result_buffer_.data(), result_rows_);</a>
+<a name="ln106">    }</a>
+<a name="ln107">  });</a>
+<a name="ln108"> </a>
+<a name="ln109">  switch (request_.stmt_type()) {</a>
+<a name="ln110">    case PgsqlWriteRequestPB::PGSQL_INSERT:</a>
+<a name="ln111">      return ApplyInsert(data, IsUpsert::kFalse);</a>
+<a name="ln112"> </a>
+<a name="ln113">    case PgsqlWriteRequestPB::PGSQL_UPDATE:</a>
+<a name="ln114">      return ApplyUpdate(data);</a>
+<a name="ln115"> </a>
+<a name="ln116">    case PgsqlWriteRequestPB::PGSQL_DELETE:</a>
+<a name="ln117">      return ApplyDelete(data);</a>
+<a name="ln118"> </a>
+<a name="ln119">    case PgsqlWriteRequestPB::PGSQL_UPSERT: {</a>
+<a name="ln120">      // Upserts should not have column refs (i.e. require read).</a>
+<a name="ln121">      DSCHECK(!request_.has_column_refs() || request_.column_refs().ids().empty(),</a>
+<a name="ln122">              IllegalState,</a>
+<a name="ln123">              &quot;Upsert operation should not have column references&quot;);</a>
+<a name="ln124">      return ApplyInsert(data, IsUpsert::kTrue);</a>
+<a name="ln125">    }</a>
+<a name="ln126"> </a>
+<a name="ln127">    case PgsqlWriteRequestPB::PGSQL_TRUNCATE_COLOCATED:</a>
+<a name="ln128">      return ApplyTruncateColocated(data);</a>
+<a name="ln129">  }</a>
+<a name="ln130">  return Status::OK();</a>
+<a name="ln131">}</a>
+<a name="ln132"> </a>
+<a name="ln133">Status PgsqlWriteOperation::ApplyInsert(const DocOperationApplyData&amp; data, IsUpsert is_upsert) {</a>
+<a name="ln134">  QLTableRow table_row;</a>
+<a name="ln135">  if (!is_upsert) {</a>
+<a name="ln136">    RETURN_NOT_OK(ReadColumns(data, &amp;table_row));</a>
+<a name="ln137">    if (!table_row.IsEmpty()) {</a>
+<a name="ln138">      VLOG(4) &lt;&lt; &quot;Duplicate row: &quot; &lt;&lt; table_row.ToString();</a>
+<a name="ln139">      // Primary key or unique index value found.</a>
+<a name="ln140">      response_-&gt;set_status(PgsqlResponsePB::PGSQL_STATUS_DUPLICATE_KEY_ERROR);</a>
+<a name="ln141">      response_-&gt;set_error_message(&quot;Duplicate key found in primary key or unique index&quot;);</a>
+<a name="ln142">      return Status::OK();</a>
+<a name="ln143">    }</a>
+<a name="ln144">  }</a>
+<a name="ln145"> </a>
+<a name="ln146">  // Add the liveness column.</a>
+<a name="ln147">  static const PrimitiveValue kLivenessColumnId =</a>
+<a name="ln148">      PrimitiveValue::SystemColumnId(SystemColumnIds::kLivenessColumn);</a>
+<a name="ln149"> </a>
+<a name="ln150">  RETURN_NOT_OK(data.doc_write_batch-&gt;SetPrimitive(</a>
+<a name="ln151">      DocPath(encoded_doc_key_.as_slice(), kLivenessColumnId),</a>
+<a name="ln152">      Value(PrimitiveValue()),</a>
+<a name="ln153">      data.read_time, data.deadline, request_.stmt_id()));</a>
+<a name="ln154"> </a>
+<a name="ln155">  for (const auto&amp; column_value : request_.column_values()) {</a>
+<a name="ln156">    // Get the column.</a>
+<a name="ln157">    if (!column_value.has_column_id()) {</a>
+<a name="ln158">      return STATUS(InternalError, &quot;column id missing&quot;, column_value.DebugString());</a>
+<a name="ln159">    }</a>
+<a name="ln160">    const ColumnId column_id(column_value.column_id());</a>
+<a name="ln161">    const ColumnSchema&amp; column = VERIFY_RESULT(schema_.column_by_id(column_id));</a>
+<a name="ln162"> </a>
+<a name="ln163">    // Check column-write operator.</a>
+<a name="ln164">    CHECK(GetTSWriteInstruction(column_value.expr()) == bfpg::TSOpcode::kScalarInsert)</a>
+<a name="ln165">      &lt;&lt; &quot;Illegal write instruction&quot;;</a>
+<a name="ln166"> </a>
+<a name="ln167">    // Evaluate column value.</a>
+<a name="ln168">    QLExprResult expr_result;</a>
+<a name="ln169">    RETURN_NOT_OK(EvalExpr(column_value.expr(), table_row, expr_result.Writer()));</a>
+<a name="ln170">    const SubDocument sub_doc =</a>
+<a name="ln171">        SubDocument::FromQLValuePB(expr_result.Value(), column.sorting_type());</a>
+<a name="ln172"> </a>
+<a name="ln173">    // Inserting into specified column.</a>
+<a name="ln174">    DocPath sub_path(encoded_doc_key_.as_slice(), PrimitiveValue(column_id));</a>
+<a name="ln175">    RETURN_NOT_OK(data.doc_write_batch-&gt;InsertSubDocument(</a>
+<a name="ln176">        sub_path, sub_doc, data.read_time, data.deadline, request_.stmt_id()));</a>
+<a name="ln177">  }</a>
+<a name="ln178"> </a>
+<a name="ln179">  RETURN_NOT_OK(PopulateResultSet(table_row));</a>
+<a name="ln180"> </a>
+<a name="ln181">  response_-&gt;set_status(PgsqlResponsePB::PGSQL_STATUS_OK);</a>
+<a name="ln182">  return Status::OK();</a>
+<a name="ln183">}</a>
+<a name="ln184"> </a>
+<a name="ln185">Status PgsqlWriteOperation::ApplyUpdate(const DocOperationApplyData&amp; data) {</a>
+<a name="ln186">  QLTableRow table_row;</a>
+<a name="ln187">  RETURN_NOT_OK(ReadColumns(data, &amp;table_row));</a>
+<a name="ln188">  if (table_row.IsEmpty()) {</a>
+<a name="ln189">    // Row not found.</a>
+<a name="ln190">    response_-&gt;set_skipped(true);</a>
+<a name="ln191">    return Status::OK();</a>
+<a name="ln192">  }</a>
+<a name="ln193"> </a>
+<a name="ln194">  // skipped is set to false if this operation produces some data to write.</a>
+<a name="ln195">  bool skipped = true;</a>
+<a name="ln196"> </a>
+<a name="ln197">  if (request_.has_ybctid_column_value()) {</a>
+<a name="ln198">    for (const auto&amp; column_value : request_.column_new_values()) {</a>
+<a name="ln199">      // Get the column.</a>
+<a name="ln200">      if (!column_value.has_column_id()) {</a>
+<a name="ln201">        return STATUS(InternalError, &quot;column id missing&quot;, column_value.DebugString());</a>
+<a name="ln202">      }</a>
+<a name="ln203">      const ColumnId column_id(column_value.column_id());</a>
+<a name="ln204">      const ColumnSchema&amp; column = VERIFY_RESULT(schema_.column_by_id(column_id));</a>
+<a name="ln205"> </a>
+<a name="ln206">      // Check column-write operator.</a>
+<a name="ln207">      SCHECK(GetTSWriteInstruction(column_value.expr()) == bfpg::TSOpcode::kScalarInsert ||</a>
+<a name="ln208">             GetTSWriteInstruction(column_value.expr()) == bfpg::TSOpcode::kPgEvalExprCall,</a>
+<a name="ln209">             InternalError,</a>
+<a name="ln210">             &quot;Unsupported DocDB Expression&quot;);</a>
+<a name="ln211"> </a>
+<a name="ln212">      // Evaluate column value.</a>
+<a name="ln213">      QLExprResult expr_result;</a>
+<a name="ln214">      RETURN_NOT_OK(EvalExpr(column_value.expr(), table_row, expr_result.Writer(), &amp;schema_));</a>
+<a name="ln215"> </a>
+<a name="ln216">      // Inserting into specified column.</a>
+<a name="ln217">      const SubDocument sub_doc =</a>
+<a name="ln218">          SubDocument::FromQLValuePB(expr_result.Value(), column.sorting_type());</a>
+<a name="ln219"> </a>
+<a name="ln220">      DocPath sub_path(encoded_doc_key_.as_slice(), PrimitiveValue(column_id));</a>
+<a name="ln221">      RETURN_NOT_OK(data.doc_write_batch-&gt;InsertSubDocument(</a>
+<a name="ln222">          sub_path, sub_doc, data.read_time, data.deadline, request_.stmt_id()));</a>
+<a name="ln223">      skipped = false;</a>
+<a name="ln224">    }</a>
+<a name="ln225">  } else {</a>
+<a name="ln226">    // This UPDATE is calling PGGATE directly without going thru PostgreSQL layer.</a>
+<a name="ln227">    // Keep it here as we might need it.</a>
+<a name="ln228"> </a>
+<a name="ln229">    // Very limited support for where expressions. Only used for updates to the sequences data</a>
+<a name="ln230">    // table.</a>
+<a name="ln231">    bool is_match = true;</a>
+<a name="ln232">    if (request_.has_where_expr()) {</a>
+<a name="ln233">      QLExprResult match;</a>
+<a name="ln234">      RETURN_NOT_OK(EvalExpr(request_.where_expr(), table_row, match.Writer()));</a>
+<a name="ln235">      is_match = match.Value().bool_value();</a>
+<a name="ln236">    }</a>
+<a name="ln237"> </a>
+<a name="ln238">    if (is_match) {</a>
+<a name="ln239">      for (const auto &amp;column_value : request_.column_new_values()) {</a>
+<a name="ln240">        // Get the column.</a>
+<a name="ln241">        if (!column_value.has_column_id()) {</a>
+<a name="ln242">          return STATUS(InternalError, &quot;column id missing&quot;, column_value.DebugString());</a>
+<a name="ln243">        }</a>
+<a name="ln244">        const ColumnId column_id(column_value.column_id());</a>
+<a name="ln245">        const ColumnSchema&amp; column = VERIFY_RESULT(schema_.column_by_id(column_id));</a>
+<a name="ln246"> </a>
+<a name="ln247">        // Check column-write operator.</a>
+<a name="ln248">        CHECK(GetTSWriteInstruction(column_value.expr()) == bfpg::TSOpcode::kScalarInsert)</a>
+<a name="ln249">        &lt;&lt; &quot;Illegal write instruction&quot;;</a>
+<a name="ln250"> </a>
+<a name="ln251">        // Evaluate column value.</a>
+<a name="ln252">        QLExprResult expr_result;</a>
+<a name="ln253">        RETURN_NOT_OK(EvalExpr(column_value.expr(), table_row, expr_result.Writer()));</a>
+<a name="ln254"> </a>
+<a name="ln255">        const SubDocument sub_doc =</a>
+<a name="ln256">            SubDocument::FromQLValuePB(expr_result.Value(), column.sorting_type());</a>
+<a name="ln257"> </a>
+<a name="ln258">        // Inserting into specified column.</a>
+<a name="ln259">        DocPath sub_path(encoded_doc_key_.as_slice(), PrimitiveValue(column_id));</a>
+<a name="ln260">        RETURN_NOT_OK(data.doc_write_batch-&gt;InsertSubDocument(</a>
+<a name="ln261">            sub_path, sub_doc, data.read_time, data.deadline, request_.stmt_id()));</a>
+<a name="ln262">        skipped = false;</a>
+<a name="ln263">      }</a>
+<a name="ln264">    }</a>
+<a name="ln265">  }</a>
+<a name="ln266"> </a>
+<a name="ln267">  // Returning the values before the update.</a>
+<a name="ln268">  RETURN_NOT_OK(PopulateResultSet(table_row));</a>
+<a name="ln269"> </a>
+<a name="ln270">  if (skipped) {</a>
+<a name="ln271">    response_-&gt;set_skipped(true);</a>
+<a name="ln272">  }</a>
+<a name="ln273">  response_-&gt;set_rows_affected_count(1);</a>
+<a name="ln274">  response_-&gt;set_status(PgsqlResponsePB::PGSQL_STATUS_OK);</a>
+<a name="ln275">  return Status::OK();</a>
+<a name="ln276">}</a>
+<a name="ln277"> </a>
+<a name="ln278">Status PgsqlWriteOperation::ApplyDelete(const DocOperationApplyData&amp; data) {</a>
+<a name="ln279">  int num_deleted = 1;</a>
+<a name="ln280">  QLTableRow table_row;</a>
+<a name="ln281">  RETURN_NOT_OK(ReadColumns(data, &amp;table_row));</a>
+<a name="ln282">  if (table_row.IsEmpty()) {</a>
+<a name="ln283">    // Row not found.</a>
+<a name="ln284">    response_-&gt;set_skipped(true);</a>
+<a name="ln285">    // Return early unless we still want to apply the delete for backfill purposes.  Deletes to</a>
+<a name="ln286">    // nonexistent rows are expected to get written to the index when the index has the delete</a>
+<a name="ln287">    // permission during an online schema migration.</a>
+<a name="ln288">    // TODO(jason): apply deletes only when this is an index table going through a schema migration,</a>
+<a name="ln289">    // not just when backfill is enabled.</a>
+<a name="ln290">    if (FLAGS_ysql_disable_index_backfill) {</a>
+<a name="ln291">      return Status::OK();</a>
+<a name="ln292">    } else {</a>
+<a name="ln293">      num_deleted = 0;</a>
+<a name="ln294">    }</a>
+<a name="ln295">  }</a>
+<a name="ln296"> </a>
+<a name="ln297">  // TODO(neil) Add support for WHERE clause.</a>
+<a name="ln298">  CHECK(request_.column_values_size() == 0) &lt;&lt; &quot;WHERE clause condition is not yet fully supported&quot;;</a>
+<a name="ln299"> </a>
+<a name="ln300">  // Otherwise, delete the referenced row (all columns).</a>
+<a name="ln301">  RETURN_NOT_OK(data.doc_write_batch-&gt;DeleteSubDoc(DocPath(</a>
+<a name="ln302">      encoded_doc_key_.as_slice()), data.read_time, data.deadline));</a>
+<a name="ln303"> </a>
+<a name="ln304">  RETURN_NOT_OK(PopulateResultSet(table_row));</a>
+<a name="ln305"> </a>
+<a name="ln306">  response_-&gt;set_rows_affected_count(num_deleted);</a>
+<a name="ln307">  response_-&gt;set_status(PgsqlResponsePB::PGSQL_STATUS_OK);</a>
+<a name="ln308">  return Status::OK();</a>
+<a name="ln309">}</a>
+<a name="ln310"> </a>
+<a name="ln311">Status PgsqlWriteOperation::ApplyTruncateColocated(const DocOperationApplyData&amp; data) {</a>
+<a name="ln312">  RETURN_NOT_OK(data.doc_write_batch-&gt;DeleteSubDoc(DocPath(</a>
+<a name="ln313">      encoded_doc_key_.as_slice()), data.read_time, data.deadline));</a>
+<a name="ln314">  response_-&gt;set_status(PgsqlResponsePB::PGSQL_STATUS_OK);</a>
+<a name="ln315">  return Status::OK();</a>
+<a name="ln316">}</a>
+<a name="ln317"> </a>
+<a name="ln318">Status PgsqlWriteOperation::ReadColumns(const DocOperationApplyData&amp; data,</a>
+<a name="ln319">                                        QLTableRow* table_row) {</a>
+<a name="ln320">  // Filter the columns using primary key.</a>
+<a name="ln321">  if (doc_key_) {</a>
+<a name="ln322">    Schema projection;</a>
+<a name="ln323">    RETURN_NOT_OK(CreateProjection(schema_, request_.column_refs(), &amp;projection));</a>
+<a name="ln324">    DocPgsqlScanSpec spec(projection, request_.stmt_id(), *doc_key_);</a>
+<a name="ln325">    DocRowwiseIterator iterator(projection,</a>
+<a name="ln326">                                schema_,</a>
+<a name="ln327">                                txn_op_context_,</a>
+<a name="ln328">                                data.doc_write_batch-&gt;doc_db(),</a>
+<a name="ln329">                                data.deadline,</a>
+<a name="ln330">                                data.read_time);</a>
+<a name="ln331">    RETURN_NOT_OK(iterator.Init(spec));</a>
+<a name="ln332">    if (VERIFY_RESULT(iterator.HasNext())) {</a>
+<a name="ln333">      RETURN_NOT_OK(iterator.NextRow(table_row));</a>
+<a name="ln334">    } else {</a>
+<a name="ln335">      table_row-&gt;Clear();</a>
+<a name="ln336">    }</a>
+<a name="ln337">    data.restart_read_ht-&gt;MakeAtLeast(iterator.RestartReadHt());</a>
+<a name="ln338">  }</a>
+<a name="ln339"> </a>
+<a name="ln340">  return Status::OK();</a>
+<a name="ln341">}</a>
+<a name="ln342"> </a>
+<a name="ln343">Status PgsqlWriteOperation::PopulateResultSet(const QLTableRow&amp; table_row) {</a>
+<a name="ln344">  if (result_buffer_.empty()) {</a>
+<a name="ln345">    // Reserve space for num rows.</a>
+<a name="ln346">    pggate::PgWire::WriteInt64(0, &amp;result_buffer_);</a>
+<a name="ln347">  }</a>
+<a name="ln348">  ++result_rows_;</a>
+<a name="ln349">  int rscol_index = 0;</a>
+<a name="ln350">  for (const PgsqlExpressionPB&amp; expr : request_.targets()) {</a>
+<a name="ln351">    if (expr.has_column_id()) {</a>
+<a name="ln352">      QLExprResult value;</a>
+<a name="ln353">      if (expr.column_id() == static_cast&lt;int&gt;(PgSystemAttrNum::kYBTupleId)) {</a>
+<a name="ln354">        // Strip cotable id / pgtable id from the serialized DocKey before returning it as ybctid.</a>
+<a name="ln355">        Slice tuple_id = encoded_doc_key_.as_slice();</a>
+<a name="ln356">        if (tuple_id.starts_with(ValueTypeAsChar::kTableId)) {</a>
+<a name="ln357">          tuple_id.remove_prefix(1 + kUuidSize);</a>
+<a name="ln358">        } else if (tuple_id.starts_with(ValueTypeAsChar::kPgTableOid)) {</a>
+<a name="ln359">          tuple_id.remove_prefix(1 + sizeof(PgTableOid));</a>
+<a name="ln360">        }</a>
+<a name="ln361">        value.Writer().NewValue().set_binary_value(tuple_id.data(), tuple_id.size());</a>
+<a name="ln362">      } else {</a>
+<a name="ln363">        RETURN_NOT_OK(EvalExpr(expr, table_row, value.Writer()));</a>
+<a name="ln364">      }</a>
+<a name="ln365">      RETURN_NOT_OK(pggate::WriteColumn(value.Value(), &amp;result_buffer_));</a>
+<a name="ln366">    }</a>
+<a name="ln367">    rscol_index++;</a>
+<a name="ln368">  }</a>
+<a name="ln369">  return Status::OK();</a>
+<a name="ln370">}</a>
+<a name="ln371"> </a>
+<a name="ln372">Status PgsqlWriteOperation::GetDocPaths(GetDocPathsMode mode,</a>
+<a name="ln373">                                        DocPathsToLock *paths,</a>
+<a name="ln374">                                        IsolationLevel *level) const {</a>
+<a name="ln375">  // When this write operation requires a read, it requires a read snapshot so paths will be locked</a>
+<a name="ln376">  // in snapshot isolation for consistency. Otherwise, pure writes will happen in serializable</a>
+<a name="ln377">  // isolation so that they will serialize but do not conflict with one another.</a>
+<a name="ln378">  //</a>
+<a name="ln379">  // Currently, only keys that are being written are locked, no lock is taken on read at the</a>
+<a name="ln380">  // snapshot isolation level.</a>
+<a name="ln381">  *level = RequireReadSnapshot() ? IsolationLevel::SNAPSHOT_ISOLATION</a>
+<a name="ln382">                                 : IsolationLevel::SERIALIZABLE_ISOLATION;</a>
+<a name="ln383"> </a>
+<a name="ln384">  if (mode == GetDocPathsMode::kIntents) {</a>
+<a name="ln385">    const google::protobuf::RepeatedPtrField&lt;PgsqlColumnValuePB&gt;* column_values = nullptr;</a>
+<a name="ln386">    if (request_.stmt_type() == PgsqlWriteRequestPB::PGSQL_INSERT ||</a>
+<a name="ln387">        request_.stmt_type() == PgsqlWriteRequestPB::PGSQL_UPSERT) {</a>
+<a name="ln388">      column_values = &amp;request_.column_values();</a>
+<a name="ln389">    } else if (request_.stmt_type() == PgsqlWriteRequestPB::PGSQL_UPDATE) {</a>
+<a name="ln390">      column_values = &amp;request_.column_new_values();</a>
+<a name="ln391">    }</a>
+<a name="ln392"> </a>
+<a name="ln393">    if (column_values != nullptr &amp;&amp; !column_values-&gt;empty()) {</a>
+<a name="ln394">      KeyBytes buffer;</a>
+<a name="ln395">      for (const auto&amp; column_value : *column_values) {</a>
+<a name="ln396">        ColumnId column_id(column_value.column_id());</a>
+<a name="ln397">        Slice doc_key = encoded_doc_key_.as_slice();</a>
+<a name="ln398">        buffer.Clear();</a>
+<a name="ln399">        buffer.AppendValueType(ValueType::kColumnId);</a>
+<a name="ln400">        buffer.AppendColumnId(column_id);</a>
+<a name="ln401">        RefCntBuffer path(doc_key.size() + buffer.size());</a>
+<a name="ln402">        memcpy(path.data(), doc_key.data(), doc_key.size());</a>
+<a name="ln403">        buffer.AsSlice().CopyTo(path.data() + doc_key.size());</a>
+<a name="ln404">        paths-&gt;push_back(RefCntPrefix(path));</a>
+<a name="ln405">      }</a>
+<a name="ln406">      return Status::OK();</a>
+<a name="ln407">    }</a>
+<a name="ln408">  }</a>
+<a name="ln409">  if (encoded_doc_key_) {</a>
+<a name="ln410">    paths-&gt;push_back(encoded_doc_key_);</a>
+<a name="ln411">  }</a>
+<a name="ln412"> </a>
+<a name="ln413">  return Status::OK();</a>
+<a name="ln414">}</a>
+<a name="ln415"> </a>
+<a name="ln416">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln417"> </a>
+<a name="ln418">Result&lt;size_t&gt; PgsqlReadOperation::Execute(const common::YQLStorageIf&amp; ql_storage,</a>
+<a name="ln419">                                           CoarseTimePoint deadline,</a>
+<a name="ln420">                                           const ReadHybridTime&amp; read_time,</a>
+<a name="ln421">                                           const Schema&amp; schema,</a>
+<a name="ln422">                                           const Schema *index_schema,</a>
+<a name="ln423">                                           faststring *result_buffer,</a>
+<a name="ln424">                                           HybridTime *restart_read_ht) {</a>
+<a name="ln425">  size_t fetched_rows = 0;</a>
+<a name="ln426">  // Reserve space for fetched rows count.</a>
+<a name="ln427">  pggate::PgWire::WriteInt64(0, result_buffer);</a>
+<a name="ln428">  auto se = ScopeExit([&amp;fetched_rows, result_buffer] {</a>
+<a name="ln429">    NetworkByteOrder::Store64(result_buffer-&gt;data(), fetched_rows);</a>
+<a name="ln430">  });</a>
+<a name="ln431">  VLOG(4) &lt;&lt; &quot;Read, read time: &quot; &lt;&lt; read_time &lt;&lt; &quot;, txn: &quot; &lt;&lt; txn_op_context_;</a>
+<a name="ln432"> </a>
+<a name="ln433">  // Fetching data.</a>
+<a name="ln434">  bool has_paging_state = false;</a>
+<a name="ln435">  if (request_.batch_arguments_size() &gt; 0) {</a>
+<a name="ln436">    if (request_.has_ybctid_column_value()) {</a>
+<a name="ln437">      fetched_rows = VERIFY_RESULT(ExecuteBatchYbctid(</a>
+<a name="ln438">          ql_storage, deadline, read_time, schema, result_buffer, restart_read_ht));</a>
+<a name="ln439">    } else {</a>
+<a name="ln440">      fetched_rows = VERIFY_RESULT(ExecuteBatch(ql_storage, deadline, read_time, schema,</a>
+<a name="ln441">                                                index_schema, result_buffer, restart_read_ht,</a>
+<a name="ln442">                                                &amp;has_paging_state));</a>
+<a name="ln443">    }</a>
+<a name="ln444">  } else {</a>
+<a name="ln445">    fetched_rows = VERIFY_RESULT(ExecuteScalar(ql_storage, deadline, read_time, schema,</a>
+<a name="ln446">                                               index_schema, -1 /* batch_arg_index */,</a>
+<a name="ln447">                                               result_buffer, restart_read_ht, &amp;has_paging_state));</a>
+<a name="ln448">  }</a>
+<a name="ln449"> </a>
+<a name="ln450">  if (FLAGS_trace_docdb_calls) {</a>
+<a name="ln451">    TRACE(&quot;Fetched $0 rows. $1 paging state&quot;, fetched_rows, (has_paging_state ? &quot;No&quot; : &quot;Has&quot;));</a>
+<a name="ln452">  }</a>
+<a name="ln453">  *restart_read_ht = table_iter_-&gt;RestartReadHt();</a>
+<a name="ln454">  return fetched_rows;</a>
+<a name="ln455">}</a>
+<a name="ln456"> </a>
+<a name="ln457">Result&lt;size_t&gt; PgsqlReadOperation::ExecuteScalar(const common::YQLStorageIf&amp; ql_storage,</a>
+<a name="ln458">                                                 CoarseTimePoint deadline,</a>
+<a name="ln459">                                                 const ReadHybridTime&amp; read_time,</a>
+<a name="ln460">                                                 const Schema&amp; schema,</a>
+<a name="ln461">                                                 const Schema *index_schema,</a>
+<a name="ln462">                                                 int64_t batch_arg_index,</a>
+<a name="ln463">                                                 faststring *result_buffer,</a>
+<a name="ln464">                                                 HybridTime *restart_read_ht,</a>
+<a name="ln465">                                                 bool *has_paging_state) {</a>
+<a name="ln466">  *has_paging_state = false;</a>
+<a name="ln467"> </a>
+<a name="ln468">  size_t fetched_rows = 0;</a>
+<a name="ln469">  size_t row_count_limit = std::numeric_limits&lt;std::size_t&gt;::max();</a>
+<a name="ln470">  if (request_.has_limit()) {</a>
+<a name="ln471">    if (request_.limit() == 0) {</a>
+<a name="ln472">      return fetched_rows;</a>
+<a name="ln473">    }</a>
+<a name="ln474">    row_count_limit = request_.limit();</a>
+<a name="ln475">  }</a>
+<a name="ln476"> </a>
+<a name="ln477">  // Create the projection of regular columns selected by the row block plus any referenced in</a>
+<a name="ln478">  // the WHERE condition. When DocRowwiseIterator::NextRow() populates the value map, it uses this</a>
+<a name="ln479">  // projection only to scan sub-documents. The query schema is used to select only referenced</a>
+<a name="ln480">  // columns and key columns.</a>
+<a name="ln481">  Schema projection;</a>
+<a name="ln482">  Schema index_projection;</a>
+<a name="ln483">  common::YQLRowwiseIteratorIf *iter;</a>
+<a name="ln484">  const Schema* scan_schema;</a>
+<a name="ln485"> </a>
+<a name="ln486">  RETURN_NOT_OK(CreateProjection(schema, request_.column_refs(), &amp;projection));</a>
+<a name="ln487">  RETURN_NOT_OK(ql_storage.GetIterator(request_, batch_arg_index,</a>
+<a name="ln488">                                       projection, schema, txn_op_context_,</a>
+<a name="ln489">                                       deadline, read_time, &amp;table_iter_));</a>
+<a name="ln490"> </a>
+<a name="ln491">  ColumnId ybbasectid_id;</a>
+<a name="ln492">  if (request_.has_index_request()) {</a>
+<a name="ln493">    const PgsqlReadRequestPB&amp; index_request = request_.index_request();</a>
+<a name="ln494">    RETURN_NOT_OK(CreateProjection(*index_schema, index_request.column_refs(), &amp;index_projection));</a>
+<a name="ln495">    RETURN_NOT_OK(ql_storage.GetIterator(index_request, batch_arg_index,</a>
+<a name="ln496">                                         index_projection, *index_schema,</a>
+<a name="ln497">                                         txn_op_context_, deadline, read_time, &amp;index_iter_));</a>
+<a name="ln498">    iter = index_iter_.get();</a>
+<a name="ln499">    const size_t idx = index_schema-&gt;find_column(&quot;ybidxbasectid&quot;);</a>
+<a name="ln500">    SCHECK_NE(idx, Schema::kColumnNotFound, Corruption, &quot;ybidxbasectid not found in index schema&quot;);</a>
+<a name="ln501">    ybbasectid_id = index_schema-&gt;column_id(idx);</a>
+<a name="ln502">    scan_schema = index_schema;</a>
+<a name="ln503">  } else {</a>
+<a name="ln504">    iter = table_iter_.get();</a>
+<a name="ln505">    scan_schema = &amp;schema;</a>
+<a name="ln506">  }</a>
+<a name="ln507"> </a>
+<a name="ln508">  if (FLAGS_trace_docdb_calls) {</a>
+<a name="ln509">    TRACE(&quot;Initialized iterator&quot;);</a>
+<a name="ln510">  }</a>
+<a name="ln511"> </a>
+<a name="ln512">  // Set scan start time.</a>
+<a name="ln513">  bool scan_time_exceeded = false;</a>
+<a name="ln514"> </a>
+<a name="ln515">  // Fetching data.</a>
+<a name="ln516">  int match_count = 0;</a>
+<a name="ln517">  QLTableRow row;</a>
+<a name="ln518">  while (fetched_rows &lt; row_count_limit &amp;&amp; VERIFY_RESULT(iter-&gt;HasNext()) &amp;&amp;</a>
+<a name="ln519">         !scan_time_exceeded) {</a>
+<a name="ln520"> </a>
+<a name="ln521">    row.Clear();</a>
+<a name="ln522"> </a>
+<a name="ln523">    // If there is an index request, fetch ybbasectid from the index and use it as ybctid</a>
+<a name="ln524">    // to fetch from the base table. Otherwise, fetch from the base table directly.</a>
+<a name="ln525">    if (request_.has_index_request()) {</a>
+<a name="ln526">      RETURN_NOT_OK(iter-&gt;NextRow(&amp;row));</a>
+<a name="ln527">      const auto&amp; tuple_id = row.GetValue(ybbasectid_id);</a>
+<a name="ln528">      SCHECK_NE(tuple_id, boost::none, Corruption, &quot;ybbasectid not found in index row&quot;);</a>
+<a name="ln529">      if (!VERIFY_RESULT(table_iter_-&gt;SeekTuple(tuple_id-&gt;binary_value()))) {</a>
+<a name="ln530">        DocKey doc_key;</a>
+<a name="ln531">        RETURN_NOT_OK(doc_key.DecodeFrom(tuple_id-&gt;binary_value()));</a>
+<a name="ln532">        return STATUS_FORMAT(Corruption, &quot;ybctid $0 not found in indexed table&quot;, doc_key);</a>
+<a name="ln533">      }</a>
+<a name="ln534">      row.Clear();</a>
+<a name="ln535">      RETURN_NOT_OK(table_iter_-&gt;NextRow(projection, &amp;row));</a>
+<a name="ln536">    } else {</a>
+<a name="ln537">      RETURN_NOT_OK(iter-&gt;NextRow(projection, &amp;row));</a>
+<a name="ln538">    }</a>
+<a name="ln539"> </a>
+<a name="ln540">    // Match the row with the where condition before adding to the row block.</a>
+<a name="ln541">    bool is_match = true;</a>
+<a name="ln542">    if (request_.has_where_expr()) {</a>
+<a name="ln543">      QLExprResult match;</a>
+<a name="ln544">      RETURN_NOT_OK(EvalExpr(request_.where_expr(), row, match.Writer()));</a>
+<a name="ln545">      is_match = match.Value().bool_value();</a>
+<a name="ln546">    }</a>
+<a name="ln547">    if (is_match) {</a>
+<a name="ln548">      match_count++;</a>
+<a name="ln549">      if (request_.is_aggregate()) {</a>
+<a name="ln550">        RETURN_NOT_OK(EvalAggregate(row));</a>
+<a name="ln551">      } else {</a>
+<a name="ln552">        RETURN_NOT_OK(PopulateResultSet(row, result_buffer));</a>
+<a name="ln553">        ++fetched_rows;</a>
+<a name="ln554">      }</a>
+<a name="ln555">    }</a>
+<a name="ln556"> </a>
+<a name="ln557">    // Check every row_count_limit matches whether we've exceeded our scan time.</a>
+<a name="ln558">    if (match_count % row_count_limit == 0) {</a>
+<a name="ln559">      scan_time_exceeded = CoarseMonoClock::now() &gt;= deadline;</a>
+<a name="ln560">    }</a>
+<a name="ln561">  }</a>
+<a name="ln562"> </a>
+<a name="ln563">  if (request_.is_aggregate() &amp;&amp; match_count &gt; 0) {</a>
+<a name="ln564">    RETURN_NOT_OK(PopulateAggregate(row, result_buffer));</a>
+<a name="ln565">    ++fetched_rows;</a>
+<a name="ln566">  }</a>
+<a name="ln567"> </a>
+<a name="ln568">  if (PREDICT_FALSE(FLAGS_TEST_slowdown_pgsql_aggregate_read_ms &gt; 0) &amp;&amp; request_.is_aggregate()) {</a>
+<a name="ln569">    TRACE(&quot;Sleeping for $0 ms&quot;, FLAGS_TEST_slowdown_pgsql_aggregate_read_ms);</a>
+<a name="ln570">    SleepFor(MonoDelta::FromMilliseconds(FLAGS_TEST_slowdown_pgsql_aggregate_read_ms));</a>
+<a name="ln571">  }</a>
+<a name="ln572"> </a>
+<a name="ln573">  RETURN_NOT_OK(SetPagingStateIfNecessary(iter, fetched_rows, row_count_limit, scan_time_exceeded,</a>
+<a name="ln574">                                          scan_schema, batch_arg_index, has_paging_state));</a>
+<a name="ln575">  return fetched_rows;</a>
+<a name="ln576">}</a>
+<a name="ln577"> </a>
+<a name="ln578">Result&lt;size_t&gt; PgsqlReadOperation::ExecuteBatch(const common::YQLStorageIf&amp; ql_storage,</a>
+<a name="ln579">                                                CoarseTimePoint deadline,</a>
+<a name="ln580">                                                const ReadHybridTime&amp; read_time,</a>
+<a name="ln581">                                                const Schema&amp; schema,</a>
+<a name="ln582">                                                const Schema *index_schema,</a>
+<a name="ln583">                                                faststring *result_buffer,</a>
+<a name="ln584">                                                HybridTime *restart_read_ht,</a>
+<a name="ln585">                                                bool *has_paging_state) {</a>
+<a name="ln586">  size_t fetched_rows = 0;</a>
+<a name="ln587">  bool exec_has_paging_state = false;</a>
+<a name="ln588"> </a>
+<a name="ln589">  int32_t batch_arg_count = request_.batch_arguments_size();</a>
+<a name="ln590">  int64_t batch_arg_index = 0;</a>
+<a name="ln591">  while (!exec_has_paging_state &amp;&amp; batch_arg_index &lt; batch_arg_count) {</a>
+<a name="ln592">    fetched_rows += VERIFY_RESULT(ExecuteScalar(ql_storage, deadline, read_time, schema,</a>
+<a name="ln593">                                                index_schema, batch_arg_index, result_buffer,</a>
+<a name="ln594">                                                restart_read_ht, &amp;exec_has_paging_state));</a>
+<a name="ln595">    batch_arg_index++;</a>
+<a name="ln596">  }</a>
+<a name="ln597">  *has_paging_state = exec_has_paging_state;</a>
+<a name="ln598"> </a>
+<a name="ln599">  response_.set_batch_arg_count(batch_arg_index);</a>
+<a name="ln600">  return fetched_rows;</a>
+<a name="ln601">}</a>
+<a name="ln602"> </a>
+<a name="ln603">Result&lt;size_t&gt; PgsqlReadOperation::ExecuteBatchYbctid(const common::YQLStorageIf&amp; ql_storage,</a>
+<a name="ln604">                                                      CoarseTimePoint deadline,</a>
+<a name="ln605">                                                      const ReadHybridTime&amp; read_time,</a>
+<a name="ln606">                                                      const Schema&amp; schema,</a>
+<a name="ln607">                                                      faststring *result_buffer,</a>
+<a name="ln608">                                                      HybridTime *restart_read_ht) {</a>
+<a name="ln609">  Schema projection;</a>
+<a name="ln610">  RETURN_NOT_OK(CreateProjection(schema, request_.column_refs(), &amp;projection));</a>
+<a name="ln611"> </a>
+<a name="ln612">  QLTableRow row;</a>
+<a name="ln613">  size_t row_count = 0;</a>
+<a name="ln614">  for (const PgsqlBatchArgumentPB&amp; batch_argument : request_.batch_arguments()) {</a>
+<a name="ln615">    // Get the row.</a>
+<a name="ln616">    RETURN_NOT_OK(ql_storage.GetIterator(request_, projection, schema, txn_op_context_,</a>
+<a name="ln617">                                         deadline, read_time, batch_argument.ybctid().value(),</a>
+<a name="ln618">                                         &amp;table_iter_));</a>
+<a name="ln619">    row.Clear();</a>
+<a name="ln620"> </a>
+<a name="ln621">    SCHECK(VERIFY_RESULT(table_iter_-&gt;HasNext()), Corruption,</a>
+<a name="ln622">           &quot;Given ybctid is not associated with any row in table&quot;);</a>
+<a name="ln623">    RETURN_NOT_OK(table_iter_-&gt;NextRow(projection, &amp;row));</a>
+<a name="ln624"> </a>
+<a name="ln625">    // Populate result set.</a>
+<a name="ln626">    RETURN_NOT_OK(PopulateResultSet(row, result_buffer));</a>
+<a name="ln627">    row_count++;</a>
+<a name="ln628">  }</a>
+<a name="ln629"> </a>
+<a name="ln630">  // Set status for this batch.</a>
+<a name="ln631">  response_.set_batch_arg_count(row_count);</a>
+<a name="ln632"> </a>
+<a name="ln633">  return row_count;</a>
+<a name="ln634">}</a>
+<a name="ln635"> </a>
+<a name="ln636">Status PgsqlReadOperation::SetPagingStateIfNecessary(const common::YQLRowwiseIteratorIf* iter,</a>
+<a name="ln637">                                                     size_t fetched_rows,</a>
+<a name="ln638">                                                     const size_t row_count_limit,</a>
+<a name="ln639">                                                     const bool scan_time_exceeded,</a>
+<a name="ln640">                                                     const Schema* schema,</a>
+<a name="ln641">                                                     int64_t batch_arg_index,</a>
+<a name="ln642">                                                     bool *has_paging_state) {</a>
+<a name="ln643">  *has_paging_state = false;</a>
+<a name="ln644">  if (!request_.return_paging_state()) {</a>
+<a name="ln645">    return Status::OK();</a>
+<a name="ln646">  }</a>
+<a name="ln647"> </a>
+<a name="ln648">  // Set the paging state for next row.</a>
+<a name="ln649">  if (fetched_rows &gt;= row_count_limit || scan_time_exceeded) {</a>
+<a name="ln650">    SubDocKey next_row_key;</a>
+<a name="ln651">    RETURN_NOT_OK(iter-&gt;GetNextReadSubDocKey(&amp;next_row_key));</a>
+<a name="ln652">    // When the &quot;limit&quot; number of rows are returned and we are asked to return the paging state,</a>
+<a name="ln653">    // return the partition key and row key of the next row to read in the paging state if there are</a>
+<a name="ln654">    // still more rows to read. Otherwise, leave the paging state empty which means we are done</a>
+<a name="ln655">    // reading from this tablet.</a>
+<a name="ln656">    if (!next_row_key.doc_key().empty()) {</a>
+<a name="ln657">      const auto&amp; keybytes = next_row_key.Encode();</a>
+<a name="ln658">      PgsqlPagingStatePB* paging_state = response_.mutable_paging_state();</a>
+<a name="ln659">      DSCHECK(schema != nullptr, IllegalState, &quot;Missing schema&quot;);</a>
+<a name="ln660">      if (schema-&gt;num_hash_key_columns() &gt; 0) {</a>
+<a name="ln661">        paging_state-&gt;set_next_partition_key(</a>
+<a name="ln662">           PartitionSchema::EncodeMultiColumnHashValue(next_row_key.doc_key().hash()));</a>
+<a name="ln663">      } else {</a>
+<a name="ln664">        paging_state-&gt;set_next_partition_key(keybytes.ToStringBuffer());</a>
+<a name="ln665">      }</a>
+<a name="ln666">      paging_state-&gt;set_next_row_key(keybytes.ToStringBuffer());</a>
+<a name="ln667">      *has_paging_state = true;</a>
+<a name="ln668">    }</a>
+<a name="ln669">  }</a>
+<a name="ln670"> </a>
+<a name="ln671">  return Status::OK();</a>
+<a name="ln672">}</a>
+<a name="ln673"> </a>
+<a name="ln674">Status PgsqlReadOperation::PopulateResultSet(const QLTableRow&amp; table_row,</a>
+<a name="ln675">                                             faststring *result_buffer) {</a>
+<a name="ln676">  QLExprResult result;</a>
+<a name="ln677">  for (const PgsqlExpressionPB&amp; expr : request_.targets()) {</a>
+<a name="ln678">    RETURN_NOT_OK(EvalExpr(expr, table_row, result.Writer()));</a>
+<a name="ln679">    RETURN_NOT_OK(pggate::WriteColumn(result.Value(), result_buffer));</a>
+<a name="ln680">  }</a>
+<a name="ln681">  return Status::OK();</a>
+<a name="ln682">}</a>
+<a name="ln683"> </a>
+<a name="ln684">Status PgsqlReadOperation::GetTupleId(QLValue *result) const {</a>
+<a name="ln685">  // Get row key and save to QLValue.</a>
+<a name="ln686">  // TODO(neil) Check if we need to append a table_id and other info to TupleID. For example, we</a>
+<a name="ln687">  // might need info to make sure the TupleId by itself is a valid reference to a specific row of</a>
+<a name="ln688">  // a valid table.</a>
+<a name="ln689">  const Slice tuple_id = VERIFY_RESULT(table_iter_-&gt;GetTupleId());</a>
+<a name="ln690">  result-&gt;set_binary_value(tuple_id.data(), tuple_id.size());</a>
+<a name="ln691">  return Status::OK();</a>
+<a name="ln692">}</a>
+<a name="ln693"> </a>
+<a name="ln694">Status PgsqlReadOperation::EvalAggregate(const QLTableRow&amp; table_row) {</a>
+<a name="ln695">  if (aggr_result_.empty()) {</a>
+<a name="ln696">    int column_count = request_.targets().size();</a>
+<a name="ln697">    aggr_result_.resize(column_count);</a>
+<a name="ln698">  }</a>
+<a name="ln699"> </a>
+<a name="ln700">  int aggr_index = 0;</a>
+<a name="ln701">  for (const PgsqlExpressionPB&amp; expr : request_.targets()) {</a>
+<a name="ln702">    RETURN_NOT_OK(EvalExpr(expr, table_row, aggr_result_[aggr_index++].Writer()));</a>
+<a name="ln703">  }</a>
+<a name="ln704">  return Status::OK();</a>
+<a name="ln705">}</a>
+<a name="ln706"> </a>
+<a name="ln707">Status PgsqlReadOperation::PopulateAggregate(const QLTableRow&amp; table_row,</a>
+<a name="ln708">                                             faststring *result_buffer) {</a>
+<a name="ln709">  int column_count = request_.targets().size();</a>
+<a name="ln710">  for (int rscol_index = 0; rscol_index &lt; column_count; rscol_index++) {</a>
+<a name="ln711">    RETURN_NOT_OK(pggate::WriteColumn(aggr_result_[rscol_index].Value(), result_buffer));</a>
+<a name="ln712">  }</a>
+<a name="ln713">  return Status::OK();</a>
+<a name="ln714">}</a>
+<a name="ln715"> </a>
+<a name="ln716">Status PgsqlReadOperation::GetPartitionIntent(</a>
+<a name="ln717">    const Schema&amp; schema,</a>
+<a name="ln718">    const google::protobuf::RepeatedPtrField&lt;PgsqlExpressionPB&gt; &amp;column_values,</a>
+<a name="ln719">    KeyValueWriteBatchPB* out) {</a>
+<a name="ln720">  auto pair = out-&gt;mutable_read_pairs()-&gt;Add();</a>
+<a name="ln721"> </a>
+<a name="ln722">  std::vector&lt;PrimitiveValue&gt; hashed_components;</a>
+<a name="ln723">  RETURN_NOT_OK(InitKeyColumnPrimitiveValues(</a>
+<a name="ln724">      column_values, schema, 0 /* start_idx */, &amp;hashed_components));</a>
+<a name="ln725"> </a>
+<a name="ln726">  DocKey doc_key(schema, request_.hash_code(), hashed_components);</a>
+<a name="ln727">  pair-&gt;set_key(doc_key.Encode().ToStringBuffer());</a>
+<a name="ln728">  pair-&gt;set_value(std::string(1, ValueTypeAsChar::kNullLow));</a>
+<a name="ln729"> </a>
+<a name="ln730">  return Status::OK();</a>
+<a name="ln731">}</a>
+<a name="ln732"> </a>
+<a name="ln733">Status PgsqlReadOperation::GetIntents(const Schema&amp; schema, KeyValueWriteBatchPB* out) {</a>
+<a name="ln734">  if (request_.partition_column_values().empty()) {</a>
+<a name="ln735">    // Empty components mean that we don't have primary key at all, but request</a>
+<a name="ln736">    // could still contain hash_code as part of tablet routing.</a>
+<a name="ln737">    // So we should ignore it.</a>
+<a name="ln738">    DocKey doc_key(schema);</a>
+<a name="ln739">    auto pair = out-&gt;mutable_read_pairs()-&gt;Add();</a>
+<a name="ln740">    pair-&gt;set_key(doc_key.Encode().ToStringBuffer());</a>
+<a name="ln741">    pair-&gt;set_value(std::string(1, ValueTypeAsChar::kNullLow));</a>
+<a name="ln742">    return Status::OK();</a>
+<a name="ln743">  }</a>
+<a name="ln744"> </a>
+<a name="ln745">  // Use &quot;true&quot; condition as DocDB only supports scalar argument currently.</a>
+<a name="ln746">  if (true) {</a>
+<a name="ln747">    // Executing scalar argument.</a>
+<a name="ln748">    return GetPartitionIntent(schema, request_.partition_column_values(), out);</a>
+<a name="ln749"> </a>
+<a name="ln750">  } else {</a>
+<a name="ln751">    // Executing batch argument.</a>
+<a name="ln752">    // Currently, this code is still an experiment for executing requests in parallel.</a>
+<a name="ln753">    // NOTE: Batch arguments are used for parallelism execution by partitions, so the partition</a>
+<a name="ln754">    //       field must be present in each batch_argument.</a>
+<a name="ln755">    DCHECK_GT(request_.batch_arguments_size(), 0) &lt;&lt; &quot;Batch argument was not provided&quot;;</a>
+<a name="ln756"> </a>
+<a name="ln757">    for (const PgsqlBatchArgumentPB&amp; batch_argument : request_.batch_arguments()) {</a>
+<a name="ln758">      DCHECK_GT(batch_argument.partition_column_values_size(), 0);</a>
+<a name="ln759">      RETURN_NOT_OK(GetPartitionIntent(schema, batch_argument.partition_column_values(), out));</a>
+<a name="ln760">    }</a>
+<a name="ln761">  }</a>
+<a name="ln762"> </a>
+<a name="ln763">  return Status::OK();</a>
+<a name="ln764">}</a>
+<a name="ln765"> </a>
+<a name="ln766">}  // namespace docdb</a>
+<a name="ln767">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="101"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="138"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="164"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v556/" target="_blank">V556</a> The values of different enum types are compared. Types: TSOpcode, TSOpcode.</p></div>
+<div class="balloon" rel="164"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="207"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v556/" target="_blank">V556</a> The values of different enum types are compared. Types: TSOpcode, TSOpcode.</p></div>
+<div class="balloon" rel="248"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v556/" target="_blank">V556</a> The values of different enum types are compared. Types: TSOpcode, TSOpcode.</p></div>
+<div class="balloon" rel="248"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="298"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="431"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

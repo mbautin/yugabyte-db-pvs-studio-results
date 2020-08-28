@@ -1,0 +1,2516 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>trace_event_impl.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) 2012 The Chromium Authors. All rights reserved.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Use of this source code is governed by a BSD-style license that can be</a>
+<a name="ln4">// found in the LICENSE file.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/util/debug/trace_event_impl.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;algorithm&gt;</a>
+<a name="ln24">#include &lt;list&gt;</a>
+<a name="ln25">#include &lt;vector&gt;</a>
+<a name="ln26"> </a>
+<a name="ln27">#include &lt;gflags/gflags.h&gt;</a>
+<a name="ln28"> </a>
+<a name="ln29">#include &quot;yb/gutil/bind.h&quot;</a>
+<a name="ln30">#include &quot;yb/util/atomic.h&quot;</a>
+<a name="ln31">#include &quot;yb/util/debug/trace_event.h&quot;</a>
+<a name="ln32">#include &quot;yb/gutil/mathlimits.h&quot;</a>
+<a name="ln33">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln34">#include &quot;yb/gutil/strings/join.h&quot;</a>
+<a name="ln35">#include &quot;yb/gutil/strings/split.h&quot;</a>
+<a name="ln36">#include &quot;yb/gutil/strings/util.h&quot;</a>
+<a name="ln37">#include &quot;yb/gutil/singleton.h&quot;</a>
+<a name="ln38">#include &quot;yb/gutil/stl_util.h&quot;</a>
+<a name="ln39">#include &quot;yb/gutil/stringprintf.h&quot;</a>
+<a name="ln40">#include &quot;yb/gutil/strings/escaping.h&quot;</a>
+<a name="ln41">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln42">#include &quot;yb/gutil/dynamic_annotations.h&quot;</a>
+<a name="ln43"> </a>
+<a name="ln44">#include &quot;yb/gutil/walltime.h&quot;</a>
+<a name="ln45">#include &quot;yb/util/debug/trace_event_synthetic_delay.h&quot;</a>
+<a name="ln46">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln47">#include &quot;yb/util/thread.h&quot;</a>
+<a name="ln48"> </a>
+<a name="ln49">DEFINE_string(trace_to_console, &quot;&quot;,</a>
+<a name="ln50">              &quot;Trace pattern specifying which trace events should be dumped &quot;</a>
+<a name="ln51">              &quot;directly to the console&quot;);</a>
+<a name="ln52">TAG_FLAG(trace_to_console, experimental);</a>
+<a name="ln53"> </a>
+<a name="ln54">// The thread buckets for the sampling profiler.</a>
+<a name="ln55">BASE_EXPORT TRACE_EVENT_API_ATOMIC_WORD g_trace_state[3];</a>
+<a name="ln56"> </a>
+<a name="ln57">namespace yb {</a>
+<a name="ln58">namespace debug {</a>
+<a name="ln59"> </a>
+<a name="ln60">using base::SpinLockHolder;</a>
+<a name="ln61"> </a>
+<a name="ln62">using strings::SubstituteAndAppend;</a>
+<a name="ln63">using std::string;</a>
+<a name="ln64"> </a>
+<a name="ln65">__thread TraceLog::PerThreadInfo* TraceLog::thread_local_info_ = nullptr;</a>
+<a name="ln66"> </a>
+<a name="ln67">namespace {</a>
+<a name="ln68"> </a>
+<a name="ln69">// Controls the number of trace events we will buffer in-memory</a>
+<a name="ln70">// before throwing them away.</a>
+<a name="ln71">const size_t kTraceBufferChunkSize = TraceBufferChunk::kTraceBufferChunkSize;</a>
+<a name="ln72">const size_t kTraceEventVectorBufferChunks = 256000 / kTraceBufferChunkSize;</a>
+<a name="ln73">const size_t kTraceEventRingBufferChunks = kTraceEventVectorBufferChunks / 4;</a>
+<a name="ln74">const size_t kTraceEventBatchChunks = 1000 / kTraceBufferChunkSize;</a>
+<a name="ln75">// Can store results for 30 seconds with 1 ms sampling interval.</a>
+<a name="ln76">const size_t kMonitorTraceEventBufferChunks = 30000 / kTraceBufferChunkSize;</a>
+<a name="ln77">// ECHO_TO_CONSOLE needs a small buffer to hold the unfinished COMPLETE events.</a>
+<a name="ln78">const size_t kEchoToConsoleTraceEventBufferChunks = 256;</a>
+<a name="ln79"> </a>
+<a name="ln80">const char kSyntheticDelayCategoryFilterPrefix[] = &quot;DELAY(&quot;;</a>
+<a name="ln81"> </a>
+<a name="ln82">#define MAX_CATEGORY_GROUPS 100</a>
+<a name="ln83"> </a>
+<a name="ln84">// Parallel arrays g_category_groups and g_category_group_enabled are separate</a>
+<a name="ln85">// so that a pointer to a member of g_category_group_enabled can be easily</a>
+<a name="ln86">// converted to an index into g_category_groups. This allows macros to deal</a>
+<a name="ln87">// only with char enabled pointers from g_category_group_enabled, and we can</a>
+<a name="ln88">// convert internally to determine the category name from the char enabled</a>
+<a name="ln89">// pointer.</a>
+<a name="ln90">const char* g_category_groups[MAX_CATEGORY_GROUPS] = {</a>
+<a name="ln91">  &quot;toplevel&quot;,</a>
+<a name="ln92">  &quot;tracing already shutdown&quot;,</a>
+<a name="ln93">  &quot;tracing categories exhausted; must increase MAX_CATEGORY_GROUPS&quot;,</a>
+<a name="ln94">  &quot;__metadata&quot;};</a>
+<a name="ln95"> </a>
+<a name="ln96">// The enabled flag is char instead of bool so that the API can be used from C.</a>
+<a name="ln97">unsigned char g_category_group_enabled[MAX_CATEGORY_GROUPS] = { 0 };</a>
+<a name="ln98">// Indexes here have to match the g_category_groups array indexes above.</a>
+<a name="ln99">const int g_category_already_shutdown = 1;</a>
+<a name="ln100">const int g_category_categories_exhausted = 2;</a>
+<a name="ln101">const int g_category_metadata = 3;</a>
+<a name="ln102">const int g_num_builtin_categories = 4;</a>
+<a name="ln103">// Skip default categories.</a>
+<a name="ln104">AtomicWord g_category_index = g_num_builtin_categories;</a>
+<a name="ln105"> </a>
+<a name="ln106">// The name of the current thread. This is used to decide if the current</a>
+<a name="ln107">// thread name has changed. We combine all the seen thread names into the</a>
+<a name="ln108">// output name for the thread.</a>
+<a name="ln109">__thread const char* g_current_thread_name = &quot;&quot;;</a>
+<a name="ln110"> </a>
+<a name="ln111">static void NOTIMPLEMENTED() {</a>
+<a name="ln112">  LOG(FATAL);</a>
+<a name="ln113">}</a>
+<a name="ln114"> </a>
+<a name="ln115">class TraceBufferRingBuffer : public TraceBuffer {</a>
+<a name="ln116"> public:</a>
+<a name="ln117">  explicit TraceBufferRingBuffer(size_t max_chunks)</a>
+<a name="ln118">      : max_chunks_(max_chunks),</a>
+<a name="ln119">        recyclable_chunks_queue_(new size_t[queue_capacity()]),</a>
+<a name="ln120">        queue_head_(0),</a>
+<a name="ln121">        queue_tail_(max_chunks),</a>
+<a name="ln122">        current_iteration_index_(0),</a>
+<a name="ln123">        current_chunk_seq_(1) {</a>
+<a name="ln124">    chunks_.reserve(max_chunks);</a>
+<a name="ln125">    for (size_t i = 0; i &lt; max_chunks; ++i)</a>
+<a name="ln126">      recyclable_chunks_queue_[i] = i;</a>
+<a name="ln127">  }</a>
+<a name="ln128"> </a>
+<a name="ln129">  ~TraceBufferRingBuffer() {</a>
+<a name="ln130">    STLDeleteElements(&amp;chunks_);</a>
+<a name="ln131">  }</a>
+<a name="ln132"> </a>
+<a name="ln133">  gscoped_ptr&lt;TraceBufferChunk&gt; GetChunk(size_t* index) override {</a>
+<a name="ln134">    // Because the number of threads is much less than the number of chunks,</a>
+<a name="ln135">    // the queue should never be empty.</a>
+<a name="ln136">    DCHECK(!QueueIsEmpty());</a>
+<a name="ln137"> </a>
+<a name="ln138">    *index = recyclable_chunks_queue_[queue_head_];</a>
+<a name="ln139">    queue_head_ = NextQueueIndex(queue_head_);</a>
+<a name="ln140">    current_iteration_index_ = queue_head_;</a>
+<a name="ln141"> </a>
+<a name="ln142">    if (*index &gt;= chunks_.size())</a>
+<a name="ln143">      chunks_.resize(*index + 1);</a>
+<a name="ln144"> </a>
+<a name="ln145">    TraceBufferChunk* chunk = chunks_[*index];</a>
+<a name="ln146">    chunks_[*index] = nullptr;  // Put NULL in the slot of a in-flight chunk.</a>
+<a name="ln147">    if (chunk)</a>
+<a name="ln148">      chunk-&gt;Reset(current_chunk_seq_++);</a>
+<a name="ln149">    else</a>
+<a name="ln150">      chunk = new TraceBufferChunk(current_chunk_seq_++);</a>
+<a name="ln151"> </a>
+<a name="ln152">    return gscoped_ptr&lt;TraceBufferChunk&gt;(chunk);</a>
+<a name="ln153">  }</a>
+<a name="ln154"> </a>
+<a name="ln155">  virtual void ReturnChunk(size_t index,</a>
+<a name="ln156">                           gscoped_ptr&lt;TraceBufferChunk&gt; chunk) override {</a>
+<a name="ln157">    // When this method is called, the queue should not be full because it</a>
+<a name="ln158">    // can contain all chunks including the one to be returned.</a>
+<a name="ln159">    DCHECK(!QueueIsFull());</a>
+<a name="ln160">    DCHECK(chunk);</a>
+<a name="ln161">    DCHECK_LT(index, chunks_.size());</a>
+<a name="ln162">    DCHECK(!chunks_[index]);</a>
+<a name="ln163">    chunks_[index] = chunk.release();</a>
+<a name="ln164">    recyclable_chunks_queue_[queue_tail_] = index;</a>
+<a name="ln165">    queue_tail_ = NextQueueIndex(queue_tail_);</a>
+<a name="ln166">  }</a>
+<a name="ln167"> </a>
+<a name="ln168">  bool IsFull() const override {</a>
+<a name="ln169">    return false;</a>
+<a name="ln170">  }</a>
+<a name="ln171"> </a>
+<a name="ln172">  size_t Size() const override {</a>
+<a name="ln173">    // This is approximate because not all of the chunks are full.</a>
+<a name="ln174">    return chunks_.size() * kTraceBufferChunkSize;</a>
+<a name="ln175">  }</a>
+<a name="ln176"> </a>
+<a name="ln177">  size_t Capacity() const override {</a>
+<a name="ln178">    return max_chunks_ * kTraceBufferChunkSize;</a>
+<a name="ln179">  }</a>
+<a name="ln180"> </a>
+<a name="ln181">  TraceEvent* GetEventByHandle(TraceEventHandle handle) override {</a>
+<a name="ln182">    if (handle.chunk_index &gt;= chunks_.size())</a>
+<a name="ln183">      return nullptr;</a>
+<a name="ln184">    TraceBufferChunk* chunk = chunks_[handle.chunk_index];</a>
+<a name="ln185">    if (!chunk || chunk-&gt;seq() != handle.chunk_seq)</a>
+<a name="ln186">      return nullptr;</a>
+<a name="ln187">    return chunk-&gt;GetEventAt(handle.event_index);</a>
+<a name="ln188">  }</a>
+<a name="ln189"> </a>
+<a name="ln190">  const TraceBufferChunk* NextChunk() override {</a>
+<a name="ln191">    if (chunks_.empty())</a>
+<a name="ln192">      return nullptr;</a>
+<a name="ln193"> </a>
+<a name="ln194">    while (current_iteration_index_ != queue_tail_) {</a>
+<a name="ln195">      size_t chunk_index = recyclable_chunks_queue_[current_iteration_index_];</a>
+<a name="ln196">      current_iteration_index_ = NextQueueIndex(current_iteration_index_);</a>
+<a name="ln197">      if (chunk_index &gt;= chunks_.size()) // Skip uninitialized chunks.</a>
+<a name="ln198">        continue;</a>
+<a name="ln199">      DCHECK(chunks_[chunk_index]);</a>
+<a name="ln200">      return chunks_[chunk_index];</a>
+<a name="ln201">    }</a>
+<a name="ln202">    return nullptr;</a>
+<a name="ln203">  }</a>
+<a name="ln204"> </a>
+<a name="ln205">  gscoped_ptr&lt;TraceBuffer&gt; CloneForIteration() const override {</a>
+<a name="ln206">    gscoped_ptr&lt;ClonedTraceBuffer&gt; cloned_buffer(new ClonedTraceBuffer());</a>
+<a name="ln207">    for (size_t queue_index = queue_head_; queue_index != queue_tail_;</a>
+<a name="ln208">        queue_index = NextQueueIndex(queue_index)) {</a>
+<a name="ln209">      size_t chunk_index = recyclable_chunks_queue_[queue_index];</a>
+<a name="ln210">      if (chunk_index &gt;= chunks_.size()) // Skip uninitialized chunks.</a>
+<a name="ln211">        continue;</a>
+<a name="ln212">      TraceBufferChunk* chunk = chunks_[chunk_index];</a>
+<a name="ln213">      cloned_buffer-&gt;chunks_.push_back(chunk ? chunk-&gt;Clone().release() : nullptr);</a>
+<a name="ln214">    }</a>
+<a name="ln215">    return cloned_buffer.PassAs&lt;TraceBuffer&gt;();</a>
+<a name="ln216">  }</a>
+<a name="ln217"> </a>
+<a name="ln218"> private:</a>
+<a name="ln219">  class ClonedTraceBuffer : public TraceBuffer {</a>
+<a name="ln220">   public:</a>
+<a name="ln221">    ClonedTraceBuffer() : current_iteration_index_(0) {}</a>
+<a name="ln222">    ~ClonedTraceBuffer() {</a>
+<a name="ln223">      STLDeleteElements(&amp;chunks_);</a>
+<a name="ln224">    }</a>
+<a name="ln225"> </a>
+<a name="ln226">    // The only implemented method.</a>
+<a name="ln227">    const TraceBufferChunk* NextChunk() override {</a>
+<a name="ln228">      return current_iteration_index_ &lt; chunks_.size() ?</a>
+<a name="ln229">          chunks_[current_iteration_index_++] : nullptr;</a>
+<a name="ln230">    }</a>
+<a name="ln231"> </a>
+<a name="ln232">    gscoped_ptr&lt;TraceBufferChunk&gt; GetChunk(size_t* index) override {</a>
+<a name="ln233">      NOTIMPLEMENTED();</a>
+<a name="ln234">      return gscoped_ptr&lt;TraceBufferChunk&gt;();</a>
+<a name="ln235">    }</a>
+<a name="ln236">    virtual void ReturnChunk(size_t index,</a>
+<a name="ln237">                             gscoped_ptr&lt;TraceBufferChunk&gt;) override {</a>
+<a name="ln238">      NOTIMPLEMENTED();</a>
+<a name="ln239">    }</a>
+<a name="ln240">    bool IsFull() const override { return false; }</a>
+<a name="ln241">    size_t Size() const override { return 0; }</a>
+<a name="ln242">    size_t Capacity() const override { return 0; }</a>
+<a name="ln243">    TraceEvent* GetEventByHandle(TraceEventHandle handle) override {</a>
+<a name="ln244">      return nullptr;</a>
+<a name="ln245">    }</a>
+<a name="ln246">    gscoped_ptr&lt;TraceBuffer&gt; CloneForIteration() const override {</a>
+<a name="ln247">      NOTIMPLEMENTED();</a>
+<a name="ln248">      return gscoped_ptr&lt;TraceBuffer&gt;();</a>
+<a name="ln249">    }</a>
+<a name="ln250"> </a>
+<a name="ln251">    size_t current_iteration_index_;</a>
+<a name="ln252">    vector&lt;TraceBufferChunk*&gt; chunks_;</a>
+<a name="ln253">  };</a>
+<a name="ln254"> </a>
+<a name="ln255">  bool QueueIsEmpty() const {</a>
+<a name="ln256">    return queue_head_ == queue_tail_;</a>
+<a name="ln257">  }</a>
+<a name="ln258"> </a>
+<a name="ln259">  size_t QueueSize() const {</a>
+<a name="ln260">    return queue_tail_ &gt; queue_head_ ? queue_tail_ - queue_head_ :</a>
+<a name="ln261">        queue_tail_ + queue_capacity() - queue_head_;</a>
+<a name="ln262">  }</a>
+<a name="ln263"> </a>
+<a name="ln264">  bool QueueIsFull() const {</a>
+<a name="ln265">    return QueueSize() == queue_capacity() - 1;</a>
+<a name="ln266">  }</a>
+<a name="ln267"> </a>
+<a name="ln268">  size_t queue_capacity() const {</a>
+<a name="ln269">    // One extra space to help distinguish full state and empty state.</a>
+<a name="ln270">    return max_chunks_ + 1;</a>
+<a name="ln271">  }</a>
+<a name="ln272"> </a>
+<a name="ln273">  size_t NextQueueIndex(size_t index) const {</a>
+<a name="ln274">    index++;</a>
+<a name="ln275">    if (index &gt;= queue_capacity())</a>
+<a name="ln276">      index = 0;</a>
+<a name="ln277">    return index;</a>
+<a name="ln278">  }</a>
+<a name="ln279"> </a>
+<a name="ln280">  size_t max_chunks_;</a>
+<a name="ln281">  vector&lt;TraceBufferChunk*&gt; chunks_;</a>
+<a name="ln282"> </a>
+<a name="ln283">  gscoped_ptr&lt;size_t[]&gt; recyclable_chunks_queue_;</a>
+<a name="ln284">  size_t queue_head_;</a>
+<a name="ln285">  size_t queue_tail_;</a>
+<a name="ln286"> </a>
+<a name="ln287">  size_t current_iteration_index_;</a>
+<a name="ln288">  uint32 current_chunk_seq_;</a>
+<a name="ln289"> </a>
+<a name="ln290">  DISALLOW_COPY_AND_ASSIGN(TraceBufferRingBuffer);</a>
+<a name="ln291">};</a>
+<a name="ln292"> </a>
+<a name="ln293">class TraceBufferVector : public TraceBuffer {</a>
+<a name="ln294"> public:</a>
+<a name="ln295">  TraceBufferVector()</a>
+<a name="ln296">      : in_flight_chunk_count_(0),</a>
+<a name="ln297">        current_iteration_index_(0) {</a>
+<a name="ln298">    chunks_.reserve(kTraceEventVectorBufferChunks);</a>
+<a name="ln299">  }</a>
+<a name="ln300">  ~TraceBufferVector() {</a>
+<a name="ln301">    STLDeleteElements(&amp;chunks_);</a>
+<a name="ln302">  }</a>
+<a name="ln303"> </a>
+<a name="ln304">  gscoped_ptr&lt;TraceBufferChunk&gt; GetChunk(size_t* index) override {</a>
+<a name="ln305">    // This function may be called when adding normal events or indirectly from</a>
+<a name="ln306">    // AddMetadataEventsWhileLocked(). We can not DCHECK(!IsFull()) because we</a>
+<a name="ln307">    // have to add the metadata events and flush thread-local buffers even if</a>
+<a name="ln308">    // the buffer is full.</a>
+<a name="ln309">    *index = chunks_.size();</a>
+<a name="ln310">    chunks_.push_back(nullptr);  // Put NULL in the slot of a in-flight chunk.</a>
+<a name="ln311">    ++in_flight_chunk_count_;</a>
+<a name="ln312">    // + 1 because zero chunk_seq is not allowed.</a>
+<a name="ln313">    return gscoped_ptr&lt;TraceBufferChunk&gt;(</a>
+<a name="ln314">        new TraceBufferChunk(static_cast&lt;uint32&gt;(*index) + 1));</a>
+<a name="ln315">  }</a>
+<a name="ln316"> </a>
+<a name="ln317">  virtual void ReturnChunk(size_t index,</a>
+<a name="ln318">                           gscoped_ptr&lt;TraceBufferChunk&gt; chunk) override {</a>
+<a name="ln319">    DCHECK_GT(in_flight_chunk_count_, 0u);</a>
+<a name="ln320">    DCHECK_LT(index, chunks_.size());</a>
+<a name="ln321">    DCHECK(!chunks_[index]);</a>
+<a name="ln322">    --in_flight_chunk_count_;</a>
+<a name="ln323">    chunks_[index] = chunk.release();</a>
+<a name="ln324">  }</a>
+<a name="ln325"> </a>
+<a name="ln326">  bool IsFull() const override {</a>
+<a name="ln327">    return chunks_.size() &gt;= kTraceEventVectorBufferChunks;</a>
+<a name="ln328">  }</a>
+<a name="ln329"> </a>
+<a name="ln330">  size_t Size() const override {</a>
+<a name="ln331">    // This is approximate because not all of the chunks are full.</a>
+<a name="ln332">    return chunks_.size() * kTraceBufferChunkSize;</a>
+<a name="ln333">  }</a>
+<a name="ln334"> </a>
+<a name="ln335">  size_t Capacity() const override {</a>
+<a name="ln336">    return kTraceEventVectorBufferChunks * kTraceBufferChunkSize;</a>
+<a name="ln337">  }</a>
+<a name="ln338"> </a>
+<a name="ln339">  TraceEvent* GetEventByHandle(TraceEventHandle handle) override {</a>
+<a name="ln340">    if (handle.chunk_index &gt;= chunks_.size())</a>
+<a name="ln341">      return nullptr;</a>
+<a name="ln342">    TraceBufferChunk* chunk = chunks_[handle.chunk_index];</a>
+<a name="ln343">    if (!chunk || chunk-&gt;seq() != handle.chunk_seq)</a>
+<a name="ln344">      return nullptr;</a>
+<a name="ln345">    return chunk-&gt;GetEventAt(handle.event_index);</a>
+<a name="ln346">  }</a>
+<a name="ln347"> </a>
+<a name="ln348">  const TraceBufferChunk* NextChunk() override {</a>
+<a name="ln349">    while (current_iteration_index_ &lt; chunks_.size()) {</a>
+<a name="ln350">      // Skip in-flight chunks.</a>
+<a name="ln351">      const TraceBufferChunk* chunk = chunks_[current_iteration_index_++];</a>
+<a name="ln352">      if (chunk)</a>
+<a name="ln353">        return chunk;</a>
+<a name="ln354">    }</a>
+<a name="ln355">    return nullptr;</a>
+<a name="ln356">  }</a>
+<a name="ln357"> </a>
+<a name="ln358">  gscoped_ptr&lt;TraceBuffer&gt; CloneForIteration() const override {</a>
+<a name="ln359">    NOTIMPLEMENTED();</a>
+<a name="ln360">    return gscoped_ptr&lt;TraceBuffer&gt;();</a>
+<a name="ln361">  }</a>
+<a name="ln362"> </a>
+<a name="ln363"> private:</a>
+<a name="ln364">  size_t in_flight_chunk_count_;</a>
+<a name="ln365">  size_t current_iteration_index_;</a>
+<a name="ln366">  vector&lt;TraceBufferChunk*&gt; chunks_;</a>
+<a name="ln367"> </a>
+<a name="ln368">  DISALLOW_COPY_AND_ASSIGN(TraceBufferVector);</a>
+<a name="ln369">};</a>
+<a name="ln370"> </a>
+<a name="ln371">template &lt;typename T&gt;</a>
+<a name="ln372">void InitializeMetadataEvent(TraceEvent* trace_event,</a>
+<a name="ln373">                             int thread_id,</a>
+<a name="ln374">                             const char* metadata_name, const char* arg_name,</a>
+<a name="ln375">                             const T&amp; value) {</a>
+<a name="ln376">  if (!trace_event)</a>
+<a name="ln377">    return;</a>
+<a name="ln378"> </a>
+<a name="ln379">  int num_args = 1;</a>
+<a name="ln380">  unsigned char arg_type;</a>
+<a name="ln381">  uint64_t arg_value;</a>
+<a name="ln382">  ::trace_event_internal::SetTraceValue(value, &amp;arg_type, &amp;arg_value);</a>
+<a name="ln383">  trace_event-&gt;Initialize(thread_id,</a>
+<a name="ln384">                          MicrosecondsInt64(0), MicrosecondsInt64(0), TRACE_EVENT_PHASE_METADATA,</a>
+<a name="ln385">                          &amp;g_category_group_enabled[g_category_metadata],</a>
+<a name="ln386">                          metadata_name, ::trace_event_internal::kNoEventId,</a>
+<a name="ln387">                          num_args, &amp;arg_name, &amp;arg_type, &amp;arg_value, nullptr,</a>
+<a name="ln388">                          TRACE_EVENT_FLAG_NONE);</a>
+<a name="ln389">}</a>
+<a name="ln390"> </a>
+<a name="ln391">// RAII object which marks '*dst' with a non-zero value while in scope.</a>
+<a name="ln392">// This assumes that no other threads write to '*dst'.</a>
+<a name="ln393">class MarkFlagInScope {</a>
+<a name="ln394"> public:</a>
+<a name="ln395">  explicit MarkFlagInScope(Atomic32* dst)</a>
+<a name="ln396">      : dst_(dst) {</a>
+<a name="ln397">    // We currently use Acquire_AtomicExchange here because it appears</a>
+<a name="ln398">    // to be the cheapest way of getting an &quot;Acquire_Store&quot; barrier. Actually</a>
+<a name="ln399">    // using Acquire_Store generates more assembly instructions and benchmarks</a>
+<a name="ln400">    // slightly slower.</a>
+<a name="ln401">    //</a>
+<a name="ln402">    // TODO: it would be even faster to avoid the memory barrier here entirely,</a>
+<a name="ln403">    // and do an asymmetric barrier, for example by having the flusher thread</a>
+<a name="ln404">    // send a signal to every registered thread, or wait until every other thread</a>
+<a name="ln405">    // has experienced at least one context switch. A number of options for this</a>
+<a name="ln406">    // are outlined in:</a>
+<a name="ln407">    // http://home.comcast.net/~pjbishop/Dave/Asymmetric-Dekker-Synchronization.txt</a>
+<a name="ln408">    Atomic32 old_val = base::subtle::Acquire_AtomicExchange(dst_, 1);</a>
+<a name="ln409">    DCHECK_EQ(old_val, 0);</a>
+<a name="ln410">  }</a>
+<a name="ln411">  ~MarkFlagInScope() {</a>
+<a name="ln412">    base::subtle::Release_Store(dst_, 0);</a>
+<a name="ln413">  }</a>
+<a name="ln414"> </a>
+<a name="ln415"> private:</a>
+<a name="ln416">  Atomic32* dst_;</a>
+<a name="ln417">  DISALLOW_COPY_AND_ASSIGN(MarkFlagInScope);</a>
+<a name="ln418">};</a>
+<a name="ln419">}  // anonymous namespace</a>
+<a name="ln420"> </a>
+<a name="ln421">TraceLog::ThreadLocalEventBuffer* TraceLog::PerThreadInfo::AtomicTakeBuffer() {</a>
+<a name="ln422">  return reinterpret_cast&lt;TraceLog::ThreadLocalEventBuffer*&gt;(</a>
+<a name="ln423">    base::subtle::Acquire_AtomicExchange(</a>
+<a name="ln424">      reinterpret_cast&lt;AtomicWord*&gt;(&amp;event_buffer_),</a>
+<a name="ln425">      0));</a>
+<a name="ln426">}</a>
+<a name="ln427"> </a>
+<a name="ln428">void TraceBufferChunk::Reset(uint32 new_seq) {</a>
+<a name="ln429">  for (size_t i = 0; i &lt; next_free_; ++i)</a>
+<a name="ln430">    chunk_[i].Reset();</a>
+<a name="ln431">  next_free_ = 0;</a>
+<a name="ln432">  seq_ = new_seq;</a>
+<a name="ln433">}</a>
+<a name="ln434"> </a>
+<a name="ln435">TraceEvent* TraceBufferChunk::AddTraceEvent(size_t* event_index) {</a>
+<a name="ln436">  DCHECK(!IsFull());</a>
+<a name="ln437">  *event_index = next_free_++;</a>
+<a name="ln438">  return &amp;chunk_[*event_index];</a>
+<a name="ln439">}</a>
+<a name="ln440"> </a>
+<a name="ln441">gscoped_ptr&lt;TraceBufferChunk&gt; TraceBufferChunk::Clone() const {</a>
+<a name="ln442">  gscoped_ptr&lt;TraceBufferChunk&gt; cloned_chunk(new TraceBufferChunk(seq_));</a>
+<a name="ln443">  cloned_chunk-&gt;next_free_ = next_free_;</a>
+<a name="ln444">  for (size_t i = 0; i &lt; next_free_; ++i)</a>
+<a name="ln445">    cloned_chunk-&gt;chunk_[i].CopyFrom(chunk_[i]);</a>
+<a name="ln446">  return cloned_chunk.Pass();</a>
+<a name="ln447">}</a>
+<a name="ln448"> </a>
+<a name="ln449">// A helper class that allows the lock to be acquired in the middle of the scope</a>
+<a name="ln450">// and unlocks at the end of scope if locked.</a>
+<a name="ln451">class TraceLog::OptionalAutoLock {</a>
+<a name="ln452"> public:</a>
+<a name="ln453">  explicit OptionalAutoLock(base::SpinLock* lock)</a>
+<a name="ln454">      : lock_(lock),</a>
+<a name="ln455">        locked_(false) {</a>
+<a name="ln456">  }</a>
+<a name="ln457"> </a>
+<a name="ln458">  ~OptionalAutoLock() {</a>
+<a name="ln459">    if (locked_)</a>
+<a name="ln460">      lock_-&gt;Unlock();</a>
+<a name="ln461">  }</a>
+<a name="ln462"> </a>
+<a name="ln463">  void EnsureAcquired() ACQUIRE() {</a>
+<a name="ln464">    if (!locked_) {</a>
+<a name="ln465">      lock_-&gt;Lock();</a>
+<a name="ln466">      locked_ = true;</a>
+<a name="ln467">    }</a>
+<a name="ln468">  }</a>
+<a name="ln469"> </a>
+<a name="ln470"> private:</a>
+<a name="ln471">  base::SpinLock* lock_;</a>
+<a name="ln472">  bool locked_;</a>
+<a name="ln473">  DISALLOW_COPY_AND_ASSIGN(OptionalAutoLock);</a>
+<a name="ln474">};</a>
+<a name="ln475"> </a>
+<a name="ln476">// Use this function instead of TraceEventHandle constructor to keep the</a>
+<a name="ln477">// overhead of ScopedTracer (trace_event.h) constructor minimum.</a>
+<a name="ln478">void MakeHandle(uint32 chunk_seq, size_t chunk_index, size_t event_index,</a>
+<a name="ln479">                TraceEventHandle* handle) {</a>
+<a name="ln480">  DCHECK(chunk_seq);</a>
+<a name="ln481">  DCHECK(chunk_index &lt; (1u &lt;&lt; 16));</a>
+<a name="ln482">  DCHECK(event_index &lt; (1u &lt;&lt; 16));</a>
+<a name="ln483">  handle-&gt;chunk_seq = chunk_seq;</a>
+<a name="ln484">  handle-&gt;chunk_index = static_cast&lt;uint16&gt;(chunk_index);</a>
+<a name="ln485">  handle-&gt;event_index = static_cast&lt;uint16&gt;(event_index);</a>
+<a name="ln486">}</a>
+<a name="ln487"> </a>
+<a name="ln488">////////////////////////////////////////////////////////////////////////////////</a>
+<a name="ln489">//</a>
+<a name="ln490">// TraceEvent</a>
+<a name="ln491">//</a>
+<a name="ln492">////////////////////////////////////////////////////////////////////////////////</a>
+<a name="ln493"> </a>
+<a name="ln494">namespace {</a>
+<a name="ln495"> </a>
+<a name="ln496">size_t GetAllocLength(const char* str) { return str ? strlen(str) + 1 : 0; }</a>
+<a name="ln497"> </a>
+<a name="ln498">// Copies |*member| into |*buffer|, sets |*member| to point to this new</a>
+<a name="ln499">// location, and then advances |*buffer| by the amount written.</a>
+<a name="ln500">void CopyTraceEventParameter(char** buffer,</a>
+<a name="ln501">                             const char** member,</a>
+<a name="ln502">                             const char* end) {</a>
+<a name="ln503">  if (*member) {</a>
+<a name="ln504">    size_t written = strings::strlcpy(*buffer, *member, end - *buffer) + 1;</a>
+<a name="ln505">    DCHECK_LE(static_cast&lt;int&gt;(written), end - *buffer);</a>
+<a name="ln506">    *member = *buffer;</a>
+<a name="ln507">    *buffer += written;</a>
+<a name="ln508">  }</a>
+<a name="ln509">}</a>
+<a name="ln510"> </a>
+<a name="ln511">}  // namespace</a>
+<a name="ln512"> </a>
+<a name="ln513">TraceEvent::TraceEvent()</a>
+<a name="ln514">    : duration_(-1),</a>
+<a name="ln515">      thread_duration_(-1),</a>
+<a name="ln516">      id_(0u),</a>
+<a name="ln517">      category_group_enabled_(nullptr),</a>
+<a name="ln518">      name_(nullptr),</a>
+<a name="ln519">      thread_id_(0),</a>
+<a name="ln520">      phase_(TRACE_EVENT_PHASE_BEGIN),</a>
+<a name="ln521">      flags_(0) {</a>
+<a name="ln522">  for (auto&amp; arg_name : arg_names_) {</a>
+<a name="ln523">    arg_name = nullptr;</a>
+<a name="ln524">  }</a>
+<a name="ln525">  memset(arg_values_, 0, sizeof(arg_values_));</a>
+<a name="ln526">}</a>
+<a name="ln527"> </a>
+<a name="ln528">TraceEvent::~TraceEvent() {</a>
+<a name="ln529">}</a>
+<a name="ln530"> </a>
+<a name="ln531">void TraceEvent::CopyFrom(const TraceEvent&amp; other) {</a>
+<a name="ln532">  timestamp_ = other.timestamp_;</a>
+<a name="ln533">  thread_timestamp_ = other.thread_timestamp_;</a>
+<a name="ln534">  duration_ = other.duration_;</a>
+<a name="ln535">  id_ = other.id_;</a>
+<a name="ln536">  category_group_enabled_ = other.category_group_enabled_;</a>
+<a name="ln537">  name_ = other.name_;</a>
+<a name="ln538">  thread_id_ = other.thread_id_;</a>
+<a name="ln539">  phase_ = other.phase_;</a>
+<a name="ln540">  flags_ = other.flags_;</a>
+<a name="ln541">  parameter_copy_storage_ = other.parameter_copy_storage_;</a>
+<a name="ln542"> </a>
+<a name="ln543">  for (int i = 0; i &lt; kTraceMaxNumArgs; ++i) {</a>
+<a name="ln544">    arg_names_[i] = other.arg_names_[i];</a>
+<a name="ln545">    arg_types_[i] = other.arg_types_[i];</a>
+<a name="ln546">    arg_values_[i] = other.arg_values_[i];</a>
+<a name="ln547">    convertable_values_[i] = other.convertable_values_[i];</a>
+<a name="ln548">  }</a>
+<a name="ln549">}</a>
+<a name="ln550"> </a>
+<a name="ln551">void TraceEvent::Initialize(</a>
+<a name="ln552">    int thread_id,</a>
+<a name="ln553">    MicrosecondsInt64 timestamp,</a>
+<a name="ln554">    MicrosecondsInt64 thread_timestamp,</a>
+<a name="ln555">    char phase,</a>
+<a name="ln556">    const unsigned char* category_group_enabled,</a>
+<a name="ln557">    const char* name,</a>
+<a name="ln558">    uint64_t id,</a>
+<a name="ln559">    int num_args,</a>
+<a name="ln560">    const char** arg_names,</a>
+<a name="ln561">    const unsigned char* arg_types,</a>
+<a name="ln562">    const uint64_t* arg_values,</a>
+<a name="ln563">    const scoped_refptr&lt;ConvertableToTraceFormat&gt;* convertable_values,</a>
+<a name="ln564">    unsigned char flags) {</a>
+<a name="ln565">  timestamp_ = timestamp;</a>
+<a name="ln566">  thread_timestamp_ = thread_timestamp;</a>
+<a name="ln567">  duration_ = -1;;</a>
+<a name="ln568">  id_ = id;</a>
+<a name="ln569">  category_group_enabled_ = category_group_enabled;</a>
+<a name="ln570">  name_ = name;</a>
+<a name="ln571">  thread_id_ = thread_id;</a>
+<a name="ln572">  phase_ = phase;</a>
+<a name="ln573">  flags_ = flags;</a>
+<a name="ln574"> </a>
+<a name="ln575">  // Clamp num_args since it may have been set by a third_party library.</a>
+<a name="ln576">  num_args = (num_args &gt; kTraceMaxNumArgs) ? kTraceMaxNumArgs : num_args;</a>
+<a name="ln577">  int i = 0;</a>
+<a name="ln578">  for (; i &lt; num_args; ++i) {</a>
+<a name="ln579">    arg_names_[i] = arg_names[i];</a>
+<a name="ln580">    arg_types_[i] = arg_types[i];</a>
+<a name="ln581"> </a>
+<a name="ln582">    if (arg_types[i] == TRACE_VALUE_TYPE_CONVERTABLE)</a>
+<a name="ln583">      convertable_values_[i] = convertable_values[i];</a>
+<a name="ln584">    else</a>
+<a name="ln585">      arg_values_[i].as_uint = arg_values[i];</a>
+<a name="ln586">  }</a>
+<a name="ln587">  for (; i &lt; kTraceMaxNumArgs; ++i) {</a>
+<a name="ln588">    arg_names_[i] = nullptr;</a>
+<a name="ln589">    arg_values_[i].as_uint = 0u;</a>
+<a name="ln590">    convertable_values_[i] = nullptr;</a>
+<a name="ln591">    arg_types_[i] = TRACE_VALUE_TYPE_UINT;</a>
+<a name="ln592">  }</a>
+<a name="ln593"> </a>
+<a name="ln594">  bool copy = !!(flags &amp; TRACE_EVENT_FLAG_COPY);</a>
+<a name="ln595">  size_t alloc_size = 0;</a>
+<a name="ln596">  if (copy) {</a>
+<a name="ln597">    alloc_size += GetAllocLength(name);</a>
+<a name="ln598">    for (i = 0; i &lt; num_args; ++i) {</a>
+<a name="ln599">      alloc_size += GetAllocLength(arg_names_[i]);</a>
+<a name="ln600">      if (arg_types_[i] == TRACE_VALUE_TYPE_STRING)</a>
+<a name="ln601">        arg_types_[i] = TRACE_VALUE_TYPE_COPY_STRING;</a>
+<a name="ln602">    }</a>
+<a name="ln603">  }</a>
+<a name="ln604"> </a>
+<a name="ln605">  bool arg_is_copy[kTraceMaxNumArgs];</a>
+<a name="ln606">  for (i = 0; i &lt; num_args; ++i) {</a>
+<a name="ln607">    // No copying of convertible types, we retain ownership.</a>
+<a name="ln608">    if (arg_types_[i] == TRACE_VALUE_TYPE_CONVERTABLE) {</a>
+<a name="ln609">      arg_is_copy[i] = false;  // Without this, clang analyzer complaisn below.</a>
+<a name="ln610">      continue;</a>
+<a name="ln611">    }</a>
+<a name="ln612"> </a>
+<a name="ln613">    // We only take a copy of arg_vals if they are of type COPY_STRING.</a>
+<a name="ln614">    arg_is_copy[i] = (arg_types_[i] == TRACE_VALUE_TYPE_COPY_STRING);</a>
+<a name="ln615">    if (arg_is_copy[i])</a>
+<a name="ln616">      alloc_size += GetAllocLength(arg_values_[i].as_string);</a>
+<a name="ln617">  }</a>
+<a name="ln618"> </a>
+<a name="ln619">  if (alloc_size) {</a>
+<a name="ln620">    parameter_copy_storage_ = new RefCountedString;</a>
+<a name="ln621">    parameter_copy_storage_-&gt;data().resize(alloc_size);</a>
+<a name="ln622">    char* ptr = string_as_array(&amp;parameter_copy_storage_-&gt;data());</a>
+<a name="ln623">    const char* end = ptr + alloc_size;</a>
+<a name="ln624">    if (copy) {</a>
+<a name="ln625">      CopyTraceEventParameter(&amp;ptr, &amp;name_, end);</a>
+<a name="ln626">      for (i = 0; i &lt; num_args; ++i) {</a>
+<a name="ln627">        CopyTraceEventParameter(&amp;ptr, &amp;arg_names_[i], end);</a>
+<a name="ln628">      }</a>
+<a name="ln629">    }</a>
+<a name="ln630">    for (i = 0; i &lt; num_args; ++i) {</a>
+<a name="ln631">      if (arg_types_[i] == TRACE_VALUE_TYPE_CONVERTABLE)</a>
+<a name="ln632">        continue;</a>
+<a name="ln633">      // Without the assignment to arg_is_copy[i] before a continue statement above, clang</a>
+<a name="ln634">      // analyzer says this here:</a>
+<a name="ln635">      // warning: Branch condition evaluates to a garbage value</a>
+<a name="ln636">      if (arg_is_copy[i]) {</a>
+<a name="ln637">        CopyTraceEventParameter(&amp;ptr, &amp;arg_values_[i].as_string, end);</a>
+<a name="ln638">      }</a>
+<a name="ln639">    }</a>
+<a name="ln640">    DCHECK_EQ(end, ptr) &lt;&lt; &quot;Overrun by &quot; &lt;&lt; ptr - end;</a>
+<a name="ln641">  }</a>
+<a name="ln642">}</a>
+<a name="ln643"> </a>
+<a name="ln644">void TraceEvent::Reset() {</a>
+<a name="ln645">  // Only reset fields that won't be initialized in Initialize(), or that may</a>
+<a name="ln646">  // hold references to other objects.</a>
+<a name="ln647">  duration_ = -1;;</a>
+<a name="ln648">  parameter_copy_storage_ = nullptr;</a>
+<a name="ln649">  for (int i = 0; i &lt; kTraceMaxNumArgs &amp;&amp; arg_names_[i]; ++i)</a>
+<a name="ln650">    convertable_values_[i] = nullptr;</a>
+<a name="ln651">}</a>
+<a name="ln652"> </a>
+<a name="ln653">void TraceEvent::UpdateDuration(const MicrosecondsInt64&amp; now,</a>
+<a name="ln654">                                const MicrosecondsInt64&amp; thread_now) {</a>
+<a name="ln655">  DCHECK_EQ(duration_, -1);</a>
+<a name="ln656">  duration_ = now - timestamp_;</a>
+<a name="ln657">  thread_duration_ = thread_now - thread_timestamp_;</a>
+<a name="ln658">}</a>
+<a name="ln659"> </a>
+<a name="ln660">namespace {</a>
+<a name="ln661">// Escape the given string using JSON rules.</a>
+<a name="ln662">void JsonEscape(GStringPiece s, string* out) {</a>
+<a name="ln663">  out-&gt;reserve(out-&gt;size() + s.size() * 2);</a>
+<a name="ln664">  const char* p_end = s.data() + s.size();</a>
+<a name="ln665">  for (const char* p = s.data(); p != p_end; p++) {</a>
+<a name="ln666">    // Only the following characters need to be escaped, according to json.org.</a>
+<a name="ln667">    // In particular, it's illegal to escape the single-quote character, and</a>
+<a name="ln668">    // JSON does not support the &quot;\x&quot; escape sequence like C/Java.</a>
+<a name="ln669">    switch (*p) {</a>
+<a name="ln670">      case '&quot;':</a>
+<a name="ln671">      case '\\':</a>
+<a name="ln672">        out-&gt;push_back('\\');</a>
+<a name="ln673">        out-&gt;push_back(*p);</a>
+<a name="ln674">        break;</a>
+<a name="ln675">      case '\b':</a>
+<a name="ln676">        out-&gt;append(&quot;\\b&quot;);</a>
+<a name="ln677">        break;</a>
+<a name="ln678">      case '\f':</a>
+<a name="ln679">        out-&gt;append(&quot;\\f&quot;);</a>
+<a name="ln680">        break;</a>
+<a name="ln681">      case '\n':</a>
+<a name="ln682">        out-&gt;append(&quot;\\n&quot;);</a>
+<a name="ln683">        // The following break statement was missing in the original Kudu code, most likely a bug.</a>
+<a name="ln684">        break;</a>
+<a name="ln685">      case '\r':</a>
+<a name="ln686">        out-&gt;append(&quot;\\r&quot;);</a>
+<a name="ln687">        break;</a>
+<a name="ln688">      case '\t':</a>
+<a name="ln689">        out-&gt;append(&quot;\\t&quot;);</a>
+<a name="ln690">        break;</a>
+<a name="ln691">      default:</a>
+<a name="ln692">        out-&gt;push_back(*p);</a>
+<a name="ln693">    }</a>
+<a name="ln694">  }</a>
+<a name="ln695">}</a>
+<a name="ln696">} // anonymous namespace</a>
+<a name="ln697"> </a>
+<a name="ln698">// static</a>
+<a name="ln699">void TraceEvent::AppendValueAsJSON(unsigned char type,</a>
+<a name="ln700">                                   TraceEvent::TraceValue value,</a>
+<a name="ln701">                                   std::string* out) {</a>
+<a name="ln702">  switch (type) {</a>
+<a name="ln703">    case TRACE_VALUE_TYPE_BOOL:</a>
+<a name="ln704">      *out += value.as_bool ? &quot;true&quot; : &quot;false&quot;;</a>
+<a name="ln705">      break;</a>
+<a name="ln706">    case TRACE_VALUE_TYPE_UINT:</a>
+<a name="ln707">      SubstituteAndAppend(out, &quot;$0&quot;, static_cast&lt;uint64&gt;(value.as_uint));</a>
+<a name="ln708">      break;</a>
+<a name="ln709">    case TRACE_VALUE_TYPE_INT:</a>
+<a name="ln710">      SubstituteAndAppend(out, &quot;$0&quot;, static_cast&lt;int64&gt;(value.as_int));</a>
+<a name="ln711">      break;</a>
+<a name="ln712">    case TRACE_VALUE_TYPE_DOUBLE: {</a>
+<a name="ln713">      // FIXME: base/json/json_writer.cc is using the same code,</a>
+<a name="ln714">      //        should be made into a common method.</a>
+<a name="ln715">      std::string real;</a>
+<a name="ln716">      double val = value.as_double;</a>
+<a name="ln717">      if (MathLimits&lt;double&gt;::IsFinite(val)) {</a>
+<a name="ln718">        real = strings::Substitute(&quot;$0&quot;, val);</a>
+<a name="ln719">        // Ensure that the number has a .0 if there's no decimal or 'e'.  This</a>
+<a name="ln720">        // makes sure that when we read the JSON back, it's interpreted as a</a>
+<a name="ln721">        // real rather than an int.</a>
+<a name="ln722">        if (real.find('.') == std::string::npos &amp;&amp;</a>
+<a name="ln723">            real.find('e') == std::string::npos &amp;&amp;</a>
+<a name="ln724">            real.find('E') == std::string::npos) {</a>
+<a name="ln725">          real.append(&quot;.0&quot;);</a>
+<a name="ln726">        }</a>
+<a name="ln727">        // The JSON spec requires that non-integer values in the range (-1,1)</a>
+<a name="ln728">        // have a zero before the decimal point - &quot;.52&quot; is not valid, &quot;0.52&quot; is.</a>
+<a name="ln729">        if (real[0] == '.') {</a>
+<a name="ln730">          real.insert(0, &quot;0&quot;);</a>
+<a name="ln731">        } else if (real.length() &gt; 1 &amp;&amp; real[0] == '-' &amp;&amp; real[1] == '.') {</a>
+<a name="ln732">          // &quot;-.1&quot; bad &quot;-0.1&quot; good</a>
+<a name="ln733">          real.insert(1, &quot;0&quot;);</a>
+<a name="ln734">        }</a>
+<a name="ln735">      } else if (MathLimits&lt;double&gt;::IsNaN(val)) {</a>
+<a name="ln736">        // The JSON spec doesn't allow NaN and Infinity (since these are</a>
+<a name="ln737">        // objects in EcmaScript).  Use strings instead.</a>
+<a name="ln738">        real = &quot;\&quot;NaN\&quot;&quot;;</a>
+<a name="ln739">      } else if (val &lt; 0) {</a>
+<a name="ln740">        real = &quot;\&quot;-Infinity\&quot;&quot;;</a>
+<a name="ln741">      } else {</a>
+<a name="ln742">        real = &quot;\&quot;Infinity\&quot;&quot;;</a>
+<a name="ln743">      }</a>
+<a name="ln744">      SubstituteAndAppend(out, &quot;$0&quot;, real);</a>
+<a name="ln745">      break;</a>
+<a name="ln746">    }</a>
+<a name="ln747">    case TRACE_VALUE_TYPE_POINTER:</a>
+<a name="ln748">      // JSON only supports double and int numbers.</a>
+<a name="ln749">      // So as not to lose bits from a 64-bit pointer, output as a hex string.</a>
+<a name="ln750">      StringAppendF(out, &quot;\&quot;0x%&quot; PRIx64 &quot;\&quot;&quot;, static_cast&lt;uint64&gt;(</a>
+<a name="ln751">                                     reinterpret_cast&lt;intptr_t&gt;(</a>
+<a name="ln752">                                     value.as_pointer)));</a>
+<a name="ln753">      break;</a>
+<a name="ln754">    case TRACE_VALUE_TYPE_STRING:</a>
+<a name="ln755">    case TRACE_VALUE_TYPE_COPY_STRING:</a>
+<a name="ln756">      *out += &quot;\&quot;&quot;;</a>
+<a name="ln757">      JsonEscape(value.as_string ? value.as_string : &quot;NULL&quot;, out);</a>
+<a name="ln758">      *out += &quot;\&quot;&quot;;</a>
+<a name="ln759">      break;</a>
+<a name="ln760">    default:</a>
+<a name="ln761">      LOG(FATAL) &lt;&lt; &quot;Don't know how to print this value&quot;;</a>
+<a name="ln762">      break;</a>
+<a name="ln763">  }</a>
+<a name="ln764">}</a>
+<a name="ln765"> </a>
+<a name="ln766">void TraceEvent::AppendAsJSON(std::string* out) const {</a>
+<a name="ln767">  int64 time_int64 = timestamp_;</a>
+<a name="ln768">  int process_id = TraceLog::GetInstance()-&gt;process_id();</a>
+<a name="ln769">  // Category group checked at category creation time.</a>
+<a name="ln770">  DCHECK(!strchr(name_, '&quot;'));</a>
+<a name="ln771">  StringAppendF(out,</a>
+<a name="ln772">      &quot;{\&quot;cat\&quot;:\&quot;%s\&quot;,\&quot;pid\&quot;:%i,\&quot;tid\&quot;:%i,\&quot;ts\&quot;:%&quot; PRId64 &quot;,&quot;</a>
+<a name="ln773">      &quot;\&quot;ph\&quot;:\&quot;%c\&quot;,\&quot;name\&quot;:\&quot;%s\&quot;,\&quot;args\&quot;:{&quot;,</a>
+<a name="ln774">      TraceLog::GetCategoryGroupName(category_group_enabled_),</a>
+<a name="ln775">      process_id,</a>
+<a name="ln776">      thread_id_,</a>
+<a name="ln777">      time_int64,</a>
+<a name="ln778">      phase_,</a>
+<a name="ln779">      name_);</a>
+<a name="ln780"> </a>
+<a name="ln781">  // Output argument names and values, stop at first NULL argument name.</a>
+<a name="ln782">  for (int i = 0; i &lt; kTraceMaxNumArgs &amp;&amp; arg_names_[i]; ++i) {</a>
+<a name="ln783">    if (i &gt; 0)</a>
+<a name="ln784">      *out += &quot;,&quot;;</a>
+<a name="ln785">    *out += &quot;\&quot;&quot;;</a>
+<a name="ln786">    *out += arg_names_[i];</a>
+<a name="ln787">    *out += &quot;\&quot;:&quot;;</a>
+<a name="ln788"> </a>
+<a name="ln789">    if (arg_types_[i] == TRACE_VALUE_TYPE_CONVERTABLE)</a>
+<a name="ln790">      convertable_values_[i]-&gt;AppendAsTraceFormat(out);</a>
+<a name="ln791">    else</a>
+<a name="ln792">      AppendValueAsJSON(arg_types_[i], arg_values_[i], out);</a>
+<a name="ln793">  }</a>
+<a name="ln794">  *out += &quot;}&quot;;</a>
+<a name="ln795"> </a>
+<a name="ln796">  if (phase_ == TRACE_EVENT_PHASE_COMPLETE) {</a>
+<a name="ln797">    int64 duration = duration_;</a>
+<a name="ln798">    if (duration != -1)</a>
+<a name="ln799">      StringAppendF(out, &quot;,\&quot;dur\&quot;:%&quot; PRId64, duration);</a>
+<a name="ln800">    if (thread_timestamp_ &gt;= 0) {</a>
+<a name="ln801">      int64 thread_duration = thread_duration_;</a>
+<a name="ln802">      if (thread_duration != -1)</a>
+<a name="ln803">        StringAppendF(out, &quot;,\&quot;tdur\&quot;:%&quot; PRId64, thread_duration);</a>
+<a name="ln804">    }</a>
+<a name="ln805">  }</a>
+<a name="ln806"> </a>
+<a name="ln807">  // Output tts if thread_timestamp is valid.</a>
+<a name="ln808">  if (thread_timestamp_ &gt;= 0) {</a>
+<a name="ln809">    int64 thread_time_int64 = thread_timestamp_;</a>
+<a name="ln810">    StringAppendF(out, &quot;,\&quot;tts\&quot;:%&quot; PRId64, thread_time_int64);</a>
+<a name="ln811">  }</a>
+<a name="ln812"> </a>
+<a name="ln813">  // If id_ is set, print it out as a hex string so we don't loose any</a>
+<a name="ln814">  // bits (it might be a 64-bit pointer).</a>
+<a name="ln815">  if (flags_ &amp; TRACE_EVENT_FLAG_HAS_ID)</a>
+<a name="ln816">    StringAppendF(out, &quot;,\&quot;id\&quot;:\&quot;0x%&quot; PRIx64 &quot;\&quot;&quot;, static_cast&lt;uint64&gt;(id_));</a>
+<a name="ln817"> </a>
+<a name="ln818">  // Instant events also output their scope.</a>
+<a name="ln819">  if (phase_ == TRACE_EVENT_PHASE_INSTANT) {</a>
+<a name="ln820">    char scope = '?';</a>
+<a name="ln821">    switch (flags_ &amp; TRACE_EVENT_FLAG_SCOPE_MASK) {</a>
+<a name="ln822">      case TRACE_EVENT_SCOPE_GLOBAL:</a>
+<a name="ln823">        scope = TRACE_EVENT_SCOPE_NAME_GLOBAL;</a>
+<a name="ln824">        break;</a>
+<a name="ln825"> </a>
+<a name="ln826">      case TRACE_EVENT_SCOPE_PROCESS:</a>
+<a name="ln827">        scope = TRACE_EVENT_SCOPE_NAME_PROCESS;</a>
+<a name="ln828">        break;</a>
+<a name="ln829"> </a>
+<a name="ln830">      case TRACE_EVENT_SCOPE_THREAD:</a>
+<a name="ln831">        scope = TRACE_EVENT_SCOPE_NAME_THREAD;</a>
+<a name="ln832">        break;</a>
+<a name="ln833">    }</a>
+<a name="ln834">    StringAppendF(out, &quot;,\&quot;s\&quot;:\&quot;%c\&quot;&quot;, scope);</a>
+<a name="ln835">  }</a>
+<a name="ln836"> </a>
+<a name="ln837">  *out += &quot;}&quot;;</a>
+<a name="ln838">}</a>
+<a name="ln839"> </a>
+<a name="ln840">void TraceEvent::AppendPrettyPrinted(std::ostringstream* out) const {</a>
+<a name="ln841">  *out &lt;&lt; name_ &lt;&lt; &quot;[&quot;;</a>
+<a name="ln842">  *out &lt;&lt; TraceLog::GetCategoryGroupName(category_group_enabled_);</a>
+<a name="ln843">  *out &lt;&lt; &quot;]&quot;;</a>
+<a name="ln844">  if (arg_names_[0]) {</a>
+<a name="ln845">    *out &lt;&lt; &quot;, {&quot;;</a>
+<a name="ln846">    for (int i = 0; i &lt; kTraceMaxNumArgs &amp;&amp; arg_names_[i]; ++i) {</a>
+<a name="ln847">      if (i &gt; 0)</a>
+<a name="ln848">        *out &lt;&lt; &quot;, &quot;;</a>
+<a name="ln849">      *out &lt;&lt; arg_names_[i] &lt;&lt; &quot;:&quot;;</a>
+<a name="ln850">      std::string value_as_text;</a>
+<a name="ln851"> </a>
+<a name="ln852">      if (arg_types_[i] == TRACE_VALUE_TYPE_CONVERTABLE)</a>
+<a name="ln853">        convertable_values_[i]-&gt;AppendAsTraceFormat(&amp;value_as_text);</a>
+<a name="ln854">      else</a>
+<a name="ln855">        AppendValueAsJSON(arg_types_[i], arg_values_[i], &amp;value_as_text);</a>
+<a name="ln856"> </a>
+<a name="ln857">      *out &lt;&lt; value_as_text;</a>
+<a name="ln858">    }</a>
+<a name="ln859">    *out &lt;&lt; &quot;}&quot;;</a>
+<a name="ln860">  }</a>
+<a name="ln861">}</a>
+<a name="ln862"> </a>
+<a name="ln863">////////////////////////////////////////////////////////////////////////////////</a>
+<a name="ln864">//</a>
+<a name="ln865">// TraceResultBuffer</a>
+<a name="ln866">//</a>
+<a name="ln867">////////////////////////////////////////////////////////////////////////////////</a>
+<a name="ln868"> </a>
+<a name="ln869">string TraceResultBuffer::FlushTraceLogToString() {</a>
+<a name="ln870">  return DoFlush(false);</a>
+<a name="ln871">}</a>
+<a name="ln872"> </a>
+<a name="ln873">string TraceResultBuffer::FlushTraceLogToStringButLeaveBufferIntact() {</a>
+<a name="ln874">  return DoFlush(true);</a>
+<a name="ln875">}</a>
+<a name="ln876"> </a>
+<a name="ln877">string TraceResultBuffer::DoFlush(bool leave_intact) {</a>
+<a name="ln878">  TraceResultBuffer buf;</a>
+<a name="ln879">  TraceLog* tl = TraceLog::GetInstance();</a>
+<a name="ln880">  if (leave_intact) {</a>
+<a name="ln881">    tl-&gt;FlushButLeaveBufferIntact(Bind(&amp;TraceResultBuffer::Collect, Unretained(&amp;buf)));</a>
+<a name="ln882">  } else {</a>
+<a name="ln883">    tl-&gt;Flush(Bind(&amp;TraceResultBuffer::Collect, Unretained(&amp;buf)));</a>
+<a name="ln884">  }</a>
+<a name="ln885">  buf.json_.append(&quot;]}\n&quot;);</a>
+<a name="ln886">  return buf.json_;</a>
+<a name="ln887">}</a>
+<a name="ln888"> </a>
+<a name="ln889">TraceResultBuffer::TraceResultBuffer()</a>
+<a name="ln890">  : first_(true) {</a>
+<a name="ln891">}</a>
+<a name="ln892">TraceResultBuffer::~TraceResultBuffer() {</a>
+<a name="ln893">}</a>
+<a name="ln894"> </a>
+<a name="ln895">void TraceResultBuffer::Collect(</a>
+<a name="ln896">  const scoped_refptr&lt;RefCountedString&gt;&amp; s,</a>
+<a name="ln897">  bool has_more_events) {</a>
+<a name="ln898">  if (first_) {</a>
+<a name="ln899">    json_.append(&quot;{\&quot;traceEvents\&quot;: [\n&quot;);</a>
+<a name="ln900">    first_ = false;</a>
+<a name="ln901">  } else if (!s-&gt;data().empty()) {</a>
+<a name="ln902">    // Sometimes we get sent an empty chunk at the end,</a>
+<a name="ln903">    // and we don't want to end up with an extra trailing ','.</a>
+<a name="ln904">    json_.append(&quot;,\n&quot;);</a>
+<a name="ln905">  }</a>
+<a name="ln906">  json_.append(s-&gt;data());</a>
+<a name="ln907">}</a>
+<a name="ln908"> </a>
+<a name="ln909">////////////////////////////////////////////////////////////////////////////////</a>
+<a name="ln910">//</a>
+<a name="ln911">// TraceSamplingThread</a>
+<a name="ln912">//</a>
+<a name="ln913">////////////////////////////////////////////////////////////////////////////////</a>
+<a name="ln914">class TraceBucketData;</a>
+<a name="ln915">typedef Callback&lt;void(TraceBucketData*)&gt; TraceSampleCallback;</a>
+<a name="ln916"> </a>
+<a name="ln917">class TraceBucketData {</a>
+<a name="ln918"> public:</a>
+<a name="ln919">  TraceBucketData(AtomicWord* bucket,</a>
+<a name="ln920">                  const char* name,</a>
+<a name="ln921">                  TraceSampleCallback callback);</a>
+<a name="ln922">  ~TraceBucketData();</a>
+<a name="ln923"> </a>
+<a name="ln924">  TRACE_EVENT_API_ATOMIC_WORD* bucket;</a>
+<a name="ln925">  const char* bucket_name;</a>
+<a name="ln926">  TraceSampleCallback callback;</a>
+<a name="ln927">};</a>
+<a name="ln928"> </a>
+<a name="ln929">// This object must be created on the IO thread.</a>
+<a name="ln930">class TraceSamplingThread {</a>
+<a name="ln931"> public:</a>
+<a name="ln932">  TraceSamplingThread();</a>
+<a name="ln933">  virtual ~TraceSamplingThread();</a>
+<a name="ln934"> </a>
+<a name="ln935">  void ThreadMain();</a>
+<a name="ln936"> </a>
+<a name="ln937">  static void DefaultSamplingCallback(TraceBucketData* bucekt_data);</a>
+<a name="ln938"> </a>
+<a name="ln939">  void Stop();</a>
+<a name="ln940"> </a>
+<a name="ln941"> private:</a>
+<a name="ln942">  friend class TraceLog;</a>
+<a name="ln943"> </a>
+<a name="ln944">  void GetSamples();</a>
+<a name="ln945">  // Not thread-safe. Once the ThreadMain has been called, this can no longer</a>
+<a name="ln946">  // be called.</a>
+<a name="ln947">  void RegisterSampleBucket(TRACE_EVENT_API_ATOMIC_WORD* bucket,</a>
+<a name="ln948">                            const char* const name,</a>
+<a name="ln949">                            TraceSampleCallback callback);</a>
+<a name="ln950">  // Splits a combined &quot;category\0name&quot; into the two component parts.</a>
+<a name="ln951">  static void ExtractCategoryAndName(const char* combined,</a>
+<a name="ln952">                                     const char** category,</a>
+<a name="ln953">                                     const char** name);</a>
+<a name="ln954">  std::vector&lt;TraceBucketData&gt; sample_buckets_;</a>
+<a name="ln955">  bool thread_running_;</a>
+<a name="ln956">  AtomicBool cancellation_flag_;</a>
+<a name="ln957">};</a>
+<a name="ln958"> </a>
+<a name="ln959"> </a>
+<a name="ln960">TraceSamplingThread::TraceSamplingThread()</a>
+<a name="ln961">  : thread_running_(false),</a>
+<a name="ln962">    cancellation_flag_(false) {</a>
+<a name="ln963">}</a>
+<a name="ln964"> </a>
+<a name="ln965">TraceSamplingThread::~TraceSamplingThread() {</a>
+<a name="ln966">}</a>
+<a name="ln967"> </a>
+<a name="ln968">void TraceSamplingThread::ThreadMain() {</a>
+<a name="ln969">  thread_running_ = true;</a>
+<a name="ln970">  const MonoDelta sleepDelta = MonoDelta::FromMicroseconds(1000);</a>
+<a name="ln971">  while (!cancellation_flag_.Load()) {</a>
+<a name="ln972">    SleepFor(sleepDelta);</a>
+<a name="ln973">    GetSamples();</a>
+<a name="ln974">  }</a>
+<a name="ln975">}</a>
+<a name="ln976"> </a>
+<a name="ln977">// static</a>
+<a name="ln978">void TraceSamplingThread::DefaultSamplingCallback(</a>
+<a name="ln979">    TraceBucketData* bucket_data) {</a>
+<a name="ln980">  TRACE_EVENT_API_ATOMIC_WORD category_and_name =</a>
+<a name="ln981">      TRACE_EVENT_API_ATOMIC_LOAD(*bucket_data-&gt;bucket);</a>
+<a name="ln982">  if (!category_and_name)</a>
+<a name="ln983">    return;</a>
+<a name="ln984">  const char* const combined =</a>
+<a name="ln985">      reinterpret_cast&lt;const char* const&gt;(category_and_name);</a>
+<a name="ln986">  const char* category_group;</a>
+<a name="ln987">  const char* name;</a>
+<a name="ln988">  ExtractCategoryAndName(combined, &amp;category_group, &amp;name);</a>
+<a name="ln989"> </a>
+<a name="ln990">  TRACE_EVENT_API_ADD_TRACE_EVENT(TRACE_EVENT_PHASE_SAMPLE,</a>
+<a name="ln991">      TraceLog::GetCategoryGroupEnabled(category_group),</a>
+<a name="ln992">      name, 0, 0, nullptr, nullptr, nullptr, nullptr, 0);</a>
+<a name="ln993">}</a>
+<a name="ln994"> </a>
+<a name="ln995">void TraceSamplingThread::GetSamples() {</a>
+<a name="ln996">  for (auto&amp; sample_bucket : sample_buckets_) {</a>
+<a name="ln997">    TraceBucketData* bucket_data = &amp;sample_bucket;</a>
+<a name="ln998">    bucket_data-&gt;callback.Run(bucket_data);</a>
+<a name="ln999">  }</a>
+<a name="ln1000">}</a>
+<a name="ln1001"> </a>
+<a name="ln1002">void TraceSamplingThread::RegisterSampleBucket(</a>
+<a name="ln1003">    TRACE_EVENT_API_ATOMIC_WORD* bucket,</a>
+<a name="ln1004">    const char* const name,</a>
+<a name="ln1005">    TraceSampleCallback callback) {</a>
+<a name="ln1006">  // Access to sample_buckets_ doesn't cause races with the sampling thread</a>
+<a name="ln1007">  // that uses the sample_buckets_, because it is guaranteed that</a>
+<a name="ln1008">  // RegisterSampleBucket is called before the sampling thread is created.</a>
+<a name="ln1009">  DCHECK(!thread_running_);</a>
+<a name="ln1010">  sample_buckets_.push_back(TraceBucketData(bucket, name, callback));</a>
+<a name="ln1011">}</a>
+<a name="ln1012"> </a>
+<a name="ln1013">// static</a>
+<a name="ln1014">void TraceSamplingThread::ExtractCategoryAndName(const char* combined,</a>
+<a name="ln1015">                                                 const char** category,</a>
+<a name="ln1016">                                                 const char** name) {</a>
+<a name="ln1017">  *category = combined;</a>
+<a name="ln1018">  *name = &amp;combined[strlen(combined) + 1];</a>
+<a name="ln1019">}</a>
+<a name="ln1020"> </a>
+<a name="ln1021">void TraceSamplingThread::Stop() {</a>
+<a name="ln1022">  cancellation_flag_.Store(true);</a>
+<a name="ln1023">}</a>
+<a name="ln1024"> </a>
+<a name="ln1025">TraceBucketData::TraceBucketData(AtomicWord* bucket, const char* name,</a>
+<a name="ln1026">                                 TraceSampleCallback callback)</a>
+<a name="ln1027">    : bucket(bucket), bucket_name(name), callback(std::move(callback)) {}</a>
+<a name="ln1028"> </a>
+<a name="ln1029">TraceBucketData::~TraceBucketData() {</a>
+<a name="ln1030">}</a>
+<a name="ln1031"> </a>
+<a name="ln1032">////////////////////////////////////////////////////////////////////////////////</a>
+<a name="ln1033">//</a>
+<a name="ln1034">// TraceLog</a>
+<a name="ln1035">//</a>
+<a name="ln1036">////////////////////////////////////////////////////////////////////////////////</a>
+<a name="ln1037"> </a>
+<a name="ln1038">class TraceLog::ThreadLocalEventBuffer {</a>
+<a name="ln1039"> public:</a>
+<a name="ln1040">  explicit ThreadLocalEventBuffer(TraceLog* trace_log);</a>
+<a name="ln1041">  virtual ~ThreadLocalEventBuffer();</a>
+<a name="ln1042"> </a>
+<a name="ln1043">  TraceEvent* AddTraceEvent(TraceEventHandle* handle);</a>
+<a name="ln1044"> </a>
+<a name="ln1045">  TraceEvent* GetEventByHandle(TraceEventHandle handle) {</a>
+<a name="ln1046">    if (!chunk_ || handle.chunk_seq != chunk_-&gt;seq() ||</a>
+<a name="ln1047">        handle.chunk_index != chunk_index_)</a>
+<a name="ln1048">      return nullptr;</a>
+<a name="ln1049"> </a>
+<a name="ln1050">    return chunk_-&gt;GetEventAt(handle.event_index);</a>
+<a name="ln1051">  }</a>
+<a name="ln1052"> </a>
+<a name="ln1053">  int generation() const { return generation_; }</a>
+<a name="ln1054"> </a>
+<a name="ln1055">  void Flush(int64_t tid);</a>
+<a name="ln1056"> </a>
+<a name="ln1057"> private:</a>
+<a name="ln1058">  // Check that the current thread is the one that constructed this trace buffer.</a>
+<a name="ln1059">  void CheckIsOwnerThread() const {</a>
+<a name="ln1060">    DCHECK_EQ(yb::Thread::UniqueThreadId(), owner_tid_);</a>
+<a name="ln1061">  }</a>
+<a name="ln1062"> </a>
+<a name="ln1063">  // Since TraceLog is a leaky singleton, trace_log_ will always be valid</a>
+<a name="ln1064">  // as long as the thread exists.</a>
+<a name="ln1065">  TraceLog* trace_log_;</a>
+<a name="ln1066">  gscoped_ptr&lt;TraceBufferChunk&gt; chunk_;</a>
+<a name="ln1067">  size_t chunk_index_;</a>
+<a name="ln1068">  int generation_;</a>
+<a name="ln1069"> </a>
+<a name="ln1070">  // The TID of the thread that constructed this event buffer. Only this thread</a>
+<a name="ln1071">  // may add trace events.</a>
+<a name="ln1072">  int64_t owner_tid_;</a>
+<a name="ln1073"> </a>
+<a name="ln1074">  DISALLOW_COPY_AND_ASSIGN(ThreadLocalEventBuffer);</a>
+<a name="ln1075">};</a>
+<a name="ln1076"> </a>
+<a name="ln1077">TraceLog::ThreadLocalEventBuffer::ThreadLocalEventBuffer(TraceLog* trace_log)</a>
+<a name="ln1078">    : trace_log_(trace_log),</a>
+<a name="ln1079">      chunk_index_(0),</a>
+<a name="ln1080">      generation_(trace_log-&gt;generation()),</a>
+<a name="ln1081">      owner_tid_(yb::Thread::UniqueThreadId()) {</a>
+<a name="ln1082">}</a>
+<a name="ln1083"> </a>
+<a name="ln1084">TraceLog::ThreadLocalEventBuffer::~ThreadLocalEventBuffer() {</a>
+<a name="ln1085">}</a>
+<a name="ln1086"> </a>
+<a name="ln1087">TraceEvent* TraceLog::ThreadLocalEventBuffer::AddTraceEvent(</a>
+<a name="ln1088">    TraceEventHandle* handle) {</a>
+<a name="ln1089">  CheckIsOwnerThread();</a>
+<a name="ln1090"> </a>
+<a name="ln1091">  if (chunk_ &amp;&amp; chunk_-&gt;IsFull()) {</a>
+<a name="ln1092">    SpinLockHolder lock(&amp;trace_log_-&gt;lock_);</a>
+<a name="ln1093">    Flush(Thread::UniqueThreadId());</a>
+<a name="ln1094">    chunk_.reset();</a>
+<a name="ln1095">  }</a>
+<a name="ln1096">  if (!chunk_) {</a>
+<a name="ln1097">    SpinLockHolder lock(&amp;trace_log_-&gt;lock_);</a>
+<a name="ln1098">    chunk_ = trace_log_-&gt;logged_events_-&gt;GetChunk(&amp;chunk_index_);</a>
+<a name="ln1099">    trace_log_-&gt;CheckIfBufferIsFullWhileLocked();</a>
+<a name="ln1100">  }</a>
+<a name="ln1101">  if (!chunk_)</a>
+<a name="ln1102">    return nullptr;</a>
+<a name="ln1103"> </a>
+<a name="ln1104">  size_t event_index;</a>
+<a name="ln1105">  TraceEvent* trace_event = chunk_-&gt;AddTraceEvent(&amp;event_index);</a>
+<a name="ln1106">  if (trace_event &amp;&amp; handle)</a>
+<a name="ln1107">    MakeHandle(chunk_-&gt;seq(), chunk_index_, event_index, handle);</a>
+<a name="ln1108"> </a>
+<a name="ln1109">  return trace_event;</a>
+<a name="ln1110">}</a>
+<a name="ln1111"> </a>
+<a name="ln1112">void TraceLog::ThreadLocalEventBuffer::Flush(int64_t tid) {</a>
+<a name="ln1113">  DCHECK(trace_log_-&gt;lock_.IsHeld());</a>
+<a name="ln1114"> </a>
+<a name="ln1115">  if (!chunk_)</a>
+<a name="ln1116">    return;</a>
+<a name="ln1117"> </a>
+<a name="ln1118">  if (trace_log_-&gt;CheckGeneration(generation_)) {</a>
+<a name="ln1119">    // Return the chunk to the buffer only if the generation matches.</a>
+<a name="ln1120">    trace_log_-&gt;logged_events_-&gt;ReturnChunk(chunk_index_, chunk_.Pass());</a>
+<a name="ln1121">  }</a>
+<a name="ln1122">}</a>
+<a name="ln1123"> </a>
+<a name="ln1124">// static</a>
+<a name="ln1125">TraceLog* TraceLog::GetInstance() {</a>
+<a name="ln1126">  return Singleton&lt;TraceLog&gt;::get();</a>
+<a name="ln1127">}</a>
+<a name="ln1128"> </a>
+<a name="ln1129">TraceLog::TraceLog()</a>
+<a name="ln1130">    : mode_(DISABLED),</a>
+<a name="ln1131">      num_traces_recorded_(0),</a>
+<a name="ln1132">      event_callback_(0),</a>
+<a name="ln1133">      dispatching_to_observer_list_(false),</a>
+<a name="ln1134">      process_sort_index_(0),</a>
+<a name="ln1135">      process_id_hash_(0),</a>
+<a name="ln1136">      process_id_(0),</a>
+<a name="ln1137">      time_offset_(0),</a>
+<a name="ln1138">      watch_category_(0),</a>
+<a name="ln1139">      trace_options_(RECORD_UNTIL_FULL),</a>
+<a name="ln1140">      sampling_thread_handle_(nullptr),</a>
+<a name="ln1141">      category_filter_(CategoryFilter::kDefaultCategoryFilterString),</a>
+<a name="ln1142">      event_callback_category_filter_(</a>
+<a name="ln1143">          CategoryFilter::kDefaultCategoryFilterString),</a>
+<a name="ln1144">      thread_shared_chunk_index_(0),</a>
+<a name="ln1145">      generation_(0) {</a>
+<a name="ln1146">  // Trace is enabled or disabled on one thread while other threads are</a>
+<a name="ln1147">  // accessing the enabled flag. We don't care whether edge-case events are</a>
+<a name="ln1148">  // traced or not, so we allow races on the enabled flag to keep the trace</a>
+<a name="ln1149">  // macros fast.</a>
+<a name="ln1150">  ANNOTATE_BENIGN_RACE_SIZED(g_category_group_enabled,</a>
+<a name="ln1151">                             sizeof(g_category_group_enabled),</a>
+<a name="ln1152">                             &quot;trace_event category enabled&quot;);</a>
+<a name="ln1153">  for (int i = 0; i &lt; MAX_CATEGORY_GROUPS; ++i) {</a>
+<a name="ln1154">    ANNOTATE_BENIGN_RACE(&amp;g_category_group_enabled[i],</a>
+<a name="ln1155">                         &quot;trace_event category enabled&quot;);</a>
+<a name="ln1156">  }</a>
+<a name="ln1157">  SetProcessID(static_cast&lt;int&gt;(getpid()));</a>
+<a name="ln1158"> </a>
+<a name="ln1159">  string filter = FLAGS_trace_to_console;</a>
+<a name="ln1160">  if (!filter.empty()) {</a>
+<a name="ln1161">    SetEnabled(CategoryFilter(filter), RECORDING_MODE, ECHO_TO_CONSOLE);</a>
+<a name="ln1162">    LOG(ERROR) &lt;&lt; &quot;Tracing to console with CategoryFilter '&quot; &lt;&lt; filter &lt;&lt; &quot;'.&quot;;</a>
+<a name="ln1163">  }</a>
+<a name="ln1164"> </a>
+<a name="ln1165">  logged_events_.reset(CreateTraceBuffer());</a>
+<a name="ln1166">}</a>
+<a name="ln1167"> </a>
+<a name="ln1168">TraceLog::~TraceLog() {</a>
+<a name="ln1169">}</a>
+<a name="ln1170"> </a>
+<a name="ln1171">const unsigned char* TraceLog::GetCategoryGroupEnabled(</a>
+<a name="ln1172">    const char* category_group) {</a>
+<a name="ln1173">  TraceLog* tracelog = GetInstance();</a>
+<a name="ln1174">  if (!tracelog) {</a>
+<a name="ln1175">    DCHECK(!g_category_group_enabled[g_category_already_shutdown]);</a>
+<a name="ln1176">    return &amp;g_category_group_enabled[g_category_already_shutdown];</a>
+<a name="ln1177">  }</a>
+<a name="ln1178">  return tracelog-&gt;GetCategoryGroupEnabledInternal(category_group);</a>
+<a name="ln1179">}</a>
+<a name="ln1180"> </a>
+<a name="ln1181">const char* TraceLog::GetCategoryGroupName(</a>
+<a name="ln1182">    const unsigned char* category_group_enabled) {</a>
+<a name="ln1183">  // Calculate the index of the category group by finding</a>
+<a name="ln1184">  // category_group_enabled in g_category_group_enabled array.</a>
+<a name="ln1185">  uintptr_t category_begin =</a>
+<a name="ln1186">      reinterpret_cast&lt;uintptr_t&gt;(g_category_group_enabled);</a>
+<a name="ln1187">  uintptr_t category_ptr = reinterpret_cast&lt;uintptr_t&gt;(category_group_enabled);</a>
+<a name="ln1188">  DCHECK(category_ptr &gt;= category_begin &amp;&amp;</a>
+<a name="ln1189">         category_ptr &lt; reinterpret_cast&lt;uintptr_t&gt;(</a>
+<a name="ln1190">             g_category_group_enabled + MAX_CATEGORY_GROUPS)) &lt;&lt;</a>
+<a name="ln1191">      &quot;out of bounds category pointer&quot;;</a>
+<a name="ln1192">  uintptr_t category_index =</a>
+<a name="ln1193">      (category_ptr - category_begin) / sizeof(g_category_group_enabled[0]);</a>
+<a name="ln1194">  return g_category_groups[category_index];</a>
+<a name="ln1195">}</a>
+<a name="ln1196"> </a>
+<a name="ln1197">void TraceLog::UpdateCategoryGroupEnabledFlag(int category_index) {</a>
+<a name="ln1198">  unsigned char enabled_flag = 0;</a>
+<a name="ln1199">  const char* category_group = g_category_groups[category_index];</a>
+<a name="ln1200">  if (mode_ == RECORDING_MODE &amp;&amp;</a>
+<a name="ln1201">      category_filter_.IsCategoryGroupEnabled(category_group))</a>
+<a name="ln1202">    enabled_flag |= ENABLED_FOR_RECORDING;</a>
+<a name="ln1203">  else if (mode_ == MONITORING_MODE &amp;&amp;</a>
+<a name="ln1204">      category_filter_.IsCategoryGroupEnabled(category_group))</a>
+<a name="ln1205">    enabled_flag |= ENABLED_FOR_MONITORING;</a>
+<a name="ln1206">  if (event_callback_ &amp;&amp;</a>
+<a name="ln1207">      event_callback_category_filter_.IsCategoryGroupEnabled(category_group))</a>
+<a name="ln1208">    enabled_flag |= ENABLED_FOR_EVENT_CALLBACK;</a>
+<a name="ln1209">  g_category_group_enabled[category_index] = enabled_flag;</a>
+<a name="ln1210">}</a>
+<a name="ln1211"> </a>
+<a name="ln1212">void TraceLog::UpdateCategoryGroupEnabledFlags() {</a>
+<a name="ln1213">  int category_index = base::subtle::NoBarrier_Load(&amp;g_category_index);</a>
+<a name="ln1214">  for (int i = 0; i &lt; category_index; i++)</a>
+<a name="ln1215">    UpdateCategoryGroupEnabledFlag(i);</a>
+<a name="ln1216">}</a>
+<a name="ln1217"> </a>
+<a name="ln1218">void TraceLog::UpdateSyntheticDelaysFromCategoryFilter() {</a>
+<a name="ln1219">  ResetTraceEventSyntheticDelays();</a>
+<a name="ln1220">  const CategoryFilter::StringList&amp; delays =</a>
+<a name="ln1221">      category_filter_.GetSyntheticDelayValues();</a>
+<a name="ln1222">  CategoryFilter::StringList::const_iterator ci;</a>
+<a name="ln1223">  for (ci = delays.begin(); ci != delays.end(); ++ci) {</a>
+<a name="ln1224">    std::list&lt;string&gt; tokens = strings::Split(*ci, &quot;;&quot;);</a>
+<a name="ln1225">    if (tokens.empty()) continue;</a>
+<a name="ln1226"> </a>
+<a name="ln1227">    TraceEventSyntheticDelay* delay =</a>
+<a name="ln1228">        TraceEventSyntheticDelay::Lookup(tokens.front());</a>
+<a name="ln1229">    tokens.pop_front();</a>
+<a name="ln1230">    while (!tokens.empty()) {</a>
+<a name="ln1231">      std::string token = tokens.front();</a>
+<a name="ln1232">      tokens.pop_front();</a>
+<a name="ln1233">      char* duration_end;</a>
+<a name="ln1234">      double target_duration = strtod(token.c_str(), &amp;duration_end);</a>
+<a name="ln1235">      if (duration_end != token.c_str()) {</a>
+<a name="ln1236">        delay-&gt;SetTargetDuration(MonoDelta::FromSeconds(target_duration));</a>
+<a name="ln1237">      } else if (token == &quot;static&quot;) {</a>
+<a name="ln1238">        delay-&gt;SetMode(TraceEventSyntheticDelay::STATIC);</a>
+<a name="ln1239">      } else if (token == &quot;oneshot&quot;) {</a>
+<a name="ln1240">        delay-&gt;SetMode(TraceEventSyntheticDelay::ONE_SHOT);</a>
+<a name="ln1241">      } else if (token == &quot;alternating&quot;) {</a>
+<a name="ln1242">        delay-&gt;SetMode(TraceEventSyntheticDelay::ALTERNATING);</a>
+<a name="ln1243">      }</a>
+<a name="ln1244">    }</a>
+<a name="ln1245">  }</a>
+<a name="ln1246">}</a>
+<a name="ln1247"> </a>
+<a name="ln1248">const unsigned char* TraceLog::GetCategoryGroupEnabledInternal(</a>
+<a name="ln1249">    const char* category_group) {</a>
+<a name="ln1250">  DCHECK(!strchr(category_group, '&quot;')) &lt;&lt;</a>
+<a name="ln1251">      &quot;Category groups may not contain double quote&quot;;</a>
+<a name="ln1252">  // The g_category_groups is append only, avoid using a lock for the fast path.</a>
+<a name="ln1253">  int current_category_index = base::subtle::Acquire_Load(&amp;g_category_index);</a>
+<a name="ln1254"> </a>
+<a name="ln1255">  // Search for pre-existing category group.</a>
+<a name="ln1256">  for (int i = 0; i &lt; current_category_index; ++i) {</a>
+<a name="ln1257">    if (strcmp(g_category_groups[i], category_group) == 0) {</a>
+<a name="ln1258">      return &amp;g_category_group_enabled[i];</a>
+<a name="ln1259">    }</a>
+<a name="ln1260">  }</a>
+<a name="ln1261"> </a>
+<a name="ln1262">  unsigned char* category_group_enabled = nullptr;</a>
+<a name="ln1263">  // This is the slow path: the lock is not held in the case above, so more</a>
+<a name="ln1264">  // than one thread could have reached here trying to add the same category.</a>
+<a name="ln1265">  // Only hold to lock when actually appending a new category, and</a>
+<a name="ln1266">  // check the categories groups again.</a>
+<a name="ln1267">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1268">  int category_index = base::subtle::Acquire_Load(&amp;g_category_index);</a>
+<a name="ln1269">  for (int i = 0; i &lt; category_index; ++i) {</a>
+<a name="ln1270">    if (strcmp(g_category_groups[i], category_group) == 0) {</a>
+<a name="ln1271">      return &amp;g_category_group_enabled[i];</a>
+<a name="ln1272">    }</a>
+<a name="ln1273">  }</a>
+<a name="ln1274"> </a>
+<a name="ln1275">  // Create a new category group.</a>
+<a name="ln1276">  DCHECK(category_index &lt; MAX_CATEGORY_GROUPS) &lt;&lt;</a>
+<a name="ln1277">      &quot;must increase MAX_CATEGORY_GROUPS&quot;;</a>
+<a name="ln1278">  if (category_index &lt; MAX_CATEGORY_GROUPS) {</a>
+<a name="ln1279">    // Don't hold on to the category_group pointer, so that we can create</a>
+<a name="ln1280">    // category groups with strings not known at compile time (this is</a>
+<a name="ln1281">    // required by SetWatchEvent).</a>
+<a name="ln1282">    const char* new_group = strdup(category_group);</a>
+<a name="ln1283">    // NOTE: new_group is leaked, but this is a small finite amount of data.</a>
+<a name="ln1284">    g_category_groups[category_index] = new_group;</a>
+<a name="ln1285">    DCHECK(!g_category_group_enabled[category_index]);</a>
+<a name="ln1286">    // Note that if both included and excluded patterns in the</a>
+<a name="ln1287">    // CategoryFilter are empty, we exclude nothing,</a>
+<a name="ln1288">    // thereby enabling this category group.</a>
+<a name="ln1289">    UpdateCategoryGroupEnabledFlag(category_index);</a>
+<a name="ln1290">    category_group_enabled = &amp;g_category_group_enabled[category_index];</a>
+<a name="ln1291">    // Update the max index now.</a>
+<a name="ln1292">    base::subtle::Release_Store(&amp;g_category_index, category_index + 1);</a>
+<a name="ln1293">  } else {</a>
+<a name="ln1294">    category_group_enabled =</a>
+<a name="ln1295">        &amp;g_category_group_enabled[g_category_categories_exhausted];</a>
+<a name="ln1296">  }</a>
+<a name="ln1297">  return category_group_enabled;</a>
+<a name="ln1298">}</a>
+<a name="ln1299"> </a>
+<a name="ln1300">void TraceLog::GetKnownCategoryGroups(</a>
+<a name="ln1301">    std::vector&lt;std::string&gt;* category_groups) {</a>
+<a name="ln1302">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1303">  int category_index = base::subtle::NoBarrier_Load(&amp;g_category_index);</a>
+<a name="ln1304">  for (int i = g_num_builtin_categories; i &lt; category_index; i++)</a>
+<a name="ln1305">    category_groups-&gt;push_back(g_category_groups[i]);</a>
+<a name="ln1306">}</a>
+<a name="ln1307"> </a>
+<a name="ln1308">void TraceLog::SetEnabled(const CategoryFilter&amp; category_filter,</a>
+<a name="ln1309">                          Mode mode,</a>
+<a name="ln1310">                          Options options) {</a>
+<a name="ln1311">  std::vector&lt;EnabledStateObserver*&gt; observer_list;</a>
+<a name="ln1312">  {</a>
+<a name="ln1313">    SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1314"> </a>
+<a name="ln1315">    // Can't enable tracing when Flush() is in progress.</a>
+<a name="ln1316">    Options old_options = trace_options();</a>
+<a name="ln1317"> </a>
+<a name="ln1318">    if (IsEnabled()) {</a>
+<a name="ln1319">      if (options != old_options) {</a>
+<a name="ln1320">        DLOG(ERROR) &lt;&lt; &quot;Attempting to re-enable tracing with a different &quot;</a>
+<a name="ln1321">                    &lt;&lt; &quot;set of options.&quot;;</a>
+<a name="ln1322">      }</a>
+<a name="ln1323"> </a>
+<a name="ln1324">      if (mode != mode_) {</a>
+<a name="ln1325">        DLOG(ERROR) &lt;&lt; &quot;Attempting to re-enable tracing with a different mode.&quot;;</a>
+<a name="ln1326">      }</a>
+<a name="ln1327"> </a>
+<a name="ln1328">      category_filter_.Merge(category_filter);</a>
+<a name="ln1329">      UpdateCategoryGroupEnabledFlags();</a>
+<a name="ln1330">      return;</a>
+<a name="ln1331">    }</a>
+<a name="ln1332"> </a>
+<a name="ln1333">    if (dispatching_to_observer_list_) {</a>
+<a name="ln1334">      DLOG(ERROR) &lt;&lt;</a>
+<a name="ln1335">          &quot;Cannot manipulate TraceLog::Enabled state from an observer.&quot;;</a>
+<a name="ln1336">      return;</a>
+<a name="ln1337">    }</a>
+<a name="ln1338"> </a>
+<a name="ln1339">    mode_ = mode;</a>
+<a name="ln1340"> </a>
+<a name="ln1341">    if (options != old_options) {</a>
+<a name="ln1342">      base::subtle::NoBarrier_Store(&amp;trace_options_, options);</a>
+<a name="ln1343">      UseNextTraceBuffer();</a>
+<a name="ln1344">    }</a>
+<a name="ln1345"> </a>
+<a name="ln1346">    num_traces_recorded_++;</a>
+<a name="ln1347"> </a>
+<a name="ln1348">    category_filter_ = CategoryFilter(category_filter);</a>
+<a name="ln1349">    UpdateCategoryGroupEnabledFlags();</a>
+<a name="ln1350">    UpdateSyntheticDelaysFromCategoryFilter();</a>
+<a name="ln1351"> </a>
+<a name="ln1352">    if (options &amp; ENABLE_SAMPLING) {</a>
+<a name="ln1353">      sampling_thread_.reset(new TraceSamplingThread);</a>
+<a name="ln1354">      sampling_thread_-&gt;RegisterSampleBucket(</a>
+<a name="ln1355">          &amp;g_trace_state[0],</a>
+<a name="ln1356">          &quot;bucket0&quot;,</a>
+<a name="ln1357">          Bind(&amp;TraceSamplingThread::DefaultSamplingCallback));</a>
+<a name="ln1358">      sampling_thread_-&gt;RegisterSampleBucket(</a>
+<a name="ln1359">          &amp;g_trace_state[1],</a>
+<a name="ln1360">          &quot;bucket1&quot;,</a>
+<a name="ln1361">          Bind(&amp;TraceSamplingThread::DefaultSamplingCallback));</a>
+<a name="ln1362">      sampling_thread_-&gt;RegisterSampleBucket(</a>
+<a name="ln1363">          &amp;g_trace_state[2],</a>
+<a name="ln1364">          &quot;bucket2&quot;,</a>
+<a name="ln1365">          Bind(&amp;TraceSamplingThread::DefaultSamplingCallback));</a>
+<a name="ln1366"> </a>
+<a name="ln1367">      Status s = Thread::Create(&quot;tracing&quot;, &quot;sampler&quot;,</a>
+<a name="ln1368">                                &amp;TraceSamplingThread::ThreadMain,</a>
+<a name="ln1369">                                sampling_thread_.get(),</a>
+<a name="ln1370">                                &amp;sampling_thread_handle_);</a>
+<a name="ln1371">      if (!s.ok()) {</a>
+<a name="ln1372">        LOG(DFATAL) &lt;&lt; &quot;failed to create trace sampling thread: &quot; &lt;&lt; s.ToString();</a>
+<a name="ln1373">      }</a>
+<a name="ln1374">    }</a>
+<a name="ln1375"> </a>
+<a name="ln1376">    dispatching_to_observer_list_ = true;</a>
+<a name="ln1377">    observer_list = enabled_state_observer_list_;</a>
+<a name="ln1378">  }</a>
+<a name="ln1379">  // Notify observers outside the lock in case they trigger trace events.</a>
+<a name="ln1380">  for (const auto&amp; observer : observer_list)</a>
+<a name="ln1381">    observer-&gt;OnTraceLogEnabled();</a>
+<a name="ln1382"> </a>
+<a name="ln1383">  {</a>
+<a name="ln1384">    SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1385">    dispatching_to_observer_list_ = false;</a>
+<a name="ln1386">  }</a>
+<a name="ln1387">}</a>
+<a name="ln1388"> </a>
+<a name="ln1389">CategoryFilter TraceLog::GetCurrentCategoryFilter() {</a>
+<a name="ln1390">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1391">  return category_filter_;</a>
+<a name="ln1392">}</a>
+<a name="ln1393"> </a>
+<a name="ln1394">void TraceLog::SetDisabled() {</a>
+<a name="ln1395">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1396">  SetDisabledWhileLocked();</a>
+<a name="ln1397">}</a>
+<a name="ln1398"> </a>
+<a name="ln1399">void NO_THREAD_SAFETY_ANALYSIS TraceLog::SetDisabledWhileLocked() {</a>
+<a name="ln1400">  DCHECK(lock_.IsHeld());</a>
+<a name="ln1401"> </a>
+<a name="ln1402">  if (!IsEnabled())</a>
+<a name="ln1403">    return;</a>
+<a name="ln1404"> </a>
+<a name="ln1405">  if (dispatching_to_observer_list_) {</a>
+<a name="ln1406">    DLOG(ERROR)</a>
+<a name="ln1407">        &lt;&lt; &quot;Cannot manipulate TraceLog::Enabled state from an observer.&quot;;</a>
+<a name="ln1408">    return;</a>
+<a name="ln1409">  }</a>
+<a name="ln1410"> </a>
+<a name="ln1411">  mode_ = DISABLED;</a>
+<a name="ln1412"> </a>
+<a name="ln1413">  if (sampling_thread_.get()) {</a>
+<a name="ln1414">    // Stop the sampling thread.</a>
+<a name="ln1415">    sampling_thread_-&gt;Stop();</a>
+<a name="ln1416">    lock_.Unlock();</a>
+<a name="ln1417">    sampling_thread_handle_-&gt;Join();</a>
+<a name="ln1418">    lock_.Lock();</a>
+<a name="ln1419">    sampling_thread_handle_.reset();</a>
+<a name="ln1420">    sampling_thread_.reset();</a>
+<a name="ln1421">  }</a>
+<a name="ln1422"> </a>
+<a name="ln1423">  category_filter_.Clear();</a>
+<a name="ln1424">  base::subtle::NoBarrier_Store(&amp;watch_category_, 0);</a>
+<a name="ln1425">  watch_event_name_ = &quot;&quot;;</a>
+<a name="ln1426">  UpdateCategoryGroupEnabledFlags();</a>
+<a name="ln1427">  AddMetadataEventsWhileLocked();</a>
+<a name="ln1428"> </a>
+<a name="ln1429">  dispatching_to_observer_list_ = true;</a>
+<a name="ln1430">  std::vector&lt;EnabledStateObserver*&gt; observer_list =</a>
+<a name="ln1431">      enabled_state_observer_list_;</a>
+<a name="ln1432"> </a>
+<a name="ln1433">  {</a>
+<a name="ln1434">    // Dispatch to observers outside the lock in case the observer triggers a</a>
+<a name="ln1435">    // trace event.</a>
+<a name="ln1436">    lock_.Unlock();</a>
+<a name="ln1437">    for (const auto&amp; observer : observer_list)</a>
+<a name="ln1438">      observer-&gt;OnTraceLogDisabled();</a>
+<a name="ln1439">    lock_.Lock();</a>
+<a name="ln1440">  }</a>
+<a name="ln1441">  dispatching_to_observer_list_ = false;</a>
+<a name="ln1442">}</a>
+<a name="ln1443"> </a>
+<a name="ln1444">int TraceLog::GetNumTracesRecorded() {</a>
+<a name="ln1445">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1446">  if (!IsEnabled())</a>
+<a name="ln1447">    return -1;</a>
+<a name="ln1448">  return num_traces_recorded_;</a>
+<a name="ln1449">}</a>
+<a name="ln1450"> </a>
+<a name="ln1451">void TraceLog::AddEnabledStateObserver(EnabledStateObserver* listener) {</a>
+<a name="ln1452">  enabled_state_observer_list_.push_back(listener);</a>
+<a name="ln1453">}</a>
+<a name="ln1454"> </a>
+<a name="ln1455">void TraceLog::RemoveEnabledStateObserver(EnabledStateObserver* listener) {</a>
+<a name="ln1456">  auto it = std::find(enabled_state_observer_list_.begin(),</a>
+<a name="ln1457">                      enabled_state_observer_list_.end(), listener);</a>
+<a name="ln1458">  if (it != enabled_state_observer_list_.end())</a>
+<a name="ln1459">    enabled_state_observer_list_.erase(it);</a>
+<a name="ln1460">}</a>
+<a name="ln1461"> </a>
+<a name="ln1462">bool TraceLog::HasEnabledStateObserver(EnabledStateObserver* listener) const {</a>
+<a name="ln1463">  auto it = std::find(enabled_state_observer_list_.begin(),</a>
+<a name="ln1464">                      enabled_state_observer_list_.end(), listener);</a>
+<a name="ln1465">  return it != enabled_state_observer_list_.end();</a>
+<a name="ln1466">}</a>
+<a name="ln1467"> </a>
+<a name="ln1468">float TraceLog::GetBufferPercentFull() const {</a>
+<a name="ln1469">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1470">  return static_cast&lt;float&gt;(static_cast&lt;double&gt;(logged_events_-&gt;Size()) /</a>
+<a name="ln1471">                            logged_events_-&gt;Capacity());</a>
+<a name="ln1472">}</a>
+<a name="ln1473"> </a>
+<a name="ln1474">bool TraceLog::BufferIsFull() const {</a>
+<a name="ln1475">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1476">  return logged_events_-&gt;IsFull();</a>
+<a name="ln1477">}</a>
+<a name="ln1478"> </a>
+<a name="ln1479">TraceBuffer* TraceLog::CreateTraceBuffer() {</a>
+<a name="ln1480">  Options options = trace_options();</a>
+<a name="ln1481">  if (options &amp; RECORD_CONTINUOUSLY)</a>
+<a name="ln1482">    return new TraceBufferRingBuffer(kTraceEventRingBufferChunks);</a>
+<a name="ln1483">  else if ((options &amp; ENABLE_SAMPLING) &amp;&amp; mode_ == MONITORING_MODE)</a>
+<a name="ln1484">    return new TraceBufferRingBuffer(kMonitorTraceEventBufferChunks);</a>
+<a name="ln1485">  else if (options &amp; ECHO_TO_CONSOLE)</a>
+<a name="ln1486">    return new TraceBufferRingBuffer(kEchoToConsoleTraceEventBufferChunks);</a>
+<a name="ln1487">  return new TraceBufferVector();</a>
+<a name="ln1488">}</a>
+<a name="ln1489"> </a>
+<a name="ln1490">TraceEvent* TraceLog::AddEventToThreadSharedChunkWhileLocked(</a>
+<a name="ln1491">    TraceEventHandle* handle, bool check_buffer_is_full) {</a>
+<a name="ln1492">  DCHECK(lock_.IsHeld());</a>
+<a name="ln1493"> </a>
+<a name="ln1494">  if (thread_shared_chunk_ &amp;&amp; thread_shared_chunk_-&gt;IsFull()) {</a>
+<a name="ln1495">    logged_events_-&gt;ReturnChunk(thread_shared_chunk_index_,</a>
+<a name="ln1496">                                thread_shared_chunk_.Pass());</a>
+<a name="ln1497">  }</a>
+<a name="ln1498"> </a>
+<a name="ln1499">  if (!thread_shared_chunk_) {</a>
+<a name="ln1500">    thread_shared_chunk_ = logged_events_-&gt;GetChunk(</a>
+<a name="ln1501">        &amp;thread_shared_chunk_index_);</a>
+<a name="ln1502">    if (check_buffer_is_full)</a>
+<a name="ln1503">      CheckIfBufferIsFullWhileLocked();</a>
+<a name="ln1504">  }</a>
+<a name="ln1505">  if (!thread_shared_chunk_)</a>
+<a name="ln1506">    return nullptr;</a>
+<a name="ln1507"> </a>
+<a name="ln1508">  size_t event_index;</a>
+<a name="ln1509">  TraceEvent* trace_event = thread_shared_chunk_-&gt;AddTraceEvent(&amp;event_index);</a>
+<a name="ln1510">  if (trace_event &amp;&amp; handle) {</a>
+<a name="ln1511">    MakeHandle(thread_shared_chunk_-&gt;seq(), thread_shared_chunk_index_,</a>
+<a name="ln1512">               event_index, handle);</a>
+<a name="ln1513">  }</a>
+<a name="ln1514">  return trace_event;</a>
+<a name="ln1515">}</a>
+<a name="ln1516"> </a>
+<a name="ln1517">void TraceLog::CheckIfBufferIsFullWhileLocked() {</a>
+<a name="ln1518">  DCHECK(lock_.IsHeld());</a>
+<a name="ln1519">  if (logged_events_-&gt;IsFull())</a>
+<a name="ln1520">    SetDisabledWhileLocked();</a>
+<a name="ln1521">}</a>
+<a name="ln1522"> </a>
+<a name="ln1523">void TraceLog::SetEventCallbackEnabled(const CategoryFilter&amp; category_filter,</a>
+<a name="ln1524">                                       EventCallback cb) {</a>
+<a name="ln1525">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1526">  base::subtle::NoBarrier_Store(&amp;event_callback_,</a>
+<a name="ln1527">                          reinterpret_cast&lt;AtomicWord&gt;(cb));</a>
+<a name="ln1528">  event_callback_category_filter_ = category_filter;</a>
+<a name="ln1529">  UpdateCategoryGroupEnabledFlags();</a>
+<a name="ln1530">}</a>
+<a name="ln1531"> </a>
+<a name="ln1532">void TraceLog::SetEventCallbackDisabled() {</a>
+<a name="ln1533">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1534">  base::subtle::NoBarrier_Store(&amp;event_callback_, 0);</a>
+<a name="ln1535">  UpdateCategoryGroupEnabledFlags();</a>
+<a name="ln1536">}</a>
+<a name="ln1537"> </a>
+<a name="ln1538">// Flush() works as the following:</a>
+<a name="ln1539">//</a>
+<a name="ln1540">// We ensure by taking the global lock that we have exactly one Flusher thread</a>
+<a name="ln1541">// (the caller of this function) and some number of &quot;target&quot; threads. We do</a>
+<a name="ln1542">// not want to block the target threads, since they are running application code,</a>
+<a name="ln1543">// so this implementation takes an approach based on asymmetric synchronization.</a>
+<a name="ln1544">//</a>
+<a name="ln1545">// For each active thread, we grab its PerThreadInfo object, which may contain</a>
+<a name="ln1546">// a pointer to its active trace chunk. We use an AtomicExchange to swap this</a>
+<a name="ln1547">// out for a null pointer. This ensures that, on the *next* TRACE call made by</a>
+<a name="ln1548">// that thread, it will see a NULL buffer and create a _new_ trace buffer. That</a>
+<a name="ln1549">// new buffer would be assigned the generation of the next collection and we don't</a>
+<a name="ln1550">// have to worry about it in the current Flush().</a>
+<a name="ln1551">//</a>
+<a name="ln1552">// However, the swap doesn't ensure that the thread doesn't already have a local copy of</a>
+<a name="ln1553">// the 'event_buffer_' that we are trying to flush. So, if the thread is in the</a>
+<a name="ln1554">// middle of a Trace call, we have to wait until it exits. We do that by spinning</a>
+<a name="ln1555">// on the 'is_in_trace_event_' member of that thread's thread-local structure.</a>
+<a name="ln1556">//</a>
+<a name="ln1557">// After we've swapped the buffer pointer and waited on the thread to exit any</a>
+<a name="ln1558">// concurrent Trace() call, we know that no other thread can hold a pointer to</a>
+<a name="ln1559">// the trace buffer, and we can safely flush it and delete it.</a>
+<a name="ln1560">void TraceLog::Flush(const TraceLog::OutputCallback&amp; cb) {</a>
+<a name="ln1561">  if (IsEnabled()) {</a>
+<a name="ln1562">    // Can't flush when tracing is enabled because otherwise PostTask would</a>
+<a name="ln1563">    // - generate more trace events;</a>
+<a name="ln1564">    // - deschedule the calling thread on some platforms causing inaccurate</a>
+<a name="ln1565">    //   timing of the trace events.</a>
+<a name="ln1566">    scoped_refptr&lt;RefCountedString&gt; empty_result = new RefCountedString;</a>
+<a name="ln1567">    if (!cb.is_null())</a>
+<a name="ln1568">      cb.Run(empty_result, false);</a>
+<a name="ln1569">    LOG(WARNING) &lt;&lt; &quot;Ignored TraceLog::Flush called when tracing is enabled&quot;;</a>
+<a name="ln1570">    return;</a>
+<a name="ln1571">  }</a>
+<a name="ln1572"> </a>
+<a name="ln1573">  int generation = this-&gt;generation();</a>
+<a name="ln1574">  {</a>
+<a name="ln1575">    // Holding the active threads lock ensures that no thread will exit and</a>
+<a name="ln1576">    // delete its own PerThreadInfo object.</a>
+<a name="ln1577">    MutexLock l(active_threads_lock_);</a>
+<a name="ln1578">    for (const ActiveThreadMap::value_type&amp; entry : active_threads_) {</a>
+<a name="ln1579">      int64_t tid = entry.first;</a>
+<a name="ln1580">      PerThreadInfo* thr_info = entry.second;</a>
+<a name="ln1581"> </a>
+<a name="ln1582">      // Swap out their buffer from their thread-local data.</a>
+<a name="ln1583">      // After this, any _future_ trace calls on that thread will create a new buffer</a>
+<a name="ln1584">      // and not use the one we obtain here.</a>
+<a name="ln1585">      ThreadLocalEventBuffer* buf = thr_info-&gt;AtomicTakeBuffer();</a>
+<a name="ln1586"> </a>
+<a name="ln1587">      // If this thread hasn't traced anything since our last</a>
+<a name="ln1588">      // flush, we can skip it.</a>
+<a name="ln1589">      if (!buf) {</a>
+<a name="ln1590">        continue;</a>
+<a name="ln1591">      }</a>
+<a name="ln1592"> </a>
+<a name="ln1593">      // The buffer may still be in use by that thread if they're in a call. Sleep until</a>
+<a name="ln1594">      // they aren't, so we can flush/delete their old buffer.</a>
+<a name="ln1595">      //</a>
+<a name="ln1596">      // It's important that we do not hold 'lock_' here, because otherwise we can get a</a>
+<a name="ln1597">      // deadlock: a thread may be in the middle of a trace event (is_in_trace_event_ ==</a>
+<a name="ln1598">      // true) and waiting to take lock_, while we are holding the lock and waiting for it</a>
+<a name="ln1599">      // to not be in the trace event.</a>
+<a name="ln1600">      while (base::subtle::Acquire_Load(&amp;thr_info-&gt;is_in_trace_event_)) {</a>
+<a name="ln1601">        sched_yield();</a>
+<a name="ln1602">      }</a>
+<a name="ln1603"> </a>
+<a name="ln1604">      {</a>
+<a name="ln1605">        SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1606">        buf-&gt;Flush(tid);</a>
+<a name="ln1607">      }</a>
+<a name="ln1608">      delete buf;</a>
+<a name="ln1609">    }</a>
+<a name="ln1610">  }</a>
+<a name="ln1611"> </a>
+<a name="ln1612">  {</a>
+<a name="ln1613">    SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1614"> </a>
+<a name="ln1615">    if (thread_shared_chunk_) {</a>
+<a name="ln1616">      logged_events_-&gt;ReturnChunk(thread_shared_chunk_index_,</a>
+<a name="ln1617">                                  thread_shared_chunk_.Pass());</a>
+<a name="ln1618">    }</a>
+<a name="ln1619">  }</a>
+<a name="ln1620"> </a>
+<a name="ln1621">  FinishFlush(generation, cb);</a>
+<a name="ln1622">}</a>
+<a name="ln1623"> </a>
+<a name="ln1624">void TraceLog::ConvertTraceEventsToTraceFormat(</a>
+<a name="ln1625">    gscoped_ptr&lt;TraceBuffer&gt; logged_events,</a>
+<a name="ln1626">    const TraceLog::OutputCallback&amp; flush_output_callback) {</a>
+<a name="ln1627"> </a>
+<a name="ln1628">  if (flush_output_callback.is_null())</a>
+<a name="ln1629">    return;</a>
+<a name="ln1630"> </a>
+<a name="ln1631">  // The callback need to be called at least once even if there is no events</a>
+<a name="ln1632">  // to let the caller know the completion of flush.</a>
+<a name="ln1633">  bool has_more_events = true;</a>
+<a name="ln1634">  do {</a>
+<a name="ln1635">    scoped_refptr&lt;RefCountedString&gt; json_events_str_ptr =</a>
+<a name="ln1636">        new RefCountedString();</a>
+<a name="ln1637"> </a>
+<a name="ln1638">    for (size_t i = 0; i &lt; kTraceEventBatchChunks; ++i) {</a>
+<a name="ln1639">      const TraceBufferChunk* chunk = logged_events-&gt;NextChunk();</a>
+<a name="ln1640">      if (!chunk) {</a>
+<a name="ln1641">        has_more_events = false;</a>
+<a name="ln1642">        break;</a>
+<a name="ln1643">      }</a>
+<a name="ln1644">      for (size_t j = 0; j &lt; chunk-&gt;size(); ++j) {</a>
+<a name="ln1645">        if (i &gt; 0 || j &gt; 0)</a>
+<a name="ln1646">          json_events_str_ptr-&gt;data().append(&quot;,&quot;);</a>
+<a name="ln1647">        chunk-&gt;GetEventAt(j)-&gt;AppendAsJSON(&amp;(json_events_str_ptr-&gt;data()));</a>
+<a name="ln1648">      }</a>
+<a name="ln1649">    }</a>
+<a name="ln1650"> </a>
+<a name="ln1651">    flush_output_callback.Run(json_events_str_ptr, has_more_events);</a>
+<a name="ln1652">  } while (has_more_events);</a>
+<a name="ln1653">}</a>
+<a name="ln1654"> </a>
+<a name="ln1655">void TraceLog::FinishFlush(int generation,</a>
+<a name="ln1656">                           const TraceLog::OutputCallback&amp; flush_output_callback) {</a>
+<a name="ln1657">  gscoped_ptr&lt;TraceBuffer&gt; previous_logged_events;</a>
+<a name="ln1658"> </a>
+<a name="ln1659">  if (!CheckGeneration(generation))</a>
+<a name="ln1660">    return;</a>
+<a name="ln1661"> </a>
+<a name="ln1662">  {</a>
+<a name="ln1663">    SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1664"> </a>
+<a name="ln1665">    previous_logged_events.swap(logged_events_);</a>
+<a name="ln1666">    UseNextTraceBuffer();</a>
+<a name="ln1667">  }</a>
+<a name="ln1668"> </a>
+<a name="ln1669">  ConvertTraceEventsToTraceFormat(previous_logged_events.Pass(),</a>
+<a name="ln1670">                                  flush_output_callback);</a>
+<a name="ln1671">}</a>
+<a name="ln1672"> </a>
+<a name="ln1673">void TraceLog::FlushButLeaveBufferIntact(</a>
+<a name="ln1674">    const TraceLog::OutputCallback&amp; flush_output_callback) {</a>
+<a name="ln1675">  gscoped_ptr&lt;TraceBuffer&gt; previous_logged_events;</a>
+<a name="ln1676">  {</a>
+<a name="ln1677">    SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1678">    if (mode_ == DISABLED || (trace_options_ &amp; RECORD_CONTINUOUSLY) == 0) {</a>
+<a name="ln1679">      scoped_refptr&lt;RefCountedString&gt; empty_result = new RefCountedString;</a>
+<a name="ln1680">      flush_output_callback.Run(empty_result, false);</a>
+<a name="ln1681">      LOG(WARNING) &lt;&lt; &quot;Ignored TraceLog::FlushButLeaveBufferIntact when monitoring is not enabled&quot;;</a>
+<a name="ln1682">      return;</a>
+<a name="ln1683">    }</a>
+<a name="ln1684"> </a>
+<a name="ln1685">    AddMetadataEventsWhileLocked();</a>
+<a name="ln1686">    if (thread_shared_chunk_) {</a>
+<a name="ln1687">      // Return the chunk to the main buffer to flush the sampling data.</a>
+<a name="ln1688">      logged_events_-&gt;ReturnChunk(thread_shared_chunk_index_,</a>
+<a name="ln1689">                                  thread_shared_chunk_.Pass());</a>
+<a name="ln1690">    }</a>
+<a name="ln1691">    previous_logged_events = logged_events_-&gt;CloneForIteration().Pass();</a>
+<a name="ln1692">  }</a>
+<a name="ln1693"> </a>
+<a name="ln1694">  ConvertTraceEventsToTraceFormat(previous_logged_events.Pass(),</a>
+<a name="ln1695">                                  flush_output_callback);</a>
+<a name="ln1696">}</a>
+<a name="ln1697"> </a>
+<a name="ln1698">void TraceLog::UseNextTraceBuffer() {</a>
+<a name="ln1699">  logged_events_.reset(CreateTraceBuffer());</a>
+<a name="ln1700">  base::subtle::NoBarrier_AtomicIncrement(&amp;generation_, 1);</a>
+<a name="ln1701">  thread_shared_chunk_.reset();</a>
+<a name="ln1702">  thread_shared_chunk_index_ = 0;</a>
+<a name="ln1703">}</a>
+<a name="ln1704"> </a>
+<a name="ln1705">TraceEventHandle TraceLog::AddTraceEvent(</a>
+<a name="ln1706">    char phase,</a>
+<a name="ln1707">    const unsigned char* category_group_enabled,</a>
+<a name="ln1708">    const char* name,</a>
+<a name="ln1709">    uint64_t id,</a>
+<a name="ln1710">    int num_args,</a>
+<a name="ln1711">    const char** arg_names,</a>
+<a name="ln1712">    const unsigned char* arg_types,</a>
+<a name="ln1713">    const uint64_t* arg_values,</a>
+<a name="ln1714">    const scoped_refptr&lt;ConvertableToTraceFormat&gt;* convertable_values,</a>
+<a name="ln1715">    unsigned char flags) {</a>
+<a name="ln1716">  int thread_id = static_cast&lt;int&gt;(yb::Thread::UniqueThreadId());</a>
+<a name="ln1717">  MicrosecondsInt64 now = GetMonoTimeMicros();</a>
+<a name="ln1718">  return AddTraceEventWithThreadIdAndTimestamp(phase, category_group_enabled,</a>
+<a name="ln1719">                                               name, id, thread_id, now,</a>
+<a name="ln1720">                                               num_args, arg_names,</a>
+<a name="ln1721">                                               arg_types, arg_values,</a>
+<a name="ln1722">                                               convertable_values, flags);</a>
+<a name="ln1723">}</a>
+<a name="ln1724"> </a>
+<a name="ln1725">TraceLog::PerThreadInfo* TraceLog::SetupThreadLocalBuffer() {</a>
+<a name="ln1726">  int64_t cur_tid = Thread::UniqueThreadId();</a>
+<a name="ln1727"> </a>
+<a name="ln1728">  auto thr_info = new PerThreadInfo();</a>
+<a name="ln1729">  thr_info-&gt;event_buffer_ = nullptr;</a>
+<a name="ln1730">  thr_info-&gt;is_in_trace_event_ = 0;</a>
+<a name="ln1731">  thread_local_info_ = thr_info;</a>
+<a name="ln1732"> </a>
+<a name="ln1733">  Thread* t = Thread::current_thread();</a>
+<a name="ln1734">  if (t) {</a>
+<a name="ln1735">    t-&gt;CallAtExit(Bind(&amp;TraceLog::ThreadExiting, Unretained(this)));</a>
+<a name="ln1736">  }</a>
+<a name="ln1737"> </a>
+<a name="ln1738">  {</a>
+<a name="ln1739">    MutexLock lock(active_threads_lock_);</a>
+<a name="ln1740">    InsertOrDie(&amp;active_threads_, cur_tid, thr_info);</a>
+<a name="ln1741">  }</a>
+<a name="ln1742">  return thr_info;</a>
+<a name="ln1743">}</a>
+<a name="ln1744"> </a>
+<a name="ln1745">void TraceLog::ThreadExiting() {</a>
+<a name="ln1746">  PerThreadInfo* thr_info = thread_local_info_;</a>
+<a name="ln1747">  if (!thr_info) {</a>
+<a name="ln1748">    return;</a>
+<a name="ln1749">  }</a>
+<a name="ln1750"> </a>
+<a name="ln1751">  int64_t cur_tid = Thread::UniqueThreadId();</a>
+<a name="ln1752"> </a>
+<a name="ln1753">  // Flush our own buffer back to the central event buffer.</a>
+<a name="ln1754">  // We do the atomic exchange because a flusher thread may</a>
+<a name="ln1755">  // also be trying to flush us at the same time, and we need to avoid</a>
+<a name="ln1756">  // conflict.</a>
+<a name="ln1757">  ThreadLocalEventBuffer* buf = thr_info-&gt;AtomicTakeBuffer();</a>
+<a name="ln1758">  if (buf) {</a>
+<a name="ln1759">    SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1760">    buf-&gt;Flush(Thread::UniqueThreadId());</a>
+<a name="ln1761">  }</a>
+<a name="ln1762">  delete buf;</a>
+<a name="ln1763"> </a>
+<a name="ln1764">  {</a>
+<a name="ln1765">    MutexLock lock(active_threads_lock_);</a>
+<a name="ln1766">    active_threads_.erase(cur_tid);</a>
+<a name="ln1767">  }</a>
+<a name="ln1768">  delete thr_info;</a>
+<a name="ln1769">}</a>
+<a name="ln1770"> </a>
+<a name="ln1771">TraceEventHandle TraceLog::AddTraceEventWithThreadIdAndTimestamp(</a>
+<a name="ln1772">    char phase,</a>
+<a name="ln1773">    const unsigned char* category_group_enabled,</a>
+<a name="ln1774">    const char* name,</a>
+<a name="ln1775">    uint64_t id,</a>
+<a name="ln1776">    int thread_id,</a>
+<a name="ln1777">    const MicrosecondsInt64&amp; timestamp,</a>
+<a name="ln1778">    int num_args,</a>
+<a name="ln1779">    const char** arg_names,</a>
+<a name="ln1780">    const unsigned char* arg_types,</a>
+<a name="ln1781">    const uint64_t* arg_values,</a>
+<a name="ln1782">    const scoped_refptr&lt;ConvertableToTraceFormat&gt;* convertable_values,</a>
+<a name="ln1783">    unsigned char flags) {</a>
+<a name="ln1784">  TraceEventHandle handle = { 0, 0, 0 };</a>
+<a name="ln1785">  if (!*category_group_enabled)</a>
+<a name="ln1786">    return handle;</a>
+<a name="ln1787"> </a>
+<a name="ln1788">  DCHECK(name);</a>
+<a name="ln1789"> </a>
+<a name="ln1790">  if (flags &amp; TRACE_EVENT_FLAG_MANGLE_ID)</a>
+<a name="ln1791">    id ^= process_id_hash_;</a>
+<a name="ln1792"> </a>
+<a name="ln1793">  MicrosecondsInt64 now = OffsetTimestamp(timestamp);</a>
+<a name="ln1794">  MicrosecondsInt64 thread_now = GetThreadCpuTimeMicros();</a>
+<a name="ln1795"> </a>
+<a name="ln1796">  PerThreadInfo* thr_info = thread_local_info_;</a>
+<a name="ln1797">  if (PREDICT_FALSE(!thr_info)) {</a>
+<a name="ln1798">    thr_info = SetupThreadLocalBuffer();</a>
+<a name="ln1799">  }</a>
+<a name="ln1800"> </a>
+<a name="ln1801">  // Avoid re-entrance of AddTraceEvent. This may happen in GPU process when</a>
+<a name="ln1802">  // ECHO_TO_CONSOLE is enabled: AddTraceEvent -&gt; LOG(ERROR) -&gt;</a>
+<a name="ln1803">  // GpuProcessLogMessageHandler -&gt; PostPendingTask -&gt; TRACE_EVENT ...</a>
+<a name="ln1804">  if (base::subtle::NoBarrier_Load(&amp;thr_info-&gt;is_in_trace_event_))</a>
+<a name="ln1805">    return handle;</a>
+<a name="ln1806"> </a>
+<a name="ln1807">  MarkFlagInScope thread_is_in_trace_event(&amp;thr_info-&gt;is_in_trace_event_);</a>
+<a name="ln1808"> </a>
+<a name="ln1809">  ThreadLocalEventBuffer* thread_local_event_buffer =</a>
+<a name="ln1810">    reinterpret_cast&lt;ThreadLocalEventBuffer*&gt;(</a>
+<a name="ln1811">      base::subtle::NoBarrier_Load(</a>
+<a name="ln1812">        reinterpret_cast&lt;AtomicWord*&gt;(&amp;thr_info-&gt;event_buffer_)));</a>
+<a name="ln1813"> </a>
+<a name="ln1814">  // If we have an event buffer, but it's a left-over from a previous trace,</a>
+<a name="ln1815">  // delete it.</a>
+<a name="ln1816">  if (PREDICT_FALSE(thread_local_event_buffer &amp;&amp;</a>
+<a name="ln1817">                    !CheckGeneration(thread_local_event_buffer-&gt;generation()))) {</a>
+<a name="ln1818">    // We might also race against a flusher thread, so we have to atomically</a>
+<a name="ln1819">    // take the buffer.</a>
+<a name="ln1820">    thread_local_event_buffer = thr_info-&gt;AtomicTakeBuffer();</a>
+<a name="ln1821">    delete thread_local_event_buffer;</a>
+<a name="ln1822">    thread_local_event_buffer = nullptr;</a>
+<a name="ln1823">  }</a>
+<a name="ln1824"> </a>
+<a name="ln1825">  // If there is no current buffer, create one for this event.</a>
+<a name="ln1826">  if (PREDICT_FALSE(!thread_local_event_buffer)) {</a>
+<a name="ln1827">    thread_local_event_buffer = new ThreadLocalEventBuffer(this);</a>
+<a name="ln1828"> </a>
+<a name="ln1829">    base::subtle::NoBarrier_Store(</a>
+<a name="ln1830">      reinterpret_cast&lt;AtomicWord*&gt;(&amp;thr_info-&gt;event_buffer_),</a>
+<a name="ln1831">      reinterpret_cast&lt;AtomicWord&gt;(thread_local_event_buffer));</a>
+<a name="ln1832">  }</a>
+<a name="ln1833"> </a>
+<a name="ln1834">  // Check and update the current thread name only if the event is for the</a>
+<a name="ln1835">  // current thread to avoid locks in most cases.</a>
+<a name="ln1836">  if (thread_id == static_cast&lt;int&gt;(Thread::UniqueThreadId())) {</a>
+<a name="ln1837">    Thread* yb_thr = Thread::current_thread();</a>
+<a name="ln1838">    if (yb_thr) {</a>
+<a name="ln1839">      const char* new_name = yb_thr-&gt;name().c_str();</a>
+<a name="ln1840">      // Check if the thread name has been set or changed since the previous</a>
+<a name="ln1841">      // call (if any), but don't bother if the new name is empty. Note this will</a>
+<a name="ln1842">      // not detect a thread name change within the same char* buffer address: we</a>
+<a name="ln1843">      // favor common case performance over corner case correctness.</a>
+<a name="ln1844">      if (PREDICT_FALSE(new_name != g_current_thread_name &amp;&amp;</a>
+<a name="ln1845">                        new_name &amp;&amp; *new_name)) {</a>
+<a name="ln1846">        g_current_thread_name = new_name;</a>
+<a name="ln1847"> </a>
+<a name="ln1848">        SpinLockHolder thread_info_lock(&amp;thread_info_lock_);</a>
+<a name="ln1849"> </a>
+<a name="ln1850">        auto existing_name = thread_names_.find(thread_id);</a>
+<a name="ln1851">        if (existing_name == thread_names_.end()) {</a>
+<a name="ln1852">          // This is a new thread id, and a new name.</a>
+<a name="ln1853">          thread_names_[thread_id] = new_name;</a>
+<a name="ln1854">        } else {</a>
+<a name="ln1855">          // This is a thread id that we've seen before, but potentially with a</a>
+<a name="ln1856">          // new name.</a>
+<a name="ln1857">          std::vector&lt;GStringPiece&gt; existing_names = strings::Split(existing_name-&gt;second, &quot;,&quot;);</a>
+<a name="ln1858">          bool found = std::find(existing_names.begin(),</a>
+<a name="ln1859">                                 existing_names.end(),</a>
+<a name="ln1860">                                 new_name) != existing_names.end();</a>
+<a name="ln1861">          if (!found) {</a>
+<a name="ln1862">            if (existing_names.size())</a>
+<a name="ln1863">              existing_name-&gt;second.push_back(',');</a>
+<a name="ln1864">            existing_name-&gt;second.append(new_name);</a>
+<a name="ln1865">          }</a>
+<a name="ln1866">        }</a>
+<a name="ln1867">      }</a>
+<a name="ln1868">    }</a>
+<a name="ln1869">  }</a>
+<a name="ln1870"> </a>
+<a name="ln1871">  std::string console_message;</a>
+<a name="ln1872">  if (*category_group_enabled &amp;</a>
+<a name="ln1873">      (ENABLED_FOR_RECORDING | ENABLED_FOR_MONITORING)) {</a>
+<a name="ln1874">    TraceEvent* trace_event = thread_local_event_buffer-&gt;AddTraceEvent(&amp;handle);</a>
+<a name="ln1875"> </a>
+<a name="ln1876">    if (trace_event) {</a>
+<a name="ln1877">      trace_event-&gt;Initialize(thread_id, now, thread_now, phase,</a>
+<a name="ln1878">                              category_group_enabled, name, id,</a>
+<a name="ln1879">                              num_args, arg_names, arg_types, arg_values,</a>
+<a name="ln1880">                              convertable_values, flags);</a>
+<a name="ln1881"> </a>
+<a name="ln1882">#if defined(OS_ANDROID)</a>
+<a name="ln1883">      trace_event-&gt;SendToATrace();</a>
+<a name="ln1884">#endif</a>
+<a name="ln1885">    }</a>
+<a name="ln1886"> </a>
+<a name="ln1887">    if (trace_options() &amp; ECHO_TO_CONSOLE) {</a>
+<a name="ln1888">      console_message = EventToConsoleMessage(</a>
+<a name="ln1889">          phase == TRACE_EVENT_PHASE_COMPLETE ? TRACE_EVENT_PHASE_BEGIN : phase,</a>
+<a name="ln1890">          timestamp, trace_event);</a>
+<a name="ln1891">    }</a>
+<a name="ln1892">  }</a>
+<a name="ln1893"> </a>
+<a name="ln1894">  if (PREDICT_FALSE(console_message.size()))</a>
+<a name="ln1895">    LOG(ERROR) &lt;&lt; console_message;</a>
+<a name="ln1896"> </a>
+<a name="ln1897">  if (PREDICT_FALSE(reinterpret_cast&lt;const unsigned char*&gt;(</a>
+<a name="ln1898">                      base::subtle::NoBarrier_Load(&amp;watch_category_)) == category_group_enabled)) {</a>
+<a name="ln1899">    bool event_name_matches;</a>
+<a name="ln1900">    WatchEventCallback watch_event_callback_copy;</a>
+<a name="ln1901">    {</a>
+<a name="ln1902">      SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln1903">      event_name_matches = watch_event_name_ == name;</a>
+<a name="ln1904">      watch_event_callback_copy = watch_event_callback_;</a>
+<a name="ln1905">    }</a>
+<a name="ln1906">    if (event_name_matches) {</a>
+<a name="ln1907">      if (!watch_event_callback_copy.is_null())</a>
+<a name="ln1908">        watch_event_callback_copy.Run();</a>
+<a name="ln1909">    }</a>
+<a name="ln1910">  }</a>
+<a name="ln1911"> </a>
+<a name="ln1912">  if (PREDICT_FALSE(*category_group_enabled &amp; ENABLED_FOR_EVENT_CALLBACK)) {</a>
+<a name="ln1913">    EventCallback event_callback = reinterpret_cast&lt;EventCallback&gt;(</a>
+<a name="ln1914">      base::subtle::NoBarrier_Load(&amp;event_callback_));</a>
+<a name="ln1915">    if (event_callback) {</a>
+<a name="ln1916">      event_callback(now,</a>
+<a name="ln1917">                     phase == TRACE_EVENT_PHASE_COMPLETE ?</a>
+<a name="ln1918">                         TRACE_EVENT_PHASE_BEGIN : phase,</a>
+<a name="ln1919">                     category_group_enabled, name, id,</a>
+<a name="ln1920">                     num_args, arg_names, arg_types, arg_values,</a>
+<a name="ln1921">                     flags);</a>
+<a name="ln1922">    }</a>
+<a name="ln1923">  }</a>
+<a name="ln1924"> </a>
+<a name="ln1925">  return handle;</a>
+<a name="ln1926">}</a>
+<a name="ln1927"> </a>
+<a name="ln1928">// May be called when a COMPLETE event ends and the unfinished event has been</a>
+<a name="ln1929">// recycled (phase == TRACE_EVENT_PHASE_END and trace_event == NULL).</a>
+<a name="ln1930">std::string TraceLog::EventToConsoleMessage(unsigned char phase,</a>
+<a name="ln1931">                                            const MicrosecondsInt64&amp; timestamp,</a>
+<a name="ln1932">                                            TraceEvent* trace_event) {</a>
+<a name="ln1933">  SpinLockHolder thread_info_lock(&amp;thread_info_lock_);</a>
+<a name="ln1934"> </a>
+<a name="ln1935">  // The caller should translate TRACE_EVENT_PHASE_COMPLETE to</a>
+<a name="ln1936">  // TRACE_EVENT_PHASE_BEGIN or TRACE_EVENT_END.</a>
+<a name="ln1937">  DCHECK(phase != TRACE_EVENT_PHASE_COMPLETE);</a>
+<a name="ln1938"> </a>
+<a name="ln1939">  MicrosecondsInt64 duration = 0;</a>
+<a name="ln1940">  int thread_id = trace_event ?</a>
+<a name="ln1941">      trace_event-&gt;thread_id() : Thread::UniqueThreadId();</a>
+<a name="ln1942">  if (phase == TRACE_EVENT_PHASE_END) {</a>
+<a name="ln1943">    duration = timestamp - thread_event_start_times_[thread_id].top();</a>
+<a name="ln1944">    thread_event_start_times_[thread_id].pop();</a>
+<a name="ln1945">  }</a>
+<a name="ln1946"> </a>
+<a name="ln1947">  std::string thread_name = thread_names_[thread_id];</a>
+<a name="ln1948">  if (thread_colors_.find(thread_name) == thread_colors_.end())</a>
+<a name="ln1949">    thread_colors_[thread_name] = (thread_colors_.size() % 6) + 1;</a>
+<a name="ln1950"> </a>
+<a name="ln1951">  std::ostringstream log;</a>
+<a name="ln1952">  log &lt;&lt; StringPrintf(&quot;%s: \x1b[0;3%dm&quot;,</a>
+<a name="ln1953">                            thread_name.c_str(),</a>
+<a name="ln1954">                            thread_colors_[thread_name]);</a>
+<a name="ln1955"> </a>
+<a name="ln1956">  size_t depth = 0;</a>
+<a name="ln1957">  if (thread_event_start_times_.find(thread_id) !=</a>
+<a name="ln1958">      thread_event_start_times_.end())</a>
+<a name="ln1959">    depth = thread_event_start_times_[thread_id].size();</a>
+<a name="ln1960"> </a>
+<a name="ln1961">  for (size_t i = 0; i &lt; depth; ++i)</a>
+<a name="ln1962">    log &lt;&lt; &quot;| &quot;;</a>
+<a name="ln1963"> </a>
+<a name="ln1964">  if (trace_event)</a>
+<a name="ln1965">    trace_event-&gt;AppendPrettyPrinted(&amp;log);</a>
+<a name="ln1966">  if (phase == TRACE_EVENT_PHASE_END)</a>
+<a name="ln1967">    log &lt;&lt; StringPrintf(&quot; (%.3f ms)&quot;, duration / 1000.0f);</a>
+<a name="ln1968"> </a>
+<a name="ln1969">  log &lt;&lt; &quot;\x1b[0;m&quot;;</a>
+<a name="ln1970"> </a>
+<a name="ln1971">  if (phase == TRACE_EVENT_PHASE_BEGIN)</a>
+<a name="ln1972">    thread_event_start_times_[thread_id].push(timestamp);</a>
+<a name="ln1973"> </a>
+<a name="ln1974">  return log.str();</a>
+<a name="ln1975">}</a>
+<a name="ln1976"> </a>
+<a name="ln1977">void TraceLog::AddTraceEventEtw(char phase,</a>
+<a name="ln1978">                                const char* name,</a>
+<a name="ln1979">                                const void* id,</a>
+<a name="ln1980">                                const char* extra) {</a>
+<a name="ln1981">#if defined(OS_WIN)</a>
+<a name="ln1982">  TraceEventETWProvider::Trace(name, phase, id, extra);</a>
+<a name="ln1983">#endif</a>
+<a name="ln1984">  INTERNAL_TRACE_EVENT_ADD(phase, &quot;ETW Trace Event&quot;, name,</a>
+<a name="ln1985">                           TRACE_EVENT_FLAG_COPY, &quot;id&quot;, id, &quot;extra&quot;, extra);</a>
+<a name="ln1986">}</a>
+<a name="ln1987"> </a>
+<a name="ln1988">void TraceLog::AddTraceEventEtw(char phase,</a>
+<a name="ln1989">                                const char* name,</a>
+<a name="ln1990">                                const void* id,</a>
+<a name="ln1991">                                const std::string&amp; extra) {</a>
+<a name="ln1992">#if defined(OS_WIN)</a>
+<a name="ln1993">  TraceEventETWProvider::Trace(name, phase, id, extra);</a>
+<a name="ln1994">#endif</a>
+<a name="ln1995">  INTERNAL_TRACE_EVENT_ADD(phase, &quot;ETW Trace Event&quot;, name,</a>
+<a name="ln1996">                           TRACE_EVENT_FLAG_COPY, &quot;id&quot;, id, &quot;extra&quot;, extra);</a>
+<a name="ln1997">}</a>
+<a name="ln1998"> </a>
+<a name="ln1999">void TraceLog::UpdateTraceEventDuration(</a>
+<a name="ln2000">    const unsigned char* category_group_enabled,</a>
+<a name="ln2001">    const char* name,</a>
+<a name="ln2002">    TraceEventHandle handle) {</a>
+<a name="ln2003"> </a>
+<a name="ln2004">  PerThreadInfo* thr_info = thread_local_info_;</a>
+<a name="ln2005">  if (!thr_info) {</a>
+<a name="ln2006">    thr_info = SetupThreadLocalBuffer();</a>
+<a name="ln2007">  }</a>
+<a name="ln2008"> </a>
+<a name="ln2009">  // Avoid re-entrance of AddTraceEvent. This may happen in GPU process when</a>
+<a name="ln2010">  // ECHO_TO_CONSOLE is enabled: AddTraceEvent -&gt; LOG(ERROR) -&gt;</a>
+<a name="ln2011">  // GpuProcessLogMessageHandler -&gt; PostPendingTask -&gt; TRACE_EVENT ...</a>
+<a name="ln2012">  if (base::subtle::NoBarrier_Load(&amp;thr_info-&gt;is_in_trace_event_))</a>
+<a name="ln2013">    return;</a>
+<a name="ln2014">  MarkFlagInScope thread_is_in_trace_event(&amp;thr_info-&gt;is_in_trace_event_);</a>
+<a name="ln2015"> </a>
+<a name="ln2016">  MicrosecondsInt64 thread_now = GetThreadCpuTimeMicros();</a>
+<a name="ln2017">  MicrosecondsInt64 now = OffsetNow();</a>
+<a name="ln2018"> </a>
+<a name="ln2019">  std::string console_message;</a>
+<a name="ln2020">  if (*category_group_enabled &amp; ENABLED_FOR_RECORDING) {</a>
+<a name="ln2021">    OptionalAutoLock lock(&amp;lock_);</a>
+<a name="ln2022"> </a>
+<a name="ln2023">    TraceEvent* trace_event = GetEventByHandleInternal(handle, &amp;lock);</a>
+<a name="ln2024">    if (trace_event) {</a>
+<a name="ln2025">      DCHECK(trace_event-&gt;phase() == TRACE_EVENT_PHASE_COMPLETE);</a>
+<a name="ln2026">      trace_event-&gt;UpdateDuration(now, thread_now);</a>
+<a name="ln2027">#if defined(OS_ANDROID)</a>
+<a name="ln2028">      trace_event-&gt;SendToATrace();</a>
+<a name="ln2029">#endif</a>
+<a name="ln2030">    }</a>
+<a name="ln2031"> </a>
+<a name="ln2032">    if (trace_options() &amp; ECHO_TO_CONSOLE) {</a>
+<a name="ln2033">      console_message = EventToConsoleMessage(TRACE_EVENT_PHASE_END,</a>
+<a name="ln2034">                                              now, trace_event);</a>
+<a name="ln2035">    }</a>
+<a name="ln2036">  }</a>
+<a name="ln2037"> </a>
+<a name="ln2038">  if (console_message.size())</a>
+<a name="ln2039">    LOG(ERROR) &lt;&lt; console_message;</a>
+<a name="ln2040"> </a>
+<a name="ln2041">  if (*category_group_enabled &amp; ENABLED_FOR_EVENT_CALLBACK) {</a>
+<a name="ln2042">    EventCallback event_callback = reinterpret_cast&lt;EventCallback&gt;(</a>
+<a name="ln2043">      base::subtle::NoBarrier_Load(&amp;event_callback_));</a>
+<a name="ln2044">    if (event_callback) {</a>
+<a name="ln2045">      event_callback(now, TRACE_EVENT_PHASE_END, category_group_enabled, name,</a>
+<a name="ln2046">                     trace_event_internal::kNoEventId, 0, nullptr, nullptr, nullptr,</a>
+<a name="ln2047">                     TRACE_EVENT_FLAG_NONE);</a>
+<a name="ln2048">    }</a>
+<a name="ln2049">  }</a>
+<a name="ln2050">}</a>
+<a name="ln2051"> </a>
+<a name="ln2052">void TraceLog::SetWatchEvent(const std::string&amp; category_name,</a>
+<a name="ln2053">                             const std::string&amp; event_name,</a>
+<a name="ln2054">                             const WatchEventCallback&amp; callback) {</a>
+<a name="ln2055">  const unsigned char* category = GetCategoryGroupEnabled(</a>
+<a name="ln2056">      category_name.c_str());</a>
+<a name="ln2057">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln2058">  base::subtle::NoBarrier_Store(&amp;watch_category_,</a>
+<a name="ln2059">                          reinterpret_cast&lt;AtomicWord&gt;(category));</a>
+<a name="ln2060">  watch_event_name_ = event_name;</a>
+<a name="ln2061">  watch_event_callback_ = callback;</a>
+<a name="ln2062">}</a>
+<a name="ln2063"> </a>
+<a name="ln2064">void TraceLog::CancelWatchEvent() {</a>
+<a name="ln2065">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln2066">  base::subtle::NoBarrier_Store(&amp;watch_category_, 0);</a>
+<a name="ln2067">  watch_event_name_ = &quot;&quot;;</a>
+<a name="ln2068">  watch_event_callback_.Reset();</a>
+<a name="ln2069">}</a>
+<a name="ln2070"> </a>
+<a name="ln2071">void TraceLog::AddMetadataEventsWhileLocked() {</a>
+<a name="ln2072">  DCHECK(lock_.IsHeld());</a>
+<a name="ln2073"> </a>
+<a name="ln2074">#if !defined(OS_NACL)  // NaCl shouldn't expose the process id.</a>
+<a name="ln2075">  InitializeMetadataEvent(AddEventToThreadSharedChunkWhileLocked(nullptr, false),</a>
+<a name="ln2076">                          0,</a>
+<a name="ln2077">                          &quot;num_cpus&quot;, &quot;number&quot;,</a>
+<a name="ln2078">                          base::NumCPUs());</a>
+<a name="ln2079">#endif</a>
+<a name="ln2080"> </a>
+<a name="ln2081"> </a>
+<a name="ln2082">  int current_thread_id = static_cast&lt;int&gt;(yb::Thread::UniqueThreadId());</a>
+<a name="ln2083">  if (process_sort_index_ != 0) {</a>
+<a name="ln2084">    InitializeMetadataEvent(AddEventToThreadSharedChunkWhileLocked(nullptr, false),</a>
+<a name="ln2085">                            current_thread_id,</a>
+<a name="ln2086">                            &quot;process_sort_index&quot;, &quot;sort_index&quot;,</a>
+<a name="ln2087">                            process_sort_index_);</a>
+<a name="ln2088">  }</a>
+<a name="ln2089"> </a>
+<a name="ln2090">  if (process_name_.size()) {</a>
+<a name="ln2091">    InitializeMetadataEvent(AddEventToThreadSharedChunkWhileLocked(nullptr, false),</a>
+<a name="ln2092">                            current_thread_id,</a>
+<a name="ln2093">                            &quot;process_name&quot;, &quot;name&quot;,</a>
+<a name="ln2094">                            process_name_);</a>
+<a name="ln2095">  }</a>
+<a name="ln2096"> </a>
+<a name="ln2097">  if (process_labels_.size() &gt; 0) {</a>
+<a name="ln2098">    std::vector&lt;std::string&gt; labels;</a>
+<a name="ln2099">    for (auto&amp; label : process_labels_) {</a>
+<a name="ln2100">      labels.push_back(label.second);</a>
+<a name="ln2101">    }</a>
+<a name="ln2102">    InitializeMetadataEvent(AddEventToThreadSharedChunkWhileLocked(nullptr, false),</a>
+<a name="ln2103">                            current_thread_id,</a>
+<a name="ln2104">                            &quot;process_labels&quot;, &quot;labels&quot;,</a>
+<a name="ln2105">                            JoinStrings(labels, &quot;,&quot;));</a>
+<a name="ln2106">  }</a>
+<a name="ln2107"> </a>
+<a name="ln2108">  // Thread sort indices.</a>
+<a name="ln2109">  for (auto&amp; sort_index : thread_sort_indices_) {</a>
+<a name="ln2110">    if (sort_index.second == 0)</a>
+<a name="ln2111">      continue;</a>
+<a name="ln2112">    InitializeMetadataEvent(AddEventToThreadSharedChunkWhileLocked(nullptr, false),</a>
+<a name="ln2113">                            sort_index.first,</a>
+<a name="ln2114">                            &quot;thread_sort_index&quot;, &quot;sort_index&quot;,</a>
+<a name="ln2115">                            sort_index.second);</a>
+<a name="ln2116">  }</a>
+<a name="ln2117"> </a>
+<a name="ln2118">  // Thread names.</a>
+<a name="ln2119">  SpinLockHolder thread_info_lock(&amp;thread_info_lock_);</a>
+<a name="ln2120">  for (auto&amp; name : thread_names_) {</a>
+<a name="ln2121">    if (name.second.empty())</a>
+<a name="ln2122">      continue;</a>
+<a name="ln2123">    InitializeMetadataEvent(AddEventToThreadSharedChunkWhileLocked(nullptr, false),</a>
+<a name="ln2124">                            name.first,</a>
+<a name="ln2125">                            &quot;thread_name&quot;, &quot;name&quot;,</a>
+<a name="ln2126">                            name.second);</a>
+<a name="ln2127">  }</a>
+<a name="ln2128">}</a>
+<a name="ln2129"> </a>
+<a name="ln2130"> </a>
+<a name="ln2131">TraceEvent* TraceLog::GetEventByHandle(TraceEventHandle handle) {</a>
+<a name="ln2132">  return GetEventByHandleInternal(handle, nullptr);</a>
+<a name="ln2133">}</a>
+<a name="ln2134"> </a>
+<a name="ln2135">TraceEvent* NO_THREAD_SAFETY_ANALYSIS TraceLog::GetEventByHandleInternal(</a>
+<a name="ln2136">    TraceEventHandle handle, OptionalAutoLock* lock) {</a>
+<a name="ln2137">  TraceLog::PerThreadInfo* thr_info = TraceLog::thread_local_info_;</a>
+<a name="ln2138"> </a>
+<a name="ln2139">  if (!handle.chunk_seq)</a>
+<a name="ln2140">    return nullptr;</a>
+<a name="ln2141"> </a>
+<a name="ln2142">  if (thr_info) {</a>
+<a name="ln2143">    ThreadLocalEventBuffer* buf =</a>
+<a name="ln2144">      reinterpret_cast&lt;ThreadLocalEventBuffer*&gt;(</a>
+<a name="ln2145">        base::subtle::NoBarrier_Load(</a>
+<a name="ln2146">          reinterpret_cast&lt;AtomicWord*&gt;(&amp;thr_info-&gt;event_buffer_)));</a>
+<a name="ln2147"> </a>
+<a name="ln2148">    if (buf) {</a>
+<a name="ln2149">      DCHECK_EQ(1, ANNOTATE_UNPROTECTED_READ(thr_info-&gt;is_in_trace_event_));</a>
+<a name="ln2150"> </a>
+<a name="ln2151">      TraceEvent* trace_event = buf-&gt;GetEventByHandle(handle);</a>
+<a name="ln2152">      if (trace_event)</a>
+<a name="ln2153">        return trace_event;</a>
+<a name="ln2154">    }</a>
+<a name="ln2155">  }</a>
+<a name="ln2156"> </a>
+<a name="ln2157">  // The event has been out-of-control of the thread local buffer.</a>
+<a name="ln2158">  // Try to get the event from the main buffer with a lock.</a>
+<a name="ln2159">  if (lock)</a>
+<a name="ln2160">    lock-&gt;EnsureAcquired();</a>
+<a name="ln2161"> </a>
+<a name="ln2162">  if (thread_shared_chunk_ &amp;&amp;</a>
+<a name="ln2163">      handle.chunk_index == thread_shared_chunk_index_) {</a>
+<a name="ln2164">    return handle.chunk_seq == thread_shared_chunk_-&gt;seq() ?</a>
+<a name="ln2165">        thread_shared_chunk_-&gt;GetEventAt(handle.event_index) : nullptr;</a>
+<a name="ln2166">  }</a>
+<a name="ln2167"> </a>
+<a name="ln2168">  return logged_events_-&gt;GetEventByHandle(handle);</a>
+<a name="ln2169">}</a>
+<a name="ln2170"> </a>
+<a name="ln2171">void TraceLog::SetProcessID(int process_id) {</a>
+<a name="ln2172">  process_id_ = process_id;</a>
+<a name="ln2173">  // Create a FNV hash from the process ID for XORing.</a>
+<a name="ln2174">  // See http://isthe.com/chongo/tech/comp/fnv/ for algorithm details.</a>
+<a name="ln2175">  uint64_t offset_basis = 14695981039346656037ull;</a>
+<a name="ln2176">  uint64_t fnv_prime = 1099511628211ull;</a>
+<a name="ln2177">  uint64_t pid = static_cast&lt;uint64_t&gt;(process_id_);</a>
+<a name="ln2178">  process_id_hash_ = (offset_basis ^ pid) * fnv_prime;</a>
+<a name="ln2179">}</a>
+<a name="ln2180"> </a>
+<a name="ln2181">void TraceLog::SetProcessSortIndex(int sort_index) {</a>
+<a name="ln2182">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln2183">  process_sort_index_ = sort_index;</a>
+<a name="ln2184">}</a>
+<a name="ln2185"> </a>
+<a name="ln2186">void TraceLog::SetProcessName(const std::string&amp; process_name) {</a>
+<a name="ln2187">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln2188">  process_name_ = process_name;</a>
+<a name="ln2189">}</a>
+<a name="ln2190"> </a>
+<a name="ln2191">void TraceLog::UpdateProcessLabel(</a>
+<a name="ln2192">    int label_id, const std::string&amp; current_label) {</a>
+<a name="ln2193">  if(!current_label.length())</a>
+<a name="ln2194">    return RemoveProcessLabel(label_id);</a>
+<a name="ln2195"> </a>
+<a name="ln2196">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln2197">  process_labels_[label_id] = current_label;</a>
+<a name="ln2198">}</a>
+<a name="ln2199"> </a>
+<a name="ln2200">void TraceLog::RemoveProcessLabel(int label_id) {</a>
+<a name="ln2201">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln2202">  auto it = process_labels_.find(label_id);</a>
+<a name="ln2203">  if (it == process_labels_.end())</a>
+<a name="ln2204">    return;</a>
+<a name="ln2205"> </a>
+<a name="ln2206">  process_labels_.erase(it);</a>
+<a name="ln2207">}</a>
+<a name="ln2208"> </a>
+<a name="ln2209">void TraceLog::SetThreadSortIndex(int64_t thread_id, int sort_index) {</a>
+<a name="ln2210">  SpinLockHolder lock(&amp;lock_);</a>
+<a name="ln2211">  thread_sort_indices_[static_cast&lt;int&gt;(thread_id)] = sort_index;</a>
+<a name="ln2212">}</a>
+<a name="ln2213"> </a>
+<a name="ln2214">void TraceLog::SetTimeOffset(MicrosecondsInt64 offset) {</a>
+<a name="ln2215">  time_offset_ = offset;</a>
+<a name="ln2216">}</a>
+<a name="ln2217"> </a>
+<a name="ln2218">size_t TraceLog::GetObserverCountForTest() const {</a>
+<a name="ln2219">  return enabled_state_observer_list_.size();</a>
+<a name="ln2220">}</a>
+<a name="ln2221"> </a>
+<a name="ln2222">bool CategoryFilter::IsEmptyOrContainsLeadingOrTrailingWhitespace(</a>
+<a name="ln2223">    const std::string&amp; str) {</a>
+<a name="ln2224">  return  str.empty() ||</a>
+<a name="ln2225">          str.at(0) == ' ' ||</a>
+<a name="ln2226">          str.at(str.length() - 1) == ' ';</a>
+<a name="ln2227">}</a>
+<a name="ln2228"> </a>
+<a name="ln2229">bool CategoryFilter::DoesCategoryGroupContainCategory(</a>
+<a name="ln2230">    const char* category_group,</a>
+<a name="ln2231">    const char* category) const {</a>
+<a name="ln2232">  DCHECK(category);</a>
+<a name="ln2233">  vector&lt;string&gt; pieces = strings::Split(category_group, &quot;,&quot;);</a>
+<a name="ln2234">  for (const string&amp; category_group_token : pieces) {</a>
+<a name="ln2235">    // Don't allow empty tokens, nor tokens with leading or trailing space.</a>
+<a name="ln2236">    DCHECK(!CategoryFilter::IsEmptyOrContainsLeadingOrTrailingWhitespace(</a>
+<a name="ln2237">        category_group_token))</a>
+<a name="ln2238">        &lt;&lt; &quot;Disallowed category string&quot;;</a>
+<a name="ln2239"> </a>
+<a name="ln2240">    if (MatchPattern(category_group_token.c_str(), category))</a>
+<a name="ln2241">      return true;</a>
+<a name="ln2242">  }</a>
+<a name="ln2243">  return false;</a>
+<a name="ln2244">}</a>
+<a name="ln2245"> </a>
+<a name="ln2246">CategoryFilter::CategoryFilter(const std::string&amp; filter_string) {</a>
+<a name="ln2247">  if (!filter_string.empty())</a>
+<a name="ln2248">    Initialize(filter_string);</a>
+<a name="ln2249">  else</a>
+<a name="ln2250">    Initialize(CategoryFilter::kDefaultCategoryFilterString);</a>
+<a name="ln2251">}</a>
+<a name="ln2252"> </a>
+<a name="ln2253">CategoryFilter::CategoryFilter(const CategoryFilter&amp; cf)</a>
+<a name="ln2254">    : included_(cf.included_),</a>
+<a name="ln2255">      disabled_(cf.disabled_),</a>
+<a name="ln2256">      excluded_(cf.excluded_),</a>
+<a name="ln2257">      delays_(cf.delays_) {</a>
+<a name="ln2258">}</a>
+<a name="ln2259"> </a>
+<a name="ln2260">CategoryFilter::~CategoryFilter() {</a>
+<a name="ln2261">}</a>
+<a name="ln2262"> </a>
+<a name="ln2263">CategoryFilter&amp; CategoryFilter::operator=(const CategoryFilter&amp; rhs) {</a>
+<a name="ln2264">  if (this == &amp;rhs)</a>
+<a name="ln2265">    return *this;</a>
+<a name="ln2266"> </a>
+<a name="ln2267">  included_ = rhs.included_;</a>
+<a name="ln2268">  disabled_ = rhs.disabled_;</a>
+<a name="ln2269">  excluded_ = rhs.excluded_;</a>
+<a name="ln2270">  delays_ = rhs.delays_;</a>
+<a name="ln2271">  return *this;</a>
+<a name="ln2272">}</a>
+<a name="ln2273"> </a>
+<a name="ln2274">void CategoryFilter::Initialize(const std::string&amp; filter_string) {</a>
+<a name="ln2275">  // Tokenize list of categories, delimited by ','.</a>
+<a name="ln2276">  vector&lt;string&gt; tokens = strings::Split(filter_string, &quot;,&quot;);</a>
+<a name="ln2277">  // Add each token to the appropriate list (included_,excluded_).</a>
+<a name="ln2278">  for (string category : tokens) {</a>
+<a name="ln2279">    // Ignore empty categories.</a>
+<a name="ln2280">    if (category.empty())</a>
+<a name="ln2281">      continue;</a>
+<a name="ln2282">    // Synthetic delays are of the form 'DELAY(delay;option;option;...)'.</a>
+<a name="ln2283">    if (category.find(kSyntheticDelayCategoryFilterPrefix) == 0 &amp;&amp;</a>
+<a name="ln2284">        category.at(category.size() - 1) == ')') {</a>
+<a name="ln2285">      category = category.substr(</a>
+<a name="ln2286">          strlen(kSyntheticDelayCategoryFilterPrefix),</a>
+<a name="ln2287">          category.size() - strlen(kSyntheticDelayCategoryFilterPrefix) - 1);</a>
+<a name="ln2288">      size_t name_length = category.find(';');</a>
+<a name="ln2289">      if (name_length != std::string::npos &amp;&amp; name_length &gt; 0 &amp;&amp;</a>
+<a name="ln2290">          name_length != category.size() - 1) {</a>
+<a name="ln2291">        delays_.push_back(category);</a>
+<a name="ln2292">      }</a>
+<a name="ln2293">    } else if (category.at(0) == '-') {</a>
+<a name="ln2294">      // Excluded categories start with '-'.</a>
+<a name="ln2295">      // Remove '-' from category string.</a>
+<a name="ln2296">      category = category.substr(1);</a>
+<a name="ln2297">      excluded_.push_back(category);</a>
+<a name="ln2298">    } else if (category.compare(0, strlen(TRACE_DISABLED_BY_DEFAULT(&quot;&quot;)),</a>
+<a name="ln2299">                                TRACE_DISABLED_BY_DEFAULT(&quot;&quot;)) == 0) {</a>
+<a name="ln2300">      disabled_.push_back(category);</a>
+<a name="ln2301">    } else {</a>
+<a name="ln2302">      included_.push_back(category);</a>
+<a name="ln2303">    }</a>
+<a name="ln2304">  }</a>
+<a name="ln2305">}</a>
+<a name="ln2306"> </a>
+<a name="ln2307">void CategoryFilter::WriteString(const StringList&amp; values,</a>
+<a name="ln2308">                                 std::string* out,</a>
+<a name="ln2309">                                 bool included) const {</a>
+<a name="ln2310">  bool prepend_comma = !out-&gt;empty();</a>
+<a name="ln2311">  int token_cnt = 0;</a>
+<a name="ln2312">  for (const auto&amp; value : values) {</a>
+<a name="ln2313">    if (token_cnt &gt; 0 || prepend_comma)</a>
+<a name="ln2314">      StringAppendF(out, &quot;,&quot;);</a>
+<a name="ln2315">    StringAppendF(out, &quot;%s%s&quot;, (included ? &quot;&quot; : &quot;-&quot;), value.c_str());</a>
+<a name="ln2316">    ++token_cnt;</a>
+<a name="ln2317">  }</a>
+<a name="ln2318">}</a>
+<a name="ln2319"> </a>
+<a name="ln2320">void CategoryFilter::WriteString(const StringList&amp; delays,</a>
+<a name="ln2321">                                 std::string* out) const {</a>
+<a name="ln2322">  bool prepend_comma = !out-&gt;empty();</a>
+<a name="ln2323">  int token_cnt = 0;</a>
+<a name="ln2324">  for (const auto&amp; delay : delays) {</a>
+<a name="ln2325">    if (token_cnt &gt; 0 || prepend_comma)</a>
+<a name="ln2326">      StringAppendF(out, &quot;,&quot;);</a>
+<a name="ln2327">    StringAppendF(out, &quot;%s%s)&quot;, kSyntheticDelayCategoryFilterPrefix,</a>
+<a name="ln2328">                  delay.c_str());</a>
+<a name="ln2329">    ++token_cnt;</a>
+<a name="ln2330">  }</a>
+<a name="ln2331">}</a>
+<a name="ln2332"> </a>
+<a name="ln2333">std::string CategoryFilter::ToString() const {</a>
+<a name="ln2334">  std::string filter_string;</a>
+<a name="ln2335">  WriteString(included_, &amp;filter_string, true);</a>
+<a name="ln2336">  WriteString(disabled_, &amp;filter_string, true);</a>
+<a name="ln2337">  WriteString(excluded_, &amp;filter_string, false);</a>
+<a name="ln2338">  WriteString(delays_, &amp;filter_string);</a>
+<a name="ln2339">  return filter_string;</a>
+<a name="ln2340">}</a>
+<a name="ln2341"> </a>
+<a name="ln2342">bool CategoryFilter::IsCategoryGroupEnabled(</a>
+<a name="ln2343">    const char* category_group_name) const {</a>
+<a name="ln2344">  // TraceLog should call this method only as  part of enabling/disabling</a>
+<a name="ln2345">  // categories.</a>
+<a name="ln2346">  StringList::const_iterator ci;</a>
+<a name="ln2347"> </a>
+<a name="ln2348">  // Check the disabled- filters and the disabled-* wildcard first so that a</a>
+<a name="ln2349">  // &quot;*&quot; filter does not include the disabled.</a>
+<a name="ln2350">  for (ci = disabled_.begin(); ci != disabled_.end(); ++ci) {</a>
+<a name="ln2351">    if (DoesCategoryGroupContainCategory(category_group_name, ci-&gt;c_str()))</a>
+<a name="ln2352">      return true;</a>
+<a name="ln2353">  }</a>
+<a name="ln2354">  if (DoesCategoryGroupContainCategory(category_group_name,</a>
+<a name="ln2355">                                       TRACE_DISABLED_BY_DEFAULT(&quot;*&quot;)))</a>
+<a name="ln2356">    return false;</a>
+<a name="ln2357"> </a>
+<a name="ln2358">  for (ci = included_.begin(); ci != included_.end(); ++ci) {</a>
+<a name="ln2359">    if (DoesCategoryGroupContainCategory(category_group_name, ci-&gt;c_str()))</a>
+<a name="ln2360">      return true;</a>
+<a name="ln2361">  }</a>
+<a name="ln2362"> </a>
+<a name="ln2363">  for (ci = excluded_.begin(); ci != excluded_.end(); ++ci) {</a>
+<a name="ln2364">    if (DoesCategoryGroupContainCategory(category_group_name, ci-&gt;c_str()))</a>
+<a name="ln2365">      return false;</a>
+<a name="ln2366">  }</a>
+<a name="ln2367">  // If the category group is not excluded, and there are no included patterns</a>
+<a name="ln2368">  // we consider this pattern enabled.</a>
+<a name="ln2369">  return included_.empty();</a>
+<a name="ln2370">}</a>
+<a name="ln2371"> </a>
+<a name="ln2372">bool CategoryFilter::HasIncludedPatterns() const {</a>
+<a name="ln2373">  return !included_.empty();</a>
+<a name="ln2374">}</a>
+<a name="ln2375"> </a>
+<a name="ln2376">void CategoryFilter::Merge(const CategoryFilter&amp; nested_filter) {</a>
+<a name="ln2377">  // Keep included patterns only if both filters have an included entry.</a>
+<a name="ln2378">  // Otherwise, one of the filter was specifying &quot;*&quot; and we want to honour the</a>
+<a name="ln2379">  // broadest filter.</a>
+<a name="ln2380">  if (HasIncludedPatterns() &amp;&amp; nested_filter.HasIncludedPatterns()) {</a>
+<a name="ln2381">    included_.insert(included_.end(),</a>
+<a name="ln2382">                     nested_filter.included_.begin(),</a>
+<a name="ln2383">                     nested_filter.included_.end());</a>
+<a name="ln2384">  } else {</a>
+<a name="ln2385">    included_.clear();</a>
+<a name="ln2386">  }</a>
+<a name="ln2387"> </a>
+<a name="ln2388">  disabled_.insert(disabled_.end(),</a>
+<a name="ln2389">                   nested_filter.disabled_.begin(),</a>
+<a name="ln2390">                   nested_filter.disabled_.end());</a>
+<a name="ln2391">  excluded_.insert(excluded_.end(),</a>
+<a name="ln2392">                   nested_filter.excluded_.begin(),</a>
+<a name="ln2393">                   nested_filter.excluded_.end());</a>
+<a name="ln2394">  delays_.insert(delays_.end(),</a>
+<a name="ln2395">                 nested_filter.delays_.begin(),</a>
+<a name="ln2396">                 nested_filter.delays_.end());</a>
+<a name="ln2397">}</a>
+<a name="ln2398"> </a>
+<a name="ln2399">void CategoryFilter::Clear() {</a>
+<a name="ln2400">  included_.clear();</a>
+<a name="ln2401">  disabled_.clear();</a>
+<a name="ln2402">  excluded_.clear();</a>
+<a name="ln2403">}</a>
+<a name="ln2404"> </a>
+<a name="ln2405">const CategoryFilter::StringList&amp;</a>
+<a name="ln2406">    CategoryFilter::GetSyntheticDelayValues() const {</a>
+<a name="ln2407">  return delays_;</a>
+<a name="ln2408">}</a>
+<a name="ln2409"> </a>
+<a name="ln2410">}  // namespace debug</a>
+<a name="ln2411">}  // namespace yb</a>
+<a name="ln2412"> </a>
+<a name="ln2413">namespace trace_event_internal {</a>
+<a name="ln2414"> </a>
+<a name="ln2415">ScopedTraceBinaryEfficient::ScopedTraceBinaryEfficient(</a>
+<a name="ln2416">    const char* category_group, const char* name) {</a>
+<a name="ln2417">  // The single atom works because for now the category_group can only be &quot;gpu&quot;.</a>
+<a name="ln2418">  DCHECK_EQ(strcmp(category_group, &quot;gpu&quot;), 0);</a>
+<a name="ln2419">  static TRACE_EVENT_API_ATOMIC_WORD atomic = 0;</a>
+<a name="ln2420">  INTERNAL_TRACE_EVENT_GET_CATEGORY_INFO_CUSTOM_VARIABLES(</a>
+<a name="ln2421">      category_group, atomic, category_group_enabled_);</a>
+<a name="ln2422">  name_ = name;</a>
+<a name="ln2423">  if (*category_group_enabled_) {</a>
+<a name="ln2424">    event_handle_ =</a>
+<a name="ln2425">        TRACE_EVENT_API_ADD_TRACE_EVENT_WITH_THREAD_ID_AND_TIMESTAMP(</a>
+<a name="ln2426">            TRACE_EVENT_PHASE_COMPLETE, category_group_enabled_, name,</a>
+<a name="ln2427">            trace_event_internal::kNoEventId,</a>
+<a name="ln2428">            static_cast&lt;int&gt;(yb::Thread::UniqueThreadId()),</a>
+<a name="ln2429">            GetMonoTimeMicros(),</a>
+<a name="ln2430">            0, nullptr, nullptr, nullptr, nullptr, TRACE_EVENT_FLAG_NONE);</a>
+<a name="ln2431">  }</a>
+<a name="ln2432">}</a>
+<a name="ln2433"> </a>
+<a name="ln2434">ScopedTraceBinaryEfficient::~ScopedTraceBinaryEfficient() {</a>
+<a name="ln2435">  if (*category_group_enabled_) {</a>
+<a name="ln2436">    TRACE_EVENT_API_UPDATE_TRACE_EVENT_DURATION(category_group_enabled_,</a>
+<a name="ln2437">                                                name_, event_handle_);</a>
+<a name="ln2438">  }</a>
+<a name="ln2439">}</a>
+<a name="ln2440"> </a>
+<a name="ln2441">}  // namespace trace_event_internal</a>
+
+</code></pre>
+<div class="balloon" rel="136"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="159"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="160"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="162"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="197"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1051/" target="_blank">V1051</a> Consider checking for misprints. It's possible that the 'current_iteration_index_' should be checked here.</p></div>
+<div class="balloon" rel="199"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="321"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="436"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="480"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="481"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="482"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="770"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1009"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1113"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1175"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1188"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1250"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1276"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1285"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1400"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1492"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1518"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1788"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1844"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v560/" target="_blank">V560</a> A part of conditional expression is always true: new_name.</p></div>
+<div class="balloon" rel="1937"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="2025"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="2072"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="2232"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="2236"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="513"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: timestamp_, thread_timestamp_, arg_names_, arg_types_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

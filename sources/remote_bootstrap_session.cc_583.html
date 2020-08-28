@@ -1,0 +1,656 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>remote_bootstrap_session.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32">#include &quot;yb/tserver/remote_bootstrap_session.h&quot;</a>
+<a name="ln33"> </a>
+<a name="ln34">#include &lt;algorithm&gt;</a>
+<a name="ln35">#include &lt;boost/optional.hpp&gt;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &quot;yb/consensus/consensus.h&quot;</a>
+<a name="ln38">#include &quot;yb/consensus/log.h&quot;</a>
+<a name="ln39">#include &quot;yb/consensus/log_reader.h&quot;</a>
+<a name="ln40">#include &quot;yb/gutil/map-util.h&quot;</a>
+<a name="ln41">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln42">#include &quot;yb/gutil/type_traits.h&quot;</a>
+<a name="ln43">#include &quot;yb/server/metadata.h&quot;</a>
+<a name="ln44">#include &quot;yb/tablet/tablet.h&quot;</a>
+<a name="ln45">#include &quot;yb/tablet/tablet_peer.h&quot;</a>
+<a name="ln46">#include &quot;yb/tablet/tablet_snapshots.h&quot;</a>
+<a name="ln47"> </a>
+<a name="ln48">#include &quot;yb/tserver/remote_bootstrap_snapshots.h&quot;</a>
+<a name="ln49"> </a>
+<a name="ln50">#include &quot;yb/util/size_literals.h&quot;</a>
+<a name="ln51">#include &quot;yb/util/stopwatch.h&quot;</a>
+<a name="ln52">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln53"> </a>
+<a name="ln54">DECLARE_int32(rpc_max_message_size);</a>
+<a name="ln55">DECLARE_int64(remote_bootstrap_rate_limit_bytes_per_sec);</a>
+<a name="ln56"> </a>
+<a name="ln57">namespace yb {</a>
+<a name="ln58">namespace tserver {</a>
+<a name="ln59"> </a>
+<a name="ln60">using std::shared_ptr;</a>
+<a name="ln61">using std::vector;</a>
+<a name="ln62">using std::string;</a>
+<a name="ln63"> </a>
+<a name="ln64">using consensus::MinimumOpId;</a>
+<a name="ln65">using consensus::RaftPeerPB;</a>
+<a name="ln66">using log::LogAnchorRegistry;</a>
+<a name="ln67">using log::ReadableLogSegment;</a>
+<a name="ln68">using strings::Substitute;</a>
+<a name="ln69">using tablet::RaftGroupMetadata;</a>
+<a name="ln70">using tablet::RaftGroupMetadataPtr;</a>
+<a name="ln71">using tablet::TabletPeer;</a>
+<a name="ln72">using tablet::RaftGroupReplicaSuperBlockPB;</a>
+<a name="ln73"> </a>
+<a name="ln74">RemoteBootstrapSession::RemoteBootstrapSession(</a>
+<a name="ln75">    const std::shared_ptr&lt;TabletPeer&gt;&amp; tablet_peer, std::string session_id,</a>
+<a name="ln76">    std::string requestor_uuid, const std::atomic&lt;int&gt;* nsessions)</a>
+<a name="ln77">    : tablet_peer_(tablet_peer),</a>
+<a name="ln78">      session_id_(std::move(session_id)),</a>
+<a name="ln79">      requestor_uuid_(std::move(requestor_uuid)),</a>
+<a name="ln80">      succeeded_(false),</a>
+<a name="ln81">      nsessions_(nsessions) {</a>
+<a name="ln82">  AddSource&lt;RemoteBootstrapSnapshotsSource&gt;();</a>
+<a name="ln83">}</a>
+<a name="ln84"> </a>
+<a name="ln85">RemoteBootstrapSession::~RemoteBootstrapSession() {</a>
+<a name="ln86">  // No lock taken in the destructor, should only be 1 thread with access now.</a>
+<a name="ln87">  CHECK_OK(UnregisterAnchorIfNeededUnlocked());</a>
+<a name="ln88"> </a>
+<a name="ln89">  // Delete checkpoint directory.</a>
+<a name="ln90">  if (!checkpoint_dir_.empty()) {</a>
+<a name="ln91">    auto s = env()-&gt;DeleteRecursively(checkpoint_dir_);</a>
+<a name="ln92">    if (!s.ok()) {</a>
+<a name="ln93">      LOG(WARNING) &lt;&lt; &quot;Unable to delete checkpoint directory &quot; &lt;&lt; checkpoint_dir_;</a>
+<a name="ln94">    } else {</a>
+<a name="ln95">      LOG(INFO) &lt;&lt; &quot;Successfully deleted checkpoint directory &quot; &lt;&lt; checkpoint_dir_;</a>
+<a name="ln96">    }</a>
+<a name="ln97">  } else {</a>
+<a name="ln98">    LOG(INFO) &lt;&lt; &quot;No checkpoint directory was created for this session&quot;;</a>
+<a name="ln99">  }</a>
+<a name="ln100"> </a>
+<a name="ln101">}</a>
+<a name="ln102"> </a>
+<a name="ln103">Status RemoteBootstrapSession::ChangeRole() {</a>
+<a name="ln104">  CHECK(Succeeded());</a>
+<a name="ln105"> </a>
+<a name="ln106">  shared_ptr&lt;consensus::Consensus&gt; consensus = tablet_peer_-&gt;shared_consensus();</a>
+<a name="ln107">  // This check fixes an issue with test TestDeleteTabletDuringRemoteBootstrap in which a tablet is</a>
+<a name="ln108">  // tombstoned while the bootstrap is happening. This causes the peer's consensus object to be</a>
+<a name="ln109">  // null.</a>
+<a name="ln110">  if (!consensus) {</a>
+<a name="ln111">    tablet::RaftGroupStatePB tablet_state = tablet_peer_-&gt;state();</a>
+<a name="ln112">    return STATUS(IllegalState, Substitute(</a>
+<a name="ln113">        &quot;Unable to change role for server $0 in config for tablet $1. Consensus is not available. &quot;</a>
+<a name="ln114">        &quot;Tablet state: $2 ($3)&quot;, requestor_uuid_, tablet_peer_-&gt;tablet_id(),</a>
+<a name="ln115">        tablet::RaftGroupStatePB_Name(tablet_state), tablet_state));</a>
+<a name="ln116">  }</a>
+<a name="ln117"> </a>
+<a name="ln118">  // If peer being bootstrapped is already a VOTER, don't send the ChangeConfig request. This could</a>
+<a name="ln119">  // happen when a tserver that is already a VOTER in the configuration tombstones its tablet, and</a>
+<a name="ln120">  // the leader starts bootstrapping it.</a>
+<a name="ln121">  const consensus::RaftConfigPB config = tablet_peer_-&gt;RaftConfig();</a>
+<a name="ln122">  for (const RaftPeerPB&amp; peer_pb : config.peers()) {</a>
+<a name="ln123">    if (peer_pb.permanent_uuid() != requestor_uuid_) {</a>
+<a name="ln124">      continue;</a>
+<a name="ln125">    }</a>
+<a name="ln126"> </a>
+<a name="ln127">    switch(peer_pb.member_type()) {</a>
+<a name="ln128">      case RaftPeerPB::OBSERVER: FALLTHROUGH_INTENDED;</a>
+<a name="ln129">      case RaftPeerPB::VOTER:</a>
+<a name="ln130">        LOG(ERROR) &lt;&lt; &quot;Peer &quot; &lt;&lt; peer_pb.permanent_uuid() &lt;&lt; &quot; is a &quot;</a>
+<a name="ln131">                   &lt;&lt; RaftPeerPB::MemberType_Name(peer_pb.member_type())</a>
+<a name="ln132">                   &lt;&lt; &quot; Not changing its role after remote bootstrap&quot;;</a>
+<a name="ln133"> </a>
+<a name="ln134">        // Even though this is an error, we return Status::OK() so the remote server doesn't</a>
+<a name="ln135">        // tombstone its tablet.</a>
+<a name="ln136">        return Status::OK();</a>
+<a name="ln137"> </a>
+<a name="ln138">      case RaftPeerPB::PRE_OBSERVER: FALLTHROUGH_INTENDED;</a>
+<a name="ln139">      case RaftPeerPB::PRE_VOTER: {</a>
+<a name="ln140">        consensus::ChangeConfigRequestPB req;</a>
+<a name="ln141">        consensus::ChangeConfigResponsePB resp;</a>
+<a name="ln142"> </a>
+<a name="ln143">        req.set_tablet_id(tablet_peer_-&gt;tablet_id());</a>
+<a name="ln144">        req.set_type(consensus::CHANGE_ROLE);</a>
+<a name="ln145">        RaftPeerPB* peer = req.mutable_server();</a>
+<a name="ln146">        peer-&gt;set_permanent_uuid(requestor_uuid_);</a>
+<a name="ln147"> </a>
+<a name="ln148">        boost::optional&lt;TabletServerErrorPB::Code&gt; error_code;</a>
+<a name="ln149"> </a>
+<a name="ln150">        LOG(INFO) &lt;&lt; &quot;Changing config with request: { &quot; &lt;&lt; req.ShortDebugString() &lt;&lt; &quot; } &quot;</a>
+<a name="ln151">                  &lt;&lt; &quot;in bootstrap session &quot; &lt;&lt; session_id_;</a>
+<a name="ln152"> </a>
+<a name="ln153">        // If another ChangeConfig is being processed, our request will be rejected.</a>
+<a name="ln154">        return consensus-&gt;ChangeConfig(req, &amp;DoNothingStatusCB, &amp;error_code);</a>
+<a name="ln155">      }</a>
+<a name="ln156">      case RaftPeerPB::UNKNOWN_MEMBER_TYPE:</a>
+<a name="ln157">        return STATUS(IllegalState, Substitute(&quot;Unable to change role for peer $0 in config for &quot;</a>
+<a name="ln158">                                               &quot;tablet $1. Peer has an invalid member type $2&quot;,</a>
+<a name="ln159">                                               peer_pb.permanent_uuid(), tablet_peer_-&gt;tablet_id(),</a>
+<a name="ln160">                                               RaftPeerPB::MemberType_Name(peer_pb.member_type())));</a>
+<a name="ln161">    }</a>
+<a name="ln162">    LOG(FATAL) &lt;&lt; &quot;Unexpected peer member type &quot;</a>
+<a name="ln163">               &lt;&lt; RaftPeerPB::MemberType_Name(peer_pb.member_type());</a>
+<a name="ln164">  }</a>
+<a name="ln165">  return STATUS(IllegalState, Substitute(&quot;Unable to find peer $0 in config for tablet $1&quot;,</a>
+<a name="ln166">                                         requestor_uuid_, tablet_peer_-&gt;tablet_id()));</a>
+<a name="ln167">}</a>
+<a name="ln168"> </a>
+<a name="ln169">Status RemoteBootstrapSession::SetInitialCommittedState() {</a>
+<a name="ln170">  shared_ptr &lt;consensus::Consensus&gt; consensus = tablet_peer_-&gt;shared_consensus();</a>
+<a name="ln171">  if (!consensus) {</a>
+<a name="ln172">    tablet::RaftGroupStatePB tablet_state = tablet_peer_-&gt;state();</a>
+<a name="ln173">    return STATUS(IllegalState,</a>
+<a name="ln174">                  Substitute(&quot;Unable to initialize remote bootstrap session &quot;</a>
+<a name="ln175">                             &quot;for tablet $0. Consensus is not available. Tablet state: $1 ($2)&quot;,</a>
+<a name="ln176">                             tablet_peer_-&gt;tablet_id(), tablet::RaftGroupStatePB_Name(tablet_state),</a>
+<a name="ln177">                             tablet_state));</a>
+<a name="ln178">  }</a>
+<a name="ln179">  initial_committed_cstate_ = consensus-&gt;ConsensusState(consensus::CONSENSUS_CONFIG_COMMITTED);</a>
+<a name="ln180">  return Status::OK();</a>
+<a name="ln181">}</a>
+<a name="ln182"> </a>
+<a name="ln183">Result&lt;google::protobuf::RepeatedPtrField&lt;tablet::FilePB&gt;&gt; ListFiles(const std::string&amp; dir) {</a>
+<a name="ln184">  std::vector&lt;std::string&gt; files;</a>
+<a name="ln185">  auto env = Env::Default();</a>
+<a name="ln186">  auto status = env-&gt;GetChildren(dir, ExcludeDots::kTrue, &amp;files);</a>
+<a name="ln187">  if (!status.ok()) {</a>
+<a name="ln188">    return STATUS(IllegalState, Substitute(&quot;Unable to get RocksDB files in dir $0: $1&quot;, dir,</a>
+<a name="ln189">                                           status.ToString()));</a>
+<a name="ln190">  }</a>
+<a name="ln191"> </a>
+<a name="ln192">  google::protobuf::RepeatedPtrField&lt;tablet::FilePB&gt; result;</a>
+<a name="ln193">  result.Reserve(files.size());</a>
+<a name="ln194">  for (const auto&amp; file : files) {</a>
+<a name="ln195">    auto full_path = JoinPathSegments(dir, file);</a>
+<a name="ln196">    if (VERIFY_RESULT(env-&gt;IsDirectory(full_path))) {</a>
+<a name="ln197">      auto sub_files = VERIFY_RESULT(ListFiles(full_path));</a>
+<a name="ln198">      for (auto&amp; subfile : sub_files) {</a>
+<a name="ln199">        subfile.set_name(JoinPathSegments(file, subfile.name()));</a>
+<a name="ln200">        *result.Add() = std::move(subfile);</a>
+<a name="ln201">      }</a>
+<a name="ln202">      continue;</a>
+<a name="ln203">    }</a>
+<a name="ln204">    auto file_pb = result.Add();</a>
+<a name="ln205">    file_pb-&gt;set_name(file);</a>
+<a name="ln206">    file_pb-&gt;set_size_bytes(VERIFY_RESULT(env-&gt;GetFileSize(full_path)));</a>
+<a name="ln207">    file_pb-&gt;set_inode(VERIFY_RESULT(env-&gt;GetFileINode(full_path)));</a>
+<a name="ln208">  }</a>
+<a name="ln209"> </a>
+<a name="ln210">  return result;</a>
+<a name="ln211">}</a>
+<a name="ln212"> </a>
+<a name="ln213">const std::string RemoteBootstrapSession::kCheckpointsDir = &quot;checkpoints&quot;;</a>
+<a name="ln214"> </a>
+<a name="ln215">Status RemoteBootstrapSession::Init() {</a>
+<a name="ln216">  // Take locks to support re-initialization of the same session.</a>
+<a name="ln217">  std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln218">  RETURN_NOT_OK(UnregisterAnchorIfNeededUnlocked());</a>
+<a name="ln219"> </a>
+<a name="ln220">  const string&amp; tablet_id = tablet_peer_-&gt;tablet_id();</a>
+<a name="ln221"> </a>
+<a name="ln222">  // Prevent log GC while we grab log segments and Tablet metadata.</a>
+<a name="ln223">  string anchor_owner_token = Substitute(&quot;RemoteBootstrap-$0&quot;, session_id_);</a>
+<a name="ln224">  tablet_peer_-&gt;log_anchor_registry()-&gt;Register(</a>
+<a name="ln225">      MinimumOpId().index(), anchor_owner_token, &amp;log_anchor_);</a>
+<a name="ln226"> </a>
+<a name="ln227">  // Read the SuperBlock from disk.</a>
+<a name="ln228">  const RaftGroupMetadataPtr&amp; metadata = tablet_peer_-&gt;tablet_metadata();</a>
+<a name="ln229">  RETURN_NOT_OK_PREPEND(metadata-&gt;ReadSuperBlockFromDisk(&amp;tablet_superblock_),</a>
+<a name="ln230">                        Substitute(&quot;Unable to access superblock for tablet $0&quot;,</a>
+<a name="ln231">                                   tablet_id));</a>
+<a name="ln232"> </a>
+<a name="ln233">  if (!tablet_peer_-&gt;log_available()) {</a>
+<a name="ln234">    return STATUS(IllegalState, &quot;Tablet is not running (log is uninitialized)&quot;);</a>
+<a name="ln235">  }</a>
+<a name="ln236">  // Get the latest opid in the log at this point in time so we can re-anchor.</a>
+<a name="ln237">  auto last_logged_opid = tablet_peer_-&gt;GetLatestLogEntryOpId();</a>
+<a name="ln238"> </a>
+<a name="ln239">  auto tablet = tablet_peer_-&gt;shared_tablet();</a>
+<a name="ln240">  if (PREDICT_FALSE(!tablet)) {</a>
+<a name="ln241">    return STATUS(IllegalState, &quot;Tablet is not running&quot;);</a>
+<a name="ln242">  }</a>
+<a name="ln243"> </a>
+<a name="ln244">  MonoTime now = MonoTime::Now();</a>
+<a name="ln245">  auto* kv_store = tablet_superblock_.mutable_kv_store();</a>
+<a name="ln246">  const auto checkpoints_dir = JoinPathSegments(kv_store-&gt;rocksdb_dir(), kCheckpointsDir);</a>
+<a name="ln247"> </a>
+<a name="ln248">  auto session_checkpoint_dir = std::to_string(last_logged_opid.index) + &quot;_&quot; + now.ToString();</a>
+<a name="ln249">  checkpoint_dir_ = JoinPathSegments(checkpoints_dir, session_checkpoint_dir);</a>
+<a name="ln250"> </a>
+<a name="ln251">  // Clear any previous RocksDB files in the superblock. Each session should create a new list</a>
+<a name="ln252">  // based the checkpoint directory files.</a>
+<a name="ln253">  kv_store-&gt;clear_rocksdb_files();</a>
+<a name="ln254">  auto status = tablet-&gt;snapshots().CreateCheckpoint(checkpoint_dir_);</a>
+<a name="ln255">  if (status.ok()) {</a>
+<a name="ln256">    *kv_store-&gt;mutable_rocksdb_files() = VERIFY_RESULT(ListFiles(checkpoint_dir_));</a>
+<a name="ln257">  } else if (!status.IsNotSupported()) {</a>
+<a name="ln258">    RETURN_NOT_OK(status);</a>
+<a name="ln259">  }</a>
+<a name="ln260"> </a>
+<a name="ln261">  for (const auto&amp; source : sources_) {</a>
+<a name="ln262">    if (source) {</a>
+<a name="ln263">      RETURN_NOT_OK(source-&gt;Init());</a>
+<a name="ln264">    }</a>
+<a name="ln265">  }</a>
+<a name="ln266"> </a>
+<a name="ln267">  // Get the current segments from the log, including the active segment.</a>
+<a name="ln268">  // The Log doesn't add the active segment to the log reader's list until</a>
+<a name="ln269">  // a header has been written to it (but it will not have a footer).</a>
+<a name="ln270">  RETURN_NOT_OK(tablet_peer_-&gt;log()-&gt;GetSegmentsSnapshot(&amp;log_segments_));</a>
+<a name="ln271">  log_anchor_index_ = last_logged_opid.index;</a>
+<a name="ln272">  for (const auto&amp; log_segment : log_segments_) {</a>
+<a name="ln273">    if (log_segment-&gt;HasFooter() &amp;&amp; log_segment-&gt;footer().has_min_replicate_index()) {</a>
+<a name="ln274">      log_anchor_index_ = log_segment-&gt;footer().min_replicate_index();</a>
+<a name="ln275">      break;</a>
+<a name="ln276">    }</a>
+<a name="ln277">  }</a>
+<a name="ln278"> </a>
+<a name="ln279">  // Re-anchor on the highest OpId that was in the log right before we</a>
+<a name="ln280">  // snapshotted the log segments. This helps ensure that we don't end up in a</a>
+<a name="ln281">  // remote bootstrap loop due to a follower falling too far behind the</a>
+<a name="ln282">  // leader's log when remote bootstrap is slow. The remote controls when</a>
+<a name="ln283">  // this anchor is released by ending the remote bootstrap session.</a>
+<a name="ln284">  RETURN_NOT_OK(tablet_peer_-&gt;log_anchor_registry()-&gt;UpdateRegistration(</a>
+<a name="ln285">      log_anchor_index_, &amp;log_anchor_));</a>
+<a name="ln286"> </a>
+<a name="ln287">  // Look up the committed consensus state.</a>
+<a name="ln288">  // We do this after snapshotting the log for YB table types to avoid a scenario where the latest</a>
+<a name="ln289">  // entry in the log has a term higher than the term stored in the consensus metadata, which</a>
+<a name="ln290">  // will result in a CHECK failure on RaftConsensus init.</a>
+<a name="ln291">  RETURN_NOT_OK(SetInitialCommittedState());</a>
+<a name="ln292"> </a>
+<a name="ln293">  start_time_ = MonoTime::Now();</a>
+<a name="ln294"> </a>
+<a name="ln295">  return Status::OK();</a>
+<a name="ln296">}</a>
+<a name="ln297"> </a>
+<a name="ln298">const std::string&amp; RemoteBootstrapSession::tablet_id() const {</a>
+<a name="ln299">  return tablet_peer_-&gt;tablet_id();</a>
+<a name="ln300">}</a>
+<a name="ln301"> </a>
+<a name="ln302">const std::string&amp; RemoteBootstrapSession::requestor_uuid() const {</a>
+<a name="ln303">  return requestor_uuid_;</a>
+<a name="ln304">}</a>
+<a name="ln305"> </a>
+<a name="ln306">namespace {</a>
+<a name="ln307"> </a>
+<a name="ln308">// Determine the length of the data chunk to return to the client.</a>
+<a name="ln309">int64_t DetermineReadLength(int64_t bytes_remaining, int64_t requested_len) {</a>
+<a name="ln310">  // Determine the size of the chunks we want to read.</a>
+<a name="ln311">  // Choose &quot;system max&quot; as a multiple of typical HDD block size (4K) with 4K to</a>
+<a name="ln312">  // spare for other stuff in the message, like headers, other protobufs, etc.</a>
+<a name="ln313">  const int32_t kSpareBytes = 4096;</a>
+<a name="ln314">  const int32_t kDiskSectorSize = 4096;</a>
+<a name="ln315">  int32_t system_max_chunk_size =</a>
+<a name="ln316">      ((FLAGS_rpc_max_message_size - kSpareBytes) / kDiskSectorSize) * kDiskSectorSize;</a>
+<a name="ln317">  CHECK_GT(system_max_chunk_size, 0) &lt;&lt; &quot;rpc_max_message_size is too low to transfer data: &quot;</a>
+<a name="ln318">                                     &lt;&lt; FLAGS_rpc_max_message_size;</a>
+<a name="ln319"> </a>
+<a name="ln320">  // The min of the {requested, system} maxes is the effective max.</a>
+<a name="ln321">  int64_t maxlen = (requested_len &gt; 0) ? std::min&lt;int64_t&gt;(requested_len, system_max_chunk_size) :</a>
+<a name="ln322">                                        system_max_chunk_size;</a>
+<a name="ln323">  return std::min(bytes_remaining, maxlen);</a>
+<a name="ln324">}</a>
+<a name="ln325"> </a>
+<a name="ln326">// Calculate the size of the data to return given a maximum client message</a>
+<a name="ln327">// length, the file itself, and the offset into the file to be read from.</a>
+<a name="ln328">Result&lt;int64_t&gt; GetResponseDataSize(GetDataPieceInfo* info) {</a>
+<a name="ln329">  // If requested offset is off the end of the data, bail.</a>
+<a name="ln330">  if (info-&gt;offset &gt;= info-&gt;data_size) {</a>
+<a name="ln331">    info-&gt;error_code = RemoteBootstrapErrorPB::INVALID_REMOTE_BOOTSTRAP_REQUEST;</a>
+<a name="ln332">    return STATUS_FORMAT(InvalidArgument,</a>
+<a name="ln333">                         &quot;Requested offset ($0) is beyond the data size ($1)&quot;,</a>
+<a name="ln334">                         info-&gt;offset, info-&gt;data_size);</a>
+<a name="ln335">  }</a>
+<a name="ln336"> </a>
+<a name="ln337">  auto result = DetermineReadLength(info-&gt;bytes_remaining(), info-&gt;client_maxlen);</a>
+<a name="ln338">  DCHECK_GT(result, 0);</a>
+<a name="ln339">  if (info-&gt;client_maxlen &gt; 0) {</a>
+<a name="ln340">    DCHECK_LE(result, info-&gt;client_maxlen);</a>
+<a name="ln341">  }</a>
+<a name="ln342"> </a>
+<a name="ln343">  return result;</a>
+<a name="ln344">}</a>
+<a name="ln345"> </a>
+<a name="ln346">// Read a chunk of a file into a buffer.</a>
+<a name="ln347">// data_name provides a string for the block/log to be used in error messages.</a>
+<a name="ln348">Status ReadFileChunkToBuf(RandomAccessFile* file, const string&amp; data_name, GetDataPieceInfo* info) {</a>
+<a name="ln349">  auto response_data_size = VERIFY_RESULT_PREPEND(</a>
+<a name="ln350">      GetResponseDataSize(info), Format(&quot;Error reading $0&quot;, data_name));</a>
+<a name="ln351"> </a>
+<a name="ln352">  Stopwatch chunk_timer(Stopwatch::THIS_THREAD);</a>
+<a name="ln353">  chunk_timer.start();</a>
+<a name="ln354"> </a>
+<a name="ln355">  // Writing into a std::string buffer is basically guaranteed to work on C++11,</a>
+<a name="ln356">  // however any modern compiler should be compatible with it.</a>
+<a name="ln357">  // Violates the API contract, but avoids excessive copies.</a>
+<a name="ln358">  info-&gt;data.resize(response_data_size);</a>
+<a name="ln359">  auto buf = reinterpret_cast&lt;uint8_t*&gt;(const_cast&lt;char*&gt;(info-&gt;data.data()));</a>
+<a name="ln360">  Slice slice;</a>
+<a name="ln361">  Status s = env_util::ReadFully(file, info-&gt;offset, response_data_size, &amp;slice, buf);</a>
+<a name="ln362">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln363">    s = s.CloneAndPrepend(Format(&quot;Unable to read existing file for $0&quot;, data_name));</a>
+<a name="ln364">    LOG(WARNING) &lt;&lt; s;</a>
+<a name="ln365">    info-&gt;error_code = RemoteBootstrapErrorPB::IO_ERROR;</a>
+<a name="ln366">    return s;</a>
+<a name="ln367">  }</a>
+<a name="ln368">  // Figure out if Slice points to buf or if Slice points to the mmap.</a>
+<a name="ln369">  // If it points to the mmap then copy into buf.</a>
+<a name="ln370">  if (slice.data() != buf) {</a>
+<a name="ln371">    memcpy(buf, slice.data(), slice.size());</a>
+<a name="ln372">  }</a>
+<a name="ln373">  chunk_timer.stop();</a>
+<a name="ln374">  TRACE(&quot;Remote bootstrap: $0: $1 total bytes read. Total time elapsed: $2&quot;,</a>
+<a name="ln375">        data_name, response_data_size, chunk_timer.elapsed().ToString());</a>
+<a name="ln376"> </a>
+<a name="ln377">  return Status::OK();</a>
+<a name="ln378">}</a>
+<a name="ln379"> </a>
+<a name="ln380">} // namespace</a>
+<a name="ln381"> </a>
+<a name="ln382">Env* RemoteBootstrapSession::env() const {</a>
+<a name="ln383">  return tablet_peer_-&gt;tablet_metadata()-&gt;fs_manager()-&gt;env();</a>
+<a name="ln384">}</a>
+<a name="ln385"> </a>
+<a name="ln386">RemoteBootstrapSource* RemoteBootstrapSession::Source(DataIdPB::IdType id_type) const {</a>
+<a name="ln387">  size_t idx = id_type;</a>
+<a name="ln388">  return idx &lt; sources_.size() ? sources_[idx].get() : nullptr;</a>
+<a name="ln389">}</a>
+<a name="ln390"> </a>
+<a name="ln391">Status RemoteBootstrapSession::ValidateDataId(const yb::tserver::DataIdPB&amp; data_id) {</a>
+<a name="ln392">  const auto&amp; source = Source(data_id.type());</a>
+<a name="ln393"> </a>
+<a name="ln394">  if (source) {</a>
+<a name="ln395">    return source-&gt;ValidateDataId(data_id);</a>
+<a name="ln396">  }</a>
+<a name="ln397"> </a>
+<a name="ln398">  switch (data_id.type()) {</a>
+<a name="ln399">    case DataIdPB::LOG_SEGMENT:</a>
+<a name="ln400">      if (PREDICT_FALSE(!data_id.wal_segment_seqno())) {</a>
+<a name="ln401">        return STATUS(InvalidArgument,</a>
+<a name="ln402">            &quot;segment sequence number must be specified for type == LOG_SEGMENT&quot;,</a>
+<a name="ln403">            data_id.ShortDebugString());</a>
+<a name="ln404">      }</a>
+<a name="ln405">      return Status::OK();</a>
+<a name="ln406">    case DataIdPB::ROCKSDB_FILE:</a>
+<a name="ln407">      if (PREDICT_FALSE(data_id.file_name().empty())) {</a>
+<a name="ln408">        return STATUS(InvalidArgument,</a>
+<a name="ln409">            &quot;file name must be specified for type == ROCKSDB_FILE&quot;,</a>
+<a name="ln410">            data_id.ShortDebugString());</a>
+<a name="ln411">      }</a>
+<a name="ln412">      return Status::OK();</a>
+<a name="ln413">    case DataIdPB::SNAPSHOT_FILE: FALLTHROUGH_INTENDED;</a>
+<a name="ln414">    case DataIdPB::UNKNOWN:</a>
+<a name="ln415">      return STATUS(InvalidArgument, &quot;Type not supported&quot;, data_id.ShortDebugString());</a>
+<a name="ln416">  }</a>
+<a name="ln417">  LOG(FATAL) &lt;&lt; &quot;Invalid data id type: &quot; &lt;&lt; data_id.type();</a>
+<a name="ln418">}</a>
+<a name="ln419"> </a>
+<a name="ln420">Status RemoteBootstrapSession::GetDataPiece(const DataIdPB&amp; data_id, GetDataPieceInfo* info) {</a>
+<a name="ln421">  const auto&amp; source = sources_[data_id.type()];</a>
+<a name="ln422"> </a>
+<a name="ln423">  if (source) {</a>
+<a name="ln424">    // Fetching a snapshot file chunk.</a>
+<a name="ln425">    RETURN_NOT_OK_PREPEND(</a>
+<a name="ln426">        source-&gt;GetDataPiece(data_id, info),</a>
+<a name="ln427">        &quot;Unable to get piece of snapshot file&quot;);</a>
+<a name="ln428">    return Status::OK();</a>
+<a name="ln429">  }</a>
+<a name="ln430"> </a>
+<a name="ln431"> </a>
+<a name="ln432">  switch (data_id.type()) {</a>
+<a name="ln433">    case DataIdPB::LOG_SEGMENT: {</a>
+<a name="ln434">      // Fetching a log segment chunk.</a>
+<a name="ln435">      RETURN_NOT_OK_PREPEND(GetLogSegmentPiece(data_id.wal_segment_seqno(), info),</a>
+<a name="ln436">                            &quot;Unable to get piece of log segment&quot;);</a>
+<a name="ln437">      break;</a>
+<a name="ln438">    }</a>
+<a name="ln439">    case DataIdPB::ROCKSDB_FILE: {</a>
+<a name="ln440">      // Fetching a RocksDB file chunk.</a>
+<a name="ln441">      const string file_name = data_id.file_name();</a>
+<a name="ln442">      RETURN_NOT_OK_PREPEND(GetRocksDBFilePiece(data_id.file_name(), info),</a>
+<a name="ln443">                            &quot;Unable to get piece of RocksDB file&quot;);</a>
+<a name="ln444">      break;</a>
+<a name="ln445">    }</a>
+<a name="ln446">    default:</a>
+<a name="ln447">      info-&gt;error_code = RemoteBootstrapErrorPB::INVALID_REMOTE_BOOTSTRAP_REQUEST;</a>
+<a name="ln448">      return STATUS_SUBSTITUTE(InvalidArgument, &quot;Invalid request type $0&quot;, data_id.type());</a>
+<a name="ln449">  }</a>
+<a name="ln450">  DCHECK(info-&gt;client_maxlen == 0 || info-&gt;data.size() &lt;= info-&gt;client_maxlen)</a>
+<a name="ln451">      &lt;&lt; &quot;client_maxlen: &quot; &lt;&lt; info-&gt;client_maxlen &lt;&lt; &quot;, data-&gt;size(): &quot; &lt;&lt; info-&gt;data.size();</a>
+<a name="ln452"> </a>
+<a name="ln453">  return Status::OK();</a>
+<a name="ln454">}</a>
+<a name="ln455"> </a>
+<a name="ln456">Status RemoteBootstrapSession::GetLogSegmentPiece(uint64_t segment_seqno, GetDataPieceInfo* info) {</a>
+<a name="ln457">  std::shared_ptr&lt;RandomAccessFile&gt; file;</a>
+<a name="ln458">  {</a>
+<a name="ln459">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln460">    if (opened_log_segment_seqno_ != segment_seqno) {</a>
+<a name="ln461">      RETURN_NOT_OK(OpenLogSegment(segment_seqno, &amp;info-&gt;error_code));</a>
+<a name="ln462">    }</a>
+<a name="ln463">    info-&gt;data_size = opened_log_segment_file_size_;</a>
+<a name="ln464">    file = opened_log_segment_file_;</a>
+<a name="ln465">  }</a>
+<a name="ln466">  RETURN_NOT_OK(ReadFileChunkToBuf(file.get(), Substitute(&quot;log segment $0&quot;, segment_seqno), info));</a>
+<a name="ln467"> </a>
+<a name="ln468">  // Note: We do not eagerly close log segment files, since we share ownership</a>
+<a name="ln469">  // of the LogSegment objects with the Log itself.</a>
+<a name="ln470"> </a>
+<a name="ln471">  return Status::OK();</a>
+<a name="ln472">}</a>
+<a name="ln473"> </a>
+<a name="ln474">Status RemoteBootstrapSession::GetRocksDBFilePiece(</a>
+<a name="ln475">    const std::string&amp; file_name, GetDataPieceInfo* info) {</a>
+<a name="ln476">  return GetFilePiece(checkpoint_dir_, file_name, env(), info);</a>
+<a name="ln477">}</a>
+<a name="ln478"> </a>
+<a name="ln479">Status RemoteBootstrapSession::GetFilePiece(</a>
+<a name="ln480">    const std::string&amp; path, const std::string&amp; file_name, Env* env, GetDataPieceInfo* info) {</a>
+<a name="ln481">  auto file_path = JoinPathSegments(path, file_name);</a>
+<a name="ln482">  if (!env-&gt;FileExists(file_path)) {</a>
+<a name="ln483">    info-&gt;error_code = RemoteBootstrapErrorPB::ROCKSDB_FILE_NOT_FOUND;</a>
+<a name="ln484">    return STATUS(NotFound, Substitute(&quot;Unable to find RocksDB file $0 in directory $1&quot;,</a>
+<a name="ln485">                                       file_name, path));</a>
+<a name="ln486">  }</a>
+<a name="ln487"> </a>
+<a name="ln488">  std::unique_ptr&lt;RandomAccessFile&gt; readable_file;</a>
+<a name="ln489"> </a>
+<a name="ln490">  RETURN_NOT_OK(env-&gt;NewRandomAccessFile(file_path, &amp;readable_file));</a>
+<a name="ln491"> </a>
+<a name="ln492">  info-&gt;data_size = VERIFY_RESULT(readable_file-&gt;Size());</a>
+<a name="ln493">  auto inode = VERIFY_RESULT(readable_file-&gt;INode());</a>
+<a name="ln494">  VLOG(2) &lt;&lt; &quot;Reading RocksDB file. File path: &quot; &lt;&lt; file_path &lt;&lt; &quot;, file size: &quot; &lt;&lt; info-&gt;data_size</a>
+<a name="ln495">          &lt;&lt; &quot;, inode: &quot; &lt;&lt; inode;</a>
+<a name="ln496"> </a>
+<a name="ln497">  RETURN_NOT_OK(ReadFileChunkToBuf(</a>
+<a name="ln498">      readable_file.get(), Substitute(&quot;rocksdb file $0&quot;, file_name), info));</a>
+<a name="ln499"> </a>
+<a name="ln500">  return Status::OK();</a>
+<a name="ln501">}</a>
+<a name="ln502"> </a>
+<a name="ln503">// Add a file to the cache and populate the given ImmutableRandomAcccessFileInfo</a>
+<a name="ln504">// object with the file ref and size.</a>
+<a name="ln505">template &lt;class Collection, class Key, class Readable&gt;</a>
+<a name="ln506">static Status AddImmutableFileToMap(Collection* const cache,</a>
+<a name="ln507">                                    const Key&amp; key,</a>
+<a name="ln508">                                    const Readable&amp; readable,</a>
+<a name="ln509">                                    uint64_t size) {</a>
+<a name="ln510">  // Sanity check for 0-length files.</a>
+<a name="ln511">  if (size == 0) {</a>
+<a name="ln512">    return STATUS(Corruption, &quot;Found 0-length object&quot;);</a>
+<a name="ln513">  }</a>
+<a name="ln514"> </a>
+<a name="ln515">  // Looks good, add it to the cache.</a>
+<a name="ln516">  typedef typename Collection::mapped_type InfoPtr;</a>
+<a name="ln517">  typedef typename InfoPtr::element_type Info;</a>
+<a name="ln518">  CHECK(cache-&gt;emplace(key, std::make_unique&lt;Info&gt;(readable, size)).second);</a>
+<a name="ln519"> </a>
+<a name="ln520">  return Status::OK();</a>
+<a name="ln521">}</a>
+<a name="ln522"> </a>
+<a name="ln523">Status RemoteBootstrapSession::OpenLogSegment(</a>
+<a name="ln524">    uint64_t segment_seqno, RemoteBootstrapErrorPB::Code* error_code) {</a>
+<a name="ln525">  auto active_seqno = tablet_peer_-&gt;log()-&gt;active_segment_sequence_number();</a>
+<a name="ln526">  auto log_segment = tablet_peer_-&gt;log()-&gt;GetSegmentBySequenceNumber(segment_seqno);</a>
+<a name="ln527">  // Usually active log segment is extended, while sent of the wire. So we cannot send next segment,</a>
+<a name="ln528">  // Otherwise entries at end of previously active log segment could be missing.</a>
+<a name="ln529">  if (opened_log_segment_active_) {</a>
+<a name="ln530">    *error_code = RemoteBootstrapErrorPB::WAL_SEGMENT_NOT_FOUND;</a>
+<a name="ln531">    return STATUS_FORMAT(NotFound, &quot;Already sent active log segment, don't send $0&quot;, segment_seqno);</a>
+<a name="ln532">  }</a>
+<a name="ln533">  if (!log_segment) {</a>
+<a name="ln534">    *error_code = RemoteBootstrapErrorPB::WAL_SEGMENT_NOT_FOUND;</a>
+<a name="ln535">    return STATUS_FORMAT(NotFound, &quot;Log segment $0 not found&quot;, segment_seqno);</a>
+<a name="ln536">  }</a>
+<a name="ln537">  opened_log_segment_file_size_ = log_segment-&gt;readable_up_to() + log_segment-&gt;get_header_size();</a>
+<a name="ln538">  opened_log_segment_seqno_ = segment_seqno;</a>
+<a name="ln539">  opened_log_segment_file_ = log_segment-&gt;readable_file_checkpoint();</a>
+<a name="ln540">  opened_log_segment_active_ = active_seqno == segment_seqno;</a>
+<a name="ln541"> </a>
+<a name="ln542">  if (log_segment-&gt;HasFooter() &amp;&amp;</a>
+<a name="ln543">      log_segment-&gt;footer().min_replicate_index() &gt; log_anchor_index_) {</a>
+<a name="ln544">    log_anchor_index_ = log_segment-&gt;footer().min_replicate_index();</a>
+<a name="ln545"> </a>
+<a name="ln546">    // Update log anchor, since we don't need older logs anymore.</a>
+<a name="ln547">    auto status = tablet_peer_-&gt;log_anchor_registry()-&gt;UpdateRegistration(</a>
+<a name="ln548">        log_anchor_index_, &amp;log_anchor_);</a>
+<a name="ln549">    if (!status.ok()) {</a>
+<a name="ln550">      *error_code = RemoteBootstrapErrorPB::UNKNOWN_ERROR;</a>
+<a name="ln551">      return status;</a>
+<a name="ln552">    }</a>
+<a name="ln553">  }</a>
+<a name="ln554"> </a>
+<a name="ln555">  return Status::OK();</a>
+<a name="ln556">}</a>
+<a name="ln557"> </a>
+<a name="ln558">Status RemoteBootstrapSession::UnregisterAnchorIfNeededUnlocked() {</a>
+<a name="ln559">  return tablet_peer_-&gt;log_anchor_registry()-&gt;UnregisterIfAnchored(&amp;log_anchor_);</a>
+<a name="ln560">}</a>
+<a name="ln561"> </a>
+<a name="ln562">void RemoteBootstrapSession::SetSuccess() {</a>
+<a name="ln563">  std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln564">  succeeded_ = true;</a>
+<a name="ln565">}</a>
+<a name="ln566"> </a>
+<a name="ln567">bool RemoteBootstrapSession::Succeeded() {</a>
+<a name="ln568">  std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln569">  return succeeded_;</a>
+<a name="ln570">}</a>
+<a name="ln571"> </a>
+<a name="ln572">void RemoteBootstrapSession::EnsureRateLimiterIsInitialized() {</a>
+<a name="ln573">  if (!rate_limiter_.IsInitialized()) {</a>
+<a name="ln574">    InitRateLimiter();</a>
+<a name="ln575">  }</a>
+<a name="ln576">}</a>
+<a name="ln577"> </a>
+<a name="ln578"> </a>
+<a name="ln579">void RemoteBootstrapSession::InitRateLimiter() {</a>
+<a name="ln580">  if (FLAGS_remote_bootstrap_rate_limit_bytes_per_sec &gt; 0 &amp;&amp; nsessions_) {</a>
+<a name="ln581">    // Calling SetTargetRateUpdater will activate the rate limiter.</a>
+<a name="ln582">    rate_limiter_.SetTargetRateUpdater([this]() -&gt; uint64_t {</a>
+<a name="ln583">      DCHECK_GT(FLAGS_remote_bootstrap_rate_limit_bytes_per_sec, 0);</a>
+<a name="ln584">      if (FLAGS_remote_bootstrap_rate_limit_bytes_per_sec &lt;= 0) {</a>
+<a name="ln585">        YB_LOG_EVERY_N(ERROR, 1000)</a>
+<a name="ln586">          &lt;&lt; &quot;Invalid value for remote_bootstrap_rate_limit_bytes_per_sec: &quot;</a>
+<a name="ln587">          &lt;&lt; FLAGS_remote_bootstrap_rate_limit_bytes_per_sec;</a>
+<a name="ln588">        // Since the rate limiter is initialized, it's expected that the value of</a>
+<a name="ln589">        // FLAGS_remote_bootstrap_rate_limit_bytes_per_sec is greater than 0. Since this is not the</a>
+<a name="ln590">        // case, we'll log an error, and set the rate to 50 MB/s.</a>
+<a name="ln591">        return 50_MB;</a>
+<a name="ln592">      }</a>
+<a name="ln593">      auto nsessions = nsessions_-&gt;load(std::memory_order_acquire);</a>
+<a name="ln594">      if (nsessions &gt; 0) {</a>
+<a name="ln595">        return FLAGS_remote_bootstrap_rate_limit_bytes_per_sec / nsessions;</a>
+<a name="ln596">      } else {</a>
+<a name="ln597">        LOG(DFATAL) &lt;&lt; &quot;Invalid number of sessions: &quot; &lt;&lt; nsessions;</a>
+<a name="ln598">        return FLAGS_remote_bootstrap_rate_limit_bytes_per_sec;</a>
+<a name="ln599">      }</a>
+<a name="ln600">    });</a>
+<a name="ln601">  }</a>
+<a name="ln602">  rate_limiter_.Init();</a>
+<a name="ln603">}</a>
+<a name="ln604"> </a>
+<a name="ln605">} // namespace tserver</a>
+<a name="ln606">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="87"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="104"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="450"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="494"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="518"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

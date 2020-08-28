@@ -1,0 +1,345 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>bfql.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/util/bfql/bfql.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;functional&gt;</a>
+<a name="ln19">#include &lt;unordered_map&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/util/bfql/directory.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">using std::function;</a>
+<a name="ln24">using std::vector;</a>
+<a name="ln25">using std::unordered_map;</a>
+<a name="ln26">using strings::Substitute;</a>
+<a name="ln27"> </a>
+<a name="ln28">namespace yb {</a>
+<a name="ln29">namespace bfql {</a>
+<a name="ln30"> </a>
+<a name="ln31">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln32">bool IsAggregateOpcode(TSOpcode op) {</a>
+<a name="ln33">  switch (op) {</a>
+<a name="ln34">  case TSOpcode::kAvg: FALLTHROUGH_INTENDED;</a>
+<a name="ln35">  case TSOpcode::kCount: FALLTHROUGH_INTENDED;</a>
+<a name="ln36">  case TSOpcode::kMax: FALLTHROUGH_INTENDED;</a>
+<a name="ln37">  case TSOpcode::kMin: FALLTHROUGH_INTENDED;</a>
+<a name="ln38">  case TSOpcode::kSum:</a>
+<a name="ln39">    return true;</a>
+<a name="ln40">  default:</a>
+<a name="ln41">    return false;</a>
+<a name="ln42">  }</a>
+<a name="ln43">}</a>
+<a name="ln44"> </a>
+<a name="ln45">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln46">// Check compatible type in function call.</a>
+<a name="ln47">inline bool IsCompatible(DataType left, DataType right) {</a>
+<a name="ln48">  return QLType::IsPotentiallyConvertible(left, right);</a>
+<a name="ln49">}</a>
+<a name="ln50"> </a>
+<a name="ln51">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln52">// HasExactSignature() is a predicate to check if the datatypes of actual parameters (arguments)</a>
+<a name="ln53">// and formal parameters (signature) are identical.</a>
+<a name="ln54">// NOTES:</a>
+<a name="ln55">//   PTypePtr can be a (shared_ptr&lt;MyClass&gt;) or a raw pointer (MyClass*)</a>
+<a name="ln56"> </a>
+<a name="ln57">static bool HasExactTypeSignature(const std::vector&lt;DataType&gt;&amp; signature,</a>
+<a name="ln58">                                  const std::vector&lt;DataType&gt;&amp; actual_types) {</a>
+<a name="ln59">  // Check parameter count.</a>
+<a name="ln60">  const int formal_count = signature.size();</a>
+<a name="ln61">  const int actual_count = actual_types.size();</a>
+<a name="ln62"> </a>
+<a name="ln63">  // Check for exact match.</a>
+<a name="ln64">  int index;</a>
+<a name="ln65">  for (index = 0; index &lt; formal_count; index++) {</a>
+<a name="ln66">    // Check if the signature accept varargs which can be matched with the rest of arguments.</a>
+<a name="ln67">    if (signature[index] == DataType::TYPEARGS) {</a>
+<a name="ln68">      return true;</a>
+<a name="ln69">    }</a>
+<a name="ln70"> </a>
+<a name="ln71">    // Return false if one of the following is true.</a>
+<a name="ln72">    // - The number of arguments is less than the formal count.</a>
+<a name="ln73">    // - The datatype of an argument is not an exact match of the signature type and the</a>
+<a name="ln74">    //   signature type is not ANYTYPE.</a>
+<a name="ln75">    if (index &gt;= actual_count || (signature[index] != actual_types[index] &amp;&amp;</a>
+<a name="ln76">        signature[index] != DataType::NULL_VALUE_TYPE)) {</a>
+<a name="ln77">      return false;</a>
+<a name="ln78">    }</a>
+<a name="ln79">  }</a>
+<a name="ln80"> </a>
+<a name="ln81">  // Assert that the number of arguments is the same as the formal count.</a>
+<a name="ln82">  if (index &lt; actual_count) {</a>
+<a name="ln83">    return false;</a>
+<a name="ln84">  }</a>
+<a name="ln85">  return true;</a>
+<a name="ln86">}</a>
+<a name="ln87"> </a>
+<a name="ln88">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln89">// HasSimilarSignature() is a predicate to check if the datatypes of actual parameters (arguments)</a>
+<a name="ln90">// and formal parameters (signature) are similar.</a>
+<a name="ln91">//</a>
+<a name="ln92">// Similar is mainly used for integers vs floating point values.</a>
+<a name="ln93">//   INT8 is &quot;similar&quot; to INT64.</a>
+<a name="ln94">//   INT8 is NOT &quot;similar&quot; to DOUBLE.</a>
+<a name="ln95">//   FLOAT is &quot;similar&quot; to DOUBLE.</a>
+<a name="ln96">// This rule is to help resolve the overloading functions between integers and float point data.</a>
+<a name="ln97">//</a>
+<a name="ln98">// NOTES:</a>
+<a name="ln99">//   PTypePtr and RTypePtr can be either a (shared_ptr&lt;MyClass&gt;) or a raw pointer (MyClass*)</a>
+<a name="ln100"> </a>
+<a name="ln101">static bool HasSimilarTypeSignature(const std::vector&lt;DataType&gt;&amp; signature,</a>
+<a name="ln102">                                    const std::vector&lt;DataType&gt;&amp; actual_types) {</a>
+<a name="ln103">  const int formal_count = signature.size();</a>
+<a name="ln104">  const int actual_count = actual_types.size();</a>
+<a name="ln105"> </a>
+<a name="ln106">  // Check for exact match.</a>
+<a name="ln107">  int index;</a>
+<a name="ln108">  for (index = 0; index &lt; formal_count; index++) {</a>
+<a name="ln109">    // Check if the signature accept varargs which can be matched with the rest of arguments.</a>
+<a name="ln110">    if (signature[index] == DataType::TYPEARGS) {</a>
+<a name="ln111">      return true;</a>
+<a name="ln112">    }</a>
+<a name="ln113"> </a>
+<a name="ln114">    // Return false if one of the following is true.</a>
+<a name="ln115">    // - The number of arguments is less than the formal count.</a>
+<a name="ln116">    // - The datatype of an argument is not an similar match of the signature type.</a>
+<a name="ln117">    if (index &gt;= actual_count || !QLType::IsSimilar(signature[index], actual_types[index])) {</a>
+<a name="ln118">      return false;</a>
+<a name="ln119">    }</a>
+<a name="ln120">  }</a>
+<a name="ln121"> </a>
+<a name="ln122">  // Assert that the number of arguments is the same as the formal count.</a>
+<a name="ln123">  if (index &lt; actual_count) {</a>
+<a name="ln124">    return false;</a>
+<a name="ln125">  }</a>
+<a name="ln126"> </a>
+<a name="ln127">  return true;</a>
+<a name="ln128">}</a>
+<a name="ln129"> </a>
+<a name="ln130">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln131">// HasCompatibleSignature() is a predicate to check if the arguments is convertible to the</a>
+<a name="ln132">// signature.</a>
+<a name="ln133">// Examples:</a>
+<a name="ln134">// - INT16 is convertible to DOUBLE, so passing an int16 value to func(DOUBLE) is valid.</a>
+<a name="ln135">// - In CQL, DOUBLE is not convertible to INT16, so passing a double value to func(INT26) is</a>
+<a name="ln136">// invalid. This case would become valid if YugaByte eases this conversion restriction.</a>
+<a name="ln137">//</a>
+<a name="ln138">// NOTES:</a>
+<a name="ln139">//   PTypePtr and RTypePtr can be either a (shared_ptr&lt;MyClass&gt;) or a raw pointer (MyClass*).</a>
+<a name="ln140"> </a>
+<a name="ln141">static bool HasCompatibleTypeSignature(const std::vector&lt;DataType&gt;&amp; signature,</a>
+<a name="ln142">                                       const std::vector&lt;DataType&gt;&amp; actual_types) {</a>
+<a name="ln143"> </a>
+<a name="ln144">  const int formal_count = signature.size();</a>
+<a name="ln145">  const int actual_count = actual_types.size();</a>
+<a name="ln146"> </a>
+<a name="ln147">  // Check for compatible match.</a>
+<a name="ln148">  int index;</a>
+<a name="ln149">  for (index = 0; index &lt; formal_count; index++) {</a>
+<a name="ln150">    // Check if the signature accept varargs which can be matched with the rest of arguments.</a>
+<a name="ln151">    if (signature[index] == DataType::TYPEARGS) {</a>
+<a name="ln152">      return true;</a>
+<a name="ln153">    }</a>
+<a name="ln154"> </a>
+<a name="ln155">    // Return false if one of the following is true.</a>
+<a name="ln156">    // - The number of arguments is less than the formal count.</a>
+<a name="ln157">    // - The datatype of an argument is not a compatible match of the signature type.</a>
+<a name="ln158">    if (index &gt;= actual_count || !IsCompatible(signature[index], actual_types[index])) {</a>
+<a name="ln159">      return false;</a>
+<a name="ln160">    }</a>
+<a name="ln161">  }</a>
+<a name="ln162"> </a>
+<a name="ln163">  // Assert that the number of arguments is the same as the formal count.</a>
+<a name="ln164">  if (index &lt; actual_count) {</a>
+<a name="ln165">    return false;</a>
+<a name="ln166">  }</a>
+<a name="ln167"> </a>
+<a name="ln168">  return true;</a>
+<a name="ln169">}</a>
+<a name="ln170"> </a>
+<a name="ln171">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln172">// Searches all overloading versions of a function and finds exactly one function specification</a>
+<a name="ln173">// whose signature matches with the datatypes of the arguments.</a>
+<a name="ln174">// NOTES:</a>
+<a name="ln175">//   &quot;compare_signature&quot; is a predicate to compare datatypes of formal and actual parameters.</a>
+<a name="ln176">//   PTypePtr and RTypePtr can be either a (shared_ptr&lt;MyClass&gt;) or a raw pointer (MyClass*)</a>
+<a name="ln177">static Status FindMatch(</a>
+<a name="ln178">    const string&amp; ql_name,</a>
+<a name="ln179">    function&lt;bool(const std::vector&lt;DataType&gt;&amp;, const std::vector&lt;DataType&gt;&amp;)&gt; compare_signature,</a>
+<a name="ln180">    BFOpcode max_opcode,</a>
+<a name="ln181">    const std::vector&lt;DataType&gt;&amp; actual_types,</a>
+<a name="ln182">    BFOpcode *found_opcode,</a>
+<a name="ln183">    const BFDecl **found_decl,</a>
+<a name="ln184">    DataType *return_type) {</a>
+<a name="ln185"> </a>
+<a name="ln186">  // Find a compatible operator, and raise error if there's more than one match.</a>
+<a name="ln187">  const BFOperator *compatible_operator = nullptr;</a>
+<a name="ln188">  while (true) {</a>
+<a name="ln189">    const BFOperator *bf_operator = kBFOperators[static_cast&lt;int&gt;(max_opcode)].get();</a>
+<a name="ln190">    DCHECK(max_opcode == bf_operator-&gt;opcode());</a>
+<a name="ln191"> </a>
+<a name="ln192">    // Check if each parameter has compatible type match.</a>
+<a name="ln193">    if (compare_signature(bf_operator-&gt;param_types(), actual_types)) {</a>
+<a name="ln194">      // Found a compatible match. Make sure that it is the only match.</a>
+<a name="ln195">      if (compatible_operator != nullptr) {</a>
+<a name="ln196">        return STATUS(InvalidArgument,</a>
+<a name="ln197">                      Substitute(&quot;Found too many matches for builtin function '$0'&quot;, ql_name));</a>
+<a name="ln198">      }</a>
+<a name="ln199">      compatible_operator = bf_operator;</a>
+<a name="ln200">      VLOG(3) &lt;&lt; &quot;Matched function with opcode &quot; &lt;&lt; static_cast&lt;int&gt;(max_opcode);</a>
+<a name="ln201">    }</a>
+<a name="ln202"> </a>
+<a name="ln203">    // Break the loop if we have processed all operators in the overloading chain.</a>
+<a name="ln204">    if (max_opcode == bf_operator-&gt;overloaded_opcode()) {</a>
+<a name="ln205">      break;</a>
+<a name="ln206">    }</a>
+<a name="ln207"> </a>
+<a name="ln208">    // Jump to the next overloading opcode.</a>
+<a name="ln209">    max_opcode = bf_operator-&gt;overloaded_opcode();</a>
+<a name="ln210">  }</a>
+<a name="ln211"> </a>
+<a name="ln212">  // Returns error if no match is found.</a>
+<a name="ln213">  if (compatible_operator == nullptr) {</a>
+<a name="ln214">    return STATUS(NotFound,</a>
+<a name="ln215">                  Substitute(&quot;Signature mismatch in call to builtin function '$0'&quot;, ql_name));</a>
+<a name="ln216">  }</a>
+<a name="ln217"> </a>
+<a name="ln218">  // Returns error if the return type is not compatible.</a>
+<a name="ln219">  if (return_type != nullptr) {</a>
+<a name="ln220">    if (QLType::IsUnknown(*return_type)) {</a>
+<a name="ln221">      *return_type = compatible_operator-&gt;return_type();</a>
+<a name="ln222">    } else if (!IsCompatible(*return_type, compatible_operator-&gt;return_type())) {</a>
+<a name="ln223">      return STATUS(InvalidArgument,</a>
+<a name="ln224">                    Substitute(&quot;Return-type mismatch in call to builtin function '$0'&quot;, ql_name));</a>
+<a name="ln225">    }</a>
+<a name="ln226">  }</a>
+<a name="ln227"> </a>
+<a name="ln228">  // Raise error if the function execution was not yet implemented.</a>
+<a name="ln229">  if (!compatible_operator-&gt;op_decl()-&gt;implemented()) {</a>
+<a name="ln230">    return STATUS(NotSupported,</a>
+<a name="ln231">                  Substitute(&quot;Builtin function '$0' is not yet implemented&quot;, ql_name));</a>
+<a name="ln232">  }</a>
+<a name="ln233"> </a>
+<a name="ln234">  *found_opcode = compatible_operator-&gt;opcode();</a>
+<a name="ln235">  *found_decl = compatible_operator-&gt;op_decl();</a>
+<a name="ln236">  return Status::OK();</a>
+<a name="ln237">}</a>
+<a name="ln238"> </a>
+<a name="ln239">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln240">// Find the builtin opcode, declaration, and return type for a builtin call.</a>
+<a name="ln241">// Inputs: Builtin function name and parameter types.</a>
+<a name="ln242">// Outputs: opcode and bfdecl.</a>
+<a name="ln243">// In/Out parameter: return_type</a>
+<a name="ln244">//   If return_type is given, check if it is compatible with the declaration.</a>
+<a name="ln245">//   If not, return_type is an output parameter whose value is the return type of the builtin.</a>
+<a name="ln246">Status FindOpcodeByType(const string&amp; ql_name,</a>
+<a name="ln247">                        const std::vector&lt;DataType&gt;&amp; actual_types,</a>
+<a name="ln248">                        BFOpcode *opcode,</a>
+<a name="ln249">                        const BFDecl **bfdecl,</a>
+<a name="ln250">                        DataType *return_type) {</a>
+<a name="ln251">  auto entry = kBfqlName2Opcode.find(ql_name);</a>
+<a name="ln252">  if (entry == kBfqlName2Opcode.end()) {</a>
+<a name="ln253">    VLOG(3) &lt;&lt; strings::Substitute(&quot;Function '$0' does not exist&quot;, ql_name);</a>
+<a name="ln254">    return STATUS(NotFound, strings::Substitute(&quot;Function '$0' does not exist&quot;, ql_name));</a>
+<a name="ln255">  }</a>
+<a name="ln256"> </a>
+<a name="ln257">  // Seek the correct overload functions in the following order:</a>
+<a name="ln258">  // - Find the exact signature match.</a>
+<a name="ln259">  //   Example:</a>
+<a name="ln260">  //   . Overload #1: FuncX(int8_t i) would be used for the call FuncX(int8_t(7)).</a>
+<a name="ln261">  //   . Overload #2: FuncX(int16_t i) would be used for the call FuncX(int16_t(7)).</a>
+<a name="ln262">  //</a>
+<a name="ln263">  // - For &quot;cast&quot; operator, if exact match is not found, return error. For all other operators,</a>
+<a name="ln264">  //   continue to the next steps.</a>
+<a name="ln265">  //</a>
+<a name="ln266">  // - Find the similar signature match.</a>
+<a name="ln267">  //   Example:</a>
+<a name="ln268">  //   . Overload #2: FuncY(int64_t i) would be used for FuncY(int8_t(7)).</a>
+<a name="ln269">  //       int64_t and int8_t are both integer values.</a>
+<a name="ln270">  //   . Overload #1: FuncY(double d) would be used for FuncY(float(7)).</a>
+<a name="ln271">  //       double &amp; float are both floating values.</a>
+<a name="ln272">  //</a>
+<a name="ln273">  // - Find the compatible match. Signatures are of convertible datatypes.</a>
+<a name="ln274">  Status s = FindMatch(ql_name, HasExactTypeSignature, entry-&gt;second, actual_types,</a>
+<a name="ln275">                       opcode, bfdecl, return_type);</a>
+<a name="ln276">  VLOG(3) &lt;&lt; &quot;Seek exact match for function call &quot; &lt;&lt; ql_name &lt;&lt; &quot;(): &quot; &lt;&lt; s.ToString();</a>
+<a name="ln277"> </a>
+<a name="ln278">  if (ql_name != kCastFuncName &amp;&amp; s.IsNotFound()) {</a>
+<a name="ln279">    s = FindMatch(ql_name, HasSimilarTypeSignature, entry-&gt;second, actual_types,</a>
+<a name="ln280">                  opcode, bfdecl, return_type);</a>
+<a name="ln281">    VLOG(3) &lt;&lt; &quot;Seek similar match for function call &quot; &lt;&lt; ql_name &lt;&lt; &quot;(): &quot; &lt;&lt; s.ToString();</a>
+<a name="ln282"> </a>
+<a name="ln283">    if (s.IsNotFound()) {</a>
+<a name="ln284">      s = FindMatch(ql_name, HasCompatibleTypeSignature, entry-&gt;second, actual_types,</a>
+<a name="ln285">                    opcode, bfdecl, return_type);</a>
+<a name="ln286">      VLOG(3) &lt;&lt; &quot;Seek compatible match for function call &quot; &lt;&lt; ql_name &lt;&lt; &quot;(): &quot; &lt;&lt; s.ToString();</a>
+<a name="ln287">    }</a>
+<a name="ln288">  }</a>
+<a name="ln289"> </a>
+<a name="ln290">  return s;</a>
+<a name="ln291">}</a>
+<a name="ln292"> </a>
+<a name="ln293">} // namespace bfql</a>
+<a name="ln294">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="190"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="200"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="253"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="276"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="281"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="286"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

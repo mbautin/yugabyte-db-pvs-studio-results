@@ -1,0 +1,366 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>master_rpc.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32">// This module is internal to the client and not a public API.</a>
+<a name="ln33"> </a>
+<a name="ln34">#include &quot;yb/master/master_rpc.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">#include &lt;mutex&gt;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &quot;yb/common/wire_protocol.h&quot;</a>
+<a name="ln39">#include &quot;yb/common/wire_protocol.pb.h&quot;</a>
+<a name="ln40">#include &quot;yb/gutil/bind.h&quot;</a>
+<a name="ln41">#include &quot;yb/gutil/strings/join.h&quot;</a>
+<a name="ln42">#include &quot;yb/gutil/strings/substitute.h&quot;</a>
+<a name="ln43">#include &quot;yb/master/master.proxy.h&quot;</a>
+<a name="ln44">#include &quot;yb/util/net/net_util.h&quot;</a>
+<a name="ln45">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln46"> </a>
+<a name="ln47">using std::shared_ptr;</a>
+<a name="ln48">using std::string;</a>
+<a name="ln49">using std::vector;</a>
+<a name="ln50"> </a>
+<a name="ln51">using yb::consensus::RaftPeerPB;</a>
+<a name="ln52">using yb::rpc::Messenger;</a>
+<a name="ln53">using yb::rpc::Rpc;</a>
+<a name="ln54"> </a>
+<a name="ln55">using namespace std::placeholders;</a>
+<a name="ln56"> </a>
+<a name="ln57">DEFINE_int32(master_leader_rpc_timeout_ms, 500,</a>
+<a name="ln58">             &quot;Number of milliseconds that the tserver will keep querying for master leader before&quot;</a>
+<a name="ln59">             &quot;selecting a follower.&quot;);</a>
+<a name="ln60">TAG_FLAG(master_leader_rpc_timeout_ms, advanced);</a>
+<a name="ln61">TAG_FLAG(master_leader_rpc_timeout_ms, hidden);</a>
+<a name="ln62"> </a>
+<a name="ln63">namespace yb {</a>
+<a name="ln64">namespace master {</a>
+<a name="ln65"> </a>
+<a name="ln66">namespace {</a>
+<a name="ln67"> </a>
+<a name="ln68">////////////////////////////////////////////////////////////</a>
+<a name="ln69">// GetMasterRegistrationRpc</a>
+<a name="ln70">////////////////////////////////////////////////////////////</a>
+<a name="ln71"> </a>
+<a name="ln72">// An RPC for getting a Master server's registration.</a>
+<a name="ln73">class GetMasterRegistrationRpc: public rpc::Rpc {</a>
+<a name="ln74"> public:</a>
+<a name="ln75"> </a>
+<a name="ln76">  // Create a wrapper object for a retriable GetMasterRegistration RPC</a>
+<a name="ln77">  // to 'addr'. The result is stored in 'out', which must be a valid</a>
+<a name="ln78">  // pointer for the lifetime of this object.</a>
+<a name="ln79">  //</a>
+<a name="ln80">  // Invokes 'user_cb' upon failure or success of the RPC call.</a>
+<a name="ln81">  GetMasterRegistrationRpc(StatusFunctor user_cb,</a>
+<a name="ln82">                           const HostPort&amp; addr,</a>
+<a name="ln83">                           CoarseTimePoint deadline,</a>
+<a name="ln84">                           rpc::Messenger* messenger,</a>
+<a name="ln85">                           rpc::ProxyCache* proxy_cache,</a>
+<a name="ln86">                           ServerEntryPB* out)</a>
+<a name="ln87">      : Rpc(deadline, messenger, proxy_cache),</a>
+<a name="ln88">        user_cb_(std::move(user_cb)),</a>
+<a name="ln89">        addr_(addr),</a>
+<a name="ln90">        out_(DCHECK_NOTNULL(out)) {}</a>
+<a name="ln91"> </a>
+<a name="ln92">  void SendRpc() override;</a>
+<a name="ln93"> </a>
+<a name="ln94">  std::string ToString() const override;</a>
+<a name="ln95"> </a>
+<a name="ln96"> private:</a>
+<a name="ln97">  void Finished(const Status&amp; status) override;</a>
+<a name="ln98"> </a>
+<a name="ln99">  StatusFunctor user_cb_;</a>
+<a name="ln100">  HostPort addr_;</a>
+<a name="ln101"> </a>
+<a name="ln102">  ServerEntryPB* out_;</a>
+<a name="ln103"> </a>
+<a name="ln104">  GetMasterRegistrationResponsePB resp_;</a>
+<a name="ln105">};</a>
+<a name="ln106"> </a>
+<a name="ln107">void GetMasterRegistrationRpc::SendRpc() {</a>
+<a name="ln108">  MasterServiceProxy proxy(&amp;retrier().proxy_cache(), addr_);</a>
+<a name="ln109">  GetMasterRegistrationRequestPB req;</a>
+<a name="ln110">  proxy.GetMasterRegistrationAsync(</a>
+<a name="ln111">      req, &amp;resp_, PrepareController(),</a>
+<a name="ln112">      std::bind(&amp;GetMasterRegistrationRpc::Finished, this, Status::OK()));</a>
+<a name="ln113">}</a>
+<a name="ln114"> </a>
+<a name="ln115">string GetMasterRegistrationRpc::ToString() const {</a>
+<a name="ln116">  return Format(&quot;GetMasterRegistrationRpc(address: $0, num_attempts: $1, retries: $2)&quot;,</a>
+<a name="ln117">                addr_, num_attempts(), retrier());</a>
+<a name="ln118">}</a>
+<a name="ln119"> </a>
+<a name="ln120">void GetMasterRegistrationRpc::Finished(const Status&amp; status) {</a>
+<a name="ln121">  Status new_status = status;</a>
+<a name="ln122">  if (new_status.ok() &amp;&amp; mutable_retrier()-&gt;HandleResponse(this, &amp;new_status)) {</a>
+<a name="ln123">    return;</a>
+<a name="ln124">  }</a>
+<a name="ln125">  if (new_status.ok() &amp;&amp; resp_.has_error()) {</a>
+<a name="ln126">    if (resp_.error().code() == MasterErrorPB::CATALOG_MANAGER_NOT_INITIALIZED) {</a>
+<a name="ln127">      // If CatalogManager is not initialized, treat the node as a</a>
+<a name="ln128">      // FOLLOWER for the time being, as currently this RPC is only</a>
+<a name="ln129">      // used for the purposes of finding the leader master.</a>
+<a name="ln130">      resp_.set_role(RaftPeerPB::FOLLOWER);</a>
+<a name="ln131">      new_status = Status::OK();</a>
+<a name="ln132">    } else {</a>
+<a name="ln133">      out_-&gt;mutable_error()-&gt;CopyFrom(resp_.error().status());</a>
+<a name="ln134">      new_status = StatusFromPB(resp_.error().status());</a>
+<a name="ln135">    }</a>
+<a name="ln136">  }</a>
+<a name="ln137">  if (new_status.ok()) {</a>
+<a name="ln138">    out_-&gt;mutable_instance_id()-&gt;CopyFrom(resp_.instance_id());</a>
+<a name="ln139">    out_-&gt;mutable_registration()-&gt;CopyFrom(resp_.registration());</a>
+<a name="ln140">    out_-&gt;set_role(resp_.role());</a>
+<a name="ln141">  }</a>
+<a name="ln142">  auto callback = std::move(user_cb_);</a>
+<a name="ln143">  callback(new_status);</a>
+<a name="ln144">}</a>
+<a name="ln145"> </a>
+<a name="ln146">} // namespace</a>
+<a name="ln147"> </a>
+<a name="ln148">////////////////////////////////////////////////////////////</a>
+<a name="ln149">// GetLeaderMasterRpc</a>
+<a name="ln150">////////////////////////////////////////////////////////////</a>
+<a name="ln151"> </a>
+<a name="ln152">GetLeaderMasterRpc::GetLeaderMasterRpc(LeaderCallback user_cb,</a>
+<a name="ln153">                                       const server::MasterAddresses&amp; addrs,</a>
+<a name="ln154">                                       CoarseTimePoint deadline,</a>
+<a name="ln155">                                       Messenger* messenger,</a>
+<a name="ln156">                                       rpc::ProxyCache* proxy_cache,</a>
+<a name="ln157">                                       rpc::Rpcs* rpcs,</a>
+<a name="ln158">                                       bool should_timeout_to_follower,</a>
+<a name="ln159">                                       bool wait_for_leader_election)</a>
+<a name="ln160">    : Rpc(deadline, messenger, proxy_cache),</a>
+<a name="ln161">      user_cb_(std::move(user_cb)),</a>
+<a name="ln162">      rpcs_(*rpcs),</a>
+<a name="ln163">      should_timeout_to_follower_(should_timeout_to_follower),</a>
+<a name="ln164">      wait_for_leader_election_(wait_for_leader_election) {</a>
+<a name="ln165">  DCHECK(deadline != CoarseTimePoint::max());</a>
+<a name="ln166"> </a>
+<a name="ln167">  for (const auto&amp; list : addrs) {</a>
+<a name="ln168">    addrs_.insert(addrs_.end(), list.begin(), list.end());</a>
+<a name="ln169">  }</a>
+<a name="ln170">  // Using resize instead of reserve to explicitly initialized the values.</a>
+<a name="ln171">  responses_.resize(addrs_.size());</a>
+<a name="ln172">}</a>
+<a name="ln173"> </a>
+<a name="ln174">GetLeaderMasterRpc::~GetLeaderMasterRpc() {</a>
+<a name="ln175">}</a>
+<a name="ln176"> </a>
+<a name="ln177">string GetLeaderMasterRpc::ToString() const {</a>
+<a name="ln178">  return Format(&quot;GetLeaderMasterRpc(addrs: $0, num_attempts: $1)&quot;, addrs_, num_attempts());</a>
+<a name="ln179">}</a>
+<a name="ln180"> </a>
+<a name="ln181">void GetLeaderMasterRpc::SendRpc() {</a>
+<a name="ln182">  auto self = shared_from_this();</a>
+<a name="ln183"> </a>
+<a name="ln184">  size_t size = addrs_.size();</a>
+<a name="ln185">  std::vector&lt;rpc::Rpcs::Handle&gt; handles;</a>
+<a name="ln186">  handles.reserve(size);</a>
+<a name="ln187">  {</a>
+<a name="ln188">    std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln189">    pending_responses_ = size;</a>
+<a name="ln190">    for (int i = 0; i &lt; size; i++) {</a>
+<a name="ln191">      auto handle = rpcs_.Prepare();</a>
+<a name="ln192">      if (handle == rpcs_.InvalidHandle()) {</a>
+<a name="ln193">        GetMasterRegistrationRpcCbForNode(i, STATUS(Aborted, &quot;Stopping&quot;), self, handle);</a>
+<a name="ln194">        continue;</a>
+<a name="ln195">      }</a>
+<a name="ln196">      *handle = std::make_shared&lt;GetMasterRegistrationRpc&gt;(</a>
+<a name="ln197">          std::bind(</a>
+<a name="ln198">              &amp;GetLeaderMasterRpc::GetMasterRegistrationRpcCbForNode, this, i, _1, self, handle),</a>
+<a name="ln199">          addrs_[i],</a>
+<a name="ln200">          retrier().deadline(),</a>
+<a name="ln201">          retrier().messenger(),</a>
+<a name="ln202">          &amp;retrier().proxy_cache(),</a>
+<a name="ln203">          &amp;responses_[i]);</a>
+<a name="ln204">      handles.push_back(handle);</a>
+<a name="ln205">    }</a>
+<a name="ln206">  }</a>
+<a name="ln207"> </a>
+<a name="ln208">  for (const auto&amp; handle : handles) {</a>
+<a name="ln209">    (**handle).SendRpc();</a>
+<a name="ln210">  }</a>
+<a name="ln211">}</a>
+<a name="ln212"> </a>
+<a name="ln213">void GetLeaderMasterRpc::Finished(const Status&amp; status) {</a>
+<a name="ln214">  // If we've received replies from all of the nodes without finding</a>
+<a name="ln215">  // the leader, or if there were network errors talking to all of the</a>
+<a name="ln216">  // nodes the error is retriable and we can perform a delayed retry.</a>
+<a name="ln217">  num_iters_++;</a>
+<a name="ln218">  if (status.IsNetworkError() || (wait_for_leader_election_ &amp;&amp; status.IsNotFound())) {</a>
+<a name="ln219">    VLOG(4) &lt;&lt; &quot;About to retry operation due to error: &quot; &lt;&lt; status.ToString();</a>
+<a name="ln220">    // TODO (KUDU-573): Allow cancelling delayed tasks on reactor so</a>
+<a name="ln221">    // that we can safely use DelayedRetry here.</a>
+<a name="ln222">    auto retry_status = mutable_retrier()-&gt;DelayedRetry(this, status);</a>
+<a name="ln223">    if (!retry_status.ok()) {</a>
+<a name="ln224">      LOG(WARNING) &lt;&lt; &quot;Failed to schedule retry: &quot; &lt;&lt; retry_status;</a>
+<a name="ln225">    } else {</a>
+<a name="ln226">      return;</a>
+<a name="ln227">    }</a>
+<a name="ln228">  }</a>
+<a name="ln229">  VLOG(4) &lt;&lt; &quot;Completed GetLeaderMasterRpc, calling callback with status &quot;</a>
+<a name="ln230">          &lt;&lt; status.ToString();</a>
+<a name="ln231">  {</a>
+<a name="ln232">    std::lock_guard&lt;simple_spinlock&gt; l(lock_);</a>
+<a name="ln233">    // 'completed_' prevents 'user_cb_' from being invoked twice.</a>
+<a name="ln234">    if (completed_) {</a>
+<a name="ln235">      return;</a>
+<a name="ln236">    }</a>
+<a name="ln237">    completed_ = true;</a>
+<a name="ln238">  }</a>
+<a name="ln239">  auto callback = std::move(user_cb_);</a>
+<a name="ln240">  user_cb_.Reset();</a>
+<a name="ln241">  callback.Run(status, leader_master_);</a>
+<a name="ln242">}</a>
+<a name="ln243"> </a>
+<a name="ln244">void GetLeaderMasterRpc::GetMasterRegistrationRpcCbForNode(</a>
+<a name="ln245">    int idx, const Status&amp; status, const std::shared_ptr&lt;rpc::RpcCommand&gt;&amp; self,</a>
+<a name="ln246">    rpc::Rpcs::Handle handle) {</a>
+<a name="ln247">  rpcs_.Unregister(handle);</a>
+<a name="ln248"> </a>
+<a name="ln249">  // TODO: handle the situation where one Master is partitioned from</a>
+<a name="ln250">  // the rest of the Master consensus configuration, all are reachable by the client,</a>
+<a name="ln251">  // and the partitioned node &quot;thinks&quot; it's the leader.</a>
+<a name="ln252">  //</a>
+<a name="ln253">  // The proper way to do so is to add term/index to the responses</a>
+<a name="ln254">  // from the Master, wait for majority of the Masters to respond, and</a>
+<a name="ln255">  // pick the one with the highest term/index as the leader.</a>
+<a name="ln256">  Status new_status = status;</a>
+<a name="ln257">  {</a>
+<a name="ln258">    std::lock_guard&lt;simple_spinlock&gt; lock(lock_);</a>
+<a name="ln259">    --pending_responses_;</a>
+<a name="ln260">    if (completed_) {</a>
+<a name="ln261">      // If 'user_cb_' has been invoked (see Finished above), we can</a>
+<a name="ln262">      // stop.</a>
+<a name="ln263">      return;</a>
+<a name="ln264">    }</a>
+<a name="ln265">    auto&amp; resp = responses_[idx];</a>
+<a name="ln266">    if (new_status.ok()) {</a>
+<a name="ln267">      if (resp.role() != RaftPeerPB::LEADER) {</a>
+<a name="ln268">        // Use a STATUS(NotFound, &quot;&quot;) to indicate that the node is not</a>
+<a name="ln269">        // the leader: this way, we can handle the case where we've</a>
+<a name="ln270">        // received a reply from all of the nodes in the cluster (no</a>
+<a name="ln271">        // network or other errors encountered), but haven't found a</a>
+<a name="ln272">        // leader (which means that Finished() above can perform a</a>
+<a name="ln273">        // delayed retry).</a>
+<a name="ln274"> </a>
+<a name="ln275">        // If we have exceeded FLAGS_master_leader_rpc_timeout_ms, set this follower to be master</a>
+<a name="ln276">        // leader. This prevents an infinite retry loop when none of the master addresses passed in</a>
+<a name="ln277">        // are leaders.</a>
+<a name="ln278">        if (should_timeout_to_follower_ &amp;&amp;</a>
+<a name="ln279">            MonoTime::Now() - start_time_ &gt;</a>
+<a name="ln280">            MonoDelta::FromMilliseconds(FLAGS_master_leader_rpc_timeout_ms)) {</a>
+<a name="ln281">          LOG(WARNING) &lt;&lt; &quot;More than &quot; &lt;&lt; FLAGS_master_leader_rpc_timeout_ms &lt;&lt; &quot; ms has passed, &quot;</a>
+<a name="ln282">              &quot;choosing to heartbeat to follower master &quot; &lt;&lt; resp.instance_id().permanent_uuid()</a>
+<a name="ln283">              &lt;&lt; &quot; after &quot; &lt;&lt; num_iters_ &lt;&lt; &quot; iterations of all masters.&quot;;</a>
+<a name="ln284">          leader_master_ = addrs_[idx];</a>
+<a name="ln285">        } else {</a>
+<a name="ln286">          new_status = STATUS(NotFound, &quot;no leader found: &quot; + ToString());</a>
+<a name="ln287">        }</a>
+<a name="ln288">      } else {</a>
+<a name="ln289">        // We've found a leader.</a>
+<a name="ln290">        leader_master_ = addrs_[idx];</a>
+<a name="ln291">      }</a>
+<a name="ln292">    }</a>
+<a name="ln293">    if (!new_status.ok()) {</a>
+<a name="ln294">      if (pending_responses_ &gt; 0) {</a>
+<a name="ln295">        // Don't call Finished() on error unless we're the last</a>
+<a name="ln296">        // outstanding response: calling Finished() will trigger</a>
+<a name="ln297">        // a delayed re-try, which don't need to do unless we've</a>
+<a name="ln298">        // been unable to find a leader so far.</a>
+<a name="ln299">        return;</a>
+<a name="ln300">      }</a>
+<a name="ln301">    } else {</a>
+<a name="ln302">      completed_ = true;</a>
+<a name="ln303">    }</a>
+<a name="ln304">  }</a>
+<a name="ln305"> </a>
+<a name="ln306">  // Called if the leader has been determined, or if we've received</a>
+<a name="ln307">  // all of the responses.</a>
+<a name="ln308">  if (new_status.ok()) {</a>
+<a name="ln309">    auto callback = std::move(user_cb_);</a>
+<a name="ln310">    user_cb_.Reset();</a>
+<a name="ln311">    callback.Run(new_status, leader_master_);</a>
+<a name="ln312">  } else {</a>
+<a name="ln313">    Finished(new_status);</a>
+<a name="ln314">  }</a>
+<a name="ln315">}</a>
+<a name="ln316"> </a>
+<a name="ln317">} // namespace master</a>
+<a name="ln318">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="165"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="219"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="229"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

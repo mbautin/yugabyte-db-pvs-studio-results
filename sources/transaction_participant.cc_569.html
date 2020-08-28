@@ -1,0 +1,1763 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>transaction_participant.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/tablet/transaction_participant.h&quot;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &lt;mutex&gt;</a>
+<a name="ln19">#include &lt;queue&gt;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &lt;boost/multi_index_container.hpp&gt;</a>
+<a name="ln22">#include &lt;boost/multi_index/hashed_index.hpp&gt;</a>
+<a name="ln23">#include &lt;boost/multi_index/ordered_index.hpp&gt;</a>
+<a name="ln24">#include &lt;boost/multi_index/mem_fun.hpp&gt;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &lt;boost/optional/optional.hpp&gt;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &lt;boost/uuid/uuid_io.hpp&gt;</a>
+<a name="ln29"> </a>
+<a name="ln30">#include &quot;yb/rocksdb/write_batch.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32">#include &quot;yb/client/transaction_rpc.h&quot;</a>
+<a name="ln33"> </a>
+<a name="ln34">#include &quot;yb/common/pgsql_error.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">#include &quot;yb/consensus/consensus_util.h&quot;</a>
+<a name="ln37"> </a>
+<a name="ln38">#include &quot;yb/docdb/docdb_rocksdb_util.h&quot;</a>
+<a name="ln39">#include &quot;yb/docdb/docdb.h&quot;</a>
+<a name="ln40"> </a>
+<a name="ln41">#include &quot;yb/rpc/rpc.h&quot;</a>
+<a name="ln42">#include &quot;yb/rpc/rpc_context.h&quot;</a>
+<a name="ln43">#include &quot;yb/rpc/thread_pool.h&quot;</a>
+<a name="ln44"> </a>
+<a name="ln45">#include &quot;yb/tablet/cleanup_aborts_task.h&quot;</a>
+<a name="ln46">#include &quot;yb/tablet/cleanup_intents_task.h&quot;</a>
+<a name="ln47">#include &quot;yb/tablet/operations/update_txn_operation.h&quot;</a>
+<a name="ln48">#include &quot;yb/tablet/running_transaction.h&quot;</a>
+<a name="ln49">#include &quot;yb/tablet/tablet.h&quot;</a>
+<a name="ln50">#include &quot;yb/tablet/transaction_status_resolver.h&quot;</a>
+<a name="ln51"> </a>
+<a name="ln52">#include &quot;yb/tserver/tserver_service.pb.h&quot;</a>
+<a name="ln53">#include &quot;yb/tserver/service_util.h&quot;</a>
+<a name="ln54"> </a>
+<a name="ln55">#include &quot;yb/util/delayer.h&quot;</a>
+<a name="ln56">#include &quot;yb/util/flag_tags.h&quot;</a>
+<a name="ln57">#include &quot;yb/util/locks.h&quot;</a>
+<a name="ln58">#include &quot;yb/util/monotime.h&quot;</a>
+<a name="ln59">#include &quot;yb/util/pb_util.h&quot;</a>
+<a name="ln60">#include &quot;yb/util/random_util.h&quot;</a>
+<a name="ln61">#include &quot;yb/util/scope_exit.h&quot;</a>
+<a name="ln62">#include &quot;yb/util/thread_restrictions.h&quot;</a>
+<a name="ln63"> </a>
+<a name="ln64">using namespace std::literals;</a>
+<a name="ln65">using namespace std::placeholders;</a>
+<a name="ln66"> </a>
+<a name="ln67">DEFINE_uint64(transaction_min_running_check_delay_ms, 50,</a>
+<a name="ln68">              &quot;When transaction with minimal start hybrid time is updated at transaction &quot;</a>
+<a name="ln69">              &quot;participant, we wait at least this number of milliseconds before checking its &quot;</a>
+<a name="ln70">              &quot;status at transaction coordinator. Used for the optimization that deletes &quot;</a>
+<a name="ln71">              &quot;provisional records RocksDB SSTable files.&quot;);</a>
+<a name="ln72"> </a>
+<a name="ln73">DEFINE_uint64(transaction_min_running_check_interval_ms, 250,</a>
+<a name="ln74">              &quot;While transaction with minimal start hybrid time remains the same, we will try &quot;</a>
+<a name="ln75">              &quot;to check its status at transaction coordinator at regular intervals this &quot;</a>
+<a name="ln76">              &quot;long (ms). Used for the optimization that deletes &quot;</a>
+<a name="ln77">              &quot;provisional records RocksDB SSTable files.&quot;);</a>
+<a name="ln78"> </a>
+<a name="ln79">DEFINE_test_flag(double, transaction_ignore_applying_probability_in_tests, 0,</a>
+<a name="ln80">                 &quot;Probability to ignore APPLYING update in tests.&quot;);</a>
+<a name="ln81">DEFINE_test_flag(bool, fail_in_apply_if_no_metadata, false,</a>
+<a name="ln82">                 &quot;Fail when applying intents if metadata is not found.&quot;);</a>
+<a name="ln83">DEFINE_test_flag(int32, inject_load_transaction_delay_ms, 0,</a>
+<a name="ln84">                 &quot;Inject delay before loading each transaction at startup.&quot;);</a>
+<a name="ln85"> </a>
+<a name="ln86">DECLARE_bool(TEST_fail_on_replicated_batch_idx_set_in_txn_record);</a>
+<a name="ln87"> </a>
+<a name="ln88">DEFINE_uint64(max_transactions_in_status_request, 128,</a>
+<a name="ln89">              &quot;Request status for at most specified number of transactions at once. &quot;</a>
+<a name="ln90">                  &quot;0 disables load time transaction status resolution.&quot;);</a>
+<a name="ln91"> </a>
+<a name="ln92">METRIC_DEFINE_simple_counter(</a>
+<a name="ln93">    tablet, transaction_load_attempts,</a>
+<a name="ln94">    &quot;Total number of tries to load transaction metadata from the intents RocksDB&quot;,</a>
+<a name="ln95">    yb::MetricUnit::kTransactions);</a>
+<a name="ln96">METRIC_DEFINE_simple_counter(</a>
+<a name="ln97">    tablet, transaction_not_found,</a>
+<a name="ln98">    &quot;Total number of missing transactions during load&quot;,</a>
+<a name="ln99">    yb::MetricUnit::kTransactions);</a>
+<a name="ln100">METRIC_DEFINE_simple_gauge_uint64(</a>
+<a name="ln101">    tablet, transactions_running,</a>
+<a name="ln102">    &quot;Total number of transactions running in participant&quot;,</a>
+<a name="ln103">    yb::MetricUnit::kTransactions);</a>
+<a name="ln104"> </a>
+<a name="ln105">namespace yb {</a>
+<a name="ln106">namespace tablet {</a>
+<a name="ln107"> </a>
+<a name="ln108">namespace {</a>
+<a name="ln109"> </a>
+<a name="ln110">YB_STRONGLY_TYPED_BOOL(PostApplyCleanup);</a>
+<a name="ln111"> </a>
+<a name="ln112">struct ApplyStateWithCommitHt {</a>
+<a name="ln113">  docdb::ApplyTransactionState state;</a>
+<a name="ln114">  HybridTime commit_ht;</a>
+<a name="ln115"> </a>
+<a name="ln116">  std::string ToString() const {</a>
+<a name="ln117">    return YB_STRUCT_TO_STRING(state, commit_ht);</a>
+<a name="ln118">  }</a>
+<a name="ln119">};</a>
+<a name="ln120"> </a>
+<a name="ln121">using ApplyStatesMap = std::unordered_map&lt;</a>
+<a name="ln122">    TransactionId, ApplyStateWithCommitHt, TransactionIdHash&gt;;</a>
+<a name="ln123"> </a>
+<a name="ln124">std::unique_ptr&lt;docdb::BoundedRocksDbIterator&gt; CreateFullScanIterator(rocksdb::DB* db) {</a>
+<a name="ln125">  return std::make_unique&lt;docdb::BoundedRocksDbIterator&gt;(docdb::CreateRocksDBIterator(</a>
+<a name="ln126">      db, &amp;docdb::KeyBounds::kNoBounds,</a>
+<a name="ln127">      docdb::BloomFilterMode::DONT_USE_BLOOM_FILTER,</a>
+<a name="ln128">      /* user_key_for_filter= */ boost::none, rocksdb::kDefaultQueryId));</a>
+<a name="ln129">}</a>
+<a name="ln130"> </a>
+<a name="ln131">} // namespace</a>
+<a name="ln132"> </a>
+<a name="ln133">std::string TransactionApplyData::ToString() const {</a>
+<a name="ln134">  return YB_STRUCT_TO_STRING(</a>
+<a name="ln135">      leader_term, transaction_id, op_id, commit_ht, log_ht, sealed, status_tablet, apply_state);</a>
+<a name="ln136">}</a>
+<a name="ln137"> </a>
+<a name="ln138">class TransactionParticipant::Impl : public RunningTransactionContext {</a>
+<a name="ln139"> public:</a>
+<a name="ln140">  Impl(TransactionParticipantContext* context, TransactionIntentApplier* applier,</a>
+<a name="ln141">       const scoped_refptr&lt;MetricEntity&gt;&amp; entity)</a>
+<a name="ln142">      : RunningTransactionContext(context, applier),</a>
+<a name="ln143">        log_prefix_(context-&gt;LogPrefix()),</a>
+<a name="ln144">        status_resolver_(context, &amp;rpcs_, FLAGS_max_transactions_in_status_request,</a>
+<a name="ln145">                         std::bind(&amp;Impl::TransactionsStatus, this, _1)),</a>
+<a name="ln146">        last_loaded_(TransactionId::Nil()) {</a>
+<a name="ln147">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Create&quot;;</a>
+<a name="ln148">    metric_transactions_running_ = METRIC_transactions_running.Instantiate(entity, 0);</a>
+<a name="ln149">    metric_transaction_load_attempts_ = METRIC_transaction_load_attempts.Instantiate(entity);</a>
+<a name="ln150">    metric_transaction_not_found_ = METRIC_transaction_not_found.Instantiate(entity);</a>
+<a name="ln151">  }</a>
+<a name="ln152"> </a>
+<a name="ln153">  ~Impl() {</a>
+<a name="ln154">    if (StartShutdown()) {</a>
+<a name="ln155">      CompleteShutdown();</a>
+<a name="ln156">    } else {</a>
+<a name="ln157">      LOG_IF_WITH_PREFIX(DFATAL, !shutdown_done_.load(std::memory_order_acquire))</a>
+<a name="ln158">          &lt;&lt; &quot;Destroying transaction participant that did not complete shutdown&quot;;</a>
+<a name="ln159">    }</a>
+<a name="ln160">  }</a>
+<a name="ln161"> </a>
+<a name="ln162">  bool StartShutdown() {</a>
+<a name="ln163">    bool expected = false;</a>
+<a name="ln164">    if (!closing_.compare_exchange_strong(expected, true)) {</a>
+<a name="ln165">      return false;</a>
+<a name="ln166">    }</a>
+<a name="ln167"> </a>
+<a name="ln168">    if (start_latch_.count()) {</a>
+<a name="ln169">      start_latch_.CountDown();</a>
+<a name="ln170">    }</a>
+<a name="ln171"> </a>
+<a name="ln172">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Shutdown&quot;;</a>
+<a name="ln173">    return true;</a>
+<a name="ln174">  }</a>
+<a name="ln175"> </a>
+<a name="ln176">  void CompleteShutdown() {</a>
+<a name="ln177">    LOG_IF_WITH_PREFIX(DFATAL, !closing_.load()) &lt;&lt; __func__ &lt;&lt; &quot; w/o StartShutdown&quot;;</a>
+<a name="ln178"> </a>
+<a name="ln179">    {</a>
+<a name="ln180">      MinRunningNotifier min_running_notifier(nullptr /* applier */);</a>
+<a name="ln181">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln182">      transactions_.clear();</a>
+<a name="ln183">      TransactionsModifiedUnlocked(&amp;min_running_notifier);</a>
+<a name="ln184">    }</a>
+<a name="ln185"> </a>
+<a name="ln186">    rpcs_.Shutdown();</a>
+<a name="ln187">    if (load_thread_.joinable()) {</a>
+<a name="ln188">      load_thread_.join();</a>
+<a name="ln189">    }</a>
+<a name="ln190">    status_resolver_.Shutdown();</a>
+<a name="ln191">    shutdown_done_.store(true, std::memory_order_release);</a>
+<a name="ln192">  }</a>
+<a name="ln193"> </a>
+<a name="ln194">  bool Closing() const override {</a>
+<a name="ln195">    return closing_.load(std::memory_order_acquire);</a>
+<a name="ln196">  }</a>
+<a name="ln197"> </a>
+<a name="ln198">  void Start() {</a>
+<a name="ln199">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Start&quot;;</a>
+<a name="ln200">    start_latch_.CountDown();</a>
+<a name="ln201">  }</a>
+<a name="ln202"> </a>
+<a name="ln203">  // Adds new running transaction.</a>
+<a name="ln204">  bool Add(const TransactionMetadataPB&amp; data, rocksdb::WriteBatch *write_batch) {</a>
+<a name="ln205">    auto metadata = TransactionMetadata::FromPB(data);</a>
+<a name="ln206">    if (!metadata.ok()) {</a>
+<a name="ln207">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Invalid transaction id: &quot; &lt;&lt; metadata.status().ToString();</a>
+<a name="ln208">      return false;</a>
+<a name="ln209">    }</a>
+<a name="ln210">    WaitLoaded(metadata-&gt;transaction_id);</a>
+<a name="ln211">    bool store = false;</a>
+<a name="ln212">    {</a>
+<a name="ln213">      MinRunningNotifier min_running_notifier(&amp;applier_);</a>
+<a name="ln214">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln215">      auto it = transactions_.find(metadata-&gt;transaction_id);</a>
+<a name="ln216">      if (it == transactions_.end()) {</a>
+<a name="ln217">        if (WasTransactionRecentlyRemoved(metadata-&gt;transaction_id)) {</a>
+<a name="ln218">          return false;</a>
+<a name="ln219">        }</a>
+<a name="ln220">        VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Create new transaction: &quot; &lt;&lt; metadata-&gt;transaction_id;</a>
+<a name="ln221">        transactions_.insert(std::make_shared&lt;RunningTransaction&gt;(</a>
+<a name="ln222">            *metadata, TransactionalBatchData(), OneWayBitmap(), this));</a>
+<a name="ln223">        TransactionsModifiedUnlocked(&amp;min_running_notifier);</a>
+<a name="ln224">        store = true;</a>
+<a name="ln225">      }</a>
+<a name="ln226">    }</a>
+<a name="ln227">    if (store) {</a>
+<a name="ln228">      docdb::KeyBytes key;</a>
+<a name="ln229">      AppendTransactionKeyPrefix(metadata-&gt;transaction_id, &amp;key);</a>
+<a name="ln230">      auto data_copy = data;</a>
+<a name="ln231">      // We use hybrid time only for backward compatibility, actually wall time is required.</a>
+<a name="ln232">      data_copy.set_metadata_write_time(GetCurrentTimeMicros());</a>
+<a name="ln233">      auto value = data.SerializeAsString();</a>
+<a name="ln234">      write_batch-&gt;Put(key.AsSlice(), value);</a>
+<a name="ln235">    }</a>
+<a name="ln236">    return true;</a>
+<a name="ln237">  }</a>
+<a name="ln238"> </a>
+<a name="ln239">  HybridTime LocalCommitTime(const TransactionId&amp; id) {</a>
+<a name="ln240">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln241">    auto it = transactions_.find(id);</a>
+<a name="ln242">    if (it == transactions_.end()) {</a>
+<a name="ln243">      return HybridTime::kInvalid;</a>
+<a name="ln244">    }</a>
+<a name="ln245">    return (**it).local_commit_time();</a>
+<a name="ln246">  }</a>
+<a name="ln247"> </a>
+<a name="ln248">  std::pair&lt;size_t, size_t&gt; TEST_CountIntents() {</a>
+<a name="ln249">    {</a>
+<a name="ln250">      MinRunningNotifier min_running_notifier(&amp;applier_);</a>
+<a name="ln251">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln252">      ProcessRemoveQueueUnlocked(&amp;min_running_notifier);</a>
+<a name="ln253">    }</a>
+<a name="ln254"> </a>
+<a name="ln255">    std::pair&lt;size_t, size_t&gt; result(0, 0);</a>
+<a name="ln256">    auto iter = docdb::CreateRocksDBIterator(db_.intents,</a>
+<a name="ln257">                                             key_bounds_,</a>
+<a name="ln258">                                             docdb::BloomFilterMode::DONT_USE_BLOOM_FILTER,</a>
+<a name="ln259">                                             boost::none,</a>
+<a name="ln260">                                             rocksdb::kDefaultQueryId);</a>
+<a name="ln261">    for (iter.SeekToFirst(); iter.Valid(); iter.Next()) {</a>
+<a name="ln262">      ++result.first;</a>
+<a name="ln263">      // Count number of transaction, by counting metadata records.</a>
+<a name="ln264">      if (iter.key().size() == TransactionId::StaticSize() + 1) {</a>
+<a name="ln265">        ++result.second;</a>
+<a name="ln266">        auto key = iter.key();</a>
+<a name="ln267">        key.remove_prefix(1);</a>
+<a name="ln268">        auto id = CHECK_RESULT(FullyDecodeTransactionId(key));</a>
+<a name="ln269">        LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Stored txn meta: &quot; &lt;&lt; id;</a>
+<a name="ln270">      }</a>
+<a name="ln271">    }</a>
+<a name="ln272"> </a>
+<a name="ln273">    return result;</a>
+<a name="ln274">  }</a>
+<a name="ln275"> </a>
+<a name="ln276">  Result&lt;TransactionMetadata&gt; PrepareMetadata(const TransactionMetadataPB&amp; pb) {</a>
+<a name="ln277">    if (pb.has_isolation()) {</a>
+<a name="ln278">      auto metadata = VERIFY_RESULT(TransactionMetadata::FromPB(pb));</a>
+<a name="ln279">      std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln280">      auto it = transactions_.find(metadata.transaction_id);</a>
+<a name="ln281">      if (it != transactions_.end()) {</a>
+<a name="ln282">        RETURN_NOT_OK((**it).CheckAborted());</a>
+<a name="ln283">      } else if (WasTransactionRecentlyRemoved(metadata.transaction_id)) {</a>
+<a name="ln284">        return MakeAbortedStatus(metadata.transaction_id);</a>
+<a name="ln285">      }</a>
+<a name="ln286">      return metadata;</a>
+<a name="ln287">    }</a>
+<a name="ln288"> </a>
+<a name="ln289">    auto id = VERIFY_RESULT(FullyDecodeTransactionId(pb.transaction_id()));</a>
+<a name="ln290"> </a>
+<a name="ln291">    // We are not trying to cleanup intents here because we don't know whether this transaction</a>
+<a name="ln292">    // has intents or not.</a>
+<a name="ln293">    auto lock_and_iterator = LockAndFind(</a>
+<a name="ln294">        id, &quot;metadata&quot;s, TransactionLoadFlags{TransactionLoadFlag::kMustExist});</a>
+<a name="ln295">    if (!lock_and_iterator.found()) {</a>
+<a name="ln296">      return STATUS(TryAgain,</a>
+<a name="ln297">                    Format(&quot;Unknown transaction, could be recently aborted: $0&quot;, id), Slice(),</a>
+<a name="ln298">                    PgsqlError(YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE));</a>
+<a name="ln299">    }</a>
+<a name="ln300">    RETURN_NOT_OK(lock_and_iterator.transaction().CheckAborted());</a>
+<a name="ln301">    return lock_and_iterator.transaction().metadata();</a>
+<a name="ln302">  }</a>
+<a name="ln303"> </a>
+<a name="ln304">  boost::optional&lt;std::pair&lt;IsolationLevel, TransactionalBatchData&gt;&gt; PrepareBatchData(</a>
+<a name="ln305">      const TransactionId&amp; id, size_t batch_idx,</a>
+<a name="ln306">      boost::container::small_vector_base&lt;uint8_t&gt;* encoded_replicated_batches) {</a>
+<a name="ln307">    // We are not trying to cleanup intents here because we don't know whether this transaction</a>
+<a name="ln308">    // has intents of not.</a>
+<a name="ln309">    auto lock_and_iterator = LockAndFind(</a>
+<a name="ln310">        id, &quot;metadata with write id&quot;s, TransactionLoadFlags{TransactionLoadFlag::kMustExist});</a>
+<a name="ln311">    if (!lock_and_iterator.found()) {</a>
+<a name="ln312">      return boost::none;</a>
+<a name="ln313">    }</a>
+<a name="ln314">    auto&amp; transaction = lock_and_iterator.transaction();</a>
+<a name="ln315">    transaction.AddReplicatedBatch(batch_idx, encoded_replicated_batches);</a>
+<a name="ln316">    return std::make_pair(transaction.metadata().isolation, transaction.last_batch_data());</a>
+<a name="ln317">  }</a>
+<a name="ln318"> </a>
+<a name="ln319">  void BatchReplicated(const TransactionId&amp; id, const TransactionalBatchData&amp; data) {</a>
+<a name="ln320">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln321">    auto it = transactions_.find(id);</a>
+<a name="ln322">    if (it == transactions_.end()) {</a>
+<a name="ln323">      LOG_IF_WITH_PREFIX(DFATAL, !WasTransactionRecentlyRemoved(id))</a>
+<a name="ln324">          &lt;&lt; &quot;Update last write id for unknown transaction: &quot; &lt;&lt; id;</a>
+<a name="ln325">      return;</a>
+<a name="ln326">    }</a>
+<a name="ln327">    (**it).BatchReplicated(data);</a>
+<a name="ln328">  }</a>
+<a name="ln329"> </a>
+<a name="ln330">  void RequestStatusAt(const StatusRequest&amp; request) {</a>
+<a name="ln331">    auto lock_and_iterator = LockAndFind(*request.id, *request.reason, request.flags);</a>
+<a name="ln332">    if (!lock_and_iterator.found()) {</a>
+<a name="ln333">      request.callback(</a>
+<a name="ln334">          STATUS_FORMAT(NotFound, &quot;Request status of unknown transaction: $0&quot;, *request.id));</a>
+<a name="ln335">      return;</a>
+<a name="ln336">    }</a>
+<a name="ln337">    lock_and_iterator.transaction().RequestStatusAt(request, &amp;lock_and_iterator.lock);</a>
+<a name="ln338">  }</a>
+<a name="ln339"> </a>
+<a name="ln340">  // Registers a request, giving it a newly allocated id and returning this id.</a>
+<a name="ln341">  int64_t RegisterRequest() {</a>
+<a name="ln342">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln343">    auto result = NextRequestIdUnlocked();</a>
+<a name="ln344">    running_requests_.push_back(result);</a>
+<a name="ln345">    return result;</a>
+<a name="ln346">  }</a>
+<a name="ln347"> </a>
+<a name="ln348">  // Unregisters a previously registered request.</a>
+<a name="ln349">  void UnregisterRequest(int64_t request) {</a>
+<a name="ln350">    MinRunningNotifier min_running_notifier(&amp;applier_);</a>
+<a name="ln351">    {</a>
+<a name="ln352">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln353">      DCHECK(!running_requests_.empty());</a>
+<a name="ln354">      if (running_requests_.front() != request) {</a>
+<a name="ln355">        complete_requests_.push(request);</a>
+<a name="ln356">        return;</a>
+<a name="ln357">      }</a>
+<a name="ln358">      running_requests_.pop_front();</a>
+<a name="ln359">      while (!complete_requests_.empty() &amp;&amp; complete_requests_.top() == running_requests_.front()) {</a>
+<a name="ln360">        complete_requests_.pop();</a>
+<a name="ln361">        running_requests_.pop_front();</a>
+<a name="ln362">      }</a>
+<a name="ln363"> </a>
+<a name="ln364">      CleanTransactionsUnlocked(&amp;min_running_notifier);</a>
+<a name="ln365">    }</a>
+<a name="ln366">  }</a>
+<a name="ln367"> </a>
+<a name="ln368">  // Cleans transactions that are requested and now is safe to clean.</a>
+<a name="ln369">  // See RemoveUnlocked for details.</a>
+<a name="ln370">  void CleanTransactionsUnlocked(MinRunningNotifier* min_running_notifier) REQUIRES(mutex_) {</a>
+<a name="ln371">    ProcessRemoveQueueUnlocked(min_running_notifier);</a>
+<a name="ln372"> </a>
+<a name="ln373">    int64_t min_request = running_requests_.empty() ? std::numeric_limits&lt;int64_t&gt;::max()</a>
+<a name="ln374">                                                    : running_requests_.front();</a>
+<a name="ln375">    while (!cleanup_queue_.empty() &amp;&amp; cleanup_queue_.front().request_id &lt; min_request) {</a>
+<a name="ln376">      const auto&amp; id = cleanup_queue_.front().transaction_id;</a>
+<a name="ln377">      auto it = transactions_.find(id);</a>
+<a name="ln378">      if (it != transactions_.end()) {</a>
+<a name="ln379">        (**it).ScheduleRemoveIntents(*it);</a>
+<a name="ln380">        RemoveTransaction(it, min_running_notifier);</a>
+<a name="ln381">      }</a>
+<a name="ln382">      VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Cleaned from queue: &quot; &lt;&lt; id;</a>
+<a name="ln383">      cleanup_queue_.pop_front();</a>
+<a name="ln384">    }</a>
+<a name="ln385">  }</a>
+<a name="ln386"> </a>
+<a name="ln387">  void Abort(const TransactionId&amp; id, TransactionStatusCallback callback) {</a>
+<a name="ln388">    // We are not trying to cleanup intents here because we don't know whether this transaction</a>
+<a name="ln389">    // has intents of not.</a>
+<a name="ln390">    auto lock_and_iterator = LockAndFind(</a>
+<a name="ln391">        id, &quot;abort&quot;s, TransactionLoadFlags{TransactionLoadFlag::kMustExist});</a>
+<a name="ln392">    if (!lock_and_iterator.found()) {</a>
+<a name="ln393">      callback(STATUS_FORMAT(NotFound, &quot;Abort of unknown transaction: $0&quot;, id));</a>
+<a name="ln394">      return;</a>
+<a name="ln395">    }</a>
+<a name="ln396">    auto client_result = client();</a>
+<a name="ln397">    if (!client_result.ok()) {</a>
+<a name="ln398">      callback(client_result.status());</a>
+<a name="ln399">      return;</a>
+<a name="ln400">    }</a>
+<a name="ln401">    lock_and_iterator.transaction().Abort(</a>
+<a name="ln402">        *client_result, std::move(callback), &amp;lock_and_iterator.lock);</a>
+<a name="ln403">  }</a>
+<a name="ln404"> </a>
+<a name="ln405">  CHECKED_STATUS CheckAborted(const TransactionId&amp; id) {</a>
+<a name="ln406">    // We are not trying to cleanup intents here because we don't know whether this transaction</a>
+<a name="ln407">    // has intents of not.</a>
+<a name="ln408">    auto lock_and_iterator = LockAndFind(id, &quot;check aborted&quot;s, TransactionLoadFlags{});</a>
+<a name="ln409">    if (!lock_and_iterator.found()) {</a>
+<a name="ln410">      return MakeAbortedStatus(id);</a>
+<a name="ln411">    }</a>
+<a name="ln412">    return lock_and_iterator.transaction().CheckAborted();</a>
+<a name="ln413">  }</a>
+<a name="ln414"> </a>
+<a name="ln415">  void FillPriorities(</a>
+<a name="ln416">      boost::container::small_vector_base&lt;std::pair&lt;TransactionId, uint64_t&gt;&gt;* inout) {</a>
+<a name="ln417">    // TODO(dtxn) optimize locking</a>
+<a name="ln418">    for (auto&amp; pair : *inout) {</a>
+<a name="ln419">      auto lock_and_iterator = LockAndFind(</a>
+<a name="ln420">          pair.first, &quot;fill priorities&quot;s, TransactionLoadFlags{TransactionLoadFlag::kMustExist});</a>
+<a name="ln421">      if (!lock_and_iterator.found() || lock_and_iterator.transaction().WasAborted()) {</a>
+<a name="ln422">        pair.second = 0; // Minimal priority for already aborted transactions</a>
+<a name="ln423">      } else {</a>
+<a name="ln424">        pair.second = lock_and_iterator.transaction().metadata().priority;</a>
+<a name="ln425">      }</a>
+<a name="ln426">    }</a>
+<a name="ln427">  }</a>
+<a name="ln428"> </a>
+<a name="ln429">  void Handle(std::unique_ptr&lt;tablet::UpdateTxnOperationState&gt; state, int64_t term) {</a>
+<a name="ln430">    if (state-&gt;request()-&gt;status() == TransactionStatus::APPLYING) {</a>
+<a name="ln431">      HandleApplying(std::move(state), term);</a>
+<a name="ln432">      return;</a>
+<a name="ln433">    }</a>
+<a name="ln434"> </a>
+<a name="ln435">    if (state-&gt;request()-&gt;status() == TransactionStatus::CLEANUP) {</a>
+<a name="ln436">      HandleCleanup(std::move(state), term);</a>
+<a name="ln437">      return;</a>
+<a name="ln438">    }</a>
+<a name="ln439"> </a>
+<a name="ln440">    auto status = STATUS_FORMAT(</a>
+<a name="ln441">        InvalidArgument, &quot;Unexpected status in transaction participant Handle: $0&quot;, *state);</a>
+<a name="ln442">    LOG_WITH_PREFIX(DFATAL) &lt;&lt; status;</a>
+<a name="ln443">    state-&gt;CompleteWithStatus(status);</a>
+<a name="ln444">  }</a>
+<a name="ln445"> </a>
+<a name="ln446">  CHECKED_STATUS ProcessReplicated(const ReplicatedData&amp; data) {</a>
+<a name="ln447">    auto id = FullyDecodeTransactionId(data.state.transaction_id());</a>
+<a name="ln448">    if (!id.ok()) {</a>
+<a name="ln449">      return id.status();</a>
+<a name="ln450">    }</a>
+<a name="ln451"> </a>
+<a name="ln452">    if (data.state.status() == TransactionStatus::APPLYING) {</a>
+<a name="ln453">      return ReplicatedApplying(*id, data);</a>
+<a name="ln454">    } else if (data.state.status() == TransactionStatus::ABORTED) {</a>
+<a name="ln455">      return ReplicatedAborted(*id, data);</a>
+<a name="ln456">    }</a>
+<a name="ln457"> </a>
+<a name="ln458">    auto status = STATUS_FORMAT(</a>
+<a name="ln459">        InvalidArgument, &quot;Unexpected status in transaction participant ProcessReplicated: $0, $1&quot;,</a>
+<a name="ln460">        data.op_id, data.state);</a>
+<a name="ln461">    LOG_WITH_PREFIX(DFATAL) &lt;&lt; status;</a>
+<a name="ln462">    return status;</a>
+<a name="ln463">  }</a>
+<a name="ln464"> </a>
+<a name="ln465">  void Cleanup(TransactionIdSet&amp;&amp; set, TransactionStatusManager* status_manager) {</a>
+<a name="ln466">    auto cleanup_aborts_task = std::make_shared&lt;CleanupAbortsTask&gt;(</a>
+<a name="ln467">        &amp;applier_, std::move(set), &amp;participant_context_, status_manager, LogPrefix());</a>
+<a name="ln468">    cleanup_aborts_task-&gt;Prepare(cleanup_aborts_task);</a>
+<a name="ln469">    participant_context_.StrandEnqueue(cleanup_aborts_task.get());</a>
+<a name="ln470">  }</a>
+<a name="ln471"> </a>
+<a name="ln472">  CHECKED_STATUS ProcessApply(const TransactionApplyData&amp; data) {</a>
+<a name="ln473">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Apply: &quot; &lt;&lt; data.ToString();</a>
+<a name="ln474"> </a>
+<a name="ln475">    WaitLoaded(data.transaction_id);</a>
+<a name="ln476"> </a>
+<a name="ln477">    bool was_applied = false;</a>
+<a name="ln478"> </a>
+<a name="ln479">    {</a>
+<a name="ln480">      // It is our last chance to load transaction metadata, if missing.</a>
+<a name="ln481">      // Because it will be deleted when intents are applied.</a>
+<a name="ln482">      // We are not trying to cleanup intents here because we don't know whether this transaction</a>
+<a name="ln483">      // has intents of not.</a>
+<a name="ln484">      auto lock_and_iterator = LockAndFind(</a>
+<a name="ln485">          data.transaction_id, &quot;pre apply&quot;s, TransactionLoadFlags{TransactionLoadFlag::kMustExist});</a>
+<a name="ln486">      if (!lock_and_iterator.found()) {</a>
+<a name="ln487">        // This situation is normal and could be caused by 2 scenarios:</a>
+<a name="ln488">        // 1) Write batch failed, but originator doesn't know that.</a>
+<a name="ln489">        // 2) Failed to notify status tablet that we applied transaction.</a>
+<a name="ln490">        YB_LOG_WITH_PREFIX_EVERY_N_SECS(WARNING, 1)</a>
+<a name="ln491">            &lt;&lt; Format(&quot;Apply of unknown transaction: $0&quot;, data);</a>
+<a name="ln492">        NotifyApplied(data);</a>
+<a name="ln493">        CHECK(!FLAGS_TEST_fail_in_apply_if_no_metadata);</a>
+<a name="ln494">        return Status::OK();</a>
+<a name="ln495">      }</a>
+<a name="ln496"> </a>
+<a name="ln497">      auto existing_commit_ht = lock_and_iterator.transaction().local_commit_time();</a>
+<a name="ln498">      if (existing_commit_ht) {</a>
+<a name="ln499">        was_applied = true;</a>
+<a name="ln500">        LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Transaction already applied: &quot; &lt;&lt; data.transaction_id;</a>
+<a name="ln501">        LOG_IF_WITH_PREFIX(DFATAL, data.commit_ht != existing_commit_ht)</a>
+<a name="ln502">            &lt;&lt; &quot;Transaction was previously applied with another commit ht: &quot; &lt;&lt; existing_commit_ht</a>
+<a name="ln503">            &lt;&lt; &quot;, new commit ht: &quot; &lt;&lt; data.commit_ht;</a>
+<a name="ln504">      } else {</a>
+<a name="ln505">        lock_and_iterator.transaction().SetLocalCommitTime(data.commit_ht);</a>
+<a name="ln506"> </a>
+<a name="ln507">        LOG_IF_WITH_PREFIX(DFATAL, data.log_ht &lt; last_safe_time_)</a>
+<a name="ln508">            &lt;&lt; &quot;Apply transaction before last safe time &quot; &lt;&lt; data.transaction_id</a>
+<a name="ln509">            &lt;&lt; &quot;: &quot; &lt;&lt; data.log_ht &lt;&lt; &quot; vs &quot; &lt;&lt; last_safe_time_;</a>
+<a name="ln510">      }</a>
+<a name="ln511">    }</a>
+<a name="ln512"> </a>
+<a name="ln513">    if (!was_applied) {</a>
+<a name="ln514">      auto apply_state = CHECK_RESULT(applier_.ApplyIntents(data));</a>
+<a name="ln515"> </a>
+<a name="ln516">      VLOG_WITH_PREFIX(4) &lt;&lt; &quot;TXN: &quot; &lt;&lt; data.transaction_id &lt;&lt; &quot;: apply state: &quot;</a>
+<a name="ln517">                          &lt;&lt; apply_state.ToString();</a>
+<a name="ln518"> </a>
+<a name="ln519">      UpdateAppliedTransaction(data, apply_state);</a>
+<a name="ln520">    }</a>
+<a name="ln521"> </a>
+<a name="ln522">    NotifyApplied(data);</a>
+<a name="ln523">    return Status::OK();</a>
+<a name="ln524">  }</a>
+<a name="ln525"> </a>
+<a name="ln526">  void UpdateAppliedTransaction(</a>
+<a name="ln527">       const TransactionApplyData&amp; data,</a>
+<a name="ln528">       const docdb::ApplyTransactionState&amp; apply_state) NO_THREAD_SAFETY_ANALYSIS {</a>
+<a name="ln529">    MinRunningNotifier min_running_notifier(&amp;applier_);</a>
+<a name="ln530">    // We are not trying to cleanup intents here because we don't know whether this transaction</a>
+<a name="ln531">    // has intents or not.</a>
+<a name="ln532">    auto lock_and_iterator = LockAndFind(</a>
+<a name="ln533">        data.transaction_id, &quot;apply&quot;s, TransactionLoadFlags{TransactionLoadFlag::kMustExist});</a>
+<a name="ln534">    if (lock_and_iterator.found()) {</a>
+<a name="ln535">      if (!apply_state.active()) {</a>
+<a name="ln536">        RemoveUnlocked(lock_and_iterator.iterator, &quot;applied&quot;s, &amp;min_running_notifier);</a>
+<a name="ln537">      } else {</a>
+<a name="ln538">        lock_and_iterator.transaction().SetApplyData(apply_state, &amp;data);</a>
+<a name="ln539">      }</a>
+<a name="ln540">    }</a>
+<a name="ln541">  }</a>
+<a name="ln542"> </a>
+<a name="ln543">  void NotifyApplied(const TransactionApplyData&amp; data) {</a>
+<a name="ln544">    VLOG_WITH_PREFIX(4) &lt;&lt; Format(&quot;NotifyApplied($0)&quot;, data);</a>
+<a name="ln545"> </a>
+<a name="ln546">    if (data.leader_term != OpId::kUnknownTerm) {</a>
+<a name="ln547">      tserver::UpdateTransactionRequestPB req;</a>
+<a name="ln548">      req.set_tablet_id(data.status_tablet);</a>
+<a name="ln549">      auto&amp; state = *req.mutable_state();</a>
+<a name="ln550">      state.set_transaction_id(data.transaction_id.data(), data.transaction_id.size());</a>
+<a name="ln551">      state.set_status(TransactionStatus::APPLIED_IN_ONE_OF_INVOLVED_TABLETS);</a>
+<a name="ln552">      state.add_tablets(participant_context_.tablet_id());</a>
+<a name="ln553">      auto client_result = client();</a>
+<a name="ln554">      if (!client_result.ok()) {</a>
+<a name="ln555">        LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Get client failed: &quot; &lt;&lt; client_result.status();</a>
+<a name="ln556">        return;</a>
+<a name="ln557">      }</a>
+<a name="ln558"> </a>
+<a name="ln559">      auto handle = rpcs_.Prepare();</a>
+<a name="ln560">      if (handle != rpcs_.InvalidHandle()) {</a>
+<a name="ln561">        *handle = UpdateTransaction(</a>
+<a name="ln562">            TransactionRpcDeadline(),</a>
+<a name="ln563">            nullptr /* remote_tablet */,</a>
+<a name="ln564">            *client_result,</a>
+<a name="ln565">            &amp;req,</a>
+<a name="ln566">            [this, handle](const Status&amp; status,</a>
+<a name="ln567">                           const tserver::UpdateTransactionResponsePB&amp; resp) {</a>
+<a name="ln568">              client::UpdateClock(resp, &amp;participant_context_);</a>
+<a name="ln569">              rpcs_.Unregister(handle);</a>
+<a name="ln570">              LOG_IF_WITH_PREFIX(WARNING, !status.ok()) &lt;&lt; &quot;Failed to send applied: &quot; &lt;&lt; status;</a>
+<a name="ln571">            });</a>
+<a name="ln572">        (**handle).SendRpc();</a>
+<a name="ln573">      }</a>
+<a name="ln574">    }</a>
+<a name="ln575">  }</a>
+<a name="ln576"> </a>
+<a name="ln577">  CHECKED_STATUS ProcessCleanup(</a>
+<a name="ln578">      const TransactionApplyData&amp; data, PostApplyCleanup post_apply_cleanup) {</a>
+<a name="ln579">    WaitLoaded(data.transaction_id);</a>
+<a name="ln580"> </a>
+<a name="ln581">    MinRunningNotifier min_running_notifier(&amp;applier_);</a>
+<a name="ln582">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln583">    auto it = transactions_.find(data.transaction_id);</a>
+<a name="ln584">    if (it == transactions_.end()) {</a>
+<a name="ln585">      return Status::OK();</a>
+<a name="ln586">    }</a>
+<a name="ln587"> </a>
+<a name="ln588">    if (!post_apply_cleanup &amp;&amp; (**it).ProcessingApply()) {</a>
+<a name="ln589">      VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Don't cleanup transaction because it is applying intents: &quot;</a>
+<a name="ln590">                          &lt;&lt; data.transaction_id;</a>
+<a name="ln591">      return Status::OK();</a>
+<a name="ln592">    }</a>
+<a name="ln593"> </a>
+<a name="ln594">    if (!RemoveUnlocked(it, &quot;cleanup&quot;s, &amp;min_running_notifier)) {</a>
+<a name="ln595">      VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Have added aborted txn to cleanup queue: &quot;</a>
+<a name="ln596">                          &lt;&lt; data.transaction_id;</a>
+<a name="ln597">    }</a>
+<a name="ln598"> </a>
+<a name="ln599">    return Status::OK();</a>
+<a name="ln600">  }</a>
+<a name="ln601"> </a>
+<a name="ln602">  void SetDB(</a>
+<a name="ln603">      const docdb::DocDB&amp; db, const docdb::KeyBounds* key_bounds,</a>
+<a name="ln604">      RWOperationCounter* pending_op_counter) {</a>
+<a name="ln605">    bool had_db = db_.intents != nullptr;</a>
+<a name="ln606">    db_ = db;</a>
+<a name="ln607">    key_bounds_ = key_bounds;</a>
+<a name="ln608"> </a>
+<a name="ln609">    // In case of truncate we should not reload transactions.</a>
+<a name="ln610">    if (!had_db) {</a>
+<a name="ln611">      auto scoped_pending_operation = std::make_unique&lt;ScopedRWOperation&gt;(pending_op_counter);</a>
+<a name="ln612">      if (scoped_pending_operation-&gt;ok()) {</a>
+<a name="ln613">        auto regular_iterator = CreateFullScanIterator(db_.regular);</a>
+<a name="ln614">        auto intents_iterator = CreateFullScanIterator(db_.intents);</a>
+<a name="ln615">        load_thread_ = std::thread(</a>
+<a name="ln616">            &amp;Impl::LoadTransactions, this,</a>
+<a name="ln617">            regular_iterator.release(), intents_iterator.release(),</a>
+<a name="ln618">            scoped_pending_operation.release());</a>
+<a name="ln619">      }</a>
+<a name="ln620">    }</a>
+<a name="ln621">  }</a>
+<a name="ln622"> </a>
+<a name="ln623">  void GetStatus(</a>
+<a name="ln624">      const TransactionId&amp; transaction_id,</a>
+<a name="ln625">      size_t required_num_replicated_batches,</a>
+<a name="ln626">      int64_t term,</a>
+<a name="ln627">      tserver::GetTransactionStatusAtParticipantResponsePB* response,</a>
+<a name="ln628">      rpc::RpcContext* context) {</a>
+<a name="ln629">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln630">    auto it = transactions_.find(transaction_id);</a>
+<a name="ln631">    if (it == transactions_.end()) {</a>
+<a name="ln632">      response-&gt;set_num_replicated_batches(0);</a>
+<a name="ln633">      response-&gt;set_status_hybrid_time(0);</a>
+<a name="ln634">    } else {</a>
+<a name="ln635">      if ((**it).WasAborted()) {</a>
+<a name="ln636">        response-&gt;set_aborted(true);</a>
+<a name="ln637">        return;</a>
+<a name="ln638">      }</a>
+<a name="ln639">      response-&gt;set_num_replicated_batches((**it).num_replicated_batches());</a>
+<a name="ln640">      response-&gt;set_status_hybrid_time((**it).last_batch_data().hybrid_time.ToUint64());</a>
+<a name="ln641">    }</a>
+<a name="ln642">  }</a>
+<a name="ln643"> </a>
+<a name="ln644">  TransactionParticipantContext* participant_context() const {</a>
+<a name="ln645">    return &amp;participant_context_;</a>
+<a name="ln646">  }</a>
+<a name="ln647"> </a>
+<a name="ln648">  HybridTime MinRunningHybridTime() {</a>
+<a name="ln649">    auto result = min_running_ht_.load(std::memory_order_acquire);</a>
+<a name="ln650">    if (result == HybridTime::kMax || result == HybridTime::kInvalid) {</a>
+<a name="ln651">      return result;</a>
+<a name="ln652">    }</a>
+<a name="ln653">    auto now = CoarseMonoClock::now();</a>
+<a name="ln654">    auto current_next_check_min_running = next_check_min_running_.load(std::memory_order_relaxed);</a>
+<a name="ln655">    if (now &gt;= current_next_check_min_running) {</a>
+<a name="ln656">      if (next_check_min_running_.compare_exchange_strong(</a>
+<a name="ln657">              current_next_check_min_running,</a>
+<a name="ln658">              now + 1ms * FLAGS_transaction_min_running_check_interval_ms,</a>
+<a name="ln659">              std::memory_order_acq_rel)) {</a>
+<a name="ln660">        std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln661">        if (transactions_.empty()) {</a>
+<a name="ln662">          return HybridTime::kMax;</a>
+<a name="ln663">        }</a>
+<a name="ln664">        auto&amp; first_txn = **transactions_.get&lt;StartTimeTag&gt;().begin();</a>
+<a name="ln665">        VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Checking status of long running min txn &quot; &lt;&lt; first_txn.id()</a>
+<a name="ln666">                            &lt;&lt; &quot;: &quot; &lt;&lt; first_txn.WasAborted();</a>
+<a name="ln667">        static const std::string kRequestReason = &quot;min running check&quot;s;</a>
+<a name="ln668">        // Get transaction status</a>
+<a name="ln669">        auto now_ht = participant_context_.Now();</a>
+<a name="ln670">        StatusRequest status_request = {</a>
+<a name="ln671">            .id = &amp;first_txn.id(),</a>
+<a name="ln672">            .read_ht = now_ht,</a>
+<a name="ln673">            .global_limit_ht = now_ht,</a>
+<a name="ln674">            // Could use 0 here, because read_ht == global_limit_ht.</a>
+<a name="ln675">            // So we cannot accept status with time &gt;= read_ht and &lt; global_limit_ht.</a>
+<a name="ln676">            .serial_no = 0,</a>
+<a name="ln677">            .reason = &amp;kRequestReason,</a>
+<a name="ln678">            .flags = TransactionLoadFlags{},</a>
+<a name="ln679">            .callback = [this, id = first_txn.id()](Result&lt;TransactionStatusResult&gt; result) {</a>
+<a name="ln680">              // Aborted status will result in cleanup of intents.</a>
+<a name="ln681">              VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Min running status &quot; &lt;&lt; id &lt;&lt; &quot;: &quot; &lt;&lt; result;</a>
+<a name="ln682">            }</a>
+<a name="ln683">        };</a>
+<a name="ln684">        first_txn.RequestStatusAt(status_request, &amp;lock);</a>
+<a name="ln685">      }</a>
+<a name="ln686">    }</a>
+<a name="ln687">    return result;</a>
+<a name="ln688">  }</a>
+<a name="ln689"> </a>
+<a name="ln690">  void WaitMinRunningHybridTime(HybridTime ht) {</a>
+<a name="ln691">    MinRunningNotifier min_running_notifier(&amp;applier_);</a>
+<a name="ln692">    std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln693">    waiting_for_min_running_ht_ = ht;</a>
+<a name="ln694">    CheckMinRunningHybridTimeSatisfiedUnlocked(&amp;min_running_notifier);</a>
+<a name="ln695">  }</a>
+<a name="ln696"> </a>
+<a name="ln697">  CHECKED_STATUS ResolveIntents(HybridTime resolve_at, CoarseTimePoint deadline) {</a>
+<a name="ln698">    RETURN_NOT_OK(WaitUntil(participant_context_.clock_ptr().get(), resolve_at, deadline));</a>
+<a name="ln699"> </a>
+<a name="ln700">    if (FLAGS_max_transactions_in_status_request == 0) {</a>
+<a name="ln701">      return STATUS(</a>
+<a name="ln702">          IllegalState,</a>
+<a name="ln703">          &quot;Cannot resolve intents when FLAGS_max_transactions_in_status_request is zero&quot;);</a>
+<a name="ln704">    }</a>
+<a name="ln705"> </a>
+<a name="ln706">    std::vector&lt;TransactionId&gt; recheck_ids, committed_ids;</a>
+<a name="ln707"> </a>
+<a name="ln708">    // Maintain a set of transactions, check their statuses, and remove them as they get</a>
+<a name="ln709">    // committed/applied, aborted or we realize that transaction was not committed at</a>
+<a name="ln710">    // resolve_at.</a>
+<a name="ln711">    for (;;) {</a>
+<a name="ln712">      TransactionStatusResolver resolver(</a>
+<a name="ln713">          &amp;participant_context_, &amp;rpcs_, FLAGS_max_transactions_in_status_request,</a>
+<a name="ln714">          [this, resolve_at, &amp;recheck_ids, &amp;committed_ids](</a>
+<a name="ln715">              const std::vector &lt;TransactionStatusInfo&gt;&amp; status_infos) {</a>
+<a name="ln716">            std::vector&lt;TransactionId&gt; aborted;</a>
+<a name="ln717">            for (const auto&amp; info : status_infos) {</a>
+<a name="ln718">              VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Transaction status: &quot; &lt;&lt; info.ToString();</a>
+<a name="ln719">              if (info.status == TransactionStatus::COMMITTED) {</a>
+<a name="ln720">                if (info.status_ht &lt;= resolve_at) {</a>
+<a name="ln721">                  // Transaction was committed, but not yet applied.</a>
+<a name="ln722">                  // So rely on filtering recheck_ids before next phase.</a>
+<a name="ln723">                  committed_ids.push_back(info.transaction_id);</a>
+<a name="ln724">                }</a>
+<a name="ln725">              } else if (info.status == TransactionStatus::ABORTED) {</a>
+<a name="ln726">                aborted.push_back(info.transaction_id);</a>
+<a name="ln727">              } else {</a>
+<a name="ln728">                LOG_IF_WITH_PREFIX(DFATAL, info.status != TransactionStatus::PENDING)</a>
+<a name="ln729">                    &lt;&lt; &quot;Transaction is in unexpected state: &quot; &lt;&lt; info.ToString();</a>
+<a name="ln730">                if (info.status_ht &lt;= resolve_at) {</a>
+<a name="ln731">                  recheck_ids.push_back(info.transaction_id);</a>
+<a name="ln732">                }</a>
+<a name="ln733">              }</a>
+<a name="ln734">            }</a>
+<a name="ln735">            if (!aborted.empty()) {</a>
+<a name="ln736">              MinRunningNotifier min_running_notifier(&amp;applier_);</a>
+<a name="ln737">              std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln738">              for (const auto&amp; id : aborted) {</a>
+<a name="ln739">                EnqueueRemoveUnlocked(id, &amp;min_running_notifier);</a>
+<a name="ln740">              }</a>
+<a name="ln741">            }</a>
+<a name="ln742">          });</a>
+<a name="ln743">      {</a>
+<a name="ln744">        std::lock_guard &lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln745">        if (recheck_ids.empty() &amp;&amp; committed_ids.empty()) {</a>
+<a name="ln746">          // First step, check all transactions.</a>
+<a name="ln747">          for (const auto&amp; transaction : transactions_) {</a>
+<a name="ln748">            if (!transaction-&gt;local_commit_time().is_valid()) {</a>
+<a name="ln749">              resolver.Add(transaction-&gt;metadata().status_tablet, transaction-&gt;id());</a>
+<a name="ln750">            }</a>
+<a name="ln751">          }</a>
+<a name="ln752">        } else {</a>
+<a name="ln753">          for (const auto&amp; id : recheck_ids) {</a>
+<a name="ln754">            auto it = transactions_.find(id);</a>
+<a name="ln755">            if (it == transactions_.end() || (**it).local_commit_time().is_valid()) {</a>
+<a name="ln756">              continue;</a>
+<a name="ln757">            }</a>
+<a name="ln758">            resolver.Add((**it).metadata().status_tablet, id);</a>
+<a name="ln759">          }</a>
+<a name="ln760">          auto filter = [this](const TransactionId&amp; id) {</a>
+<a name="ln761">            auto it = transactions_.find(id);</a>
+<a name="ln762">            return it == transactions_.end() || (**it).local_commit_time().is_valid();</a>
+<a name="ln763">          };</a>
+<a name="ln764">          committed_ids.erase(std::remove_if(committed_ids.begin(), committed_ids.end(), filter),</a>
+<a name="ln765">                              committed_ids.end());</a>
+<a name="ln766">        }</a>
+<a name="ln767">      }</a>
+<a name="ln768"> </a>
+<a name="ln769">      recheck_ids.clear();</a>
+<a name="ln770">      resolver.Start(deadline);</a>
+<a name="ln771"> </a>
+<a name="ln772">      RETURN_NOT_OK(resolver.ResultFuture().get());</a>
+<a name="ln773"> </a>
+<a name="ln774">      if (recheck_ids.empty()) {</a>
+<a name="ln775">        if (committed_ids.empty()) {</a>
+<a name="ln776">          break;</a>
+<a name="ln777">        } else {</a>
+<a name="ln778">          // We are waiting only for committed transactions to be applied.</a>
+<a name="ln779">          // So just add some delay.</a>
+<a name="ln780">          std::this_thread::sleep_for(10ms * std::min&lt;size_t&gt;(10, committed_ids.size()));</a>
+<a name="ln781">        }</a>
+<a name="ln782">      }</a>
+<a name="ln783">    }</a>
+<a name="ln784"> </a>
+<a name="ln785">    return Status::OK();</a>
+<a name="ln786">  }</a>
+<a name="ln787"> </a>
+<a name="ln788">  size_t TEST_GetNumRunningTransactions() {</a>
+<a name="ln789">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln790">    VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Transactions: &quot; &lt;&lt; yb::ToString(transactions_);</a>
+<a name="ln791">    return transactions_.size();</a>
+<a name="ln792">  }</a>
+<a name="ln793"> </a>
+<a name="ln794">  OneWayBitmap TEST_TransactionReplicatedBatches(const TransactionId&amp; id) {</a>
+<a name="ln795">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln796">    auto it = transactions_.find(id);</a>
+<a name="ln797">    return it != transactions_.end() ? (**it).replicated_batches() : OneWayBitmap();</a>
+<a name="ln798">  }</a>
+<a name="ln799"> </a>
+<a name="ln800">  std::string DumpTransactions() {</a>
+<a name="ln801">    std::string result;</a>
+<a name="ln802">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln803"> </a>
+<a name="ln804">    result += Format(</a>
+<a name="ln805">        &quot;{ safe_time_for_participant: $0 remove_queue_size: $1 &quot;,</a>
+<a name="ln806">        participant_context_.SafeTimeForTransactionParticipant(), remove_queue_.size());</a>
+<a name="ln807">    if (!remove_queue_.empty()) {</a>
+<a name="ln808">      result += &quot;remove_queue_front: &quot; + AsString(remove_queue_.front());</a>
+<a name="ln809">    }</a>
+<a name="ln810">    if (!running_requests_.empty()) {</a>
+<a name="ln811">      result += &quot;running_requests_front: &quot; + AsString(running_requests_.front());</a>
+<a name="ln812">    }</a>
+<a name="ln813">    result += &quot;}\n&quot;;</a>
+<a name="ln814"> </a>
+<a name="ln815">    for (const auto&amp; txn : transactions_.get&lt;StartTimeTag&gt;()) {</a>
+<a name="ln816">      result += txn-&gt;ToString();</a>
+<a name="ln817">      result += &quot;\n&quot;;</a>
+<a name="ln818">    }</a>
+<a name="ln819">    return result;</a>
+<a name="ln820">  }</a>
+<a name="ln821"> </a>
+<a name="ln822">  CHECKED_STATUS StopActiveTxnsPriorTo(HybridTime cutoff, CoarseTimePoint deadline) {</a>
+<a name="ln823">    vector&lt;TransactionId&gt; ids_to_abort;</a>
+<a name="ln824">    {</a>
+<a name="ln825">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln826">      for (const auto&amp; txn : transactions_.get&lt;StartTimeTag&gt;()) {</a>
+<a name="ln827">        if (txn-&gt;start_ht() &gt; cutoff) {</a>
+<a name="ln828">          break;</a>
+<a name="ln829">        }</a>
+<a name="ln830">        if (!txn-&gt;WasAborted()) {</a>
+<a name="ln831">          ids_to_abort.push_back(txn-&gt;id());</a>
+<a name="ln832">        }</a>
+<a name="ln833">      }</a>
+<a name="ln834">    }</a>
+<a name="ln835"> </a>
+<a name="ln836">    if (ids_to_abort.empty()) {</a>
+<a name="ln837">      return Status::OK();</a>
+<a name="ln838">    }</a>
+<a name="ln839"> </a>
+<a name="ln840">    // It is ok to attempt to abort txns that have committed. We don't care</a>
+<a name="ln841">    // if our request succeeds or not.</a>
+<a name="ln842">    CountDownLatch latch(ids_to_abort.size());</a>
+<a name="ln843">    std::atomic&lt;bool&gt; failed{false};</a>
+<a name="ln844">    Status return_status = Status::OK();</a>
+<a name="ln845">    for (const auto&amp; id : ids_to_abort) {</a>
+<a name="ln846">      Abort(</a>
+<a name="ln847">          id, [this, id, &amp;failed, &amp;return_status, &amp;latch](Result&lt;TransactionStatusResult&gt; result) {</a>
+<a name="ln848">            VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Aborting &quot; &lt;&lt; id &lt;&lt; &quot; got &quot; &lt;&lt; result;</a>
+<a name="ln849">            if (!result ||</a>
+<a name="ln850">                (result-&gt;status != TransactionStatus::COMMITTED &amp;&amp; result-&gt;status != ABORTED)) {</a>
+<a name="ln851">              LOG(INFO) &lt;&lt; &quot;Could not abort &quot; &lt;&lt; id &lt;&lt; &quot; got &quot; &lt;&lt; result;</a>
+<a name="ln852"> </a>
+<a name="ln853">              bool expected = false;</a>
+<a name="ln854">              if (failed.compare_exchange_strong(expected, true)) {</a>
+<a name="ln855">                if (!result) {</a>
+<a name="ln856">                  return_status = result.status();</a>
+<a name="ln857">                } else {</a>
+<a name="ln858">                  return_status =</a>
+<a name="ln859">                      STATUS_FORMAT(IllegalState, &quot;Wrong status after abort: $0&quot;, result-&gt;status);</a>
+<a name="ln860">                }</a>
+<a name="ln861">              }</a>
+<a name="ln862">            }</a>
+<a name="ln863">            latch.CountDown();</a>
+<a name="ln864">          });</a>
+<a name="ln865">    }</a>
+<a name="ln866"> </a>
+<a name="ln867">    return latch.WaitUntil(deadline) ? return_status</a>
+<a name="ln868">                                     : STATUS(TimedOut, &quot;TimedOut while aborting old transactions&quot;);</a>
+<a name="ln869">  }</a>
+<a name="ln870"> </a>
+<a name="ln871"> private:</a>
+<a name="ln872">  class StartTimeTag;</a>
+<a name="ln873"> </a>
+<a name="ln874">  typedef boost::multi_index_container&lt;RunningTransactionPtr,</a>
+<a name="ln875">      boost::multi_index::indexed_by &lt;</a>
+<a name="ln876">          boost::multi_index::hashed_unique &lt;</a>
+<a name="ln877">              boost::multi_index::const_mem_fun &lt;</a>
+<a name="ln878">                  RunningTransaction, const TransactionId&amp;, &amp;RunningTransaction::id&gt;</a>
+<a name="ln879">          &gt;,</a>
+<a name="ln880">          boost::multi_index::ordered_non_unique &lt;</a>
+<a name="ln881">              boost::multi_index::tag&lt;StartTimeTag&gt;,</a>
+<a name="ln882">              boost::multi_index::const_mem_fun &lt;</a>
+<a name="ln883">                  RunningTransaction, HybridTime, &amp;RunningTransaction::start_ht&gt;</a>
+<a name="ln884">          &gt;</a>
+<a name="ln885">      &gt;</a>
+<a name="ln886">  &gt; Transactions;</a>
+<a name="ln887"> </a>
+<a name="ln888">  void TransactionsModifiedUnlocked(MinRunningNotifier* min_running_notifier) REQUIRES(mutex_) {</a>
+<a name="ln889">    metric_transactions_running_-&gt;set_value(transactions_.size());</a>
+<a name="ln890">    if (!all_loaded_.load(std::memory_order_acquire)) {</a>
+<a name="ln891">      return;</a>
+<a name="ln892">    }</a>
+<a name="ln893"> </a>
+<a name="ln894">    if (transactions_.empty()) {</a>
+<a name="ln895">      min_running_ht_.store(HybridTime::kMax, std::memory_order_release);</a>
+<a name="ln896">      CheckMinRunningHybridTimeSatisfiedUnlocked(min_running_notifier);</a>
+<a name="ln897">      return;</a>
+<a name="ln898">    }</a>
+<a name="ln899"> </a>
+<a name="ln900">    auto&amp; first_txn = **transactions_.get&lt;StartTimeTag&gt;().begin();</a>
+<a name="ln901">    if (first_txn.start_ht() != min_running_ht_.load(std::memory_order_relaxed)) {</a>
+<a name="ln902">      min_running_ht_.store(first_txn.start_ht(), std::memory_order_release);</a>
+<a name="ln903">      next_check_min_running_.store(</a>
+<a name="ln904">          CoarseMonoClock::now() + 1ms * FLAGS_transaction_min_running_check_delay_ms,</a>
+<a name="ln905">          std::memory_order_release);</a>
+<a name="ln906">      CheckMinRunningHybridTimeSatisfiedUnlocked(min_running_notifier);</a>
+<a name="ln907">      return;</a>
+<a name="ln908">    }</a>
+<a name="ln909">  }</a>
+<a name="ln910"> </a>
+<a name="ln911">  void EnqueueRemoveUnlocked(</a>
+<a name="ln912">      const TransactionId&amp; id, MinRunningNotifier* min_running_notifier) REQUIRES(mutex_) override {</a>
+<a name="ln913">    auto now = participant_context_.Now();</a>
+<a name="ln914">    VLOG_WITH_PREFIX(4) &lt;&lt; &quot;EnqueueRemoveUnlocked: &quot; &lt;&lt; id &lt;&lt; &quot; at &quot; &lt;&lt; now;</a>
+<a name="ln915">    remove_queue_.emplace_back(RemoveQueueEntry{id, now});</a>
+<a name="ln916">    ProcessRemoveQueueUnlocked(min_running_notifier);</a>
+<a name="ln917">  }</a>
+<a name="ln918"> </a>
+<a name="ln919">  void ProcessRemoveQueueUnlocked(MinRunningNotifier* min_running_notifier) REQUIRES(mutex_) {</a>
+<a name="ln920">    if (!remove_queue_.empty()) {</a>
+<a name="ln921">      // When a transaction participant receives an &quot;aborted&quot; response from the coordinator,</a>
+<a name="ln922">      // it puts this transaction into a &quot;remove queue&quot;, also storing the current hybrid</a>
+<a name="ln923">      // time. Then queue entries where time is less than current safe time are removed.</a>
+<a name="ln924">      //</a>
+<a name="ln925">      // This is correct because, from a transaction participant's point of view:</a>
+<a name="ln926">      //</a>
+<a name="ln927">      // (1) After we receive a response for a transaction status request, and</a>
+<a name="ln928">      // learn that the transaction is unknown to the coordinator, our local</a>
+<a name="ln929">      // hybrid time is at least as high as the local hybrid time on the</a>
+<a name="ln930">      // transaction status coordinator at the time the transaction was deleted</a>
+<a name="ln931">      // from the coordinator, due to hybrid time propagation on RPC response.</a>
+<a name="ln932">      //</a>
+<a name="ln933">      // (2) If our safe time is greater than the hybrid time when the</a>
+<a name="ln934">      // transaction was deleted from the coordinator, then we have already</a>
+<a name="ln935">      // applied this transaction's provisional records if the transaction was</a>
+<a name="ln936">      // committed.</a>
+<a name="ln937">      auto safe_time = participant_context_.SafeTimeForTransactionParticipant();</a>
+<a name="ln938">      if (!safe_time.is_valid()) {</a>
+<a name="ln939">        VLOG_WITH_PREFIX(3) &lt;&lt; &quot;Unable to obtain safe time to check remove queue&quot;;</a>
+<a name="ln940">        return;</a>
+<a name="ln941">      }</a>
+<a name="ln942">      VLOG_WITH_PREFIX(3) &lt;&lt; &quot;Checking remove queue: &quot; &lt;&lt; safe_time &lt;&lt; &quot;, &quot;</a>
+<a name="ln943">                          &lt;&lt; remove_queue_.front().time &lt;&lt; &quot;, &quot; &lt;&lt; remove_queue_.front().id;</a>
+<a name="ln944">      LOG_IF_WITH_PREFIX(DFATAL, safe_time &lt; last_safe_time_)</a>
+<a name="ln945">          &lt;&lt; &quot;Safe time decreased: &quot; &lt;&lt; safe_time &lt;&lt; &quot; vs &quot; &lt;&lt; last_safe_time_;</a>
+<a name="ln946">      last_safe_time_ = safe_time;</a>
+<a name="ln947">      while (!remove_queue_.empty()) {</a>
+<a name="ln948">        auto it = transactions_.find(remove_queue_.front().id);</a>
+<a name="ln949">        if (it == transactions_.end() || (**it).local_commit_time().is_valid()) {</a>
+<a name="ln950">          // It is regular case, since the coordinator returns ABORTED for already applied</a>
+<a name="ln951">          // transaction. But this particular tablet could not yet apply it, so</a>
+<a name="ln952">          // it would add such transaction to remove queue.</a>
+<a name="ln953">          // And it is the main reason why we are waiting for safe time, before removing intents.</a>
+<a name="ln954">          VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Evicting txn from remove queue, w/o removing intents: &quot;</a>
+<a name="ln955">                              &lt;&lt; remove_queue_.front().id;</a>
+<a name="ln956">          remove_queue_.pop_front();</a>
+<a name="ln957">          continue;</a>
+<a name="ln958">        }</a>
+<a name="ln959">        if (safe_time &lt;= remove_queue_.front().time) {</a>
+<a name="ln960">          break;</a>
+<a name="ln961">        }</a>
+<a name="ln962">        VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Removing from remove queue: &quot; &lt;&lt; remove_queue_.front().id;</a>
+<a name="ln963">        static const std::string kRemoveFromQueue = &quot;remove_queue&quot;s;</a>
+<a name="ln964">        RemoveUnlocked(remove_queue_.front().id, kRemoveFromQueue, min_running_notifier);</a>
+<a name="ln965">        remove_queue_.pop_front();</a>
+<a name="ln966">      }</a>
+<a name="ln967">    }</a>
+<a name="ln968">  }</a>
+<a name="ln969"> </a>
+<a name="ln970">  // Tries to remove transaction with specified id.</a>
+<a name="ln971">  // Returns true if transaction is not exists after call to this method, otherwise returns false.</a>
+<a name="ln972">  // Which means that transaction will be removed later.</a>
+<a name="ln973">  bool RemoveUnlocked(</a>
+<a name="ln974">      const TransactionId&amp; id, const std::string&amp; reason,</a>
+<a name="ln975">      MinRunningNotifier* min_running_notifier) REQUIRES(mutex_) override {</a>
+<a name="ln976">    auto it = transactions_.find(id);</a>
+<a name="ln977">    if (it == transactions_.end()) {</a>
+<a name="ln978">      return true;</a>
+<a name="ln979">    }</a>
+<a name="ln980">    return RemoveUnlocked(it, reason, min_running_notifier);</a>
+<a name="ln981">  }</a>
+<a name="ln982"> </a>
+<a name="ln983">  bool RemoveUnlocked(</a>
+<a name="ln984">      const Transactions::iterator&amp; it, const std::string&amp; reason,</a>
+<a name="ln985">      MinRunningNotifier* min_running_notifier) REQUIRES(mutex_) {</a>
+<a name="ln986">    if (running_requests_.empty()) {</a>
+<a name="ln987">      (**it).ScheduleRemoveIntents(*it);</a>
+<a name="ln988">      TransactionId txn_id = (**it).id();</a>
+<a name="ln989">      RemoveTransaction(it, min_running_notifier);</a>
+<a name="ln990">      VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Cleaned transaction: &quot; &lt;&lt; txn_id &lt;&lt; &quot;, reason: &quot; &lt;&lt; reason</a>
+<a name="ln991">                          &lt;&lt; &quot;, left: &quot; &lt;&lt; transactions_.size();</a>
+<a name="ln992">      return true;</a>
+<a name="ln993">    }</a>
+<a name="ln994"> </a>
+<a name="ln995">    // We cannot remove the transaction at this point, because there are running requests</a>
+<a name="ln996">    // that are reading the provisional DB and could request status of this transaction.</a>
+<a name="ln997">    // So we store transaction in a queue and wait when all requests that we launched before our</a>
+<a name="ln998">    // attempt to remove this transaction are completed.</a>
+<a name="ln999">    // Since we try to remove the transaction after all its records are removed from the provisional</a>
+<a name="ln1000">    // DB, it is safe to complete removal at this point, because it means that there will be no more</a>
+<a name="ln1001">    // queries to status of this transactions.</a>
+<a name="ln1002">    cleanup_queue_.push_back({request_serial_, (**it).id()});</a>
+<a name="ln1003">    VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Queued for cleanup: &quot; &lt;&lt; (**it).id() &lt;&lt; &quot;, reason: &quot; &lt;&lt; reason;</a>
+<a name="ln1004">    return false;</a>
+<a name="ln1005">  }</a>
+<a name="ln1006"> </a>
+<a name="ln1007">  struct LockAndFindResult {</a>
+<a name="ln1008">    static Transactions::const_iterator UninitializedIterator() {</a>
+<a name="ln1009">      static const Transactions empty_transactions;</a>
+<a name="ln1010">      return empty_transactions.end();</a>
+<a name="ln1011">    }</a>
+<a name="ln1012"> </a>
+<a name="ln1013">    std::unique_lock&lt;std::mutex&gt; lock;</a>
+<a name="ln1014">    Transactions::const_iterator iterator = UninitializedIterator();</a>
+<a name="ln1015">    bool recently_removed = false;</a>
+<a name="ln1016"> </a>
+<a name="ln1017">    bool found() const {</a>
+<a name="ln1018">      return lock.owns_lock();</a>
+<a name="ln1019">    }</a>
+<a name="ln1020"> </a>
+<a name="ln1021">    RunningTransaction&amp; transaction() const {</a>
+<a name="ln1022">      return **iterator;</a>
+<a name="ln1023">    }</a>
+<a name="ln1024">  };</a>
+<a name="ln1025"> </a>
+<a name="ln1026">  void WaitLoaded(const TransactionId&amp; id) {</a>
+<a name="ln1027">    if (all_loaded_.load(std::memory_order_acquire)) {</a>
+<a name="ln1028">      return;</a>
+<a name="ln1029">    }</a>
+<a name="ln1030">    std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln1031">    while (!all_loaded_.load(std::memory_order_acquire)) {</a>
+<a name="ln1032">      if (last_loaded_ &gt;= id) {</a>
+<a name="ln1033">        break;</a>
+<a name="ln1034">      }</a>
+<a name="ln1035">      load_cond_.wait(lock);</a>
+<a name="ln1036">    }</a>
+<a name="ln1037">  }</a>
+<a name="ln1038"> </a>
+<a name="ln1039">  LockAndFindResult LockAndFind(</a>
+<a name="ln1040">      const TransactionId&amp; id, const std::string&amp; reason, TransactionLoadFlags flags) {</a>
+<a name="ln1041">    WaitLoaded(id);</a>
+<a name="ln1042">    bool recently_removed;</a>
+<a name="ln1043">    {</a>
+<a name="ln1044">      std::unique_lock&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln1045">      auto it = transactions_.find(id);</a>
+<a name="ln1046">      if (it != transactions_.end()) {</a>
+<a name="ln1047">        return LockAndFindResult{ std::move(lock), it };</a>
+<a name="ln1048">      }</a>
+<a name="ln1049">      recently_removed = WasTransactionRecentlyRemoved(id);</a>
+<a name="ln1050">    }</a>
+<a name="ln1051">    if (recently_removed) {</a>
+<a name="ln1052">      VLOG_WITH_PREFIX(1)</a>
+<a name="ln1053">          &lt;&lt; &quot;Attempt to load recently removed transaction: &quot; &lt;&lt; id &lt;&lt; &quot;, for: &quot; &lt;&lt; reason;</a>
+<a name="ln1054">      LockAndFindResult result;</a>
+<a name="ln1055">      result.recently_removed = true;</a>
+<a name="ln1056">      return result;</a>
+<a name="ln1057">    }</a>
+<a name="ln1058">    metric_transaction_not_found_-&gt;Increment();</a>
+<a name="ln1059">    if (flags.Test(TransactionLoadFlag::kMustExist)) {</a>
+<a name="ln1060">      YB_LOG_WITH_PREFIX_EVERY_N_SECS(WARNING, 1)</a>
+<a name="ln1061">          &lt;&lt; &quot;Transaction not found: &quot; &lt;&lt; id &lt;&lt; &quot;, for: &quot; &lt;&lt; reason;</a>
+<a name="ln1062">    } else {</a>
+<a name="ln1063">      YB_LOG_WITH_PREFIX_EVERY_N_SECS(INFO, 1)</a>
+<a name="ln1064">          &lt;&lt; &quot;Transaction not found: &quot; &lt;&lt; id &lt;&lt; &quot;, for: &quot; &lt;&lt; reason;</a>
+<a name="ln1065">    }</a>
+<a name="ln1066">    if (flags.Test(TransactionLoadFlag::kCleanup)) {</a>
+<a name="ln1067">      VLOG_WITH_PREFIX(2) &lt;&lt; &quot;Schedule cleanup for: &quot; &lt;&lt; id;</a>
+<a name="ln1068">      auto cleanup_task = std::make_shared&lt;CleanupIntentsTask&gt;(</a>
+<a name="ln1069">          &amp;participant_context_, &amp;applier_, id);</a>
+<a name="ln1070">      cleanup_task-&gt;Prepare(cleanup_task);</a>
+<a name="ln1071">      participant_context_.StrandEnqueue(cleanup_task.get());</a>
+<a name="ln1072">    }</a>
+<a name="ln1073">    return LockAndFindResult{};</a>
+<a name="ln1074">  }</a>
+<a name="ln1075"> </a>
+<a name="ln1076">  void LoadPendingApplies(std::unique_ptr&lt;docdb::BoundedRocksDbIterator&gt; iter) {</a>
+<a name="ln1077">    std::array&lt;char, 1 + sizeof(TransactionId) + 1&gt; seek_buffer;</a>
+<a name="ln1078">    seek_buffer[0] = docdb::ValueTypeAsChar::kTransactionApplyState;</a>
+<a name="ln1079">    seek_buffer[seek_buffer.size() - 1] = docdb::ValueTypeAsChar::kMaxByte;</a>
+<a name="ln1080">    iter-&gt;Seek(Slice(seek_buffer.data(), 1));</a>
+<a name="ln1081"> </a>
+<a name="ln1082">    while (iter-&gt;Valid()) {</a>
+<a name="ln1083">      auto key = iter-&gt;key();</a>
+<a name="ln1084">      if (!key.TryConsumeByte(docdb::ValueTypeAsChar::kTransactionApplyState)) {</a>
+<a name="ln1085">        break;</a>
+<a name="ln1086">      }</a>
+<a name="ln1087">      auto txn_id = DecodeTransactionId(&amp;key);</a>
+<a name="ln1088">      if (!txn_id.ok() || !key.TryConsumeByte(docdb::ValueTypeAsChar::kGroupEnd)) {</a>
+<a name="ln1089">        LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Wrong txn id: &quot; &lt;&lt; iter-&gt;key().ToDebugString();</a>
+<a name="ln1090">        iter-&gt;Next();</a>
+<a name="ln1091">        continue;</a>
+<a name="ln1092">      }</a>
+<a name="ln1093">      Slice value = iter-&gt;value();</a>
+<a name="ln1094">      if (value.TryConsumeByte(docdb::ValueTypeAsChar::kString)) {</a>
+<a name="ln1095">        auto pb = pb_util::ParseFromSlice&lt;docdb::ApplyTransactionStatePB&gt;(value);</a>
+<a name="ln1096">        if (!pb.ok()) {</a>
+<a name="ln1097">          LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Failed to decode apply state &quot; &lt;&lt; key.ToDebugString() &lt;&lt; &quot;: &quot;</a>
+<a name="ln1098">                                  &lt;&lt; pb.status();</a>
+<a name="ln1099">          iter-&gt;Next();</a>
+<a name="ln1100">          continue;</a>
+<a name="ln1101">        }</a>
+<a name="ln1102"> </a>
+<a name="ln1103">        auto it = pending_applies_.emplace(*txn_id, ApplyStateWithCommitHt {</a>
+<a name="ln1104">          .state = docdb::ApplyTransactionState::FromPB(*pb),</a>
+<a name="ln1105">          .commit_ht = HybridTime(pb-&gt;commit_ht())</a>
+<a name="ln1106">        }).first;</a>
+<a name="ln1107"> </a>
+<a name="ln1108">        VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Loaded pending apply for &quot; &lt;&lt; *txn_id &lt;&lt; &quot;: &quot;</a>
+<a name="ln1109">                            &lt;&lt; it-&gt;second.ToString();</a>
+<a name="ln1110">      } else if (value.TryConsumeByte(docdb::ValueTypeAsChar::kTombstone)) {</a>
+<a name="ln1111">        VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Found deleted large apply for &quot; &lt;&lt; *txn_id;</a>
+<a name="ln1112">      } else {</a>
+<a name="ln1113">        LOG_WITH_PREFIX(DFATAL)</a>
+<a name="ln1114">            &lt;&lt; &quot;Unexpected value type in apply state: &quot; &lt;&lt; value.ToDebugString();</a>
+<a name="ln1115">      }</a>
+<a name="ln1116"> </a>
+<a name="ln1117">      memcpy(seek_buffer.data() + 1, txn_id-&gt;data(), txn_id-&gt;size());</a>
+<a name="ln1118">      ROCKSDB_SEEK(iter.get(), Slice(seek_buffer));</a>
+<a name="ln1119">    }</a>
+<a name="ln1120">  }</a>
+<a name="ln1121"> </a>
+<a name="ln1122">  void LoadTransactions(</a>
+<a name="ln1123">      docdb::BoundedRocksDbIterator* regular_iterator,</a>
+<a name="ln1124">      docdb::BoundedRocksDbIterator* intents_iterator,</a>
+<a name="ln1125">      ScopedRWOperation* scoped_pending_operation) {</a>
+<a name="ln1126">    LOG_WITH_PREFIX(INFO) &lt;&lt; __func__ &lt;&lt; &quot; start&quot;;</a>
+<a name="ln1127"> </a>
+<a name="ln1128">    CDSAttacher attacher;</a>
+<a name="ln1129"> </a>
+<a name="ln1130">    size_t loaded_transactions = 0;</a>
+<a name="ln1131">    {</a>
+<a name="ln1132">      std::unique_ptr&lt;ScopedRWOperation&gt; scoped_pending_operation_holder(</a>
+<a name="ln1133">          scoped_pending_operation);</a>
+<a name="ln1134">      LoadPendingApplies(</a>
+<a name="ln1135">          std::unique_ptr&lt;docdb::BoundedRocksDbIterator&gt;(regular_iterator));</a>
+<a name="ln1136"> </a>
+<a name="ln1137">      std::unique_ptr&lt;docdb::BoundedRocksDbIterator&gt; intents_iterator_holder(intents_iterator);</a>
+<a name="ln1138"> </a>
+<a name="ln1139">      docdb::KeyBytes key_bytes;</a>
+<a name="ln1140">      TransactionId id = TransactionId::Nil();</a>
+<a name="ln1141">      AppendTransactionKeyPrefix(id, &amp;key_bytes);</a>
+<a name="ln1142">      intents_iterator-&gt;Seek(key_bytes.AsSlice());</a>
+<a name="ln1143">      while (intents_iterator-&gt;Valid()) {</a>
+<a name="ln1144">        auto key = intents_iterator-&gt;key();</a>
+<a name="ln1145">        if (!key.TryConsumeByte(docdb::ValueTypeAsChar::kTransactionId)) {</a>
+<a name="ln1146">          break;</a>
+<a name="ln1147">        }</a>
+<a name="ln1148">        auto decode_id_result = DecodeTransactionId(&amp;key);</a>
+<a name="ln1149">        if (!decode_id_result.ok()) {</a>
+<a name="ln1150">          LOG_WITH_PREFIX(DFATAL)</a>
+<a name="ln1151">              &lt;&lt; &quot;Failed to decode transaction id from: &quot; &lt;&lt; key.ToDebugHexString();</a>
+<a name="ln1152">          break;</a>
+<a name="ln1153">        }</a>
+<a name="ln1154">        id = *decode_id_result;</a>
+<a name="ln1155">        key_bytes.Clear();</a>
+<a name="ln1156">        AppendTransactionKeyPrefix(id, &amp;key_bytes);</a>
+<a name="ln1157">        if (key.empty()) { // Key fully consists of transaction id - it is metadata record.</a>
+<a name="ln1158">          if (FLAGS_TEST_inject_load_transaction_delay_ms &gt; 0) {</a>
+<a name="ln1159">            std::this_thread::sleep_for(FLAGS_TEST_inject_load_transaction_delay_ms * 1ms);</a>
+<a name="ln1160">          }</a>
+<a name="ln1161">          LoadTransaction(intents_iterator, id, intents_iterator-&gt;value(), &amp;key_bytes);</a>
+<a name="ln1162">          ++loaded_transactions;</a>
+<a name="ln1163">        }</a>
+<a name="ln1164">        key_bytes.AppendValueType(docdb::ValueType::kMaxByte);</a>
+<a name="ln1165">        intents_iterator-&gt;Seek(key_bytes.AsSlice());</a>
+<a name="ln1166">      }</a>
+<a name="ln1167">    }</a>
+<a name="ln1168"> </a>
+<a name="ln1169">    {</a>
+<a name="ln1170">      MinRunningNotifier min_running_notifier(&amp;applier_);</a>
+<a name="ln1171">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln1172">      all_loaded_.store(true, std::memory_order_release);</a>
+<a name="ln1173">      TransactionsModifiedUnlocked(&amp;min_running_notifier);</a>
+<a name="ln1174">    }</a>
+<a name="ln1175">    load_cond_.notify_all();</a>
+<a name="ln1176">    LOG_WITH_PREFIX(INFO) &lt;&lt; __func__ &lt;&lt; &quot; done: loaded &quot; &lt;&lt; loaded_transactions &lt;&lt; &quot; transactions&quot;;</a>
+<a name="ln1177"> </a>
+<a name="ln1178">    start_latch_.Wait();</a>
+<a name="ln1179">    if (closing_.load(std::memory_order_acquire)) {</a>
+<a name="ln1180">      LOG_WITH_PREFIX(INFO) &lt;&lt; __func__ &lt;&lt; &quot;: closing, not starting transaction status resolution&quot;;</a>
+<a name="ln1181">      return;</a>
+<a name="ln1182">    }</a>
+<a name="ln1183"> </a>
+<a name="ln1184">    {</a>
+<a name="ln1185">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln1186">      for (const auto&amp; p : pending_applies_) {</a>
+<a name="ln1187">        auto it = transactions_.find(p.first);</a>
+<a name="ln1188">        if (it == transactions_.end()) {</a>
+<a name="ln1189">          LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Unknown transaction for pending apply: &quot; &lt;&lt; AsString(p.first);</a>
+<a name="ln1190">          continue;</a>
+<a name="ln1191">        }</a>
+<a name="ln1192"> </a>
+<a name="ln1193">        TransactionApplyData apply_data;</a>
+<a name="ln1194">        apply_data.transaction_id = p.first;</a>
+<a name="ln1195">        apply_data.commit_ht = p.second.commit_ht;</a>
+<a name="ln1196">        (**it).SetApplyData(p.second.state, &amp;apply_data);</a>
+<a name="ln1197">      }</a>
+<a name="ln1198">      pending_applies_.clear();</a>
+<a name="ln1199">    }</a>
+<a name="ln1200"> </a>
+<a name="ln1201">    LOG_WITH_PREFIX(INFO) &lt;&lt; __func__ &lt;&lt; &quot;: starting transaction status resolution&quot;;</a>
+<a name="ln1202">    status_resolver_.Start(CoarseTimePoint::max());</a>
+<a name="ln1203">  }</a>
+<a name="ln1204"> </a>
+<a name="ln1205">  // iterator - rocks db iterator, that should be used for write id resolution.</a>
+<a name="ln1206">  // id - transaction id to load.</a>
+<a name="ln1207">  // value - transaction metadata record value.</a>
+<a name="ln1208">  // key_bytes - buffer that contains key of current record, i.e. value type + transaction id.</a>
+<a name="ln1209">  void LoadTransaction(</a>
+<a name="ln1210">      docdb::BoundedRocksDbIterator* iterator, const TransactionId&amp; id, const Slice&amp; value,</a>
+<a name="ln1211">      docdb::KeyBytes* key_bytes) {</a>
+<a name="ln1212">    metric_transaction_load_attempts_-&gt;Increment();</a>
+<a name="ln1213">    VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Loading transaction: &quot; &lt;&lt; id;</a>
+<a name="ln1214"> </a>
+<a name="ln1215">    TransactionMetadataPB metadata_pb;</a>
+<a name="ln1216"> </a>
+<a name="ln1217">    if (!metadata_pb.ParseFromArray(value.cdata(), value.size())) {</a>
+<a name="ln1218">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Unable to parse stored metadata: &quot;</a>
+<a name="ln1219">                              &lt;&lt; value.ToDebugHexString();</a>
+<a name="ln1220">      return;</a>
+<a name="ln1221">    }</a>
+<a name="ln1222"> </a>
+<a name="ln1223">    auto metadata = TransactionMetadata::FromPB(metadata_pb);</a>
+<a name="ln1224">    if (!metadata.ok()) {</a>
+<a name="ln1225">      LOG_WITH_PREFIX(DFATAL) &lt;&lt; &quot;Loaded bad metadata: &quot; &lt;&lt; metadata.status();</a>
+<a name="ln1226">      return;</a>
+<a name="ln1227">    }</a>
+<a name="ln1228"> </a>
+<a name="ln1229">    if (!metadata-&gt;start_time.is_valid()) {</a>
+<a name="ln1230">      metadata-&gt;start_time = HybridTime::kMin;</a>
+<a name="ln1231">      LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Patched start time &quot; &lt;&lt; metadata-&gt;transaction_id &lt;&lt; &quot;: &quot;</a>
+<a name="ln1232">                            &lt;&lt; metadata-&gt;start_time;</a>
+<a name="ln1233">    }</a>
+<a name="ln1234"> </a>
+<a name="ln1235">    key_bytes-&gt;AppendValueType(docdb::ValueType::kMaxByte);</a>
+<a name="ln1236">    iterator-&gt;Seek(key_bytes-&gt;AsSlice());</a>
+<a name="ln1237">    if (iterator-&gt;Valid()) {</a>
+<a name="ln1238">      iterator-&gt;Prev();</a>
+<a name="ln1239">    } else {</a>
+<a name="ln1240">      iterator-&gt;SeekToLast();</a>
+<a name="ln1241">    }</a>
+<a name="ln1242">    key_bytes-&gt;Truncate(key_bytes-&gt;size() - 1);</a>
+<a name="ln1243">    TransactionalBatchData last_batch_data;</a>
+<a name="ln1244">    OneWayBitmap replicated_batches;</a>
+<a name="ln1245">    while (iterator-&gt;Valid() &amp;&amp; iterator-&gt;key().starts_with(*key_bytes)) {</a>
+<a name="ln1246">      auto decoded_key = docdb::DecodeIntentKey(iterator-&gt;value());</a>
+<a name="ln1247">      LOG_IF_WITH_PREFIX(DFATAL, !decoded_key.ok())</a>
+<a name="ln1248">          &lt;&lt; &quot;Failed to decode intent while loading transaction &quot; &lt;&lt; id &lt;&lt; &quot;, &quot;</a>
+<a name="ln1249">          &lt;&lt; iterator-&gt;key().ToDebugHexString() &lt;&lt; &quot; =&gt; &quot;</a>
+<a name="ln1250">          &lt;&lt; iterator-&gt;value().ToDebugHexString() &lt;&lt; &quot;: &quot; &lt;&lt; decoded_key.status();</a>
+<a name="ln1251">      if (decoded_key.ok() &amp;&amp; docdb::HasStrong(decoded_key-&gt;intent_types)) {</a>
+<a name="ln1252">        last_batch_data.hybrid_time = decoded_key-&gt;doc_ht.hybrid_time();</a>
+<a name="ln1253">        Slice rev_key_slice(iterator-&gt;value());</a>
+<a name="ln1254">        if (!rev_key_slice.empty() &amp;&amp; rev_key_slice[0] == docdb::ValueTypeAsChar::kBitSet) {</a>
+<a name="ln1255">          CHECK(!FLAGS_TEST_fail_on_replicated_batch_idx_set_in_txn_record);</a>
+<a name="ln1256">          rev_key_slice.remove_prefix(1);</a>
+<a name="ln1257">          auto result = OneWayBitmap::Decode(&amp;rev_key_slice);</a>
+<a name="ln1258">          if (result.ok()) {</a>
+<a name="ln1259">            replicated_batches = std::move(*result);</a>
+<a name="ln1260">            VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Decoded replicated batches for &quot; &lt;&lt; id &lt;&lt; &quot;: &quot;</a>
+<a name="ln1261">                                &lt;&lt; replicated_batches.ToString();</a>
+<a name="ln1262">          } else {</a>
+<a name="ln1263">            LOG_WITH_PREFIX(DFATAL)</a>
+<a name="ln1264">                &lt;&lt; &quot;Failed to decode replicated batches from &quot;</a>
+<a name="ln1265">                &lt;&lt; iterator-&gt;value().ToDebugHexString() &lt;&lt; &quot;: &quot; &lt;&lt; result.status();</a>
+<a name="ln1266">          }</a>
+<a name="ln1267">        }</a>
+<a name="ln1268">        std::string rev_key = rev_key_slice.ToBuffer();</a>
+<a name="ln1269">        iterator-&gt;Seek(rev_key);</a>
+<a name="ln1270">        // Delete could run in parallel to this load, since our deletes break snapshot read</a>
+<a name="ln1271">        // we could get into situation when metadata and reverse record were successfully read,</a>
+<a name="ln1272">        // but intent record could not be found.</a>
+<a name="ln1273">        if (iterator-&gt;Valid() &amp;&amp; iterator-&gt;key().starts_with(rev_key)) {</a>
+<a name="ln1274">          VLOG_WITH_PREFIX(1)</a>
+<a name="ln1275">              &lt;&lt; &quot;Found latest record for &quot; &lt;&lt; id</a>
+<a name="ln1276">              &lt;&lt; &quot;: &quot; &lt;&lt; docdb::SubDocKey::DebugSliceToString(iterator-&gt;key())</a>
+<a name="ln1277">              &lt;&lt; &quot; =&gt; &quot; &lt;&lt; iterator-&gt;value().ToDebugHexString();</a>
+<a name="ln1278">          auto status = docdb::DecodeIntentValue(</a>
+<a name="ln1279">              iterator-&gt;value(), id.AsSlice(), &amp;last_batch_data.write_id, nullptr /* body */);</a>
+<a name="ln1280">          LOG_IF_WITH_PREFIX(DFATAL, !status.ok())</a>
+<a name="ln1281">              &lt;&lt; &quot;Failed to decode intent value: &quot; &lt;&lt; status &lt;&lt; &quot;, &quot;</a>
+<a name="ln1282">              &lt;&lt; docdb::SubDocKey::DebugSliceToString(iterator-&gt;key()) &lt;&lt; &quot; =&gt; &quot;</a>
+<a name="ln1283">              &lt;&lt; iterator-&gt;value().ToDebugHexString();</a>
+<a name="ln1284">          ++last_batch_data.write_id;</a>
+<a name="ln1285">        }</a>
+<a name="ln1286">        break;</a>
+<a name="ln1287">      }</a>
+<a name="ln1288">      iterator-&gt;Prev();</a>
+<a name="ln1289">    }</a>
+<a name="ln1290"> </a>
+<a name="ln1291">    {</a>
+<a name="ln1292">      MinRunningNotifier min_running_notifier(&amp;applier_);</a>
+<a name="ln1293">      std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln1294">      last_loaded_ = metadata-&gt;transaction_id;</a>
+<a name="ln1295">      status_resolver_.Add(metadata-&gt;status_tablet, metadata-&gt;transaction_id);</a>
+<a name="ln1296">      auto txn = std::make_shared&lt;RunningTransaction&gt;(</a>
+<a name="ln1297">          std::move(*metadata), last_batch_data, std::move(replicated_batches), this);</a>
+<a name="ln1298">      transactions_.insert(txn);</a>
+<a name="ln1299">      auto pending_apply_it = pending_applies_.find(txn-&gt;id());</a>
+<a name="ln1300">      if (pending_apply_it != pending_applies_.end()) {</a>
+<a name="ln1301">        VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Apply state found for &quot; &lt;&lt; txn-&gt;id() &lt;&lt; &quot;: &quot;</a>
+<a name="ln1302">                            &lt;&lt; pending_apply_it-&gt;second.ToString();</a>
+<a name="ln1303">        txn-&gt;SetLocalCommitTime(pending_apply_it-&gt;second.commit_ht);</a>
+<a name="ln1304">        txn-&gt;SetApplyData(pending_apply_it-&gt;second.state);</a>
+<a name="ln1305">      }</a>
+<a name="ln1306">      TransactionsModifiedUnlocked(&amp;min_running_notifier);</a>
+<a name="ln1307">    }</a>
+<a name="ln1308">    load_cond_.notify_all();</a>
+<a name="ln1309">  }</a>
+<a name="ln1310"> </a>
+<a name="ln1311">  Result&lt;client::YBClient*&gt; client() const {</a>
+<a name="ln1312">    auto cached_value = client_cache_.load(std::memory_order_acquire);</a>
+<a name="ln1313">    if (cached_value != nullptr) {</a>
+<a name="ln1314">      return cached_value;</a>
+<a name="ln1315">    }</a>
+<a name="ln1316">    auto future_status = participant_context_.client_future().wait_for(</a>
+<a name="ln1317">        TransactionRpcTimeout().ToSteadyDuration());</a>
+<a name="ln1318">    if (future_status != std::future_status::ready) {</a>
+<a name="ln1319">      return STATUS(TimedOut, &quot;Client not ready&quot;);</a>
+<a name="ln1320">    }</a>
+<a name="ln1321">    auto result = participant_context_.client_future().get();</a>
+<a name="ln1322">    client_cache_.store(result, std::memory_order_release);</a>
+<a name="ln1323">    return result;</a>
+<a name="ln1324">  }</a>
+<a name="ln1325"> </a>
+<a name="ln1326">  const std::string&amp; LogPrefix() const override {</a>
+<a name="ln1327">    return log_prefix_;</a>
+<a name="ln1328">  }</a>
+<a name="ln1329"> </a>
+<a name="ln1330">  void RemoveTransaction(Transactions::iterator it, MinRunningNotifier* min_running_notifier)</a>
+<a name="ln1331">      REQUIRES(mutex_) {</a>
+<a name="ln1332">    auto now = CoarseMonoClock::now();</a>
+<a name="ln1333">    CleanupRecentlyRemovedTransactions(now);</a>
+<a name="ln1334">    auto&amp; transaction = **it;</a>
+<a name="ln1335">    recently_removed_transactions_cleanup_queue_.push_back({transaction.id(), now + 15s});</a>
+<a name="ln1336">    LOG_IF_WITH_PREFIX(DFATAL, !recently_removed_transactions_.insert(transaction.id()).second)</a>
+<a name="ln1337">        &lt;&lt; &quot;Transaction removed twice: &quot; &lt;&lt; transaction.id();</a>
+<a name="ln1338">    VLOG_WITH_PREFIX(4) &lt;&lt; &quot;Remove transaction: &quot; &lt;&lt; transaction.id();</a>
+<a name="ln1339">    transactions_.erase(it);</a>
+<a name="ln1340">    TransactionsModifiedUnlocked(min_running_notifier);</a>
+<a name="ln1341">  }</a>
+<a name="ln1342"> </a>
+<a name="ln1343">  void CleanupRecentlyRemovedTransactions(CoarseTimePoint now) {</a>
+<a name="ln1344">    while (!recently_removed_transactions_cleanup_queue_.empty() &amp;&amp;</a>
+<a name="ln1345">           recently_removed_transactions_cleanup_queue_.front().time &lt;= now) {</a>
+<a name="ln1346">      recently_removed_transactions_.erase(recently_removed_transactions_cleanup_queue_.front().id);</a>
+<a name="ln1347">      recently_removed_transactions_cleanup_queue_.pop_front();</a>
+<a name="ln1348">    }</a>
+<a name="ln1349">  }</a>
+<a name="ln1350"> </a>
+<a name="ln1351">  bool WasTransactionRecentlyRemoved(const TransactionId&amp; id) {</a>
+<a name="ln1352">    CleanupRecentlyRemovedTransactions(CoarseMonoClock::now());</a>
+<a name="ln1353">    return recently_removed_transactions_.count(id) != 0;</a>
+<a name="ln1354">  }</a>
+<a name="ln1355"> </a>
+<a name="ln1356">  void CheckMinRunningHybridTimeSatisfiedUnlocked(</a>
+<a name="ln1357">      MinRunningNotifier* min_running_notifier) {</a>
+<a name="ln1358">    if (min_running_ht_.load(std::memory_order_acquire) &lt;= waiting_for_min_running_ht_) {</a>
+<a name="ln1359">      return;</a>
+<a name="ln1360">    }</a>
+<a name="ln1361">    waiting_for_min_running_ht_ = HybridTime::kMax;</a>
+<a name="ln1362">    min_running_notifier-&gt;Satisfied();</a>
+<a name="ln1363">  }</a>
+<a name="ln1364"> </a>
+<a name="ln1365">  void TransactionsStatus(const std::vector&lt;TransactionStatusInfo&gt;&amp; status_infos) {</a>
+<a name="ln1366">    MinRunningNotifier min_running_notifier(&amp;applier_);</a>
+<a name="ln1367">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln1368">    for (const auto&amp; info : status_infos) {</a>
+<a name="ln1369">      if (info.status == TransactionStatus::ABORTED) {</a>
+<a name="ln1370">        EnqueueRemoveUnlocked(info.transaction_id, &amp;min_running_notifier);</a>
+<a name="ln1371">      }</a>
+<a name="ln1372">    }</a>
+<a name="ln1373">  }</a>
+<a name="ln1374"> </a>
+<a name="ln1375">  void HandleApplying(std::unique_ptr&lt;tablet::UpdateTxnOperationState&gt; state, int64_t term) {</a>
+<a name="ln1376">    if (RandomActWithProbability(GetAtomicFlag(</a>
+<a name="ln1377">        &amp;FLAGS_TEST_transaction_ignore_applying_probability_in_tests))) {</a>
+<a name="ln1378">      VLOG_WITH_PREFIX(2)</a>
+<a name="ln1379">          &lt;&lt; &quot;TEST: Rejected apply: &quot;</a>
+<a name="ln1380">          &lt;&lt; FullyDecodeTransactionId(state-&gt;request()-&gt;transaction_id());</a>
+<a name="ln1381">      state-&gt;CompleteWithStatus(Status::OK());</a>
+<a name="ln1382">      return;</a>
+<a name="ln1383">    }</a>
+<a name="ln1384">    participant_context_.SubmitUpdateTransaction(std::move(state), term);</a>
+<a name="ln1385">  }</a>
+<a name="ln1386"> </a>
+<a name="ln1387">  void HandleCleanup(std::unique_ptr&lt;tablet::UpdateTxnOperationState&gt; state, int64_t term) {</a>
+<a name="ln1388">    VLOG_WITH_PREFIX(3) &lt;&lt; &quot;Cleanup&quot;;</a>
+<a name="ln1389">    auto id = FullyDecodeTransactionId(state-&gt;request()-&gt;transaction_id());</a>
+<a name="ln1390">    if (!id.ok()) {</a>
+<a name="ln1391">      state-&gt;CompleteWithStatus(id.status());</a>
+<a name="ln1392">      return;</a>
+<a name="ln1393">    }</a>
+<a name="ln1394"> </a>
+<a name="ln1395">    TransactionApplyData data = {</a>
+<a name="ln1396">        .leader_term = term,</a>
+<a name="ln1397">        .transaction_id = *id,</a>
+<a name="ln1398">        .op_id = OpIdPB(),</a>
+<a name="ln1399">        .commit_ht = HybridTime(),</a>
+<a name="ln1400">        .log_ht = HybridTime(),</a>
+<a name="ln1401">        .sealed = state-&gt;request()-&gt;sealed(),</a>
+<a name="ln1402">        .status_tablet = std::string() };</a>
+<a name="ln1403">    WARN_NOT_OK(ProcessCleanup(data, PostApplyCleanup::kTrue),</a>
+<a name="ln1404">                &quot;Process cleanup failed&quot;);</a>
+<a name="ln1405">    state-&gt;CompleteWithStatus(Status::OK());</a>
+<a name="ln1406">  }</a>
+<a name="ln1407"> </a>
+<a name="ln1408">  CHECKED_STATUS ReplicatedApplying(const TransactionId&amp; id, const ReplicatedData&amp; data) {</a>
+<a name="ln1409">    // data.state.tablets contains only status tablet.</a>
+<a name="ln1410">    if (data.state.tablets_size() != 1) {</a>
+<a name="ln1411">      return STATUS_FORMAT(InvalidArgument,</a>
+<a name="ln1412">                           &quot;Expected only one table during APPLYING, state received: $0&quot;,</a>
+<a name="ln1413">                           data.state);</a>
+<a name="ln1414">    }</a>
+<a name="ln1415">    HybridTime commit_time(data.state.commit_hybrid_time());</a>
+<a name="ln1416">    TransactionApplyData apply_data = {</a>
+<a name="ln1417">        data.leader_term, id, data.op_id, commit_time, data.hybrid_time, data.sealed,</a>
+<a name="ln1418">        data.state.tablets(0) };</a>
+<a name="ln1419">    if (!data.already_applied_to_regular_db) {</a>
+<a name="ln1420">      return ProcessApply(apply_data);</a>
+<a name="ln1421">    }</a>
+<a name="ln1422">    if (!data.sealed) {</a>
+<a name="ln1423">      return ProcessCleanup(apply_data, PostApplyCleanup::kFalse);</a>
+<a name="ln1424">    }</a>
+<a name="ln1425">    return Status::OK();</a>
+<a name="ln1426">  }</a>
+<a name="ln1427"> </a>
+<a name="ln1428">  CHECKED_STATUS ReplicatedAborted(const TransactionId&amp; id, const ReplicatedData&amp; data) {</a>
+<a name="ln1429">    MinRunningNotifier min_running_notifier(&amp;applier_);</a>
+<a name="ln1430">    std::lock_guard&lt;std::mutex&gt; lock(mutex_);</a>
+<a name="ln1431">    auto it = transactions_.find(id);</a>
+<a name="ln1432">    if (it == transactions_.end()) {</a>
+<a name="ln1433">      TransactionMetadata metadata = {</a>
+<a name="ln1434">        .transaction_id = id,</a>
+<a name="ln1435">        .isolation = IsolationLevel::NON_TRANSACTIONAL,</a>
+<a name="ln1436">        .status_tablet = TabletId(),</a>
+<a name="ln1437">        .priority = 0</a>
+<a name="ln1438">      };</a>
+<a name="ln1439">      it = transactions_.insert(std::make_shared&lt;RunningTransaction&gt;(</a>
+<a name="ln1440">          metadata, TransactionalBatchData(), OneWayBitmap(), this)).first;</a>
+<a name="ln1441">      TransactionsModifiedUnlocked(&amp;min_running_notifier);</a>
+<a name="ln1442">    }</a>
+<a name="ln1443"> </a>
+<a name="ln1444">    // TODO(dtxn) store this fact to rocksdb.</a>
+<a name="ln1445">    (**it).Aborted();</a>
+<a name="ln1446"> </a>
+<a name="ln1447">    return Status::OK();</a>
+<a name="ln1448">  }</a>
+<a name="ln1449"> </a>
+<a name="ln1450">  struct CleanupQueueEntry {</a>
+<a name="ln1451">    int64_t request_id;</a>
+<a name="ln1452">    TransactionId transaction_id;</a>
+<a name="ln1453">  };</a>
+<a name="ln1454"> </a>
+<a name="ln1455">  std::string log_prefix_;</a>
+<a name="ln1456"> </a>
+<a name="ln1457">  docdb::DocDB db_;</a>
+<a name="ln1458">  const docdb::KeyBounds* key_bounds_;</a>
+<a name="ln1459"> </a>
+<a name="ln1460">  Transactions transactions_;</a>
+<a name="ln1461">  // Ids of running requests, stored in increasing order.</a>
+<a name="ln1462">  std::deque&lt;int64_t&gt; running_requests_;</a>
+<a name="ln1463">  // Ids of complete requests, minimal request is on top.</a>
+<a name="ln1464">  // Contains only ids greater than first running request id, otherwise entry is removed</a>
+<a name="ln1465">  // from both collections.</a>
+<a name="ln1466">  std::priority_queue&lt;int64_t, std::vector&lt;int64_t&gt;, std::greater&lt;void&gt;&gt; complete_requests_;</a>
+<a name="ln1467"> </a>
+<a name="ln1468">  // Queue of transaction ids that should be cleaned, paired with request that should be completed</a>
+<a name="ln1469">  // in order to be able to do clean.</a>
+<a name="ln1470">  // Guarded by RunningTransactionContext::mutex_</a>
+<a name="ln1471">  std::deque&lt;CleanupQueueEntry&gt; cleanup_queue_;</a>
+<a name="ln1472"> </a>
+<a name="ln1473">  // Remove queue maintains transactions that could be cleaned when safe time for follower reaches</a>
+<a name="ln1474">  // appropriate time for an entry.</a>
+<a name="ln1475">  // Since we add entries with increasing time, this queue is ordered by time.</a>
+<a name="ln1476">  struct RemoveQueueEntry {</a>
+<a name="ln1477">    TransactionId id;</a>
+<a name="ln1478">    HybridTime time;</a>
+<a name="ln1479"> </a>
+<a name="ln1480">    std::string ToString() const {</a>
+<a name="ln1481">      return Format(&quot;{ id: $0 time: $1 }&quot;, id, time);</a>
+<a name="ln1482">    }</a>
+<a name="ln1483">  };</a>
+<a name="ln1484"> </a>
+<a name="ln1485">  // Guarded by RunningTransactionContext::mutex_</a>
+<a name="ln1486">  std::deque&lt;RemoveQueueEntry&gt; remove_queue_;</a>
+<a name="ln1487"> </a>
+<a name="ln1488">  // Guarded by RunningTransactionContext::mutex_</a>
+<a name="ln1489">  HybridTime last_safe_time_ = HybridTime::kMin;</a>
+<a name="ln1490"> </a>
+<a name="ln1491">  std::unordered_set&lt;TransactionId, TransactionIdHash&gt; recently_removed_transactions_;</a>
+<a name="ln1492">  struct RecentlyRemovedTransaction {</a>
+<a name="ln1493">    TransactionId id;</a>
+<a name="ln1494">    CoarseTimePoint time;</a>
+<a name="ln1495">  };</a>
+<a name="ln1496">  std::deque&lt;RecentlyRemovedTransaction&gt; recently_removed_transactions_cleanup_queue_;</a>
+<a name="ln1497"> </a>
+<a name="ln1498">  TransactionStatusResolver status_resolver_;</a>
+<a name="ln1499"> </a>
+<a name="ln1500">  scoped_refptr&lt;AtomicGauge&lt;uint64_t&gt;&gt; metric_transactions_running_;</a>
+<a name="ln1501">  scoped_refptr&lt;Counter&gt; metric_transaction_load_attempts_;</a>
+<a name="ln1502">  scoped_refptr&lt;Counter&gt; metric_transaction_not_found_;</a>
+<a name="ln1503"> </a>
+<a name="ln1504">  std::thread load_thread_;</a>
+<a name="ln1505">  std::condition_variable load_cond_;</a>
+<a name="ln1506">  TransactionId last_loaded_;</a>
+<a name="ln1507">  std::atomic&lt;bool&gt; all_loaded_{false};</a>
+<a name="ln1508">  std::atomic&lt;bool&gt; closing_{false};</a>
+<a name="ln1509">  CountDownLatch start_latch_{1};</a>
+<a name="ln1510"> </a>
+<a name="ln1511">  std::atomic&lt;HybridTime&gt; min_running_ht_{HybridTime::kInvalid};</a>
+<a name="ln1512">  std::atomic&lt;CoarseTimePoint&gt; next_check_min_running_{CoarseTimePoint()};</a>
+<a name="ln1513">  HybridTime waiting_for_min_running_ht_ = HybridTime::kMax;</a>
+<a name="ln1514">  std::atomic&lt;bool&gt; shutdown_done_{false};</a>
+<a name="ln1515"> </a>
+<a name="ln1516">  mutable std::atomic&lt;client::YBClient*&gt; client_cache_{nullptr};</a>
+<a name="ln1517"> </a>
+<a name="ln1518">  ApplyStatesMap pending_applies_;</a>
+<a name="ln1519">};</a>
+<a name="ln1520"> </a>
+<a name="ln1521">TransactionParticipant::TransactionParticipant(</a>
+<a name="ln1522">    TransactionParticipantContext* context, TransactionIntentApplier* applier,</a>
+<a name="ln1523">    const scoped_refptr&lt;MetricEntity&gt;&amp; entity)</a>
+<a name="ln1524">    : impl_(new Impl(context, applier, entity)) {</a>
+<a name="ln1525">}</a>
+<a name="ln1526"> </a>
+<a name="ln1527">TransactionParticipant::~TransactionParticipant() {</a>
+<a name="ln1528">}</a>
+<a name="ln1529"> </a>
+<a name="ln1530">void TransactionParticipant::Start() {</a>
+<a name="ln1531">  impl_-&gt;Start();</a>
+<a name="ln1532">}</a>
+<a name="ln1533"> </a>
+<a name="ln1534">bool TransactionParticipant::Add(</a>
+<a name="ln1535">    const TransactionMetadataPB&amp; data, rocksdb::WriteBatch *write_batch) {</a>
+<a name="ln1536">  return impl_-&gt;Add(data, write_batch);</a>
+<a name="ln1537">}</a>
+<a name="ln1538"> </a>
+<a name="ln1539">Result&lt;TransactionMetadata&gt; TransactionParticipant::PrepareMetadata(</a>
+<a name="ln1540">    const TransactionMetadataPB&amp; pb) {</a>
+<a name="ln1541">  return impl_-&gt;PrepareMetadata(pb);</a>
+<a name="ln1542">}</a>
+<a name="ln1543"> </a>
+<a name="ln1544">boost::optional&lt;std::pair&lt;IsolationLevel, TransactionalBatchData&gt;&gt;</a>
+<a name="ln1545">    TransactionParticipant::PrepareBatchData(</a>
+<a name="ln1546">    const TransactionId&amp; id, size_t batch_idx,</a>
+<a name="ln1547">    boost::container::small_vector_base&lt;uint8_t&gt;* encoded_replicated_batches) {</a>
+<a name="ln1548">  return impl_-&gt;PrepareBatchData(id, batch_idx, encoded_replicated_batches);</a>
+<a name="ln1549">}</a>
+<a name="ln1550"> </a>
+<a name="ln1551">void TransactionParticipant::BatchReplicated(</a>
+<a name="ln1552">    const TransactionId&amp; id, const TransactionalBatchData&amp; data) {</a>
+<a name="ln1553">  return impl_-&gt;BatchReplicated(id, data);</a>
+<a name="ln1554">}</a>
+<a name="ln1555"> </a>
+<a name="ln1556">HybridTime TransactionParticipant::LocalCommitTime(const TransactionId&amp; id) {</a>
+<a name="ln1557">  return impl_-&gt;LocalCommitTime(id);</a>
+<a name="ln1558">}</a>
+<a name="ln1559"> </a>
+<a name="ln1560">std::pair&lt;size_t, size_t&gt; TransactionParticipant::TEST_CountIntents() const {</a>
+<a name="ln1561">  return impl_-&gt;TEST_CountIntents();</a>
+<a name="ln1562">}</a>
+<a name="ln1563"> </a>
+<a name="ln1564">void TransactionParticipant::RequestStatusAt(const StatusRequest&amp; request) {</a>
+<a name="ln1565">  return impl_-&gt;RequestStatusAt(request);</a>
+<a name="ln1566">}</a>
+<a name="ln1567"> </a>
+<a name="ln1568">int64_t TransactionParticipant::RegisterRequest() {</a>
+<a name="ln1569">  return impl_-&gt;RegisterRequest();</a>
+<a name="ln1570">}</a>
+<a name="ln1571"> </a>
+<a name="ln1572">void TransactionParticipant::UnregisterRequest(int64_t request) {</a>
+<a name="ln1573">  impl_-&gt;UnregisterRequest(request);</a>
+<a name="ln1574">}</a>
+<a name="ln1575"> </a>
+<a name="ln1576">void TransactionParticipant::Abort(const TransactionId&amp; id,</a>
+<a name="ln1577">                                   TransactionStatusCallback callback) {</a>
+<a name="ln1578">  return impl_-&gt;Abort(id, std::move(callback));</a>
+<a name="ln1579">}</a>
+<a name="ln1580"> </a>
+<a name="ln1581">void TransactionParticipant::Handle(</a>
+<a name="ln1582">    std::unique_ptr&lt;tablet::UpdateTxnOperationState&gt; request, int64_t term) {</a>
+<a name="ln1583">  impl_-&gt;Handle(std::move(request), term);</a>
+<a name="ln1584">}</a>
+<a name="ln1585"> </a>
+<a name="ln1586">void TransactionParticipant::Cleanup(TransactionIdSet&amp;&amp; set) {</a>
+<a name="ln1587">  return impl_-&gt;Cleanup(std::move(set), this);</a>
+<a name="ln1588">}</a>
+<a name="ln1589"> </a>
+<a name="ln1590">Status TransactionParticipant::ProcessReplicated(const ReplicatedData&amp; data) {</a>
+<a name="ln1591">  return impl_-&gt;ProcessReplicated(data);</a>
+<a name="ln1592">}</a>
+<a name="ln1593"> </a>
+<a name="ln1594">Status TransactionParticipant::CheckAborted(const TransactionId&amp; id) {</a>
+<a name="ln1595">  return impl_-&gt;CheckAborted(id);</a>
+<a name="ln1596">}</a>
+<a name="ln1597"> </a>
+<a name="ln1598">void TransactionParticipant::FillPriorities(</a>
+<a name="ln1599">    boost::container::small_vector_base&lt;std::pair&lt;TransactionId, uint64_t&gt;&gt;* inout) {</a>
+<a name="ln1600">  return impl_-&gt;FillPriorities(inout);</a>
+<a name="ln1601">}</a>
+<a name="ln1602"> </a>
+<a name="ln1603">void TransactionParticipant::SetDB(</a>
+<a name="ln1604">    const docdb::DocDB&amp; db, const docdb::KeyBounds* key_bounds,</a>
+<a name="ln1605">    RWOperationCounter* pending_op_counter) {</a>
+<a name="ln1606">  impl_-&gt;SetDB(db, key_bounds, pending_op_counter);</a>
+<a name="ln1607">}</a>
+<a name="ln1608"> </a>
+<a name="ln1609">void TransactionParticipant::GetStatus(</a>
+<a name="ln1610">    const TransactionId&amp; transaction_id,</a>
+<a name="ln1611">    size_t required_num_replicated_batches,</a>
+<a name="ln1612">    int64_t term,</a>
+<a name="ln1613">    tserver::GetTransactionStatusAtParticipantResponsePB* response,</a>
+<a name="ln1614">    rpc::RpcContext* context) {</a>
+<a name="ln1615">  impl_-&gt;GetStatus(transaction_id, required_num_replicated_batches, term, response, context);</a>
+<a name="ln1616">}</a>
+<a name="ln1617"> </a>
+<a name="ln1618">TransactionParticipantContext* TransactionParticipant::context() const {</a>
+<a name="ln1619">  return impl_-&gt;participant_context();</a>
+<a name="ln1620">}</a>
+<a name="ln1621"> </a>
+<a name="ln1622">HybridTime TransactionParticipant::MinRunningHybridTime() const {</a>
+<a name="ln1623">  return impl_-&gt;MinRunningHybridTime();</a>
+<a name="ln1624">}</a>
+<a name="ln1625"> </a>
+<a name="ln1626">void TransactionParticipant::WaitMinRunningHybridTime(HybridTime ht) {</a>
+<a name="ln1627">  impl_-&gt;WaitMinRunningHybridTime(ht);</a>
+<a name="ln1628">}</a>
+<a name="ln1629"> </a>
+<a name="ln1630">Status TransactionParticipant::ResolveIntents(HybridTime resolve_at, CoarseTimePoint deadline) {</a>
+<a name="ln1631">  return impl_-&gt;ResolveIntents(resolve_at, deadline);</a>
+<a name="ln1632">}</a>
+<a name="ln1633"> </a>
+<a name="ln1634">size_t TransactionParticipant::TEST_GetNumRunningTransactions() const {</a>
+<a name="ln1635">  return impl_-&gt;TEST_GetNumRunningTransactions();</a>
+<a name="ln1636">}</a>
+<a name="ln1637"> </a>
+<a name="ln1638">OneWayBitmap TransactionParticipant::TEST_TransactionReplicatedBatches(</a>
+<a name="ln1639">    const TransactionId&amp; id) const {</a>
+<a name="ln1640">  return impl_-&gt;TEST_TransactionReplicatedBatches(id);</a>
+<a name="ln1641">}</a>
+<a name="ln1642"> </a>
+<a name="ln1643">std::string TransactionParticipant::ReplicatedData::ToString() const {</a>
+<a name="ln1644">  return YB_STRUCT_TO_STRING(leader_term, state, op_id, hybrid_time, already_applied_to_regular_db);</a>
+<a name="ln1645">}</a>
+<a name="ln1646"> </a>
+<a name="ln1647">void TransactionParticipant::StartShutdown() {</a>
+<a name="ln1648">  impl_-&gt;StartShutdown();</a>
+<a name="ln1649">}</a>
+<a name="ln1650"> </a>
+<a name="ln1651">void TransactionParticipant::CompleteShutdown() {</a>
+<a name="ln1652">  impl_-&gt;CompleteShutdown();</a>
+<a name="ln1653">}</a>
+<a name="ln1654"> </a>
+<a name="ln1655">std::string TransactionParticipant::DumpTransactions() const {</a>
+<a name="ln1656">  return impl_-&gt;DumpTransactions();</a>
+<a name="ln1657">}</a>
+<a name="ln1658"> </a>
+<a name="ln1659">Status TransactionParticipant::StopActiveTxnsPriorTo(HybridTime cutoff, CoarseTimePoint deadline) {</a>
+<a name="ln1660">  return impl_-&gt;StopActiveTxnsPriorTo(cutoff, deadline);</a>
+<a name="ln1661">}</a>
+<a name="ln1662"> </a>
+<a name="ln1663">std::string TransactionParticipantContext::LogPrefix() const {</a>
+<a name="ln1664">  return consensus::MakeTabletLogPrefix(tablet_id(), permanent_uuid());</a>
+<a name="ln1665">}</a>
+<a name="ln1666"> </a>
+<a name="ln1667">} // namespace tablet</a>
+<a name="ln1668">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="147"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1053/" target="_blank">V1053</a> Calling the 'LogPrefix' virtual function in the constructor may lead to unexpected result at runtime.</p></div>
+<div class="balloon" rel="157"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="177"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="220"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="268"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="323"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="353"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="382"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="468"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v678/" target="_blank">V678</a> An object is used as an argument to its own method. Consider checking the first actual argument of the 'Prepare' function.</p></div>
+<div class="balloon" rel="473"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="493"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="501"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="507"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="514"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="516"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="544"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="570"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="589"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="595"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="665"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="681"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="718"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="728"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="774"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v547/" target="_blank">V547</a> Expression 'recheck_ids.empty()' is always true.</p></div>
+<div class="balloon" rel="790"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="848"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="914"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="939"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="942"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="944"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="954"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="962"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="990"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1003"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1052"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1067"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1070"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v678/" target="_blank">V678</a> An object is used as an argument to its own method. Consider checking the first actual argument of the 'Prepare' function.</p></div>
+<div class="balloon" rel="1108"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1111"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1213"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1247"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1255"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1260"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1274"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1280"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1301"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1336"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1338"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1378"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="1388"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

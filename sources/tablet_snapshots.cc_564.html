@@ -1,0 +1,397 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>tablet_snapshots.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/tablet/tablet_snapshots.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;boost/algorithm/string/predicate.hpp&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/common/snapshot.h&quot;</a>
+<a name="ln19"> </a>
+<a name="ln20">#include &quot;yb/docdb/consensus_frontier.h&quot;</a>
+<a name="ln21">#include &quot;yb/docdb/docdb_rocksdb_util.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/rocksdb/db.h&quot;</a>
+<a name="ln24">#include &quot;yb/rocksdb/util/file_util.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">#include &quot;yb/rocksdb/utilities/checkpoint.h&quot;</a>
+<a name="ln27"> </a>
+<a name="ln28">#include &quot;yb/tablet/tablet.h&quot;</a>
+<a name="ln29">#include &quot;yb/tablet/tablet_metadata.h&quot;</a>
+<a name="ln30">#include &quot;yb/tablet/operations/snapshot_operation.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32">#include &quot;yb/util/operation_counter.h&quot;</a>
+<a name="ln33">#include &quot;yb/util/scope_exit.h&quot;</a>
+<a name="ln34">#include &quot;yb/util/trace.h&quot;</a>
+<a name="ln35"> </a>
+<a name="ln36">namespace yb {</a>
+<a name="ln37">namespace tablet {</a>
+<a name="ln38"> </a>
+<a name="ln39">namespace {</a>
+<a name="ln40"> </a>
+<a name="ln41">const std::string kTempSnapshotDirSuffix = &quot;.tmp&quot;;</a>
+<a name="ln42"> </a>
+<a name="ln43">} // namespace</a>
+<a name="ln44"> </a>
+<a name="ln45">TabletSnapshots::TabletSnapshots(Tablet* tablet) : TabletComponent(tablet) {}</a>
+<a name="ln46"> </a>
+<a name="ln47">std::string TabletSnapshots::SnapshotsDirName(const std::string&amp; rocksdb_dir) {</a>
+<a name="ln48">  return rocksdb_dir + kSnapshotsDirSuffix;</a>
+<a name="ln49">}</a>
+<a name="ln50"> </a>
+<a name="ln51">bool TabletSnapshots::IsTempSnapshotDir(const std::string&amp; dir) {</a>
+<a name="ln52">  return boost::ends_with(dir, kTempSnapshotDirSuffix);</a>
+<a name="ln53">}</a>
+<a name="ln54"> </a>
+<a name="ln55">Status TabletSnapshots::Prepare(SnapshotOperation* operation) {</a>
+<a name="ln56">  return Status::OK();</a>
+<a name="ln57">}</a>
+<a name="ln58"> </a>
+<a name="ln59">Status TabletSnapshots::Create(SnapshotOperationState* tx_state) {</a>
+<a name="ln60">  ScopedRWOperation scoped_read_operation(&amp;pending_op_counter());</a>
+<a name="ln61">  RETURN_NOT_OK(scoped_read_operation);</a>
+<a name="ln62"> </a>
+<a name="ln63">  Status s = regular_db().Flush(rocksdb::FlushOptions());</a>
+<a name="ln64">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln65">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;RocksDB flush status: &quot; &lt;&lt; s;</a>
+<a name="ln66">    return s.CloneAndPrepend(&quot;Unable to flush RocksDB&quot;);</a>
+<a name="ln67">  }</a>
+<a name="ln68"> </a>
+<a name="ln69">  const string top_snapshots_dir = metadata().snapshots_dir();</a>
+<a name="ln70">  RETURN_NOT_OK_PREPEND(</a>
+<a name="ln71">      metadata().fs_manager()-&gt;CreateDirIfMissingAndSync(top_snapshots_dir),</a>
+<a name="ln72">      Format(&quot;Unable to create snapshots directory $0&quot;, top_snapshots_dir));</a>
+<a name="ln73"> </a>
+<a name="ln74">  Env* const env = metadata().fs_manager()-&gt;env();</a>
+<a name="ln75">  auto snapshot_hybrid_time = HybridTime::FromPB(tx_state-&gt;request()-&gt;snapshot_hybrid_time());</a>
+<a name="ln76">  auto is_transactional_snapshot = snapshot_hybrid_time.is_valid();</a>
+<a name="ln77"> </a>
+<a name="ln78">  const string snapshot_dir = tx_state-&gt;GetSnapshotDir(top_snapshots_dir);</a>
+<a name="ln79">  // Delete previous snapshot in the same directory if it exists.</a>
+<a name="ln80">  if (env-&gt;FileExists(snapshot_dir)) {</a>
+<a name="ln81">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Deleting old snapshot dir &quot; &lt;&lt; snapshot_dir;</a>
+<a name="ln82">    RETURN_NOT_OK_PREPEND(env-&gt;DeleteRecursively(snapshot_dir),</a>
+<a name="ln83">                          &quot;Cannot recursively delete old snapshot dir &quot; + snapshot_dir);</a>
+<a name="ln84">    RETURN_NOT_OK_PREPEND(env-&gt;SyncDir(top_snapshots_dir),</a>
+<a name="ln85">                          &quot;Cannot sync top snapshots dir &quot; + top_snapshots_dir);</a>
+<a name="ln86">  }</a>
+<a name="ln87"> </a>
+<a name="ln88">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Started tablet snapshot creation in folder: &quot; &lt;&lt; snapshot_dir;</a>
+<a name="ln89"> </a>
+<a name="ln90">  const string tmp_snapshot_dir = snapshot_dir + kTempSnapshotDirSuffix;</a>
+<a name="ln91"> </a>
+<a name="ln92">  // Delete temp directory if it exists.</a>
+<a name="ln93">  if (env-&gt;FileExists(tmp_snapshot_dir)) {</a>
+<a name="ln94">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Deleting old temp snapshot dir &quot; &lt;&lt; tmp_snapshot_dir;</a>
+<a name="ln95">    RETURN_NOT_OK_PREPEND(env-&gt;DeleteRecursively(tmp_snapshot_dir),</a>
+<a name="ln96">                          &quot;Cannot recursively delete old temp snapshot dir &quot; + tmp_snapshot_dir);</a>
+<a name="ln97">    RETURN_NOT_OK_PREPEND(env-&gt;SyncDir(top_snapshots_dir),</a>
+<a name="ln98">                          &quot;Cannot sync top snapshots dir &quot; + top_snapshots_dir);</a>
+<a name="ln99">  }</a>
+<a name="ln100"> </a>
+<a name="ln101">  bool exit_on_failure = true;</a>
+<a name="ln102">  // Delete snapshot (RocksDB checkpoint) directories on exit.</a>
+<a name="ln103">  auto se = ScopeExit(</a>
+<a name="ln104">      [this, env, &amp;exit_on_failure, &amp;snapshot_dir, &amp;tmp_snapshot_dir, &amp;top_snapshots_dir] {</a>
+<a name="ln105">    bool do_sync = false;</a>
+<a name="ln106"> </a>
+<a name="ln107">    if (env-&gt;FileExists(tmp_snapshot_dir)) {</a>
+<a name="ln108">      do_sync = true;</a>
+<a name="ln109">      const Status deletion_status = env-&gt;DeleteRecursively(tmp_snapshot_dir);</a>
+<a name="ln110">      if (PREDICT_FALSE(!deletion_status.ok())) {</a>
+<a name="ln111">        LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln112">            &lt;&lt; &quot;Cannot recursively delete temp snapshot dir &quot;</a>
+<a name="ln113">            &lt;&lt; tmp_snapshot_dir &lt;&lt; &quot;: &quot; &lt;&lt; deletion_status;</a>
+<a name="ln114">      }</a>
+<a name="ln115">    }</a>
+<a name="ln116"> </a>
+<a name="ln117">    if (exit_on_failure &amp;&amp; env-&gt;FileExists(snapshot_dir)) {</a>
+<a name="ln118">      do_sync = true;</a>
+<a name="ln119">      const Status deletion_status = env-&gt;DeleteRecursively(snapshot_dir);</a>
+<a name="ln120">      if (PREDICT_FALSE(!deletion_status.ok())) {</a>
+<a name="ln121">        LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln122">            &lt;&lt; &quot;Cannot recursively delete snapshot dir &quot; &lt;&lt; snapshot_dir &lt;&lt; &quot;: &quot; &lt;&lt; deletion_status;</a>
+<a name="ln123">      }</a>
+<a name="ln124">    }</a>
+<a name="ln125"> </a>
+<a name="ln126">    if (do_sync) {</a>
+<a name="ln127">      const Status sync_status = env-&gt;SyncDir(top_snapshots_dir);</a>
+<a name="ln128">      if (PREDICT_FALSE(!sync_status.ok())) {</a>
+<a name="ln129">        LOG_WITH_PREFIX(WARNING)</a>
+<a name="ln130">            &lt;&lt; &quot;Cannot sync top snapshots dir &quot; &lt;&lt; top_snapshots_dir &lt;&lt; &quot;: &quot; &lt;&lt; sync_status;</a>
+<a name="ln131">      }</a>
+<a name="ln132">    }</a>
+<a name="ln133">  });</a>
+<a name="ln134"> </a>
+<a name="ln135">  // Note: checkpoint::CreateCheckpoint() calls DisableFileDeletions()/EnableFileDeletions()</a>
+<a name="ln136">  //       for the RocksDB object.</a>
+<a name="ln137">  s = CreateCheckpoint(tmp_snapshot_dir);</a>
+<a name="ln138">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln139">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Cannot create RocksDB checkpoint: &quot; &lt;&lt; s;</a>
+<a name="ln140">    return s.CloneAndPrepend(&quot;Cannot create RocksDB checkpoint&quot;);</a>
+<a name="ln141">  }</a>
+<a name="ln142"> </a>
+<a name="ln143">  if (is_transactional_snapshot) {</a>
+<a name="ln144">    rocksdb::Options rocksdb_options;</a>
+<a name="ln145">    tablet().InitRocksDBOptions(&amp;rocksdb_options, /* log_prefix= */ std::string());</a>
+<a name="ln146">    docdb::RocksDBPatcher patcher(tmp_snapshot_dir, rocksdb_options);</a>
+<a name="ln147"> </a>
+<a name="ln148">    RETURN_NOT_OK(patcher.Load());</a>
+<a name="ln149">    RETURN_NOT_OK(patcher.SetHybridTimeFilter(snapshot_hybrid_time));</a>
+<a name="ln150">  }</a>
+<a name="ln151"> </a>
+<a name="ln152">  RETURN_NOT_OK_PREPEND(</a>
+<a name="ln153">      env-&gt;RenameFile(tmp_snapshot_dir, snapshot_dir),</a>
+<a name="ln154">      Format(&quot;Cannot rename temp snapshot dir $0 to $1&quot;, tmp_snapshot_dir, snapshot_dir));</a>
+<a name="ln155">  RETURN_NOT_OK_PREPEND(</a>
+<a name="ln156">      env-&gt;SyncDir(top_snapshots_dir),</a>
+<a name="ln157">      Format(&quot;Cannot sync top snapshots dir $0&quot;, top_snapshots_dir));</a>
+<a name="ln158"> </a>
+<a name="ln159">  // Record the fact that we've executed the &quot;create snapshot&quot; Raft operation. We are not forcing</a>
+<a name="ln160">  // the flushed frontier to have this exact value, although in practice it will, since this is the</a>
+<a name="ln161">  // latest operation we've ever executed in this Raft group. This way we keep the current value</a>
+<a name="ln162">  // of history cutoff.</a>
+<a name="ln163">  docdb::ConsensusFrontier frontier;</a>
+<a name="ln164">  frontier.set_op_id(tx_state-&gt;op_id());</a>
+<a name="ln165">  frontier.set_hybrid_time(tx_state-&gt;hybrid_time());</a>
+<a name="ln166">  RETURN_NOT_OK(tablet().ModifyFlushedFrontier(</a>
+<a name="ln167">      frontier, rocksdb::FrontierModificationMode::kUpdate));</a>
+<a name="ln168"> </a>
+<a name="ln169">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Complete snapshot creation in folder: &quot; &lt;&lt; snapshot_dir;</a>
+<a name="ln170"> </a>
+<a name="ln171">  exit_on_failure = false;</a>
+<a name="ln172">  return Status::OK();</a>
+<a name="ln173">}</a>
+<a name="ln174"> </a>
+<a name="ln175">Status TabletSnapshots::Restore(SnapshotOperationState* tx_state) {</a>
+<a name="ln176">  const std::string top_snapshots_dir = metadata().snapshots_dir();</a>
+<a name="ln177">  const std::string snapshot_dir = tx_state-&gt;GetSnapshotDir(top_snapshots_dir);</a>
+<a name="ln178"> </a>
+<a name="ln179">  RETURN_NOT_OK_PREPEND(</a>
+<a name="ln180">      FileExists(&amp;rocksdb_env(), snapshot_dir),</a>
+<a name="ln181">      Format(&quot;Snapshot directory does not exist: $0&quot;, snapshot_dir));</a>
+<a name="ln182"> </a>
+<a name="ln183">  docdb::ConsensusFrontier frontier;</a>
+<a name="ln184">  frontier.set_op_id(tx_state-&gt;op_id());</a>
+<a name="ln185">  frontier.set_hybrid_time(tx_state-&gt;hybrid_time());</a>
+<a name="ln186">  const Status s = RestoreCheckpoint(snapshot_dir, frontier);</a>
+<a name="ln187">  VLOG_WITH_PREFIX(1) &lt;&lt; &quot;Complete checkpoint restoring with result &quot; &lt;&lt; s &lt;&lt; &quot; in folder: &quot;</a>
+<a name="ln188">                      &lt;&lt; metadata().rocksdb_dir();</a>
+<a name="ln189">  return s;</a>
+<a name="ln190">}</a>
+<a name="ln191"> </a>
+<a name="ln192">Status TabletSnapshots::RestoreCheckpoint(</a>
+<a name="ln193">    const std::string&amp; dir, const docdb::ConsensusFrontier&amp; frontier) {</a>
+<a name="ln194">  // The following two lines can't just be changed to RETURN_NOT_OK(PauseReadWriteOperations()):</a>
+<a name="ln195">  // op_pause has to stay in scope until the end of the function.</a>
+<a name="ln196">  auto op_pause = PauseReadWriteOperations();</a>
+<a name="ln197">  RETURN_NOT_OK(op_pause);</a>
+<a name="ln198"> </a>
+<a name="ln199">  // Check if tablet is in shutdown mode.</a>
+<a name="ln200">  if (tablet().IsShutdownRequested()) {</a>
+<a name="ln201">    return STATUS(IllegalState, &quot;Tablet was shut down&quot;);</a>
+<a name="ln202">  }</a>
+<a name="ln203"> </a>
+<a name="ln204">  std::lock_guard&lt;std::mutex&gt; lock(create_checkpoint_lock());</a>
+<a name="ln205"> </a>
+<a name="ln206">  const rocksdb::SequenceNumber sequence_number = regular_db().GetLatestSequenceNumber();</a>
+<a name="ln207">  const string db_dir = regular_db().GetName();</a>
+<a name="ln208">  const std::string intents_db_dir = has_intents_db() ? intents_db().GetName() : std::string();</a>
+<a name="ln209"> </a>
+<a name="ln210">  // Destroy DB object.</a>
+<a name="ln211">  // TODO: snapshot current DB and try to restore it in case of failure.</a>
+<a name="ln212">  RETURN_NOT_OK(ResetRocksDBs(Destroy::kTrue, DisableFlushOnShutdown::kTrue));</a>
+<a name="ln213"> </a>
+<a name="ln214">  auto s = CopyDirectory(&amp;rocksdb_env(), dir, db_dir, UseHardLinks::kTrue, CreateIfMissing::kTrue);</a>
+<a name="ln215">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln216">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Copy checkpoint files status: &quot; &lt;&lt; s;</a>
+<a name="ln217">    return STATUS(IllegalState, &quot;Unable to copy checkpoint files&quot;, s.ToString());</a>
+<a name="ln218">  }</a>
+<a name="ln219"> </a>
+<a name="ln220">  // Reopen database from copied checkpoint.</a>
+<a name="ln221">  // Note: db_dir == metadata()-&gt;rocksdb_dir() is still valid db dir.</a>
+<a name="ln222">  s = OpenRocksDBs();</a>
+<a name="ln223">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln224">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Failed tablet db opening from checkpoint: &quot; &lt;&lt; s;</a>
+<a name="ln225">    return s;</a>
+<a name="ln226">  }</a>
+<a name="ln227"> </a>
+<a name="ln228">  docdb::ConsensusFrontier final_frontier = frontier;</a>
+<a name="ln229">  rocksdb::UserFrontierPtr checkpoint_flushed_frontier = regular_db().GetFlushedFrontier();</a>
+<a name="ln230"> </a>
+<a name="ln231">  // The history cutoff we are setting after restoring to this snapshot is determined by the</a>
+<a name="ln232">  // compactions that were done in the checkpoint, not in the old state of RocksDB in this replica.</a>
+<a name="ln233">  if (checkpoint_flushed_frontier) {</a>
+<a name="ln234">    final_frontier.set_history_cutoff(</a>
+<a name="ln235">        down_cast&lt;docdb::ConsensusFrontier&amp;&gt;(*checkpoint_flushed_frontier).history_cutoff());</a>
+<a name="ln236">  }</a>
+<a name="ln237"> </a>
+<a name="ln238">  s = tablet().ModifyFlushedFrontier(final_frontier, rocksdb::FrontierModificationMode::kForce);</a>
+<a name="ln239">  if (PREDICT_FALSE(!s.ok())) {</a>
+<a name="ln240">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Failed tablet DB setting flushed op id: &quot; &lt;&lt; s;</a>
+<a name="ln241">    return s;</a>
+<a name="ln242">  }</a>
+<a name="ln243"> </a>
+<a name="ln244">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Checkpoint restored from &quot; &lt;&lt; dir;</a>
+<a name="ln245">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Sequence numbers: old=&quot; &lt;&lt; sequence_number</a>
+<a name="ln246">            &lt;&lt; &quot;, restored=&quot; &lt;&lt; regular_db().GetLatestSequenceNumber();</a>
+<a name="ln247"> </a>
+<a name="ln248">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Re-enabling compactions&quot;;</a>
+<a name="ln249">  s = tablet().EnableCompactions(&amp;op_pause);</a>
+<a name="ln250">  if (!s.ok()) {</a>
+<a name="ln251">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Failed to enable compactions after restoring a checkpoint&quot;;</a>
+<a name="ln252">    return s;</a>
+<a name="ln253">  }</a>
+<a name="ln254"> </a>
+<a name="ln255">  DCHECK(op_pause.status().ok());  // Ensure that op_pause stays in scope throughout this function.</a>
+<a name="ln256"> </a>
+<a name="ln257">  return Status::OK();</a>
+<a name="ln258">}</a>
+<a name="ln259"> </a>
+<a name="ln260">Status TabletSnapshots::Delete(SnapshotOperationState* tx_state) {</a>
+<a name="ln261">  const std::string top_snapshots_dir = metadata().snapshots_dir();</a>
+<a name="ln262">  const auto&amp; snapshot_id = tx_state-&gt;request()-&gt;snapshot_id();</a>
+<a name="ln263">  auto txn_snapshot_id = TryFullyDecodeTxnSnapshotId(snapshot_id);</a>
+<a name="ln264">  const std::string snapshot_dir = JoinPathSegments(</a>
+<a name="ln265">      top_snapshots_dir, !txn_snapshot_id ? snapshot_id : txn_snapshot_id.ToString());</a>
+<a name="ln266"> </a>
+<a name="ln267">  std::lock_guard&lt;std::mutex&gt; lock(create_checkpoint_lock());</a>
+<a name="ln268">  Env* const env = metadata().fs_manager()-&gt;env();</a>
+<a name="ln269"> </a>
+<a name="ln270">  if (env-&gt;FileExists(snapshot_dir)) {</a>
+<a name="ln271">    const Status deletion_status = env-&gt;DeleteRecursively(snapshot_dir);</a>
+<a name="ln272">    if (PREDICT_FALSE(!deletion_status.ok())) {</a>
+<a name="ln273">      LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Cannot recursively delete snapshot dir &quot; &lt;&lt; snapshot_dir</a>
+<a name="ln274">                               &lt;&lt; &quot;: &quot; &lt;&lt; deletion_status;</a>
+<a name="ln275">    }</a>
+<a name="ln276"> </a>
+<a name="ln277">    const Status sync_status = env-&gt;SyncDir(top_snapshots_dir);</a>
+<a name="ln278">    if (PREDICT_FALSE(!sync_status.ok())) {</a>
+<a name="ln279">      LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Cannot sync top snapshots dir &quot; &lt;&lt; top_snapshots_dir</a>
+<a name="ln280">                               &lt;&lt; &quot;: &quot; &lt;&lt; sync_status;</a>
+<a name="ln281">    }</a>
+<a name="ln282">  }</a>
+<a name="ln283"> </a>
+<a name="ln284">  docdb::ConsensusFrontier frontier;</a>
+<a name="ln285">  frontier.set_op_id(tx_state-&gt;op_id());</a>
+<a name="ln286">  frontier.set_hybrid_time(tx_state-&gt;hybrid_time());</a>
+<a name="ln287">  // Here we are just recording the fact that we've executed the &quot;delete snapshot&quot; Raft operation</a>
+<a name="ln288">  // so that it won't get replayed if we crash. No need to force the flushed frontier to be the</a>
+<a name="ln289">  // exact value set above.</a>
+<a name="ln290">  RETURN_NOT_OK(tablet().ModifyFlushedFrontier(</a>
+<a name="ln291">      frontier, rocksdb::FrontierModificationMode::kUpdate));</a>
+<a name="ln292"> </a>
+<a name="ln293">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Complete snapshot deletion on tablet in folder: &quot; &lt;&lt; snapshot_dir;</a>
+<a name="ln294"> </a>
+<a name="ln295">  return Status::OK();</a>
+<a name="ln296">}</a>
+<a name="ln297"> </a>
+<a name="ln298">Status TabletSnapshots::CreateCheckpoint(</a>
+<a name="ln299">    const std::string&amp; dir, const CreateIntentsCheckpointIn create_intents_checkpoint_in) {</a>
+<a name="ln300">  ScopedRWOperation scoped_read_operation(&amp;pending_op_counter());</a>
+<a name="ln301">  RETURN_NOT_OK(scoped_read_operation);</a>
+<a name="ln302"> </a>
+<a name="ln303">  auto temp_intents_dir = dir + kIntentsDBSuffix;</a>
+<a name="ln304">  auto final_intents_dir = JoinPathSegments(dir, kIntentsSubdir);</a>
+<a name="ln305"> </a>
+<a name="ln306">  std::lock_guard&lt;std::mutex&gt; lock(create_checkpoint_lock());</a>
+<a name="ln307"> </a>
+<a name="ln308">  if (!has_regular_db()) {</a>
+<a name="ln309">    LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Skipped creating checkpoint in &quot; &lt;&lt; dir;</a>
+<a name="ln310">    return STATUS(NotSupported,</a>
+<a name="ln311">                  &quot;Tablet does not have a RocksDB (could be a transaction status tablet)&quot;);</a>
+<a name="ln312">  }</a>
+<a name="ln313"> </a>
+<a name="ln314">  auto parent_dir = DirName(dir);</a>
+<a name="ln315">  RETURN_NOT_OK_PREPEND(metadata().fs_manager()-&gt;CreateDirIfMissing(parent_dir),</a>
+<a name="ln316">                        Format(&quot;Unable to create checkpoints directory $0&quot;, parent_dir));</a>
+<a name="ln317"> </a>
+<a name="ln318">  // Order does not matter because we flush both DBs and does not have parallel writes.</a>
+<a name="ln319">  Status status;</a>
+<a name="ln320">  if (has_intents_db()) {</a>
+<a name="ln321">    status = rocksdb::checkpoint::CreateCheckpoint(&amp;intents_db(), temp_intents_dir);</a>
+<a name="ln322">  }</a>
+<a name="ln323">  if (status.ok()) {</a>
+<a name="ln324">    status = rocksdb::checkpoint::CreateCheckpoint(&amp;regular_db(), dir);</a>
+<a name="ln325">  }</a>
+<a name="ln326">  if (status.ok() &amp;&amp; has_intents_db() &amp;&amp;</a>
+<a name="ln327">      create_intents_checkpoint_in == CreateIntentsCheckpointIn::kUseIntentsDbSuffix) {</a>
+<a name="ln328">    status = Env::Default()-&gt;RenameFile(temp_intents_dir, final_intents_dir);</a>
+<a name="ln329">  }</a>
+<a name="ln330"> </a>
+<a name="ln331">  if (!status.ok()) {</a>
+<a name="ln332">    LOG_WITH_PREFIX(WARNING) &lt;&lt; &quot;Create checkpoint status: &quot; &lt;&lt; status;</a>
+<a name="ln333">    return STATUS_FORMAT(IllegalState, &quot;Unable to create checkpoint: $0&quot;, status);</a>
+<a name="ln334">  }</a>
+<a name="ln335">  LOG_WITH_PREFIX(INFO) &lt;&lt; &quot;Checkpoint created in &quot; &lt;&lt; dir;</a>
+<a name="ln336"> </a>
+<a name="ln337">  TEST_last_rocksdb_checkpoint_dir_ = dir;</a>
+<a name="ln338"> </a>
+<a name="ln339">  return Status::OK();</a>
+<a name="ln340">}</a>
+<a name="ln341"> </a>
+<a name="ln342">Status TabletSnapshots::CreateDirectories(const string&amp; rocksdb_dir, FsManager* fs) {</a>
+<a name="ln343">  const auto top_snapshots_dir = SnapshotsDirName(rocksdb_dir);</a>
+<a name="ln344">  RETURN_NOT_OK_PREPEND(fs-&gt;CreateDirIfMissingAndSync(top_snapshots_dir),</a>
+<a name="ln345">                        Format(&quot;Unable to create snapshots directory $0&quot;, top_snapshots_dir));</a>
+<a name="ln346">  return Status::OK();</a>
+<a name="ln347">}</a>
+<a name="ln348"> </a>
+<a name="ln349">} // namespace tablet</a>
+<a name="ln350">} // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="187"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="255"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

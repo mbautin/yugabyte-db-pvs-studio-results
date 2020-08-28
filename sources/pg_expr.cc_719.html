@@ -1,0 +1,762 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>pg_expr.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln2">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln3">//</a>
+<a name="ln4">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln5">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln6">//</a>
+<a name="ln7">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln8">//</a>
+<a name="ln9">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln10">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln11">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln12">// under the License.</a>
+<a name="ln13">//</a>
+<a name="ln14">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &lt;unordered_map&gt;</a>
+<a name="ln17"> </a>
+<a name="ln18">#include &quot;yb/client/schema.h&quot;</a>
+<a name="ln19">#include &quot;yb/common/pg_system_attr.h&quot;</a>
+<a name="ln20">#include &quot;yb/yql/pggate/pg_expr.h&quot;</a>
+<a name="ln21">#include &quot;yb/yql/pggate/pg_dml.h&quot;</a>
+<a name="ln22">#include &quot;yb/util/string_util.h&quot;</a>
+<a name="ln23"> </a>
+<a name="ln24">#include &quot;postgres/src/include/pg_config_manual.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">namespace yb {</a>
+<a name="ln27">namespace pggate {</a>
+<a name="ln28"> </a>
+<a name="ln29">using std::make_shared;</a>
+<a name="ln30">using std::placeholders::_1;</a>
+<a name="ln31">using std::placeholders::_2;</a>
+<a name="ln32"> </a>
+<a name="ln33">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln34">// Mapping Postgres operator names to YugaByte opcodes.</a>
+<a name="ln35">// When constructing expresions, Postgres layer will pass the operator name.</a>
+<a name="ln36">const std::unordered_map&lt;string, PgExpr::Opcode&gt; kOperatorNames = {</a>
+<a name="ln37">  { &quot;!&quot;, PgExpr::Opcode::PG_EXPR_NOT },</a>
+<a name="ln38">  { &quot;not&quot;, PgExpr::Opcode::PG_EXPR_NOT },</a>
+<a name="ln39">  { &quot;=&quot;, PgExpr::Opcode::PG_EXPR_EQ },</a>
+<a name="ln40">  { &quot;&lt;&gt;&quot;, PgExpr::Opcode::PG_EXPR_NE },</a>
+<a name="ln41">  { &quot;!=&quot;, PgExpr::Opcode::PG_EXPR_NE },</a>
+<a name="ln42">  { &quot;&gt;&quot;, PgExpr::Opcode::PG_EXPR_GT },</a>
+<a name="ln43">  { &quot;&gt;=&quot;, PgExpr::Opcode::PG_EXPR_GE },</a>
+<a name="ln44">  { &quot;&lt;&quot;, PgExpr::Opcode::PG_EXPR_LT },</a>
+<a name="ln45">  { &quot;&lt;=&quot;, PgExpr::Opcode::PG_EXPR_LE },</a>
+<a name="ln46"> </a>
+<a name="ln47">  { &quot;avg&quot;, PgExpr::Opcode::PG_EXPR_AVG },</a>
+<a name="ln48">  { &quot;sum&quot;, PgExpr::Opcode::PG_EXPR_SUM },</a>
+<a name="ln49">  { &quot;count&quot;, PgExpr::Opcode::PG_EXPR_COUNT },</a>
+<a name="ln50">  { &quot;max&quot;, PgExpr::Opcode::PG_EXPR_MAX },</a>
+<a name="ln51">  { &quot;min&quot;, PgExpr::Opcode::PG_EXPR_MIN },</a>
+<a name="ln52">  { &quot;eval_expr_call&quot;, PgExpr::Opcode::PG_EXPR_EVAL_EXPR_CALL }</a>
+<a name="ln53">};</a>
+<a name="ln54"> </a>
+<a name="ln55">PgExpr::PgExpr(Opcode opcode, const YBCPgTypeEntity *type_entity)</a>
+<a name="ln56">    : opcode_(opcode), type_entity_(type_entity) , type_attrs_({0}) {</a>
+<a name="ln57">  DCHECK(type_entity_) &lt;&lt; &quot;Datatype of result must be specified for expression&quot;;</a>
+<a name="ln58">  DCHECK(type_entity_-&gt;yb_type != YB_YQL_DATA_TYPE_NOT_SUPPORTED &amp;&amp;</a>
+<a name="ln59">         type_entity_-&gt;yb_type != YB_YQL_DATA_TYPE_UNKNOWN_DATA &amp;&amp;</a>
+<a name="ln60">         type_entity_-&gt;yb_type != YB_YQL_DATA_TYPE_NULL_VALUE_TYPE)</a>
+<a name="ln61">    &lt;&lt; &quot;Invalid datatype for YSQL expressions&quot;;</a>
+<a name="ln62">  DCHECK(type_entity_-&gt;datum_to_yb) &lt;&lt; &quot;Conversion from datum to YB format not defined&quot;;</a>
+<a name="ln63">  DCHECK(type_entity_-&gt;yb_to_datum) &lt;&lt; &quot;Conversion from YB to datum format not defined&quot;;</a>
+<a name="ln64">}</a>
+<a name="ln65"> </a>
+<a name="ln66">PgExpr::PgExpr(Opcode opcode, const YBCPgTypeEntity *type_entity, const PgTypeAttrs *type_attrs)</a>
+<a name="ln67">    : opcode_(opcode), type_entity_(type_entity), type_attrs_(*type_attrs) {</a>
+<a name="ln68">  DCHECK(type_entity_) &lt;&lt; &quot;Datatype of result must be specified for expression&quot;;</a>
+<a name="ln69">  DCHECK(type_entity_-&gt;yb_type != YB_YQL_DATA_TYPE_NOT_SUPPORTED &amp;&amp;</a>
+<a name="ln70">         type_entity_-&gt;yb_type != YB_YQL_DATA_TYPE_UNKNOWN_DATA &amp;&amp;</a>
+<a name="ln71">         type_entity_-&gt;yb_type != YB_YQL_DATA_TYPE_NULL_VALUE_TYPE)</a>
+<a name="ln72">    &lt;&lt; &quot;Invalid datatype for YSQL expressions&quot;;</a>
+<a name="ln73">  DCHECK(type_entity_-&gt;datum_to_yb) &lt;&lt; &quot;Conversion from datum to YB format not defined&quot;;</a>
+<a name="ln74">  DCHECK(type_entity_-&gt;yb_to_datum) &lt;&lt; &quot;Conversion from YB to datum format not defined&quot;;</a>
+<a name="ln75">}</a>
+<a name="ln76"> </a>
+<a name="ln77">PgExpr::PgExpr(const char *opname, const YBCPgTypeEntity *type_entity)</a>
+<a name="ln78">    : PgExpr(NameToOpcode(opname), type_entity) {</a>
+<a name="ln79">}</a>
+<a name="ln80"> </a>
+<a name="ln81">PgExpr::~PgExpr() {</a>
+<a name="ln82">}</a>
+<a name="ln83"> </a>
+<a name="ln84">Status PgExpr::CheckOperatorName(const char *name) {</a>
+<a name="ln85">  auto iter = kOperatorNames.find(name);</a>
+<a name="ln86">  if (iter == kOperatorNames.end()) {</a>
+<a name="ln87">    return STATUS_SUBSTITUTE(InvalidArgument, &quot;Wrong operator name: $0&quot;, name);</a>
+<a name="ln88">  }</a>
+<a name="ln89">  return Status::OK();</a>
+<a name="ln90">}</a>
+<a name="ln91"> </a>
+<a name="ln92">PgExpr::Opcode PgExpr::NameToOpcode(const char *name) {</a>
+<a name="ln93">  auto iter = kOperatorNames.find(name);</a>
+<a name="ln94">  DCHECK(iter != kOperatorNames.end()) &lt;&lt; &quot;Wrong operator name: &quot; &lt;&lt; name;</a>
+<a name="ln95">  return iter-&gt;second;</a>
+<a name="ln96">}</a>
+<a name="ln97"> </a>
+<a name="ln98">bfpg::TSOpcode PgExpr::PGOpcodeToTSOpcode(const PgExpr::Opcode opcode) {</a>
+<a name="ln99">  switch (opcode) {</a>
+<a name="ln100">    case Opcode::PG_EXPR_COUNT:</a>
+<a name="ln101">      return bfpg::TSOpcode::kCount;</a>
+<a name="ln102"> </a>
+<a name="ln103">    case Opcode::PG_EXPR_MAX:</a>
+<a name="ln104">      return bfpg::TSOpcode::kMax;</a>
+<a name="ln105"> </a>
+<a name="ln106">    case Opcode::PG_EXPR_MIN:</a>
+<a name="ln107">      return bfpg::TSOpcode::kMin;</a>
+<a name="ln108"> </a>
+<a name="ln109">    case Opcode::PG_EXPR_EVAL_EXPR_CALL:</a>
+<a name="ln110">      return bfpg::TSOpcode::kPgEvalExprCall;</a>
+<a name="ln111"> </a>
+<a name="ln112">    default:</a>
+<a name="ln113">      LOG(DFATAL) &lt;&lt; &quot;No supported TSOpcode for PG opcode: &quot; &lt;&lt; static_cast&lt;int32_t&gt;(opcode);</a>
+<a name="ln114">      return bfpg::TSOpcode::kNoOp;</a>
+<a name="ln115">  }</a>
+<a name="ln116">}</a>
+<a name="ln117"> </a>
+<a name="ln118">bfpg::TSOpcode PgExpr::OperandTypeToSumTSOpcode(InternalType type) {</a>
+<a name="ln119">  switch (type) {</a>
+<a name="ln120">    case InternalType::kInt8Value:</a>
+<a name="ln121">      return bfpg::TSOpcode::kSumInt8;</a>
+<a name="ln122"> </a>
+<a name="ln123">    case InternalType::kInt16Value:</a>
+<a name="ln124">      return bfpg::TSOpcode::kSumInt16;</a>
+<a name="ln125"> </a>
+<a name="ln126">    case InternalType::kInt32Value:</a>
+<a name="ln127">      return bfpg::TSOpcode::kSumInt32;</a>
+<a name="ln128"> </a>
+<a name="ln129">    case InternalType::kInt64Value:</a>
+<a name="ln130">      return bfpg::TSOpcode::kSumInt64;</a>
+<a name="ln131"> </a>
+<a name="ln132">    case InternalType::kFloatValue:</a>
+<a name="ln133">      return bfpg::TSOpcode::kSumFloat;</a>
+<a name="ln134"> </a>
+<a name="ln135">    case InternalType::kDoubleValue:</a>
+<a name="ln136">      return bfpg::TSOpcode::kSumDouble;</a>
+<a name="ln137"> </a>
+<a name="ln138">    default:</a>
+<a name="ln139">      LOG(DFATAL) &lt;&lt; &quot;No supported Sum TSOpcode for operand type: &quot; &lt;&lt; static_cast&lt;int32_t&gt;(type);</a>
+<a name="ln140">      return bfpg::TSOpcode::kNoOp;</a>
+<a name="ln141">  }</a>
+<a name="ln142">}</a>
+<a name="ln143"> </a>
+<a name="ln144">Status PgExpr::PrepareForRead(PgDml *pg_stmt, PgsqlExpressionPB *expr_pb) {</a>
+<a name="ln145">  // For expression that doesn't need to be setup and prepared at construction time.</a>
+<a name="ln146">  return Status::OK();</a>
+<a name="ln147">}</a>
+<a name="ln148"> </a>
+<a name="ln149">Status PgExpr::Eval(PgDml *pg_stmt, PgsqlExpressionPB *expr_pb) {</a>
+<a name="ln150">  // Expressions that are neither bind_variable nor constant don't need to be updated.</a>
+<a name="ln151">  // Only values for bind variables and constants need to be updated in the SQL requests.</a>
+<a name="ln152">  return Status::OK();</a>
+<a name="ln153">}</a>
+<a name="ln154"> </a>
+<a name="ln155">Status PgExpr::Eval(PgDml *pg_stmt, QLValuePB *result) {</a>
+<a name="ln156">  // Expressions that are neither bind_variable nor constant don't need to be updated.</a>
+<a name="ln157">  // Only values for bind variables and constants need to be updated in the SQL requests.</a>
+<a name="ln158">  return Status::OK();</a>
+<a name="ln159">}</a>
+<a name="ln160"> </a>
+<a name="ln161">Status PgExpr::Eval(QLValuePB *result) {</a>
+<a name="ln162">  return Status::OK();</a>
+<a name="ln163">}</a>
+<a name="ln164"> </a>
+<a name="ln165">void PgExpr::TranslateText(Slice *yb_cursor, const PgWireDataHeader&amp; header, int index,</a>
+<a name="ln166">                           const YBCPgTypeEntity *type_entity, const PgTypeAttrs *type_attrs,</a>
+<a name="ln167">                           PgTuple *pg_tuple) {</a>
+<a name="ln168">  if (header.is_null()) {</a>
+<a name="ln169">    return pg_tuple-&gt;WriteNull(index, header);</a>
+<a name="ln170">  }</a>
+<a name="ln171"> </a>
+<a name="ln172">  // Get data from RPC buffer.</a>
+<a name="ln173">  int64_t data_size;</a>
+<a name="ln174">  size_t read_size = PgDocData::ReadNumber(yb_cursor, &amp;data_size);</a>
+<a name="ln175">  yb_cursor-&gt;remove_prefix(read_size);</a>
+<a name="ln176"> </a>
+<a name="ln177">  // Expects data from DocDB matches the following format.</a>
+<a name="ln178">  // - Right trim spaces for CHAR type. This should be done by DocDB when evaluate SELECTed or</a>
+<a name="ln179">  //   RETURNed expression. Note that currently, Postgres layer (and not DocDB) evaluate</a>
+<a name="ln180">  //   expressions, so DocDB doesn't trim for CHAR type.</a>
+<a name="ln181">  // - NULL terminated string. This should be done by DocDB when serializing.</a>
+<a name="ln182">  // - Text size == strlen(). When sending data over the network, RPC layer would use the actual</a>
+<a name="ln183">  //   size of data being serialized including the '\0' character. This is not necessarily be the</a>
+<a name="ln184">  //   length of a string.</a>
+<a name="ln185">  // Find strlen() of STRING by right-trimming all '\0' characters.</a>
+<a name="ln186">  const char* text = yb_cursor-&gt;cdata();</a>
+<a name="ln187">  int64_t text_len = data_size - 1;</a>
+<a name="ln188"> </a>
+<a name="ln189">  DCHECK(text_len &gt;= 0 &amp;&amp; text[text_len] == '\0' &amp;&amp; (text_len == 0 || text[text_len - 1] != '\0'))</a>
+<a name="ln190">    &lt;&lt; &quot;Data received from DocDB does not have expected format&quot;;</a>
+<a name="ln191"> </a>
+<a name="ln192">  pg_tuple-&gt;WriteDatum(index, type_entity-&gt;yb_to_datum(text, text_len, type_attrs));</a>
+<a name="ln193">  yb_cursor-&gt;remove_prefix(data_size);</a>
+<a name="ln194">}</a>
+<a name="ln195"> </a>
+<a name="ln196">void PgExpr::TranslateBinary(Slice *yb_cursor, const PgWireDataHeader&amp; header, int index,</a>
+<a name="ln197">                             const YBCPgTypeEntity *type_entity, const PgTypeAttrs *type_attrs,</a>
+<a name="ln198">                             PgTuple *pg_tuple) {</a>
+<a name="ln199">  if (header.is_null()) {</a>
+<a name="ln200">    return pg_tuple-&gt;WriteNull(index, header);</a>
+<a name="ln201">  }</a>
+<a name="ln202">  int64_t data_size;</a>
+<a name="ln203">  size_t read_size = PgDocData::ReadNumber(yb_cursor, &amp;data_size);</a>
+<a name="ln204">  yb_cursor-&gt;remove_prefix(read_size);</a>
+<a name="ln205"> </a>
+<a name="ln206">  pg_tuple-&gt;WriteDatum(index, type_entity-&gt;yb_to_datum(yb_cursor-&gt;data(), data_size, type_attrs));</a>
+<a name="ln207">  yb_cursor-&gt;remove_prefix(data_size);</a>
+<a name="ln208">}</a>
+<a name="ln209"> </a>
+<a name="ln210"> </a>
+<a name="ln211">// Expects a serialized string representation of YB Decimal.</a>
+<a name="ln212">void PgExpr::TranslateDecimal(Slice *yb_cursor, const PgWireDataHeader&amp; header, int index,</a>
+<a name="ln213">                              const YBCPgTypeEntity *type_entity, const PgTypeAttrs *type_attrs,</a>
+<a name="ln214">                              PgTuple *pg_tuple) {</a>
+<a name="ln215">  if (header.is_null()) {</a>
+<a name="ln216">    return pg_tuple-&gt;WriteNull(index, header);</a>
+<a name="ln217">  }</a>
+<a name="ln218"> </a>
+<a name="ln219">  int64_t data_size;</a>
+<a name="ln220">  size_t read_size = PgDocData::ReadNumber(yb_cursor, &amp;data_size);</a>
+<a name="ln221">  yb_cursor-&gt;remove_prefix(read_size);</a>
+<a name="ln222"> </a>
+<a name="ln223">  std::string serialized_decimal = yb_cursor-&gt;ToBuffer();</a>
+<a name="ln224">  yb_cursor-&gt;remove_prefix(data_size);</a>
+<a name="ln225"> </a>
+<a name="ln226">  util::Decimal yb_decimal;</a>
+<a name="ln227">  if (!yb_decimal.DecodeFromComparable(serialized_decimal).ok()) {</a>
+<a name="ln228">    LOG(FATAL) &lt;&lt; &quot;Failed to deserialize DECIMAL from &quot; &lt;&lt; serialized_decimal;</a>
+<a name="ln229">    return;</a>
+<a name="ln230">  }</a>
+<a name="ln231">  auto plaintext = yb_decimal.ToString();</a>
+<a name="ln232"> </a>
+<a name="ln233">  pg_tuple-&gt;WriteDatum(index, type_entity-&gt;yb_to_datum(plaintext.c_str(), data_size, type_attrs));</a>
+<a name="ln234">}</a>
+<a name="ln235"> </a>
+<a name="ln236">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln237">// Translating system columns.</a>
+<a name="ln238">void PgExpr::TranslateSysCol(Slice *yb_cursor, const PgWireDataHeader&amp; header, PgTuple *pg_tuple,</a>
+<a name="ln239">                             uint8_t **pgbuf) {</a>
+<a name="ln240">  *pgbuf = nullptr;</a>
+<a name="ln241">  if (header.is_null()) {</a>
+<a name="ln242">    return;</a>
+<a name="ln243">  }</a>
+<a name="ln244"> </a>
+<a name="ln245">  int64_t data_size;</a>
+<a name="ln246">  size_t read_size = PgDocData::ReadNumber(yb_cursor, &amp;data_size);</a>
+<a name="ln247">  yb_cursor-&gt;remove_prefix(read_size);</a>
+<a name="ln248"> </a>
+<a name="ln249">  pg_tuple-&gt;Write(pgbuf, header, yb_cursor-&gt;data(), data_size);</a>
+<a name="ln250">  yb_cursor-&gt;remove_prefix(data_size);</a>
+<a name="ln251">}</a>
+<a name="ln252"> </a>
+<a name="ln253">void PgExpr::TranslateCtid(Slice *yb_cursor, const PgWireDataHeader&amp; header, int index,</a>
+<a name="ln254">                           const YBCPgTypeEntity *type_entity, const PgTypeAttrs *type_attrs,</a>
+<a name="ln255">                           PgTuple *pg_tuple) {</a>
+<a name="ln256">  TranslateSysCol&lt;uint64_t&gt;(yb_cursor, header, &amp;pg_tuple-&gt;syscols()-&gt;ctid);</a>
+<a name="ln257">}</a>
+<a name="ln258"> </a>
+<a name="ln259">void PgExpr::TranslateOid(Slice *yb_cursor, const PgWireDataHeader&amp; header, int index,</a>
+<a name="ln260">                          const YBCPgTypeEntity *type_entity, const PgTypeAttrs *type_attrs,</a>
+<a name="ln261">                          PgTuple *pg_tuple) {</a>
+<a name="ln262">  TranslateSysCol&lt;uint32_t&gt;(yb_cursor, header, &amp;pg_tuple-&gt;syscols()-&gt;oid);</a>
+<a name="ln263">}</a>
+<a name="ln264"> </a>
+<a name="ln265">void PgExpr::TranslateTableoid(Slice *yb_cursor, const PgWireDataHeader&amp; header, int index,</a>
+<a name="ln266">                               const YBCPgTypeEntity *type_entity, const PgTypeAttrs *type_attrs,</a>
+<a name="ln267">                               PgTuple *pg_tuple) {</a>
+<a name="ln268">  TranslateSysCol&lt;uint32_t&gt;(yb_cursor, header, &amp;pg_tuple-&gt;syscols()-&gt;tableoid);</a>
+<a name="ln269">}</a>
+<a name="ln270"> </a>
+<a name="ln271">void PgExpr::TranslateXmin(Slice *yb_cursor, const PgWireDataHeader&amp; header, int index,</a>
+<a name="ln272">                           const YBCPgTypeEntity *type_entity, const PgTypeAttrs *type_attrs,</a>
+<a name="ln273">                           PgTuple *pg_tuple) {</a>
+<a name="ln274">  TranslateSysCol&lt;uint32_t&gt;(yb_cursor, header, &amp;pg_tuple-&gt;syscols()-&gt;xmin);</a>
+<a name="ln275">}</a>
+<a name="ln276"> </a>
+<a name="ln277">void PgExpr::TranslateCmin(Slice *yb_cursor, const PgWireDataHeader&amp; header, int index,</a>
+<a name="ln278">                           const YBCPgTypeEntity *type_entity, const PgTypeAttrs *type_attrs,</a>
+<a name="ln279">                           PgTuple *pg_tuple) {</a>
+<a name="ln280">  TranslateSysCol&lt;uint32_t&gt;(yb_cursor, header, &amp;pg_tuple-&gt;syscols()-&gt;cmin);</a>
+<a name="ln281">}</a>
+<a name="ln282"> </a>
+<a name="ln283">void PgExpr::TranslateXmax(Slice *yb_cursor, const PgWireDataHeader&amp; header, int index,</a>
+<a name="ln284">                           const YBCPgTypeEntity *type_entity, const PgTypeAttrs *type_attrs,</a>
+<a name="ln285">                           PgTuple *pg_tuple) {</a>
+<a name="ln286">  TranslateSysCol&lt;uint32_t&gt;(yb_cursor, header, &amp;pg_tuple-&gt;syscols()-&gt;xmax);</a>
+<a name="ln287">}</a>
+<a name="ln288"> </a>
+<a name="ln289">void PgExpr::TranslateCmax(Slice *yb_cursor, const PgWireDataHeader&amp; header, int index,</a>
+<a name="ln290">                           const YBCPgTypeEntity *type_entity, const PgTypeAttrs *type_attrs,</a>
+<a name="ln291">                           PgTuple *pg_tuple) {</a>
+<a name="ln292">  TranslateSysCol&lt;uint32_t&gt;(yb_cursor, header, &amp;pg_tuple-&gt;syscols()-&gt;cmax);</a>
+<a name="ln293">}</a>
+<a name="ln294"> </a>
+<a name="ln295">void PgExpr::TranslateYBCtid(Slice *yb_cursor, const PgWireDataHeader&amp; header, int index,</a>
+<a name="ln296">                             const YBCPgTypeEntity *type_entity, const PgTypeAttrs *type_attrs,</a>
+<a name="ln297">                             PgTuple *pg_tuple) {</a>
+<a name="ln298">  TranslateSysCol(yb_cursor, header, pg_tuple, &amp;pg_tuple-&gt;syscols()-&gt;ybctid);</a>
+<a name="ln299">}</a>
+<a name="ln300"> </a>
+<a name="ln301">void PgExpr::TranslateYBBasectid(Slice *yb_cursor, const PgWireDataHeader&amp; header, int index,</a>
+<a name="ln302">                                 const YBCPgTypeEntity *type_entity, const PgTypeAttrs *type_attrs,</a>
+<a name="ln303">                                 PgTuple *pg_tuple) {</a>
+<a name="ln304">  TranslateSysCol(yb_cursor, header, pg_tuple, &amp;pg_tuple-&gt;syscols()-&gt;ybbasectid);</a>
+<a name="ln305">}</a>
+<a name="ln306"> </a>
+<a name="ln307">InternalType PgExpr::internal_type() const {</a>
+<a name="ln308">  DCHECK(type_entity_) &lt;&lt; &quot;Type entity is not set up&quot;;</a>
+<a name="ln309">  return client::YBColumnSchema::ToInternalDataType(</a>
+<a name="ln310">      QLType::Create(static_cast&lt;DataType&gt;(type_entity_-&gt;yb_type)));</a>
+<a name="ln311">}</a>
+<a name="ln312"> </a>
+<a name="ln313">void PgExpr::InitializeTranslateData() {</a>
+<a name="ln314">  switch (type_entity_-&gt;yb_type) {</a>
+<a name="ln315">    case YB_YQL_DATA_TYPE_INT8:</a>
+<a name="ln316">      translate_data_ = TranslateNumber&lt;int8_t&gt;;</a>
+<a name="ln317">      break;</a>
+<a name="ln318"> </a>
+<a name="ln319">    case YB_YQL_DATA_TYPE_INT16:</a>
+<a name="ln320">      translate_data_ = TranslateNumber&lt;int16_t&gt;;</a>
+<a name="ln321">      break;</a>
+<a name="ln322"> </a>
+<a name="ln323">    case YB_YQL_DATA_TYPE_INT32:</a>
+<a name="ln324">      translate_data_ = TranslateNumber&lt;int32_t&gt;;</a>
+<a name="ln325">      break;</a>
+<a name="ln326"> </a>
+<a name="ln327">    case YB_YQL_DATA_TYPE_INT64:</a>
+<a name="ln328">      translate_data_ = TranslateNumber&lt;int64_t&gt;;</a>
+<a name="ln329">      break;</a>
+<a name="ln330"> </a>
+<a name="ln331">    case YB_YQL_DATA_TYPE_UINT32:</a>
+<a name="ln332">      translate_data_ = TranslateNumber&lt;uint32_t&gt;;</a>
+<a name="ln333">      break;</a>
+<a name="ln334"> </a>
+<a name="ln335">    case YB_YQL_DATA_TYPE_UINT64:</a>
+<a name="ln336">      translate_data_ = TranslateNumber&lt;uint64_t&gt;;</a>
+<a name="ln337">      break;</a>
+<a name="ln338"> </a>
+<a name="ln339">    case YB_YQL_DATA_TYPE_STRING:</a>
+<a name="ln340">      translate_data_ = TranslateText;</a>
+<a name="ln341">      break;</a>
+<a name="ln342"> </a>
+<a name="ln343">    case YB_YQL_DATA_TYPE_BOOL:</a>
+<a name="ln344">      translate_data_ = TranslateNumber&lt;bool&gt;;</a>
+<a name="ln345">      break;</a>
+<a name="ln346"> </a>
+<a name="ln347">    case YB_YQL_DATA_TYPE_FLOAT:</a>
+<a name="ln348">      translate_data_ = TranslateNumber&lt;float&gt;;</a>
+<a name="ln349">      break;</a>
+<a name="ln350"> </a>
+<a name="ln351">    case YB_YQL_DATA_TYPE_DOUBLE:</a>
+<a name="ln352">      translate_data_ = TranslateNumber&lt;double&gt;;</a>
+<a name="ln353">      break;</a>
+<a name="ln354"> </a>
+<a name="ln355">    case YB_YQL_DATA_TYPE_BINARY:</a>
+<a name="ln356">      translate_data_ = TranslateBinary;</a>
+<a name="ln357">      break;</a>
+<a name="ln358"> </a>
+<a name="ln359">    case YB_YQL_DATA_TYPE_TIMESTAMP:</a>
+<a name="ln360">      translate_data_ = TranslateNumber&lt;int64_t&gt;;</a>
+<a name="ln361">      break;</a>
+<a name="ln362"> </a>
+<a name="ln363">    case YB_YQL_DATA_TYPE_DECIMAL:</a>
+<a name="ln364">      translate_data_ = TranslateDecimal;</a>
+<a name="ln365">      break;</a>
+<a name="ln366"> </a>
+<a name="ln367">    case YB_YQL_DATA_TYPE_VARINT:</a>
+<a name="ln368">    case YB_YQL_DATA_TYPE_INET:</a>
+<a name="ln369">    case YB_YQL_DATA_TYPE_LIST:</a>
+<a name="ln370">    case YB_YQL_DATA_TYPE_MAP:</a>
+<a name="ln371">    case YB_YQL_DATA_TYPE_SET:</a>
+<a name="ln372">    case YB_YQL_DATA_TYPE_UUID:</a>
+<a name="ln373">    case YB_YQL_DATA_TYPE_TIMEUUID:</a>
+<a name="ln374">    case YB_YQL_DATA_TYPE_TUPLE:</a>
+<a name="ln375">    case YB_YQL_DATA_TYPE_TYPEARGS:</a>
+<a name="ln376">    case YB_YQL_DATA_TYPE_USER_DEFINED_TYPE:</a>
+<a name="ln377">    case YB_YQL_DATA_TYPE_FROZEN:</a>
+<a name="ln378">    case YB_YQL_DATA_TYPE_DATE: // Not used for PG storage</a>
+<a name="ln379">    case YB_YQL_DATA_TYPE_TIME: // Not used for PG storage</a>
+<a name="ln380">    case YB_YQL_DATA_TYPE_JSONB:</a>
+<a name="ln381">    case YB_YQL_DATA_TYPE_UINT8:</a>
+<a name="ln382">    case YB_YQL_DATA_TYPE_UINT16:</a>
+<a name="ln383">    default:</a>
+<a name="ln384">      LOG(DFATAL) &lt;&lt; &quot;Internal error: unsupported type &quot; &lt;&lt; type_entity_-&gt;yb_type;</a>
+<a name="ln385">  }</a>
+<a name="ln386">}</a>
+<a name="ln387"> </a>
+<a name="ln388">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln389"> </a>
+<a name="ln390">PgConstant::PgConstant(const YBCPgTypeEntity *type_entity, uint64_t datum, bool is_null,</a>
+<a name="ln391">    PgExpr::Opcode opcode)</a>
+<a name="ln392">    : PgExpr(opcode, type_entity) {</a>
+<a name="ln393"> </a>
+<a name="ln394">  switch (type_entity_-&gt;yb_type) {</a>
+<a name="ln395">    case YB_YQL_DATA_TYPE_INT8:</a>
+<a name="ln396">      if (!is_null) {</a>
+<a name="ln397">        int8_t value;</a>
+<a name="ln398">        type_entity_-&gt;datum_to_yb(datum, &amp;value, nullptr);</a>
+<a name="ln399">        ql_value_.set_int8_value(value);</a>
+<a name="ln400">      }</a>
+<a name="ln401">      break;</a>
+<a name="ln402"> </a>
+<a name="ln403">    case YB_YQL_DATA_TYPE_INT16:</a>
+<a name="ln404">      if (!is_null) {</a>
+<a name="ln405">        int16_t value;</a>
+<a name="ln406">        type_entity_-&gt;datum_to_yb(datum, &amp;value, nullptr);</a>
+<a name="ln407">        ql_value_.set_int16_value(value);</a>
+<a name="ln408">      }</a>
+<a name="ln409">      break;</a>
+<a name="ln410"> </a>
+<a name="ln411">    case YB_YQL_DATA_TYPE_INT32:</a>
+<a name="ln412">      if (!is_null) {</a>
+<a name="ln413">        int32_t value;</a>
+<a name="ln414">        type_entity_-&gt;datum_to_yb(datum, &amp;value, nullptr);</a>
+<a name="ln415">        ql_value_.set_int32_value(value);</a>
+<a name="ln416">      }</a>
+<a name="ln417">      break;</a>
+<a name="ln418"> </a>
+<a name="ln419">    case YB_YQL_DATA_TYPE_INT64:</a>
+<a name="ln420">      if (!is_null) {</a>
+<a name="ln421">        int64_t value;</a>
+<a name="ln422">        type_entity_-&gt;datum_to_yb(datum, &amp;value, nullptr);</a>
+<a name="ln423">        ql_value_.set_int64_value(value);</a>
+<a name="ln424">      }</a>
+<a name="ln425">      break;</a>
+<a name="ln426"> </a>
+<a name="ln427">    case YB_YQL_DATA_TYPE_UINT32:</a>
+<a name="ln428">      if (!is_null) {</a>
+<a name="ln429">        uint32_t value;</a>
+<a name="ln430">        type_entity_-&gt;datum_to_yb(datum, &amp;value, nullptr);</a>
+<a name="ln431">        ql_value_.set_uint32_value(value);</a>
+<a name="ln432">      }</a>
+<a name="ln433">      break;</a>
+<a name="ln434"> </a>
+<a name="ln435">    case YB_YQL_DATA_TYPE_UINT64:</a>
+<a name="ln436">      if (!is_null) {</a>
+<a name="ln437">        uint64_t value;</a>
+<a name="ln438">        type_entity_-&gt;datum_to_yb(datum, &amp;value, nullptr);</a>
+<a name="ln439">        ql_value_.set_uint64_value(value);</a>
+<a name="ln440">      }</a>
+<a name="ln441">      break;</a>
+<a name="ln442"> </a>
+<a name="ln443">    case YB_YQL_DATA_TYPE_STRING:</a>
+<a name="ln444">      if (!is_null) {</a>
+<a name="ln445">        char *value;</a>
+<a name="ln446">        int64_t bytes = type_entity_-&gt;datum_fixed_size;</a>
+<a name="ln447">        type_entity_-&gt;datum_to_yb(datum, &amp;value, &amp;bytes);</a>
+<a name="ln448">        ql_value_.set_string_value(value, bytes);</a>
+<a name="ln449">      }</a>
+<a name="ln450">      break;</a>
+<a name="ln451"> </a>
+<a name="ln452">    case YB_YQL_DATA_TYPE_BOOL:</a>
+<a name="ln453">      if (!is_null) {</a>
+<a name="ln454">        bool value;</a>
+<a name="ln455">        type_entity_-&gt;datum_to_yb(datum, &amp;value, nullptr);</a>
+<a name="ln456">        ql_value_.set_bool_value(value);</a>
+<a name="ln457">      }</a>
+<a name="ln458">      break;</a>
+<a name="ln459"> </a>
+<a name="ln460">    case YB_YQL_DATA_TYPE_FLOAT:</a>
+<a name="ln461">      if (!is_null) {</a>
+<a name="ln462">        float value;</a>
+<a name="ln463">        type_entity_-&gt;datum_to_yb(datum, &amp;value, nullptr);</a>
+<a name="ln464">        ql_value_.set_float_value(value);</a>
+<a name="ln465">      }</a>
+<a name="ln466">      break;</a>
+<a name="ln467"> </a>
+<a name="ln468">    case YB_YQL_DATA_TYPE_DOUBLE:</a>
+<a name="ln469">      if (!is_null) {</a>
+<a name="ln470">        double value;</a>
+<a name="ln471">        type_entity_-&gt;datum_to_yb(datum, &amp;value, nullptr);</a>
+<a name="ln472">        ql_value_.set_double_value(value);</a>
+<a name="ln473">      }</a>
+<a name="ln474">      break;</a>
+<a name="ln475"> </a>
+<a name="ln476">    case YB_YQL_DATA_TYPE_BINARY:</a>
+<a name="ln477">      if (!is_null) {</a>
+<a name="ln478">        uint8_t *value;</a>
+<a name="ln479">        int64_t bytes = type_entity_-&gt;datum_fixed_size;</a>
+<a name="ln480">        type_entity_-&gt;datum_to_yb(datum, &amp;value, &amp;bytes);</a>
+<a name="ln481">        ql_value_.set_binary_value(value, bytes);</a>
+<a name="ln482">      }</a>
+<a name="ln483">      break;</a>
+<a name="ln484"> </a>
+<a name="ln485">    case YB_YQL_DATA_TYPE_TIMESTAMP:</a>
+<a name="ln486">      if (!is_null) {</a>
+<a name="ln487">        int64_t value;</a>
+<a name="ln488">        type_entity_-&gt;datum_to_yb(datum, &amp;value, nullptr);</a>
+<a name="ln489">        ql_value_.set_int64_value(value);</a>
+<a name="ln490">      }</a>
+<a name="ln491">      break;</a>
+<a name="ln492"> </a>
+<a name="ln493">    case YB_YQL_DATA_TYPE_DECIMAL:</a>
+<a name="ln494">      if (!is_null) {</a>
+<a name="ln495">        char* plaintext;</a>
+<a name="ln496">        // Calls YBCDatumToDecimalText in ybctype.c</a>
+<a name="ln497">        type_entity_-&gt;datum_to_yb(datum, &amp;plaintext, nullptr);</a>
+<a name="ln498">        util::Decimal yb_decimal(plaintext);</a>
+<a name="ln499">        ql_value_.set_decimal_value(yb_decimal.EncodeToComparable());</a>
+<a name="ln500">      }</a>
+<a name="ln501">      break;</a>
+<a name="ln502"> </a>
+<a name="ln503">    case YB_YQL_DATA_TYPE_VARINT:</a>
+<a name="ln504">    case YB_YQL_DATA_TYPE_INET:</a>
+<a name="ln505">    case YB_YQL_DATA_TYPE_LIST:</a>
+<a name="ln506">    case YB_YQL_DATA_TYPE_MAP:</a>
+<a name="ln507">    case YB_YQL_DATA_TYPE_SET:</a>
+<a name="ln508">    case YB_YQL_DATA_TYPE_UUID:</a>
+<a name="ln509">    case YB_YQL_DATA_TYPE_TIMEUUID:</a>
+<a name="ln510">    case YB_YQL_DATA_TYPE_TUPLE:</a>
+<a name="ln511">    case YB_YQL_DATA_TYPE_TYPEARGS:</a>
+<a name="ln512">    case YB_YQL_DATA_TYPE_USER_DEFINED_TYPE:</a>
+<a name="ln513">    case YB_YQL_DATA_TYPE_FROZEN:</a>
+<a name="ln514">    case YB_YQL_DATA_TYPE_DATE: // Not used for PG storage</a>
+<a name="ln515">    case YB_YQL_DATA_TYPE_TIME: // Not used for PG storage</a>
+<a name="ln516">    case YB_YQL_DATA_TYPE_JSONB:</a>
+<a name="ln517">    case YB_YQL_DATA_TYPE_UINT8:</a>
+<a name="ln518">    case YB_YQL_DATA_TYPE_UINT16:</a>
+<a name="ln519">    default:</a>
+<a name="ln520">      LOG(DFATAL) &lt;&lt; &quot;Internal error: unsupported type &quot; &lt;&lt; type_entity_-&gt;yb_type;</a>
+<a name="ln521">  }</a>
+<a name="ln522"> </a>
+<a name="ln523">  InitializeTranslateData();</a>
+<a name="ln524">}</a>
+<a name="ln525"> </a>
+<a name="ln526">PgConstant::~PgConstant() {</a>
+<a name="ln527">}</a>
+<a name="ln528"> </a>
+<a name="ln529">void PgConstant::UpdateConstant(int8_t value, bool is_null) {</a>
+<a name="ln530">  if (is_null) {</a>
+<a name="ln531">    ql_value_.Clear();</a>
+<a name="ln532">  } else {</a>
+<a name="ln533">    ql_value_.set_int8_value(value);</a>
+<a name="ln534">  }</a>
+<a name="ln535">}</a>
+<a name="ln536"> </a>
+<a name="ln537">void PgConstant::UpdateConstant(int16_t value, bool is_null) {</a>
+<a name="ln538">  if (is_null) {</a>
+<a name="ln539">    ql_value_.Clear();</a>
+<a name="ln540">  } else {</a>
+<a name="ln541">    ql_value_.set_int16_value(value);</a>
+<a name="ln542">  }</a>
+<a name="ln543">}</a>
+<a name="ln544"> </a>
+<a name="ln545">void PgConstant::UpdateConstant(int32_t value, bool is_null) {</a>
+<a name="ln546">  if (is_null) {</a>
+<a name="ln547">    ql_value_.Clear();</a>
+<a name="ln548">  } else {</a>
+<a name="ln549">    ql_value_.set_int32_value(value);</a>
+<a name="ln550">  }</a>
+<a name="ln551">}</a>
+<a name="ln552"> </a>
+<a name="ln553">void PgConstant::UpdateConstant(int64_t value, bool is_null) {</a>
+<a name="ln554">  if (is_null) {</a>
+<a name="ln555">    ql_value_.Clear();</a>
+<a name="ln556">  } else {</a>
+<a name="ln557">    ql_value_.set_int64_value(value);</a>
+<a name="ln558">  }</a>
+<a name="ln559">}</a>
+<a name="ln560"> </a>
+<a name="ln561">void PgConstant::UpdateConstant(float value, bool is_null) {</a>
+<a name="ln562">  if (is_null) {</a>
+<a name="ln563">    ql_value_.Clear();</a>
+<a name="ln564">  } else {</a>
+<a name="ln565">    ql_value_.set_float_value(value);</a>
+<a name="ln566">  }</a>
+<a name="ln567">}</a>
+<a name="ln568"> </a>
+<a name="ln569">void PgConstant::UpdateConstant(double value, bool is_null) {</a>
+<a name="ln570">  if (is_null) {</a>
+<a name="ln571">    ql_value_.Clear();</a>
+<a name="ln572">  } else {</a>
+<a name="ln573">    ql_value_.set_double_value(value);</a>
+<a name="ln574">  }</a>
+<a name="ln575">}</a>
+<a name="ln576"> </a>
+<a name="ln577">void PgConstant::UpdateConstant(const char *value, bool is_null) {</a>
+<a name="ln578">  if (is_null) {</a>
+<a name="ln579">    ql_value_.Clear();</a>
+<a name="ln580">  } else {</a>
+<a name="ln581">    ql_value_.set_string_value(value);</a>
+<a name="ln582">  }</a>
+<a name="ln583">}</a>
+<a name="ln584"> </a>
+<a name="ln585">void PgConstant::UpdateConstant(const void *value, size_t bytes, bool is_null) {</a>
+<a name="ln586">  if (is_null) {</a>
+<a name="ln587">    ql_value_.Clear();</a>
+<a name="ln588">  } else {</a>
+<a name="ln589">    ql_value_.set_binary_value(value, bytes);</a>
+<a name="ln590">  }</a>
+<a name="ln591">}</a>
+<a name="ln592"> </a>
+<a name="ln593">Status PgConstant::Eval(PgDml *pg_stmt, PgsqlExpressionPB *expr_pb) {</a>
+<a name="ln594">  QLValuePB *result = expr_pb-&gt;mutable_value();</a>
+<a name="ln595">  *result = ql_value_;</a>
+<a name="ln596">  return Status::OK();</a>
+<a name="ln597">}</a>
+<a name="ln598"> </a>
+<a name="ln599">Status PgConstant::Eval(PgDml *pg_stmt, QLValuePB *result) {</a>
+<a name="ln600">  CHECK(pg_stmt != nullptr);</a>
+<a name="ln601">  return Eval(result);</a>
+<a name="ln602">}</a>
+<a name="ln603"> </a>
+<a name="ln604">Status PgConstant::Eval(QLValuePB *result) {</a>
+<a name="ln605">  CHECK(result != nullptr);</a>
+<a name="ln606">  *result = ql_value_;</a>
+<a name="ln607">  return Status::OK();</a>
+<a name="ln608">}</a>
+<a name="ln609"> </a>
+<a name="ln610">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln611"> </a>
+<a name="ln612">PgColumnRef::PgColumnRef(int attr_num,</a>
+<a name="ln613">                         const YBCPgTypeEntity *type_entity,</a>
+<a name="ln614">                         const PgTypeAttrs *type_attrs)</a>
+<a name="ln615">    : PgExpr(PgExpr::Opcode::PG_EXPR_COLREF, type_entity, type_attrs), attr_num_(attr_num) {</a>
+<a name="ln616"> </a>
+<a name="ln617">  if (attr_num_ &lt; 0) {</a>
+<a name="ln618">    // Setup system columns.</a>
+<a name="ln619">    switch (attr_num_) {</a>
+<a name="ln620">      case static_cast&lt;int&gt;(PgSystemAttrNum::kSelfItemPointer):</a>
+<a name="ln621">        translate_data_ = TranslateCtid;</a>
+<a name="ln622">        break;</a>
+<a name="ln623">      case static_cast&lt;int&gt;(PgSystemAttrNum::kObjectId):</a>
+<a name="ln624">        translate_data_ = TranslateOid;</a>
+<a name="ln625">        break;</a>
+<a name="ln626">      case static_cast&lt;int&gt;(PgSystemAttrNum::kMinTransactionId):</a>
+<a name="ln627">        translate_data_ = TranslateXmin;</a>
+<a name="ln628">        break;</a>
+<a name="ln629">      case static_cast&lt;int&gt;(PgSystemAttrNum::kMinCommandId):</a>
+<a name="ln630">        translate_data_ = TranslateCmin;</a>
+<a name="ln631">        break;</a>
+<a name="ln632">      case static_cast&lt;int&gt;(PgSystemAttrNum::kMaxTransactionId):</a>
+<a name="ln633">        translate_data_ = TranslateXmax;</a>
+<a name="ln634">        break;</a>
+<a name="ln635">      case static_cast&lt;int&gt;(PgSystemAttrNum::kMaxCommandId):</a>
+<a name="ln636">        translate_data_ = TranslateCmax;</a>
+<a name="ln637">        break;</a>
+<a name="ln638">      case static_cast&lt;int&gt;(PgSystemAttrNum::kTableOid):</a>
+<a name="ln639">        translate_data_ = TranslateTableoid;</a>
+<a name="ln640">        break;</a>
+<a name="ln641">      case static_cast&lt;int&gt;(PgSystemAttrNum::kYBTupleId):</a>
+<a name="ln642">        translate_data_ = TranslateYBCtid;</a>
+<a name="ln643">        break;</a>
+<a name="ln644">      case static_cast&lt;int&gt;(PgSystemAttrNum::kYBIdxBaseTupleId):</a>
+<a name="ln645">        translate_data_ = TranslateYBBasectid;</a>
+<a name="ln646">        break;</a>
+<a name="ln647">    }</a>
+<a name="ln648">  } else {</a>
+<a name="ln649">    // Setup regular columns.</a>
+<a name="ln650">    InitializeTranslateData();</a>
+<a name="ln651">  }</a>
+<a name="ln652">}</a>
+<a name="ln653"> </a>
+<a name="ln654">PgColumnRef::~PgColumnRef() {</a>
+<a name="ln655">}</a>
+<a name="ln656"> </a>
+<a name="ln657">bool PgColumnRef::is_ybbasetid() const {</a>
+<a name="ln658">  return attr_num_ == static_cast&lt;int&gt;(PgSystemAttrNum::kYBIdxBaseTupleId);</a>
+<a name="ln659">}</a>
+<a name="ln660"> </a>
+<a name="ln661">Status PgColumnRef::PrepareForRead(PgDml *pg_stmt, PgsqlExpressionPB *expr_pb) {</a>
+<a name="ln662">  const PgColumn *col;</a>
+<a name="ln663">  RETURN_NOT_OK(pg_stmt-&gt;PrepareColumnForRead(attr_num_, expr_pb, &amp;col));</a>
+<a name="ln664">  return Status::OK();</a>
+<a name="ln665">}</a>
+<a name="ln666"> </a>
+<a name="ln667">//--------------------------------------------------------------------------------------------------</a>
+<a name="ln668"> </a>
+<a name="ln669">PgOperator::PgOperator(const char *opname, const YBCPgTypeEntity *type_entity)</a>
+<a name="ln670">  : PgExpr(opname, type_entity), opname_(opname) {</a>
+<a name="ln671">  InitializeTranslateData();</a>
+<a name="ln672">}</a>
+<a name="ln673"> </a>
+<a name="ln674">PgOperator::~PgOperator() {</a>
+<a name="ln675">}</a>
+<a name="ln676"> </a>
+<a name="ln677">void PgOperator::AppendArg(PgExpr *arg) {</a>
+<a name="ln678">  args_.push_back(arg);</a>
+<a name="ln679">}</a>
+<a name="ln680"> </a>
+<a name="ln681">Status PgOperator::PrepareForRead(PgDml *pg_stmt, PgsqlExpressionPB *expr_pb) {</a>
+<a name="ln682">  PgsqlBCallPB *tscall = expr_pb-&gt;mutable_tscall();</a>
+<a name="ln683">  bfpg::TSOpcode tsopcode;</a>
+<a name="ln684">  if (opcode_ == Opcode::PG_EXPR_SUM) {</a>
+<a name="ln685">    // SUM is special case as it has input type of the operand column but output</a>
+<a name="ln686">    // type of a larger similar type (e.g. INT64 for integers).</a>
+<a name="ln687">    tsopcode = OperandTypeToSumTSOpcode(args_.front()-&gt;internal_type());</a>
+<a name="ln688">  } else {</a>
+<a name="ln689">    tsopcode = PGOpcodeToTSOpcode(opcode_);</a>
+<a name="ln690">  }</a>
+<a name="ln691">  tscall-&gt;set_opcode(static_cast&lt;int32_t&gt;(tsopcode));</a>
+<a name="ln692">  for (const auto&amp; arg : args_) {</a>
+<a name="ln693">    PgsqlExpressionPB *op = tscall-&gt;add_operands();</a>
+<a name="ln694">    RETURN_NOT_OK(arg-&gt;PrepareForRead(pg_stmt, op));</a>
+<a name="ln695">    RETURN_NOT_OK(arg-&gt;Eval(pg_stmt, op));</a>
+<a name="ln696">  }</a>
+<a name="ln697">  return Status::OK();</a>
+<a name="ln698">}</a>
+<a name="ln699"> </a>
+<a name="ln700">}  // namespace pggate</a>
+<a name="ln701">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="57"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="58"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="62"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="63"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="68"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="69"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="73"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="74"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="94"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="189"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="308"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="328"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1037/" target="_blank">V1037</a> Two or more case-branches perform the same actions. Check lines: 328, 360</p></div>
+<div class="balloon" rel="420"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1037/" target="_blank">V1037</a> Two or more case-branches perform the same actions. Check lines: 420, 486</p></div>
+<div class="balloon" rel="600"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="605"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="606"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v1004/" target="_blank">V1004</a> The 'result' pointer was used unsafely after it was verified against nullptr. Check lines: 605, 606.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

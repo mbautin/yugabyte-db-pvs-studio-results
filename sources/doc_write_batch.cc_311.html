@@ -1,0 +1,694 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>doc_write_batch.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) YugaByte, Inc.</a>
+<a name="ln2">//</a>
+<a name="ln3">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln4">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln5">//</a>
+<a name="ln6">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln7">//</a>
+<a name="ln8">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln9">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln10">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln11">// under the License.</a>
+<a name="ln12">//</a>
+<a name="ln13"> </a>
+<a name="ln14">#include &quot;yb/docdb/doc_write_batch.h&quot;</a>
+<a name="ln15"> </a>
+<a name="ln16">#include &quot;yb/docdb/doc_key.h&quot;</a>
+<a name="ln17">#include &quot;yb/rocksdb/db.h&quot;</a>
+<a name="ln18">#include &quot;yb/rocksdb/write_batch.h&quot;</a>
+<a name="ln19">#include &quot;yb/rocksutil/write_batch_formatter.h&quot;</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;yb/server/hybrid_clock.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/docdb/doc_ttl_util.h&quot;</a>
+<a name="ln24">#include &quot;yb/docdb/docdb-internal.h&quot;</a>
+<a name="ln25">#include &quot;yb/docdb/docdb.pb.h&quot;</a>
+<a name="ln26">#include &quot;yb/docdb/docdb_rocksdb_util.h&quot;</a>
+<a name="ln27">#include &quot;yb/docdb/value_type.h&quot;</a>
+<a name="ln28">#include &quot;yb/docdb/kv_debug.h&quot;</a>
+<a name="ln29">#include &quot;yb/util/bytes_formatter.h&quot;</a>
+<a name="ln30">#include &quot;yb/util/enums.h&quot;</a>
+<a name="ln31"> </a>
+<a name="ln32">using yb::BinaryOutputFormat;</a>
+<a name="ln33"> </a>
+<a name="ln34">using yb::server::HybridClock;</a>
+<a name="ln35"> </a>
+<a name="ln36">namespace yb {</a>
+<a name="ln37">namespace docdb {</a>
+<a name="ln38"> </a>
+<a name="ln39">DocWriteBatch::DocWriteBatch(const DocDB&amp; doc_db,</a>
+<a name="ln40">                             InitMarkerBehavior init_marker_behavior,</a>
+<a name="ln41">                             std::atomic&lt;int64_t&gt;* monotonic_counter)</a>
+<a name="ln42">    : doc_db_(doc_db),</a>
+<a name="ln43">      init_marker_behavior_(init_marker_behavior),</a>
+<a name="ln44">      monotonic_counter_(monotonic_counter) {}</a>
+<a name="ln45"> </a>
+<a name="ln46">Status DocWriteBatch::SeekToKeyPrefix(LazyIterator* iter, bool has_ancestor) {</a>
+<a name="ln47">  subdoc_exists_ = false;</a>
+<a name="ln48">  current_entry_.value_type = ValueType::kInvalid;</a>
+<a name="ln49"> </a>
+<a name="ln50">  // Check the cache first.</a>
+<a name="ln51">  boost::optional&lt;DocWriteBatchCache::Entry&gt; cached_entry =</a>
+<a name="ln52">    cache_.Get(key_prefix_);</a>
+<a name="ln53">  if (cached_entry) {</a>
+<a name="ln54">    current_entry_ = *cached_entry;</a>
+<a name="ln55">    subdoc_exists_ = current_entry_.value_type != ValueType::kTombstone;</a>
+<a name="ln56">    return Status::OK();</a>
+<a name="ln57">  }</a>
+<a name="ln58">  return SeekToKeyPrefix(iter-&gt;Iterator(), has_ancestor);</a>
+<a name="ln59">}</a>
+<a name="ln60"> </a>
+<a name="ln61">Status DocWriteBatch::SeekToKeyPrefix(IntentAwareIterator* doc_iter, bool has_ancestor) {</a>
+<a name="ln62">  const auto prev_subdoc_ht = current_entry_.doc_hybrid_time;</a>
+<a name="ln63">  const auto prev_key_prefix_exact = current_entry_.found_exact_key_prefix;</a>
+<a name="ln64"> </a>
+<a name="ln65">  // Seek the value.</a>
+<a name="ln66">  doc_iter-&gt;Seek(key_prefix_.AsSlice());</a>
+<a name="ln67">  if (!doc_iter-&gt;valid()) {</a>
+<a name="ln68">    return Status::OK();</a>
+<a name="ln69">  }</a>
+<a name="ln70"> </a>
+<a name="ln71">  auto key_data = VERIFY_RESULT(doc_iter-&gt;FetchKey());</a>
+<a name="ln72">  if (!key_prefix_.IsPrefixOf(key_data.key)) {</a>
+<a name="ln73">    return Status::OK();</a>
+<a name="ln74">  }</a>
+<a name="ln75"> </a>
+<a name="ln76">  // Checking for expiration.</a>
+<a name="ln77">  uint64_t merge_flags = 0;</a>
+<a name="ln78">  MonoDelta ttl;</a>
+<a name="ln79">  Slice recent_value = doc_iter-&gt;value();</a>
+<a name="ln80">  RETURN_NOT_OK(Value::DecodePrimitiveValueType(</a>
+<a name="ln81">      recent_value, &amp;(current_entry_.value_type),</a>
+<a name="ln82">      &amp;merge_flags, &amp;ttl, &amp;(current_entry_.user_timestamp)));</a>
+<a name="ln83"> </a>
+<a name="ln84">  bool has_expired;</a>
+<a name="ln85">  CHECK_OK(HasExpiredTTL(key_data.write_time.hybrid_time(), ttl,</a>
+<a name="ln86">                         doc_iter-&gt;read_time().read, &amp;has_expired));</a>
+<a name="ln87"> </a>
+<a name="ln88">  if (has_expired) {</a>
+<a name="ln89">    current_entry_.value_type = ValueType::kTombstone;</a>
+<a name="ln90">    current_entry_.doc_hybrid_time = key_data.write_time;</a>
+<a name="ln91">    cache_.Put(key_prefix_, current_entry_);</a>
+<a name="ln92">    return Status::OK();</a>
+<a name="ln93">  }</a>
+<a name="ln94"> </a>
+<a name="ln95">  Slice value;</a>
+<a name="ln96">  RETURN_NOT_OK(doc_iter-&gt;NextFullValue(&amp;key_data.write_time, &amp;value, &amp;key_data.key));</a>
+<a name="ln97"> </a>
+<a name="ln98">  if (!doc_iter-&gt;valid()) {</a>
+<a name="ln99">    return Status::OK();</a>
+<a name="ln100">  }</a>
+<a name="ln101"> </a>
+<a name="ln102">  // If the first key &gt;= key_prefix_ in RocksDB starts with key_prefix_, then a</a>
+<a name="ln103">  // document/subdocument pointed to by key_prefix_ exists, or has been recently deleted.</a>
+<a name="ln104">  if (key_prefix_.IsPrefixOf(key_data.key)) {</a>
+<a name="ln105">    // No need to decode again if no merge records were encountered.</a>
+<a name="ln106">    if (value != recent_value)</a>
+<a name="ln107">      RETURN_NOT_OK(Value::DecodePrimitiveValueType(value, &amp;(current_entry_.value_type),</a>
+<a name="ln108">          /* merge flags */ nullptr, /* ttl */ nullptr, &amp;(current_entry_.user_timestamp)));</a>
+<a name="ln109">    current_entry_.found_exact_key_prefix = key_prefix_ == key_data.key;</a>
+<a name="ln110">    current_entry_.doc_hybrid_time = key_data.write_time;</a>
+<a name="ln111"> </a>
+<a name="ln112">    // TODO: with optional init markers we can find something that is more than one level</a>
+<a name="ln113">    //       deep relative to the current prefix.</a>
+<a name="ln114">    // Note: this comment was originally placed right before the line decoding the HybridTime,</a>
+<a name="ln115">    // which has since been refactored away. Not sure what this means, so keeping it for now.</a>
+<a name="ln116"> </a>
+<a name="ln117">    // Cache the results of reading from RocksDB so that we don't have to read again in a later</a>
+<a name="ln118">    // operation in the same DocWriteBatch.</a>
+<a name="ln119">    DOCDB_DEBUG_LOG(&quot;Writing to DocWriteBatchCache: $0&quot;,</a>
+<a name="ln120">                    BestEffortDocDBKeyToStr(key_prefix_));</a>
+<a name="ln121"> </a>
+<a name="ln122">    if (has_ancestor &amp;&amp; prev_subdoc_ht &gt; current_entry_.doc_hybrid_time &amp;&amp;</a>
+<a name="ln123">        prev_key_prefix_exact) {</a>
+<a name="ln124">      // We already saw an object init marker or a tombstone one level higher with a higher</a>
+<a name="ln125">      // hybrid_time, so just ignore this key/value pair. This had to be added when we switched</a>
+<a name="ln126">      // from a format with intermediate hybrid_times to our current format without them.</a>
+<a name="ln127">      //</a>
+<a name="ln128">      // Example (from a real test case):</a>
+<a name="ln129">      //</a>
+<a name="ln130">      // SubDocKey(DocKey([], [&quot;a&quot;]), [HT(38)]) -&gt; {}</a>
+<a name="ln131">      // SubDocKey(DocKey([], [&quot;a&quot;]), [HT(37)]) -&gt; DEL</a>
+<a name="ln132">      // SubDocKey(DocKey([], [&quot;a&quot;]), [HT(36)]) -&gt; false</a>
+<a name="ln133">      // SubDocKey(DocKey([], [&quot;a&quot;]), [HT(1)]) -&gt; {}</a>
+<a name="ln134">      // SubDocKey(DocKey([], [&quot;a&quot;]), [&quot;y&quot;, HT(35)]) -&gt; &quot;lD\x97\xaf^m\x0a1\xa0\xfc\xc8YM&quot;</a>
+<a name="ln135">      //</a>
+<a name="ln136">      // Caveat (04/17/2017): the HybridTime encoding in the above example is outdated.</a>
+<a name="ln137">      //</a>
+<a name="ln138">      // In the above layout, if we try to set &quot;a.y.x&quot; to a new value, we first seek to the</a>
+<a name="ln139">      // document key &quot;a&quot; and find that it exists, but then we seek to &quot;a.y&quot; and find that it</a>
+<a name="ln140">      // also exists as a primitive value (assuming we don't check the hybrid_time), and</a>
+<a name="ln141">      // therefore we can't create &quot;a.y.x&quot;, which would be incorrect.</a>
+<a name="ln142">      subdoc_exists_ = false;</a>
+<a name="ln143">    } else {</a>
+<a name="ln144">      cache_.Put(key_prefix_, current_entry_);</a>
+<a name="ln145">      subdoc_exists_ = current_entry_.value_type != ValueType::kTombstone;</a>
+<a name="ln146">    }</a>
+<a name="ln147">  }</a>
+<a name="ln148">  return Status::OK();</a>
+<a name="ln149">}</a>
+<a name="ln150"> </a>
+<a name="ln151">Result&lt;bool&gt; DocWriteBatch::SetPrimitiveInternalHandleUserTimestamp(</a>
+<a name="ln152">    const Value &amp;value,</a>
+<a name="ln153">    LazyIterator* iter) {</a>
+<a name="ln154">  bool should_apply = true;</a>
+<a name="ln155">  if (value.user_timestamp() != Value::kInvalidUserTimestamp) {</a>
+<a name="ln156">    // Seek for the older version of the key that we're about to write to. This is essentially a</a>
+<a name="ln157">    // NOOP if we've already performed the seek due to the cache.</a>
+<a name="ln158">    RETURN_NOT_OK(SeekToKeyPrefix(iter));</a>
+<a name="ln159">    // We'd like to include tombstones in our timestamp comparisons as well.</a>
+<a name="ln160">    if ((subdoc_exists_ || current_entry_.value_type == ValueType::kTombstone) &amp;&amp;</a>
+<a name="ln161">        current_entry_.found_exact_key_prefix) {</a>
+<a name="ln162">      if (current_entry_.user_timestamp != Value::kInvalidUserTimestamp) {</a>
+<a name="ln163">        should_apply = value.user_timestamp() &gt;= current_entry_.user_timestamp;</a>
+<a name="ln164">      } else {</a>
+<a name="ln165">        // Look at the hybrid time instead.</a>
+<a name="ln166">        const DocHybridTime&amp; doc_hybrid_time = current_entry_.doc_hybrid_time;</a>
+<a name="ln167">        if (doc_hybrid_time.hybrid_time().is_valid()) {</a>
+<a name="ln168">          should_apply = value.user_timestamp() &gt;=</a>
+<a name="ln169">              doc_hybrid_time.hybrid_time().GetPhysicalValueMicros();</a>
+<a name="ln170">        }</a>
+<a name="ln171">      }</a>
+<a name="ln172">    }</a>
+<a name="ln173">  }</a>
+<a name="ln174">  return should_apply;</a>
+<a name="ln175">}</a>
+<a name="ln176"> </a>
+<a name="ln177">CHECKED_STATUS DocWriteBatch::SetPrimitiveInternal(</a>
+<a name="ln178">    const DocPath&amp; doc_path,</a>
+<a name="ln179">    const Value&amp; value,</a>
+<a name="ln180">    LazyIterator* iter,</a>
+<a name="ln181">    const bool is_deletion,</a>
+<a name="ln182">    const int num_subkeys) {</a>
+<a name="ln183">  // The write_id is always incremented by one for each new element of the write batch.</a>
+<a name="ln184">  if (put_batch_.size() &gt; numeric_limits&lt;IntraTxnWriteId&gt;::max()) {</a>
+<a name="ln185">    return STATUS_SUBSTITUTE(</a>
+<a name="ln186">        NotSupported,</a>
+<a name="ln187">        &quot;Trying to add more than $0 key/value pairs in the same single-shard txn.&quot;,</a>
+<a name="ln188">        numeric_limits&lt;IntraTxnWriteId&gt;::max());</a>
+<a name="ln189">  }</a>
+<a name="ln190"> </a>
+<a name="ln191">  if (value.has_user_timestamp() &amp;&amp; !optional_init_markers()) {</a>
+<a name="ln192">    return STATUS(IllegalState,</a>
+<a name="ln193">                  &quot;User Timestamp is only supported for Optional Init Markers&quot;);</a>
+<a name="ln194">  }</a>
+<a name="ln195"> </a>
+<a name="ln196">  // We need the write_id component of DocHybridTime to disambiguate between writes in the same</a>
+<a name="ln197">  // WriteBatch, as they will have the same HybridTime when committed. E.g. if we insert, delete,</a>
+<a name="ln198">  // and re-insert the same column in one WriteBatch, we need to know the order of these operations.</a>
+<a name="ln199">  const auto write_id = static_cast&lt;IntraTxnWriteId&gt;(put_batch_.size());</a>
+<a name="ln200">  const DocHybridTime hybrid_time = DocHybridTime(HybridTime::kMax, write_id);</a>
+<a name="ln201"> </a>
+<a name="ln202">  for (int subkey_index = 0; subkey_index &lt; num_subkeys; ++subkey_index) {</a>
+<a name="ln203">    const PrimitiveValue&amp; subkey = doc_path.subkey(subkey_index);</a>
+<a name="ln204"> </a>
+<a name="ln205">    // We don't need to check if intermediate documents already exist if init markers are optional,</a>
+<a name="ln206">    // or if we already know they exist (either from previous reads or our own writes in the same</a>
+<a name="ln207">    // single-shard operation.)</a>
+<a name="ln208"> </a>
+<a name="ln209">    if (optional_init_markers() || subdoc_exists_) {</a>
+<a name="ln210">      if (required_init_markers() &amp;&amp; !IsObjectType(current_entry_.value_type)) {</a>
+<a name="ln211">        // REDIS</a>
+<a name="ln212">        // ~~~~~</a>
+<a name="ln213">        // We raise this error only if init markers are mandatory.</a>
+<a name="ln214">        return STATUS_FORMAT(IllegalState,</a>
+<a name="ln215">                             &quot;Cannot set values inside a subdocument of type $0&quot;,</a>
+<a name="ln216">                             current_entry_.value_type);</a>
+<a name="ln217">      }</a>
+<a name="ln218">      if (optional_init_markers()) {</a>
+<a name="ln219">        // CASSANDRA</a>
+<a name="ln220">        // ~~~~~~~~~</a>
+<a name="ln221">        // In the case where init markers are optional, we don't need to check existence of</a>
+<a name="ln222">        // the current subdocument. Although if we have a user timestamp specified, we need to</a>
+<a name="ln223">        // check whether the provided user timestamp is higher than what is already present. If</a>
+<a name="ln224">        // an intermediate subdocument is found with a higher timestamp, we consider it as an</a>
+<a name="ln225">        // overwrite and skip the entire write.</a>
+<a name="ln226">        auto should_apply = SetPrimitiveInternalHandleUserTimestamp(value, iter);</a>
+<a name="ln227">        RETURN_NOT_OK(should_apply);</a>
+<a name="ln228">        if (!should_apply.get()) {</a>
+<a name="ln229">          return Status::OK();</a>
+<a name="ln230">        }</a>
+<a name="ln231">        subkey.AppendToKey(&amp;key_prefix_);</a>
+<a name="ln232">      } else if (subkey_index == num_subkeys - 1 &amp;&amp; !is_deletion) {</a>
+<a name="ln233">        // REDIS</a>
+<a name="ln234">        // ~~~~~</a>
+<a name="ln235">        // We don't need to perform a RocksDB read at the last level for upserts, we just overwrite</a>
+<a name="ln236">        // the value within the last subdocument with what we're trying to write. We still perform</a>
+<a name="ln237">        // the read for deletions, because we try to avoid writing a new tombstone if the data is</a>
+<a name="ln238">        // not there anyway.</a>
+<a name="ln239">        if (!subdoc_exists_) {</a>
+<a name="ln240">          return STATUS(IllegalState, &quot;Subdocument is supposed to exist.&quot;);</a>
+<a name="ln241">        }</a>
+<a name="ln242">        if (!IsObjectType(current_entry_.value_type)) {</a>
+<a name="ln243">          return STATUS(IllegalState, &quot;Expected object subdocument type.&quot;);</a>
+<a name="ln244">        }</a>
+<a name="ln245">        subkey.AppendToKey(&amp;key_prefix_);</a>
+<a name="ln246">      } else {</a>
+<a name="ln247">        // REDIS</a>
+<a name="ln248">        // ~~~~~</a>
+<a name="ln249">        // We need to check if the subdocument at this subkey exists.</a>
+<a name="ln250">        if (!subdoc_exists_) {</a>
+<a name="ln251">          return STATUS(IllegalState, &quot;Subdocument is supposed to exist. $0&quot;);</a>
+<a name="ln252">        }</a>
+<a name="ln253">        if (!IsObjectType(current_entry_.value_type)) {</a>
+<a name="ln254">          return STATUS(IllegalState, &quot;Expected object subdocument type. $0&quot;);</a>
+<a name="ln255">        }</a>
+<a name="ln256">        subkey.AppendToKey(&amp;key_prefix_);</a>
+<a name="ln257">        RETURN_NOT_OK(SeekToKeyPrefix(iter, true));</a>
+<a name="ln258">        if (is_deletion &amp;&amp; !subdoc_exists_) {</a>
+<a name="ln259">          // A parent subdocument of the value we're trying to delete, or that value itself, does</a>
+<a name="ln260">          // not exist, nothing to do.</a>
+<a name="ln261">          //</a>
+<a name="ln262">          // TODO: in Redis's HDEL command we need to count the number of fields deleted, so we need</a>
+<a name="ln263">          // to count the deletes that are actually happening.</a>
+<a name="ln264">          // See http://redis.io/commands/hdel</a>
+<a name="ln265">          DOCDB_DEBUG_LOG(&quot;Subdocument does not exist at subkey level $0 (subkey: $1)&quot;,</a>
+<a name="ln266">                          subkey_index, subkey.ToString());</a>
+<a name="ln267">          return Status::OK();</a>
+<a name="ln268">        }</a>
+<a name="ln269">      }</a>
+<a name="ln270">    } else {</a>
+<a name="ln271">      // REDIS</a>
+<a name="ln272">      // ~~~~~</a>
+<a name="ln273">      // The subdocument at the current level does not exist.</a>
+<a name="ln274">      if (is_deletion) {</a>
+<a name="ln275">        // A parent subdocument of the subdocument we're trying to delete does not exist, nothing</a>
+<a name="ln276">        // to do.</a>
+<a name="ln277">        return Status::OK();</a>
+<a name="ln278">      }</a>
+<a name="ln279"> </a>
+<a name="ln280">      DCHECK(!value.has_user_timestamp());</a>
+<a name="ln281"> </a>
+<a name="ln282">      // Add the parent key to key/value batch before appending the encoded HybridTime to it.</a>
+<a name="ln283">      // (We replicate key/value pairs without the HybridTime and only add it before writing to</a>
+<a name="ln284">      // RocksDB.)</a>
+<a name="ln285">      put_batch_.emplace_back(key_prefix_.ToStringBuffer(), string(1, ValueTypeAsChar::kObject));</a>
+<a name="ln286"> </a>
+<a name="ln287">      // Update our local cache to record the fact that we're adding this subdocument, so that</a>
+<a name="ln288">      // future operations in this DocWriteBatch don't have to add it or look for it in RocksDB.</a>
+<a name="ln289">      cache_.Put(key_prefix_, hybrid_time, ValueType::kObject);</a>
+<a name="ln290">      subkey.AppendToKey(&amp;key_prefix_);</a>
+<a name="ln291">    }</a>
+<a name="ln292">  }</a>
+<a name="ln293"> </a>
+<a name="ln294">  // We need to handle the user timestamp if present.</a>
+<a name="ln295">  auto should_apply = SetPrimitiveInternalHandleUserTimestamp(value, iter);</a>
+<a name="ln296">  RETURN_NOT_OK(should_apply);</a>
+<a name="ln297">  if (should_apply.get()) {</a>
+<a name="ln298">    // The key in the key/value batch does not have an encoded HybridTime.</a>
+<a name="ln299">    put_batch_.emplace_back(key_prefix_.ToStringBuffer(), value.Encode());</a>
+<a name="ln300"> </a>
+<a name="ln301">    // The key we use in the DocWriteBatchCache does not have a final hybrid_time, because that's</a>
+<a name="ln302">    // the key we expect to look up.</a>
+<a name="ln303">    cache_.Put(key_prefix_, hybrid_time, value.primitive_value().value_type(),</a>
+<a name="ln304">               value.user_timestamp());</a>
+<a name="ln305">  }</a>
+<a name="ln306"> </a>
+<a name="ln307">  return Status::OK();</a>
+<a name="ln308">}</a>
+<a name="ln309"> </a>
+<a name="ln310">Status DocWriteBatch::SetPrimitive(</a>
+<a name="ln311">    const DocPath&amp; doc_path,</a>
+<a name="ln312">    const Value&amp; value,</a>
+<a name="ln313">    LazyIterator* iter) {</a>
+<a name="ln314">  DOCDB_DEBUG_LOG(&quot;Called SetPrimitive with doc_path=$0, value=$1&quot;,</a>
+<a name="ln315">                  doc_path.ToString(), value.ToString());</a>
+<a name="ln316">  current_entry_.doc_hybrid_time = DocHybridTime::kMin;</a>
+<a name="ln317">  const int num_subkeys = doc_path.num_subkeys();</a>
+<a name="ln318">  const bool is_deletion = value.primitive_value().value_type() == ValueType::kTombstone;</a>
+<a name="ln319"> </a>
+<a name="ln320">  key_prefix_ = doc_path.encoded_doc_key();</a>
+<a name="ln321"> </a>
+<a name="ln322">  // If we are overwriting an entire document with a primitive value (not deleting it), we don't</a>
+<a name="ln323">  // need to perform any reads from RocksDB at all.</a>
+<a name="ln324">  //</a>
+<a name="ln325">  // Even if we are deleting a document, but we don't need to get any feedback on whether the</a>
+<a name="ln326">  // deletion was performed or the document was not there to begin with, we could also skip the</a>
+<a name="ln327">  // read as an optimization.</a>
+<a name="ln328">  if (num_subkeys &gt; 0 || is_deletion) {</a>
+<a name="ln329">    if (required_init_markers()) {</a>
+<a name="ln330">      // Navigate to the root of the document. We don't yet know whether the document exists or when</a>
+<a name="ln331">      // it was last updated.</a>
+<a name="ln332">      RETURN_NOT_OK(SeekToKeyPrefix(iter, false));</a>
+<a name="ln333">      DOCDB_DEBUG_LOG(&quot;Top-level document exists: $0&quot;, subdoc_exists_);</a>
+<a name="ln334">      if (!subdoc_exists_ &amp;&amp; is_deletion) {</a>
+<a name="ln335">        DOCDB_DEBUG_LOG(&quot;We're performing a deletion, and the document is not present. &quot;</a>
+<a name="ln336">                        &quot;Nothing to do.&quot;);</a>
+<a name="ln337">        return Status::OK();</a>
+<a name="ln338">      }</a>
+<a name="ln339">    }</a>
+<a name="ln340">  }</a>
+<a name="ln341">  return SetPrimitiveInternal(doc_path, value, iter, is_deletion, num_subkeys);</a>
+<a name="ln342">}</a>
+<a name="ln343"> </a>
+<a name="ln344">Status DocWriteBatch::SetPrimitive(const DocPath&amp; doc_path,</a>
+<a name="ln345">                                   const Value&amp; value,</a>
+<a name="ln346">                                   const ReadHybridTime&amp; read_ht,</a>
+<a name="ln347">                                   CoarseTimePoint deadline,</a>
+<a name="ln348">                                   rocksdb::QueryId query_id) {</a>
+<a name="ln349">  DOCDB_DEBUG_LOG(&quot;Called with doc_path=$0, value=$1&quot;,</a>
+<a name="ln350">                  doc_path.ToString(), value.ToString());</a>
+<a name="ln351"> </a>
+<a name="ln352">  std::function&lt;std::unique_ptr&lt;IntentAwareIterator&gt;()&gt; createrator =</a>
+<a name="ln353">    [doc_path, query_id, deadline, read_ht, this]() {</a>
+<a name="ln354">      return yb::docdb::CreateIntentAwareIterator(</a>
+<a name="ln355">          doc_db_,</a>
+<a name="ln356">          BloomFilterMode::USE_BLOOM_FILTER,</a>
+<a name="ln357">          doc_path.encoded_doc_key().AsSlice(),</a>
+<a name="ln358">          query_id,</a>
+<a name="ln359">          /*txn_op_context*/ boost::none,</a>
+<a name="ln360">          deadline,</a>
+<a name="ln361">          read_ht);</a>
+<a name="ln362">    };</a>
+<a name="ln363"> </a>
+<a name="ln364">  LazyIterator iter(&amp;createrator);</a>
+<a name="ln365"> </a>
+<a name="ln366">  return SetPrimitive(doc_path, value, &amp;iter);</a>
+<a name="ln367">}</a>
+<a name="ln368"> </a>
+<a name="ln369">Status DocWriteBatch::ExtendSubDocument(</a>
+<a name="ln370">    const DocPath&amp; doc_path,</a>
+<a name="ln371">    const SubDocument&amp; value,</a>
+<a name="ln372">    const ReadHybridTime&amp; read_ht,</a>
+<a name="ln373">    const CoarseTimePoint deadline,</a>
+<a name="ln374">    rocksdb::QueryId query_id,</a>
+<a name="ln375">    MonoDelta ttl,</a>
+<a name="ln376">    UserTimeMicros user_timestamp) {</a>
+<a name="ln377">  if (IsObjectType(value.value_type())) {</a>
+<a name="ln378">    const auto&amp; map = value.object_container();</a>
+<a name="ln379">    for (const auto&amp; ent : map) {</a>
+<a name="ln380">      DocPath child_doc_path = doc_path;</a>
+<a name="ln381">      if (ent.first.value_type() != ValueType::kArray)</a>
+<a name="ln382">          child_doc_path.AddSubKey(ent.first);</a>
+<a name="ln383">      RETURN_NOT_OK(ExtendSubDocument(child_doc_path, ent.second,</a>
+<a name="ln384">                                      read_ht, deadline, query_id, ttl, user_timestamp));</a>
+<a name="ln385">    }</a>
+<a name="ln386">  } else if (value.value_type() == ValueType::kArray) {</a>
+<a name="ln387">    RETURN_NOT_OK(ExtendList(</a>
+<a name="ln388">        doc_path, value, read_ht, deadline, query_id, ttl, user_timestamp));</a>
+<a name="ln389">  } else {</a>
+<a name="ln390">    if (!value.IsTombstoneOrPrimitive()) {</a>
+<a name="ln391">      return STATUS_FORMAT(</a>
+<a name="ln392">          InvalidArgument,</a>
+<a name="ln393">          &quot;Found unexpected value type $0. Expecting a PrimitiveType or a Tombstone&quot;,</a>
+<a name="ln394">          value.value_type());</a>
+<a name="ln395">    }</a>
+<a name="ln396">    RETURN_NOT_OK(SetPrimitive(doc_path, Value(value, ttl, user_timestamp),</a>
+<a name="ln397">                               read_ht, deadline, query_id));</a>
+<a name="ln398">  }</a>
+<a name="ln399">  return Status::OK();</a>
+<a name="ln400">}</a>
+<a name="ln401"> </a>
+<a name="ln402">Status DocWriteBatch::InsertSubDocument(</a>
+<a name="ln403">    const DocPath&amp; doc_path,</a>
+<a name="ln404">    const SubDocument&amp; value,</a>
+<a name="ln405">    const ReadHybridTime&amp; read_ht,</a>
+<a name="ln406">    const CoarseTimePoint deadline,</a>
+<a name="ln407">    rocksdb::QueryId query_id,</a>
+<a name="ln408">    MonoDelta ttl,</a>
+<a name="ln409">    UserTimeMicros user_timestamp,</a>
+<a name="ln410">    bool init_marker_ttl) {</a>
+<a name="ln411">  if (!value.IsTombstoneOrPrimitive()) {</a>
+<a name="ln412">    auto key_ttl = init_marker_ttl ? ttl : Value::kMaxTtl;</a>
+<a name="ln413">    RETURN_NOT_OK(SetPrimitive(</a>
+<a name="ln414">        doc_path, Value(PrimitiveValue(value.value_type()), key_ttl, user_timestamp),</a>
+<a name="ln415">        read_ht, deadline, query_id));</a>
+<a name="ln416">  }</a>
+<a name="ln417">  return ExtendSubDocument(doc_path, value, read_ht, deadline, query_id, ttl, user_timestamp);</a>
+<a name="ln418">}</a>
+<a name="ln419"> </a>
+<a name="ln420">Status DocWriteBatch::ExtendList(</a>
+<a name="ln421">    const DocPath&amp; doc_path,</a>
+<a name="ln422">    const SubDocument&amp; value,</a>
+<a name="ln423">    const ReadHybridTime&amp; read_ht,</a>
+<a name="ln424">    const CoarseTimePoint deadline,</a>
+<a name="ln425">    rocksdb::QueryId query_id,</a>
+<a name="ln426">    MonoDelta ttl,</a>
+<a name="ln427">    UserTimeMicros user_timestamp) {</a>
+<a name="ln428">  if (monotonic_counter_ == nullptr) {</a>
+<a name="ln429">    return STATUS(IllegalState, &quot;List cannot be extended if monotonic_counter_ is uninitialized&quot;);</a>
+<a name="ln430">  }</a>
+<a name="ln431">  if (value.value_type() != ValueType::kArray) {</a>
+<a name="ln432">    return STATUS_FORMAT(</a>
+<a name="ln433">        InvalidArgument,</a>
+<a name="ln434">        &quot;Expecting Subdocument of type kArray, found $0&quot;,</a>
+<a name="ln435">        value.value_type());</a>
+<a name="ln436">  }</a>
+<a name="ln437">  const std::vector&lt;SubDocument&gt;&amp; list = value.array_container();</a>
+<a name="ln438">  // It is assumed that there is an exclusive lock on the list key.</a>
+<a name="ln439">  // The lock ensures that there isn't another thread picking ArrayIndexes for the same list.</a>
+<a name="ln440">  // No additional lock is required.</a>
+<a name="ln441">  int64_t index =</a>
+<a name="ln442">      std::atomic_fetch_add(monotonic_counter_, static_cast&lt;int64_t&gt;(list.size()));</a>
+<a name="ln443">  // PREPEND - adding in reverse order with negated index</a>
+<a name="ln444">  if (value.GetExtendOrder() == ListExtendOrder::PREPEND_BLOCK) {</a>
+<a name="ln445">    for (size_t i = list.size(); i &gt; 0; i--) {</a>
+<a name="ln446">      DocPath child_doc_path = doc_path;</a>
+<a name="ln447">      index++;</a>
+<a name="ln448">      child_doc_path.AddSubKey(PrimitiveValue::ArrayIndex(-index));</a>
+<a name="ln449">      RETURN_NOT_OK(ExtendSubDocument(child_doc_path, list[i - 1],</a>
+<a name="ln450">                                      read_ht, deadline, query_id, ttl, user_timestamp));</a>
+<a name="ln451">    }</a>
+<a name="ln452">  } else {</a>
+<a name="ln453">    for (size_t i = 0; i &lt; list.size(); i++) {</a>
+<a name="ln454">      DocPath child_doc_path = doc_path;</a>
+<a name="ln455">      index++;</a>
+<a name="ln456">      child_doc_path.AddSubKey(PrimitiveValue::ArrayIndex(</a>
+<a name="ln457">          value.GetExtendOrder() == ListExtendOrder::APPEND ? index : -index));</a>
+<a name="ln458">      RETURN_NOT_OK(ExtendSubDocument(child_doc_path, list[i],</a>
+<a name="ln459">                                      read_ht, deadline, query_id, ttl, user_timestamp));</a>
+<a name="ln460">    }</a>
+<a name="ln461">  }</a>
+<a name="ln462">  return Status::OK();</a>
+<a name="ln463">}</a>
+<a name="ln464"> </a>
+<a name="ln465">Status DocWriteBatch::ReplaceInList(</a>
+<a name="ln466">    const DocPath &amp;doc_path,</a>
+<a name="ln467">    const std::vector&lt;int&gt;&amp; indices,</a>
+<a name="ln468">    const std::vector&lt;SubDocument&gt;&amp; values,</a>
+<a name="ln469">    const ReadHybridTime&amp; read_ht,</a>
+<a name="ln470">    const CoarseTimePoint deadline,</a>
+<a name="ln471">    const rocksdb::QueryId query_id,</a>
+<a name="ln472">    const Direction dir,</a>
+<a name="ln473">    const int64_t start_index,</a>
+<a name="ln474">    std::vector&lt;string&gt;* results,</a>
+<a name="ln475">    MonoDelta default_ttl,</a>
+<a name="ln476">    MonoDelta write_ttl,</a>
+<a name="ln477">    bool is_cql) {</a>
+<a name="ln478">  SubDocKey sub_doc_key;</a>
+<a name="ln479">  RETURN_NOT_OK(sub_doc_key.FromDocPath(doc_path));</a>
+<a name="ln480">  key_prefix_ = sub_doc_key.Encode();</a>
+<a name="ln481"> </a>
+<a name="ln482">  auto iter = yb::docdb::CreateIntentAwareIterator(</a>
+<a name="ln483">      doc_db_,</a>
+<a name="ln484">      BloomFilterMode::USE_BLOOM_FILTER,</a>
+<a name="ln485">      key_prefix_.AsSlice(),</a>
+<a name="ln486">      query_id,</a>
+<a name="ln487">      /*txn_op_context*/ boost::none,</a>
+<a name="ln488">      deadline,</a>
+<a name="ln489">      read_ht);</a>
+<a name="ln490"> </a>
+<a name="ln491">  Slice value_slice;</a>
+<a name="ln492">  SubDocKey found_key;</a>
+<a name="ln493">  int current_index = start_index;</a>
+<a name="ln494">  int replace_index = 0;</a>
+<a name="ln495"> </a>
+<a name="ln496">  if (dir == Direction::kForward) {</a>
+<a name="ln497">    // Ensure we seek directly to indices and skip init marker if it exists.</a>
+<a name="ln498">    key_prefix_.AppendValueType(ValueType::kArrayIndex);</a>
+<a name="ln499">    RETURN_NOT_OK(SeekToKeyPrefix(iter.get(), false));</a>
+<a name="ln500">  } else {</a>
+<a name="ln501">    // We would like to seek past the entire list and go backwards.</a>
+<a name="ln502">    key_prefix_.AppendValueType(ValueType::kMaxByte);</a>
+<a name="ln503">    iter-&gt;PrevSubDocKey(key_prefix_);</a>
+<a name="ln504">    key_prefix_.RemoveValueTypeSuffix(ValueType::kMaxByte);</a>
+<a name="ln505">    key_prefix_.AppendValueType(ValueType::kArrayIndex);</a>
+<a name="ln506">  }</a>
+<a name="ln507"> </a>
+<a name="ln508">  FetchKeyResult key_data;</a>
+<a name="ln509">  while (true) {</a>
+<a name="ln510">    if (indices[replace_index] &lt;= 0 || !iter-&gt;valid() ||</a>
+<a name="ln511">        !(key_data = VERIFY_RESULT(iter-&gt;FetchKey())).key.starts_with(key_prefix_)) {</a>
+<a name="ln512">      return is_cql ?</a>
+<a name="ln513">        STATUS_SUBSTITUTE(</a>
+<a name="ln514">          QLError,</a>
+<a name="ln515">          &quot;Unable to replace items into list, expecting index $0, reached end of list with size $1&quot;,</a>
+<a name="ln516">          indices[replace_index] - 1, // YQL layer list index starts from 0, not 1 as in DocDB.</a>
+<a name="ln517">          current_index) :</a>
+<a name="ln518">        STATUS_SUBSTITUTE(Corruption,</a>
+<a name="ln519">          &quot;Index Error: $0, reached beginning of list with size $1&quot;,</a>
+<a name="ln520">          indices[replace_index] - 1, // YQL layer list index starts from 0, not 1 as in DocDB.</a>
+<a name="ln521">          current_index);</a>
+<a name="ln522">    }</a>
+<a name="ln523"> </a>
+<a name="ln524">    RETURN_NOT_OK(found_key.FullyDecodeFrom(key_data.key, HybridTimeRequired::kFalse));</a>
+<a name="ln525"> </a>
+<a name="ln526">    MonoDelta entry_ttl;</a>
+<a name="ln527">    ValueType value_type;</a>
+<a name="ln528">    value_slice = iter-&gt;value();</a>
+<a name="ln529">    RETURN_NOT_OK(Value::DecodePrimitiveValueType(value_slice, &amp;value_type, nullptr, &amp;entry_ttl));</a>
+<a name="ln530"> </a>
+<a name="ln531">    bool has_expired = value_type == ValueType::kTombstone;</a>
+<a name="ln532">    // Redis lists do not have element-level TTL.</a>
+<a name="ln533">    if (!has_expired &amp;&amp; is_cql) {</a>
+<a name="ln534">      entry_ttl = ComputeTTL(entry_ttl, default_ttl);</a>
+<a name="ln535">      RETURN_NOT_OK(HasExpiredTTL(</a>
+<a name="ln536">          key_data.write_time.hybrid_time(), entry_ttl, read_ht.read, &amp;has_expired));</a>
+<a name="ln537">    }</a>
+<a name="ln538"> </a>
+<a name="ln539">    if (has_expired) {</a>
+<a name="ln540">      found_key.KeepPrefix(sub_doc_key.num_subkeys()+1);</a>
+<a name="ln541">      if (dir == Direction::kForward) {</a>
+<a name="ln542">        iter-&gt;SeekPastSubKey(key_data.key);</a>
+<a name="ln543">      } else {</a>
+<a name="ln544">        iter-&gt;PrevSubDocKey(KeyBytes(key_data.key));</a>
+<a name="ln545">      }</a>
+<a name="ln546">      continue;</a>
+<a name="ln547">    }</a>
+<a name="ln548"> </a>
+<a name="ln549">    // TODO (rahul): it may be cleaner to put this in the read path.</a>
+<a name="ln550">    // The code below is meant specifically for POP functionality in Redis lists.</a>
+<a name="ln551">    if (results) {</a>
+<a name="ln552">      Value v;</a>
+<a name="ln553">      RETURN_NOT_OK(v.Decode(iter-&gt;value()));</a>
+<a name="ln554">      results-&gt;push_back(v.primitive_value().GetString());</a>
+<a name="ln555">    }</a>
+<a name="ln556"> </a>
+<a name="ln557">    if (dir == Direction::kForward)</a>
+<a name="ln558">      current_index++;</a>
+<a name="ln559">    else</a>
+<a name="ln560">      current_index--;</a>
+<a name="ln561"> </a>
+<a name="ln562">    // Should we verify that the subkeys are indeed numbers as list indices should be?</a>
+<a name="ln563">    // Or just go in order for the index'th largest key in any subdocument?</a>
+<a name="ln564">    if (current_index == indices[replace_index]) {</a>
+<a name="ln565">      // When inserting, key_prefix_ is modified.</a>
+<a name="ln566">      KeyBytes array_index_prefix(key_prefix_);</a>
+<a name="ln567">      DocPath child_doc_path = doc_path;</a>
+<a name="ln568">      child_doc_path.AddSubKey(found_key.subkeys()[sub_doc_key.num_subkeys()]);</a>
+<a name="ln569">      RETURN_NOT_OK(InsertSubDocument(child_doc_path, values[replace_index],</a>
+<a name="ln570">                                      read_ht, deadline, query_id, write_ttl));</a>
+<a name="ln571">      replace_index++;</a>
+<a name="ln572">      if (replace_index == indices.size()) {</a>
+<a name="ln573">        return Status::OK();</a>
+<a name="ln574">      }</a>
+<a name="ln575">      key_prefix_ = array_index_prefix;</a>
+<a name="ln576">    }</a>
+<a name="ln577"> </a>
+<a name="ln578">    if (dir == Direction::kForward) {</a>
+<a name="ln579">      iter-&gt;SeekPastSubKey(key_data.key);</a>
+<a name="ln580">    } else {</a>
+<a name="ln581">      iter-&gt;PrevSubDocKey(KeyBytes(key_data.key));</a>
+<a name="ln582">    }</a>
+<a name="ln583">  }</a>
+<a name="ln584">}</a>
+<a name="ln585"> </a>
+<a name="ln586">void DocWriteBatch::Clear() {</a>
+<a name="ln587">  put_batch_.clear();</a>
+<a name="ln588">  cache_.Clear();</a>
+<a name="ln589">}</a>
+<a name="ln590"> </a>
+<a name="ln591">void DocWriteBatch::MoveToWriteBatchPB(KeyValueWriteBatchPB *kv_pb) {</a>
+<a name="ln592">  kv_pb-&gt;mutable_write_pairs()-&gt;Reserve(put_batch_.size());</a>
+<a name="ln593">  for (auto&amp; entry : put_batch_) {</a>
+<a name="ln594">    KeyValuePairPB* kv_pair = kv_pb-&gt;add_write_pairs();</a>
+<a name="ln595">    kv_pair-&gt;mutable_key()-&gt;swap(entry.first);</a>
+<a name="ln596">    kv_pair-&gt;mutable_value()-&gt;swap(entry.second);</a>
+<a name="ln597">  }</a>
+<a name="ln598">}</a>
+<a name="ln599"> </a>
+<a name="ln600">void DocWriteBatch::TEST_CopyToWriteBatchPB(KeyValueWriteBatchPB *kv_pb) const {</a>
+<a name="ln601">  kv_pb-&gt;mutable_write_pairs()-&gt;Reserve(put_batch_.size());</a>
+<a name="ln602">  for (auto&amp; entry : put_batch_) {</a>
+<a name="ln603">    KeyValuePairPB* kv_pair = kv_pb-&gt;add_write_pairs();</a>
+<a name="ln604">    kv_pair-&gt;mutable_key()-&gt;assign(entry.first);</a>
+<a name="ln605">    kv_pair-&gt;mutable_value()-&gt;assign(entry.second);</a>
+<a name="ln606">  }</a>
+<a name="ln607">}</a>
+<a name="ln608"> </a>
+<a name="ln609">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln610">// Converting a RocksDB write batch to a string.</a>
+<a name="ln611">// ------------------------------------------------------------------------------------------------</a>
+<a name="ln612"> </a>
+<a name="ln613">class DocWriteBatchFormatter : public WriteBatchFormatter {</a>
+<a name="ln614"> public:</a>
+<a name="ln615">  DocWriteBatchFormatter(</a>
+<a name="ln616">      StorageDbType storage_db_type,</a>
+<a name="ln617">      BinaryOutputFormat binary_output_format)</a>
+<a name="ln618">      : WriteBatchFormatter(binary_output_format),</a>
+<a name="ln619">        storage_db_type_(storage_db_type) {}</a>
+<a name="ln620"> protected:</a>
+<a name="ln621">  std::string FormatKey(const Slice&amp; key) override {</a>
+<a name="ln622">    const auto key_result = DocDBKeyToDebugStr(key, storage_db_type_);</a>
+<a name="ln623">    if (key_result.ok()) {</a>
+<a name="ln624">      return *key_result;</a>
+<a name="ln625">    }</a>
+<a name="ln626">    return Format(</a>
+<a name="ln627">        &quot;$0 (error: $1)&quot;,</a>
+<a name="ln628">        WriteBatchFormatter::FormatKey(key),</a>
+<a name="ln629">        key_result.status());</a>
+<a name="ln630">  }</a>
+<a name="ln631"> </a>
+<a name="ln632"> private:</a>
+<a name="ln633">  StorageDbType storage_db_type_;</a>
+<a name="ln634">};</a>
+<a name="ln635"> </a>
+<a name="ln636">Result&lt;std::string&gt; WriteBatchToString(</a>
+<a name="ln637">    const rocksdb::WriteBatch&amp; write_batch,</a>
+<a name="ln638">    StorageDbType storage_db_type,</a>
+<a name="ln639">    BinaryOutputFormat binary_output_format) {</a>
+<a name="ln640">  DocWriteBatchFormatter formatter(storage_db_type, binary_output_format);</a>
+<a name="ln641">  RETURN_NOT_OK(write_batch.Iterate(&amp;formatter));</a>
+<a name="ln642">  return formatter.str();</a>
+<a name="ln643">}</a>
+<a name="ln644"> </a>
+<a name="ln645">}  // namespace docdb</a>
+<a name="ln646">}  // namespace yb</a>
+
+</code></pre>
+<div class="balloon" rel="85"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="280"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="39"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: current_entry_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,681 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>mem_tracker.h</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Licensed to the Apache Software Foundation (ASF) under one</a>
+<a name="ln2">// or more contributor license agreements.  See the NOTICE file</a>
+<a name="ln3">// distributed with this work for additional information</a>
+<a name="ln4">// regarding copyright ownership.  The ASF licenses this file</a>
+<a name="ln5">// to you under the Apache License, Version 2.0 (the</a>
+<a name="ln6">// &quot;License&quot;); you may not use this file except in compliance</a>
+<a name="ln7">// with the License.  You may obtain a copy of the License at</a>
+<a name="ln8">//</a>
+<a name="ln9">//   http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln10">//</a>
+<a name="ln11">// Unless required by applicable law or agreed to in writing,</a>
+<a name="ln12">// software distributed under the License is distributed on an</a>
+<a name="ln13">// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY</a>
+<a name="ln14">// KIND, either express or implied.  See the License for the</a>
+<a name="ln15">// specific language governing permissions and limitations</a>
+<a name="ln16">// under the License.</a>
+<a name="ln17">//</a>
+<a name="ln18">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln19">//</a>
+<a name="ln20">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln21">//</a>
+<a name="ln22">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln23">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln24">//</a>
+<a name="ln25">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln26">//</a>
+<a name="ln27">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln28">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln29">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln30">// under the License.</a>
+<a name="ln31">//</a>
+<a name="ln32">#ifndef YB_UTIL_MEM_TRACKER_H</a>
+<a name="ln33">#define YB_UTIL_MEM_TRACKER_H</a>
+<a name="ln34"> </a>
+<a name="ln35">#include &lt;stdint.h&gt;</a>
+<a name="ln36"> </a>
+<a name="ln37">#include &lt;functional&gt;</a>
+<a name="ln38">#include &lt;memory&gt;</a>
+<a name="ln39">#include &lt;string&gt;</a>
+<a name="ln40">#include &lt;vector&gt;</a>
+<a name="ln41">#include &lt;unordered_map&gt;</a>
+<a name="ln42"> </a>
+<a name="ln43">#ifdef TCMALLOC_ENABLED</a>
+<a name="ln44">#include &lt;gperftools/malloc_extension.h&gt;</a>
+<a name="ln45">#endif</a>
+<a name="ln46"> </a>
+<a name="ln47">#include &lt;boost/optional.hpp&gt;</a>
+<a name="ln48"> </a>
+<a name="ln49">#include &quot;yb/gutil/ref_counted.h&quot;</a>
+<a name="ln50">#include &quot;yb/util/high_water_mark.h&quot;</a>
+<a name="ln51">#include &quot;yb/util/locks.h&quot;</a>
+<a name="ln52">#include &quot;yb/util/mutex.h&quot;</a>
+<a name="ln53">#include &quot;yb/util/random.h&quot;</a>
+<a name="ln54">#include &quot;yb/util/strongly_typed_bool.h&quot;</a>
+<a name="ln55"> </a>
+<a name="ln56">namespace yb {</a>
+<a name="ln57"> </a>
+<a name="ln58">class Status;</a>
+<a name="ln59">class MemTracker;</a>
+<a name="ln60">typedef std::shared_ptr&lt;MemTracker&gt; MemTrackerPtr;</a>
+<a name="ln61"> </a>
+<a name="ln62">// Garbage collector is used by MemTracker to free memory allocated by caches when reached</a>
+<a name="ln63">// soft memory limit.</a>
+<a name="ln64">class GarbageCollector {</a>
+<a name="ln65"> public:</a>
+<a name="ln66">  virtual void CollectGarbage(size_t required) = 0;</a>
+<a name="ln67"> </a>
+<a name="ln68"> protected:</a>
+<a name="ln69">  ~GarbageCollector() {}</a>
+<a name="ln70">};</a>
+<a name="ln71"> </a>
+<a name="ln72">YB_STRONGLY_TYPED_BOOL(MayExist);</a>
+<a name="ln73">YB_STRONGLY_TYPED_BOOL(AddToParent);</a>
+<a name="ln74">YB_STRONGLY_TYPED_BOOL(CreateMetrics);</a>
+<a name="ln75">YB_STRONGLY_TYPED_BOOL(OnlyChildren);</a>
+<a name="ln76"> </a>
+<a name="ln77">typedef std::function&lt;int64_t()&gt; ConsumptionFunctor;</a>
+<a name="ln78">typedef std::function&lt;void()&gt; PollChildrenConsumptionFunctors;</a>
+<a name="ln79"> </a>
+<a name="ln80">struct SoftLimitExceededResult {</a>
+<a name="ln81">  bool exceeded;</a>
+<a name="ln82">  double current_capacity_pct;</a>
+<a name="ln83">};</a>
+<a name="ln84"> </a>
+<a name="ln85">// A MemTracker tracks memory consumption; it contains an optional limit and is</a>
+<a name="ln86">// arranged into a tree structure such that the consumption tracked by a</a>
+<a name="ln87">// MemTracker is also tracked by its ancestors.</a>
+<a name="ln88">//</a>
+<a name="ln89">// The MemTracker hierarchy is rooted in a single static MemTracker whose limi</a>
+<a name="ln90">// is set via gflag. The root MemTracker always exists, and it is the common</a>
+<a name="ln91">// ancestor to all MemTrackers. All operations that discover MemTrackers begin</a>
+<a name="ln92">// at the root and work their way down the tree, while operations that deal</a>
+<a name="ln93">// with adjusting memory consumption begin at a particular MemTracker and work</a>
+<a name="ln94">// their way up the tree to the root. The tree structure is strictly enforced:</a>
+<a name="ln95">// all MemTrackers (except the root) must have a parent, and all children</a>
+<a name="ln96">// belonging to a parent must have unique ids.</a>
+<a name="ln97">//</a>
+<a name="ln98">// When a MemTracker begins its life, it has a strong reference to its parent</a>
+<a name="ln99">// and the parent has a weak reference to it. The strong reference remains for</a>
+<a name="ln100">// the lifetime of the MemTracker, but the weak reference can be dropped via</a>
+<a name="ln101">// UnregisterFromParent(). A MemTracker in this state may continue servicing</a>
+<a name="ln102">// memory consumption operations while allowing a new MemTracker with the same</a>
+<a name="ln103">// id to be created on the old parent.</a>
+<a name="ln104">//</a>
+<a name="ln105">// By default, memory consumption is tracked via calls to Consume()/Release(), either to</a>
+<a name="ln106">// the tracker itself or to one of its descendents. Alternatively, a consumption function</a>
+<a name="ln107">// can be specified, and then the function's value is used as the consumption rather than the</a>
+<a name="ln108">// tally maintained by Consume() and Release(). A tcmalloc function is used to track process</a>
+<a name="ln109">// memory consumption, since the process memory usage may be higher than the computed</a>
+<a name="ln110">// total memory (tcmalloc does not release deallocated memory immediately).</a>
+<a name="ln111">//</a>
+<a name="ln112">// GcFunctions can be attached to a MemTracker in order to free up memory if the limit is</a>
+<a name="ln113">// reached. If LimitExceeded() is called and the limit is exceeded, it will first call the</a>
+<a name="ln114">// GcFunctions to try to free memory and recheck the limit. For example, the process</a>
+<a name="ln115">// tracker has a GcFunction that releases any unused memory still held by tcmalloc, so</a>
+<a name="ln116">// this will be called before the process limit is reported as exceeded. GcFunctions are</a>
+<a name="ln117">// called in the order they are added, so expensive functions should be added last.</a>
+<a name="ln118">//</a>
+<a name="ln119">// This class is thread-safe.</a>
+<a name="ln120">//</a>
+<a name="ln121">// NOTE: this class has been partially ported over from Impala with</a>
+<a name="ln122">// several changes, and as a result the style differs somewhat from</a>
+<a name="ln123">// the YB style.</a>
+<a name="ln124">//</a>
+<a name="ln125">// Changes from Impala:</a>
+<a name="ln126">// 1) Id a string vs. a TUniqueId</a>
+<a name="ln127">// 2) There is no concept of query trackers vs. pool trackers -- trackers are instead</a>
+<a name="ln128">//    associated with objects. Parent hierarchy is preserved, with the assumption that,</a>
+<a name="ln129">//    e.g., a tablet server's memtracker will have as its children the tablets' memtrackers,</a>
+<a name="ln130">//    which in turn will have memtrackers for their caches, logs, and so forth.</a>
+<a name="ln131">//</a>
+<a name="ln132">// TODO: this classes uses a lot of statics fields and methods, which</a>
+<a name="ln133">// isn't common in YB. It is probably wise to later move the</a>
+<a name="ln134">// 'registry' of trackers to a separate class, but it's better to</a>
+<a name="ln135">// start using the 'class' *first* and then change this functionality,</a>
+<a name="ln136">// depending on how MemTracker ends up being used in YB.</a>
+<a name="ln137">class MemTracker : public std::enable_shared_from_this&lt;MemTracker&gt; {</a>
+<a name="ln138"> public:</a>
+<a name="ln139">  // byte_limit &lt; 0 means no limit</a>
+<a name="ln140">  // 'id' is the label for LogUsage() and web UI.</a>
+<a name="ln141">  //</a>
+<a name="ln142">  // add_to_parent could be set to false in cases when we want to track memory usage of</a>
+<a name="ln143">  // some subsystem, but don't want this subsystem to take effect on parent mem tracker.</a>
+<a name="ln144">  MemTracker(int64_t byte_limit, const std::string&amp; id,</a>
+<a name="ln145">             ConsumptionFunctor consumption_functor,</a>
+<a name="ln146">             std::shared_ptr&lt;MemTracker&gt; parent,</a>
+<a name="ln147">             AddToParent add_to_parent, CreateMetrics create_metrics);</a>
+<a name="ln148"> </a>
+<a name="ln149">  ~MemTracker();</a>
+<a name="ln150"> </a>
+<a name="ln151">  #ifdef TCMALLOC_ENABLED</a>
+<a name="ln152">  static int64_t GetTCMallocProperty(const char* prop) {</a>
+<a name="ln153">    size_t value;</a>
+<a name="ln154">    if (!MallocExtension::instance()-&gt;GetNumericProperty(prop, &amp;value)) {</a>
+<a name="ln155">      LOG(DFATAL) &lt;&lt; &quot;Failed to get tcmalloc property &quot; &lt;&lt; prop;</a>
+<a name="ln156">      value = 0;</a>
+<a name="ln157">    }</a>
+<a name="ln158">    return value;</a>
+<a name="ln159">  }</a>
+<a name="ln160"> </a>
+<a name="ln161">  static int64_t GetTCMallocCurrentAllocatedBytes() {</a>
+<a name="ln162">    return GetTCMallocProperty(&quot;generic.current_allocated_bytes&quot;);</a>
+<a name="ln163">  }</a>
+<a name="ln164"> </a>
+<a name="ln165">  static int64_t GetTCMallocCurrentHeapSizeBytes() {</a>
+<a name="ln166">    return GetTCMallocProperty(&quot;generic.heap_size&quot;);</a>
+<a name="ln167">  }</a>
+<a name="ln168"> </a>
+<a name="ln169">  static int64_t GetTCMallocActualHeapSizeBytes() {</a>
+<a name="ln170">    return GetTCMallocCurrentHeapSizeBytes() -</a>
+<a name="ln171">           GetTCMallocProperty(&quot;tcmalloc.pageheap_unmapped_bytes&quot;);</a>
+<a name="ln172">  }</a>
+<a name="ln173">  #endif</a>
+<a name="ln174"> </a>
+<a name="ln175">  // Removes this tracker from its parent's children. This tracker retains its</a>
+<a name="ln176">  // link to its parent. Must be called on a tracker with a parent.</a>
+<a name="ln177">  //</a>
+<a name="ln178">  // Automatically called in the MemTracker destructor, but should be called</a>
+<a name="ln179">  // explicitly when an object is destroyed if that object is also the &quot;primary</a>
+<a name="ln180">  // owner&quot; of a tracker (i.e. the object that originally created the tracker).</a>
+<a name="ln181">  // This orphans the tracker so that if the object is recreated, its new</a>
+<a name="ln182">  // tracker won't collide with the now orphaned tracker.</a>
+<a name="ln183">  //</a>
+<a name="ln184">  // Is thread-safe on the parent but not the child. Meaning, multiple trackers</a>
+<a name="ln185">  // that share the same parent can all UnregisterFromParent() at the same</a>
+<a name="ln186">  // time, but all UnregisterFromParent() calls on a given tracker must be</a>
+<a name="ln187">  // externally synchronized.</a>
+<a name="ln188">  void UnregisterFromParent();</a>
+<a name="ln189"> </a>
+<a name="ln190">  void UnregisterChild(const std::string&amp; id);</a>
+<a name="ln191"> </a>
+<a name="ln192">  // Creates and adds the tracker to the tree so that it can be retrieved with</a>
+<a name="ln193">  // FindTracker/FindOrCreateTracker.</a>
+<a name="ln194">  //</a>
+<a name="ln195">  // byte_limit &lt; 0 means no limit; 'id' is a used as a label for LogUsage()</a>
+<a name="ln196">  // and web UI and must be unique for the given parent. Use the two-argument</a>
+<a name="ln197">  // form if there is no parent.</a>
+<a name="ln198">  static std::shared_ptr&lt;MemTracker&gt; CreateTracker(</a>
+<a name="ln199">      int64_t byte_limit,</a>
+<a name="ln200">      const std::string&amp; id,</a>
+<a name="ln201">      const std::shared_ptr&lt;MemTracker&gt;&amp; parent = std::shared_ptr&lt;MemTracker&gt;(),</a>
+<a name="ln202">      AddToParent add_to_parent = AddToParent::kTrue,</a>
+<a name="ln203">      CreateMetrics create_metrics = CreateMetrics::kTrue) {</a>
+<a name="ln204">    return CreateTracker(</a>
+<a name="ln205">        byte_limit, id, ConsumptionFunctor(), parent, add_to_parent, create_metrics);</a>
+<a name="ln206">  }</a>
+<a name="ln207"> </a>
+<a name="ln208">  static std::shared_ptr&lt;MemTracker&gt; CreateTracker(</a>
+<a name="ln209">      const std::string&amp; id,</a>
+<a name="ln210">      const std::shared_ptr&lt;MemTracker&gt;&amp; parent = std::shared_ptr&lt;MemTracker&gt;(),</a>
+<a name="ln211">      AddToParent add_to_parent = AddToParent::kTrue,</a>
+<a name="ln212">      CreateMetrics create_metrics = CreateMetrics::kTrue) {</a>
+<a name="ln213">    return CreateTracker(-1 /* byte_limit */, id, parent, add_to_parent, create_metrics);</a>
+<a name="ln214">  }</a>
+<a name="ln215"> </a>
+<a name="ln216">  static std::shared_ptr&lt;MemTracker&gt; CreateTracker(</a>
+<a name="ln217">      int64_t byte_limit,</a>
+<a name="ln218">      const std::string&amp; id,</a>
+<a name="ln219">      ConsumptionFunctor consumption_functor,</a>
+<a name="ln220">      const std::shared_ptr&lt;MemTracker&gt;&amp; parent = std::shared_ptr&lt;MemTracker&gt;(),</a>
+<a name="ln221">      AddToParent add_to_parent = AddToParent::kTrue,</a>
+<a name="ln222">      CreateMetrics create_metrics = CreateMetrics::kTrue);</a>
+<a name="ln223"> </a>
+<a name="ln224">  // If a tracker with the specified 'id' and 'parent' exists in the tree, sets</a>
+<a name="ln225">  // 'tracker' to reference that instance. Use the two-argument form if there</a>
+<a name="ln226">  // is no parent. Returns false if no such tracker exists.</a>
+<a name="ln227">  static MemTrackerPtr FindTracker(</a>
+<a name="ln228">      const std::string&amp; id,</a>
+<a name="ln229">      const MemTrackerPtr&amp; parent = MemTrackerPtr());</a>
+<a name="ln230"> </a>
+<a name="ln231">  MemTrackerPtr FindChild(const std::string&amp; id);</a>
+<a name="ln232"> </a>
+<a name="ln233">  // If a tracker with the specified 'id' and 'parent' exists in the tree,</a>
+<a name="ln234">  // returns a shared_ptr to that instance. Otherwise, creates a new</a>
+<a name="ln235">  // MemTracker with the specified byte_limit, id, and parent. Use the two</a>
+<a name="ln236">  // argument form if there is no parent.</a>
+<a name="ln237">  static std::shared_ptr&lt;MemTracker&gt; FindOrCreateTracker(</a>
+<a name="ln238">      int64_t byte_limit,</a>
+<a name="ln239">      const std::string&amp; id,</a>
+<a name="ln240">      const std::shared_ptr&lt;MemTracker&gt;&amp; parent = std::shared_ptr&lt;MemTracker&gt;(),</a>
+<a name="ln241">      AddToParent add_to_parent = AddToParent::kTrue,</a>
+<a name="ln242">      CreateMetrics create_metrics = CreateMetrics::kTrue);</a>
+<a name="ln243"> </a>
+<a name="ln244">  static std::shared_ptr&lt;MemTracker&gt; FindOrCreateTracker(</a>
+<a name="ln245">      const std::string&amp; id,</a>
+<a name="ln246">      const std::shared_ptr&lt;MemTracker&gt;&amp; parent = std::shared_ptr&lt;MemTracker&gt;(),</a>
+<a name="ln247">      AddToParent add_to_parent = AddToParent::kTrue,</a>
+<a name="ln248">      CreateMetrics create_metrics = CreateMetrics::kTrue) {</a>
+<a name="ln249">    return FindOrCreateTracker(-1 /* byte_limit */, id, parent, add_to_parent, create_metrics);</a>
+<a name="ln250">  }</a>
+<a name="ln251"> </a>
+<a name="ln252">  void ListDescendantTrackers(</a>
+<a name="ln253">      std::vector&lt;MemTrackerPtr&gt;* trackers, OnlyChildren only_children = OnlyChildren::kFalse);</a>
+<a name="ln254"> </a>
+<a name="ln255">  // Returns a list of all children of this tracker.</a>
+<a name="ln256">  std::vector&lt;MemTrackerPtr&gt; ListChildren();</a>
+<a name="ln257"> </a>
+<a name="ln258">  // Returns a list of all the valid trackers.</a>
+<a name="ln259">  static std::vector&lt;MemTrackerPtr&gt; ListTrackers();</a>
+<a name="ln260"> </a>
+<a name="ln261">  // Gets a shared_ptr to the &quot;root&quot; tracker, creating it if necessary.</a>
+<a name="ln262">  static MemTrackerPtr GetRootTracker();</a>
+<a name="ln263"> </a>
+<a name="ln264">  // Tries to update consumption from external source.</a>
+<a name="ln265">  // Returns true if consumption was updated, false otherwise.</a>
+<a name="ln266">  //</a>
+<a name="ln267">  // Currently it uses totally allocated bytes by tcmalloc for root mem tracker when available.</a>
+<a name="ln268">  bool UpdateConsumption(bool force = false);</a>
+<a name="ln269"> </a>
+<a name="ln270">  // Increases consumption of this tracker and its ancestors by 'bytes'.</a>
+<a name="ln271">  void Consume(int64_t bytes);</a>
+<a name="ln272"> </a>
+<a name="ln273">  // Try to expand the limit (by asking the resource broker for more memory) by at least</a>
+<a name="ln274">  // 'bytes'. Returns false if not possible, true if the request succeeded. May allocate</a>
+<a name="ln275">  // more memory than was requested.</a>
+<a name="ln276">  // TODO: always returns false for now, not yet implemented.</a>
+<a name="ln277">  bool ExpandLimit(int64_t /* unused: bytes */) { return false; }</a>
+<a name="ln278"> </a>
+<a name="ln279">  // Increases consumption of this tracker and its ancestors by 'bytes' only if</a>
+<a name="ln280">  // they can all consume 'bytes'. If this brings any of them over, none of them</a>
+<a name="ln281">  // are updated.</a>
+<a name="ln282">  // Returns true if the try succeeded.</a>
+<a name="ln283">  // In case of failure mem tracker that prevented consumption will be stored to</a>
+<a name="ln284">  // blocking_mem_tracker.</a>
+<a name="ln285">  bool TryConsume(int64_t bytes, MemTracker** blocking_mem_tracker = nullptr);</a>
+<a name="ln286"> </a>
+<a name="ln287">  // Decreases consumption of this tracker and its ancestors by 'bytes'.</a>
+<a name="ln288">  void Release(int64_t bytes);</a>
+<a name="ln289"> </a>
+<a name="ln290">  // Returns true if a valid limit of this tracker or one of its ancestors is</a>
+<a name="ln291">  // exceeded.</a>
+<a name="ln292">  bool AnyLimitExceeded();</a>
+<a name="ln293"> </a>
+<a name="ln294">  // If this tracker has a limit, checks the limit and attempts to free up some memory if</a>
+<a name="ln295">  // the limit is exceeded by calling any added GC functions. Returns true if the limit is</a>
+<a name="ln296">  // exceeded after calling the GC functions. Returns false if there is no limit.</a>
+<a name="ln297">  bool LimitExceeded();</a>
+<a name="ln298"> </a>
+<a name="ln299">  // Like LimitExceeded() but may also return true if the soft memory limit is exceeded.</a>
+<a name="ln300">  // The greater the excess, the higher the chance that it returns true.</a>
+<a name="ln301">  // If score is not 0, then it is used to determine positive result.</a>
+<a name="ln302">  SoftLimitExceededResult SoftLimitExceeded(double* score);</a>
+<a name="ln303"> </a>
+<a name="ln304">  SoftLimitExceededResult SoftLimitExceeded(double score) {</a>
+<a name="ln305">    return SoftLimitExceeded(&amp;score);</a>
+<a name="ln306">  }</a>
+<a name="ln307"> </a>
+<a name="ln308">  // Combines the semantics of AnyLimitExceeded() and SoftLimitExceeded().</a>
+<a name="ln309">  //</a>
+<a name="ln310">  // Note: if there's more than one soft limit defined, the probability of it being</a>
+<a name="ln311">  // exceeded in at least one tracker is much higher (as each soft limit check is an</a>
+<a name="ln312">  // independent event).</a>
+<a name="ln313">  SoftLimitExceededResult AnySoftLimitExceeded(double* score);</a>
+<a name="ln314"> </a>
+<a name="ln315">  SoftLimitExceededResult AnySoftLimitExceeded(double score) {</a>
+<a name="ln316">    return AnySoftLimitExceeded(&amp;score);</a>
+<a name="ln317">  }</a>
+<a name="ln318"> </a>
+<a name="ln319">  // Returns the maximum consumption that can be made without exceeding the limit on</a>
+<a name="ln320">  // this tracker or any of its parents. Returns int64_t::max() if there are no</a>
+<a name="ln321">  // limits and a negative value if any limit is already exceeded.</a>
+<a name="ln322">  int64_t SpareCapacity() const;</a>
+<a name="ln323"> </a>
+<a name="ln324"> </a>
+<a name="ln325">  int64_t limit() const { return limit_; }</a>
+<a name="ln326">  bool has_limit() const { return limit_ &gt;= 0; }</a>
+<a name="ln327">  const std::string&amp; id() const { return id_; }</a>
+<a name="ln328"> </a>
+<a name="ln329">  // Returns the memory consumed in bytes.</a>
+<a name="ln330">  int64_t consumption() const {</a>
+<a name="ln331">    return consumption_.current_value();</a>
+<a name="ln332">  }</a>
+<a name="ln333"> </a>
+<a name="ln334">  int64_t GetUpdatedConsumption(bool force = false) {</a>
+<a name="ln335">    UpdateConsumption(force);</a>
+<a name="ln336">    return consumption();</a>
+<a name="ln337">  }</a>
+<a name="ln338"> </a>
+<a name="ln339">  // Note that if consumption_ is based on consumption_func_, this</a>
+<a name="ln340">  // will be the max value we've recorded in consumption(), not</a>
+<a name="ln341">  // necessarily the highest value consumption_func_ has ever</a>
+<a name="ln342">  // reached.</a>
+<a name="ln343">  int64_t peak_consumption() const { return consumption_.max_value(); }</a>
+<a name="ln344"> </a>
+<a name="ln345">  // Retrieve the parent tracker, or NULL If one is not set.</a>
+<a name="ln346">  std::shared_ptr&lt;MemTracker&gt; parent() const { return parent_; }</a>
+<a name="ln347"> </a>
+<a name="ln348">  // Add a function 'f' to be called if the limit is reached.</a>
+<a name="ln349">  // 'f' does not need to be thread-safe as long as it is added to only one MemTracker.</a>
+<a name="ln350">  // Note that 'f' must be valid for the lifetime of this MemTracker.</a>
+<a name="ln351">  void AddGarbageCollector(const std::shared_ptr&lt;GarbageCollector&gt;&amp; gc) {</a>
+<a name="ln352">    std::lock_guard&lt;simple_spinlock&gt; lock(gc_mutex_);</a>
+<a name="ln353">    gcs_.push_back(gc);</a>
+<a name="ln354">  }</a>
+<a name="ln355"> </a>
+<a name="ln356">  // Logs the usage of this tracker and all of its children (recursively).</a>
+<a name="ln357">  std::string LogUsage(</a>
+<a name="ln358">      const std::string&amp; prefix = &quot;&quot;, size_t usage_threshold = 0, int indent = 0) const;</a>
+<a name="ln359"> </a>
+<a name="ln360">  void EnableLogging(bool enable, bool log_stack) {</a>
+<a name="ln361">    enable_logging_ = enable;</a>
+<a name="ln362">    log_stack_ = log_stack;</a>
+<a name="ln363">  }</a>
+<a name="ln364"> </a>
+<a name="ln365">  // Returns a textual representation of the tracker that is guaranteed to be</a>
+<a name="ln366">  // globally unique.</a>
+<a name="ln367">  std::string ToString() const;</a>
+<a name="ln368"> </a>
+<a name="ln369">  void SetMetricEntity(const scoped_refptr&lt;MetricEntity&gt;&amp; metric_entity,</a>
+<a name="ln370">                       const std::string&amp; name_suffix = std::string());</a>
+<a name="ln371">  scoped_refptr&lt;MetricEntity&gt; metric_entity() const;</a>
+<a name="ln372"> </a>
+<a name="ln373">  bool add_to_parent() const {</a>
+<a name="ln374">    return add_to_parent_;</a>
+<a name="ln375">  }</a>
+<a name="ln376"> </a>
+<a name="ln377">  void SetPollChildrenConsumptionFunctors(</a>
+<a name="ln378">      PollChildrenConsumptionFunctors poll_children_consumption_functors) {</a>
+<a name="ln379">    poll_children_consumption_functors_ = std::move(poll_children_consumption_functors);</a>
+<a name="ln380">  }</a>
+<a name="ln381"> </a>
+<a name="ln382"> private:</a>
+<a name="ln383">  bool CheckLimitExceeded() const {</a>
+<a name="ln384">    return limit_ &gt;= 0 &amp;&amp; limit_ &lt; consumption();</a>
+<a name="ln385">  }</a>
+<a name="ln386"> </a>
+<a name="ln387">  // If consumption is higher than max_consumption, attempts to free memory by calling any</a>
+<a name="ln388">  // added GC functions.  Returns true if max_consumption is still exceeded. Takes</a>
+<a name="ln389">  // gc_lock. Updates metrics if initialized.</a>
+<a name="ln390">  bool GcMemory(int64_t max_consumption);</a>
+<a name="ln391"> </a>
+<a name="ln392">  // Called when the total release memory is larger than GC_RELEASE_SIZE.</a>
+<a name="ln393">  // TcMalloc holds onto released memory and very slowly (if ever) releases it back to</a>
+<a name="ln394">  // the OS. This is problematic since it is memory we are not constantly tracking which</a>
+<a name="ln395">  // can cause us to go way over mem limits.</a>
+<a name="ln396">  void GcTcmalloc();</a>
+<a name="ln397"> </a>
+<a name="ln398">  // Logs the stack of the current consume/release. Used for debugging only.</a>
+<a name="ln399">  void LogUpdate(bool is_consume, int64_t bytes) const;</a>
+<a name="ln400"> </a>
+<a name="ln401">  // Variant of CreateTracker() that:</a>
+<a name="ln402">  // 1. Must be called with a non-NULL parent, and</a>
+<a name="ln403">  // 2. Must be called with parent-&gt;child_trackers_lock_ held.</a>
+<a name="ln404">  std::shared_ptr&lt;MemTracker&gt; CreateChild(</a>
+<a name="ln405">      int64_t byte_limit,</a>
+<a name="ln406">      const std::string&amp; id,</a>
+<a name="ln407">      ConsumptionFunctor consumption_functor,</a>
+<a name="ln408">      MayExist may_exist,</a>
+<a name="ln409">      AddToParent add_to_parent,</a>
+<a name="ln410">      CreateMetrics create_metrics);</a>
+<a name="ln411"> </a>
+<a name="ln412">  // Variant of FindTracker() that:</a>
+<a name="ln413">  // 1. Must be called with a non-NULL parent, and</a>
+<a name="ln414">  // 2. Must be called with parent-&gt;child_trackers_lock_ held.</a>
+<a name="ln415">  MemTrackerPtr FindChildUnlocked(const std::string&amp; id);</a>
+<a name="ln416"> </a>
+<a name="ln417">  // Creates the root tracker.</a>
+<a name="ln418">  static void CreateRootTracker();</a>
+<a name="ln419"> </a>
+<a name="ln420">  // Size, in bytes, that is considered a large value for Release() (or Consume() with</a>
+<a name="ln421">  // a negative value). If tcmalloc is used, this can trigger it to GC.</a>
+<a name="ln422">  // A higher value will make us call into tcmalloc less often (and therefore more</a>
+<a name="ln423">  // efficient). A lower value will mean our memory overhead is lower.</a>
+<a name="ln424">  // TODO: this is a stopgap.</a>
+<a name="ln425">  static const int64_t GC_RELEASE_SIZE = 128 * 1024L * 1024L;</a>
+<a name="ln426"> </a>
+<a name="ln427">  const int64_t limit_;</a>
+<a name="ln428">  const int64_t soft_limit_;</a>
+<a name="ln429">  const std::string id_;</a>
+<a name="ln430">  const ConsumptionFunctor consumption_functor_;</a>
+<a name="ln431">  PollChildrenConsumptionFunctors poll_children_consumption_functors_;</a>
+<a name="ln432">  const std::string descr_;</a>
+<a name="ln433">  std::shared_ptr&lt;MemTracker&gt; parent_;</a>
+<a name="ln434">  CoarseMonoClock::time_point last_consumption_update_ = CoarseMonoClock::time_point::min();</a>
+<a name="ln435"> </a>
+<a name="ln436">  class TrackerMetrics;</a>
+<a name="ln437">  std::unique_ptr&lt;TrackerMetrics&gt; metrics_;</a>
+<a name="ln438"> </a>
+<a name="ln439">  HighWaterMark consumption_{0};</a>
+<a name="ln440"> </a>
+<a name="ln441">  // this tracker plus all of its ancestors</a>
+<a name="ln442">  std::vector&lt;MemTracker*&gt; all_trackers_;</a>
+<a name="ln443">  // all_trackers_ with valid limits</a>
+<a name="ln444">  std::vector&lt;MemTracker*&gt; limit_trackers_;</a>
+<a name="ln445"> </a>
+<a name="ln446">  // All the child trackers of this tracker. Used for error reporting and</a>
+<a name="ln447">  // listing only (i.e. updating the consumption of a parent tracker does not</a>
+<a name="ln448">  // update that of its children).</a>
+<a name="ln449">  // Note: This lock must never be taken on a parent before on a child.</a>
+<a name="ln450">  // It is taken in the opposite order during UnregisterFromParentIfNoChildren()</a>
+<a name="ln451">  mutable std::mutex child_trackers_mutex_;</a>
+<a name="ln452">  std::unordered_map&lt;std::string, std::weak_ptr&lt;MemTracker&gt;&gt; child_trackers_;</a>
+<a name="ln453"> </a>
+<a name="ln454">  simple_spinlock gc_mutex_;</a>
+<a name="ln455"> </a>
+<a name="ln456">  // Functions to call after the limit is reached to free memory.</a>
+<a name="ln457">  std::vector&lt;std::weak_ptr&lt;GarbageCollector&gt;&gt; gcs_;</a>
+<a name="ln458"> </a>
+<a name="ln459">  ThreadSafeRandom rand_;</a>
+<a name="ln460"> </a>
+<a name="ln461">  // If true, logs to INFO every consume/release called. Used for debugging.</a>
+<a name="ln462">  bool enable_logging_;</a>
+<a name="ln463"> </a>
+<a name="ln464">  // If true, log the stack as well.</a>
+<a name="ln465">  bool log_stack_;</a>
+<a name="ln466"> </a>
+<a name="ln467">  AddToParent add_to_parent_;</a>
+<a name="ln468">};</a>
+<a name="ln469"> </a>
+<a name="ln470">// An std::allocator that manipulates a MemTracker during allocation</a>
+<a name="ln471">// and deallocation.</a>
+<a name="ln472">template&lt;typename T, typename Alloc = std::allocator&lt;T&gt; &gt;</a>
+<a name="ln473">class MemTrackerAllocator : public Alloc {</a>
+<a name="ln474"> public:</a>
+<a name="ln475">  typedef typename Alloc::pointer pointer;</a>
+<a name="ln476">  typedef typename Alloc::const_pointer const_pointer;</a>
+<a name="ln477">  typedef typename Alloc::size_type size_type;</a>
+<a name="ln478"> </a>
+<a name="ln479">  explicit MemTrackerAllocator(std::shared_ptr&lt;MemTracker&gt; mem_tracker)</a>
+<a name="ln480">      : mem_tracker_(std::move(mem_tracker)) {}</a>
+<a name="ln481"> </a>
+<a name="ln482">  // This constructor is used for rebinding.</a>
+<a name="ln483">  template &lt;typename U&gt;</a>
+<a name="ln484">  MemTrackerAllocator(const MemTrackerAllocator&lt;U&gt;&amp; allocator)</a>
+<a name="ln485">      : Alloc(allocator),</a>
+<a name="ln486">        mem_tracker_(allocator.mem_tracker()) {</a>
+<a name="ln487">  }</a>
+<a name="ln488"> </a>
+<a name="ln489">  ~MemTrackerAllocator() {</a>
+<a name="ln490">  }</a>
+<a name="ln491"> </a>
+<a name="ln492">  pointer allocate(size_type n, const_pointer hint = 0) {</a>
+<a name="ln493">    // Ideally we'd use TryConsume() here to enforce the tracker's limit.</a>
+<a name="ln494">    // However, that means throwing bad_alloc if the limit is exceeded, and</a>
+<a name="ln495">    // it's not clear that the rest of YB can handle that.</a>
+<a name="ln496">    mem_tracker_-&gt;Consume(n * sizeof(T));</a>
+<a name="ln497">    return Alloc::allocate(n, hint);</a>
+<a name="ln498">  }</a>
+<a name="ln499"> </a>
+<a name="ln500">  void deallocate(pointer p, size_type n) {</a>
+<a name="ln501">    Alloc::deallocate(p, n);</a>
+<a name="ln502">    mem_tracker_-&gt;Release(n * sizeof(T));</a>
+<a name="ln503">  }</a>
+<a name="ln504"> </a>
+<a name="ln505">  // This allows an allocator&lt;T&gt; to be used for a different type.</a>
+<a name="ln506">  template &lt;class U&gt;</a>
+<a name="ln507">  struct rebind {</a>
+<a name="ln508">    typedef MemTrackerAllocator&lt;U, typename Alloc::template rebind&lt;U&gt;::other&gt; other;</a>
+<a name="ln509">  };</a>
+<a name="ln510"> </a>
+<a name="ln511">  const std::shared_ptr&lt;MemTracker&gt;&amp; mem_tracker() const { return mem_tracker_; }</a>
+<a name="ln512"> </a>
+<a name="ln513"> private:</a>
+<a name="ln514">  std::shared_ptr&lt;MemTracker&gt; mem_tracker_;</a>
+<a name="ln515">};</a>
+<a name="ln516"> </a>
+<a name="ln517">YB_STRONGLY_TYPED_BOOL(AlreadyConsumed);</a>
+<a name="ln518"> </a>
+<a name="ln519">// Convenience class that adds memory consumption to a tracker when declared,</a>
+<a name="ln520">// releasing it when the end of scope is reached.</a>
+<a name="ln521">class ScopedTrackedConsumption {</a>
+<a name="ln522"> public:</a>
+<a name="ln523">  ScopedTrackedConsumption() : consumption_(0) {}</a>
+<a name="ln524"> </a>
+<a name="ln525">  ScopedTrackedConsumption(MemTrackerPtr tracker,</a>
+<a name="ln526">                           int64_t to_consume,</a>
+<a name="ln527">                           AlreadyConsumed already_consumed = AlreadyConsumed::kFalse)</a>
+<a name="ln528">      : tracker_(std::move(tracker)), consumption_(to_consume) {</a>
+<a name="ln529">    DCHECK(*this);</a>
+<a name="ln530">    if (!already_consumed) {</a>
+<a name="ln531">      tracker_-&gt;Consume(consumption_);</a>
+<a name="ln532">    }</a>
+<a name="ln533">  }</a>
+<a name="ln534"> </a>
+<a name="ln535">  ScopedTrackedConsumption(const ScopedTrackedConsumption&amp;) = delete;</a>
+<a name="ln536">  void operator=(const ScopedTrackedConsumption&amp;) = delete;</a>
+<a name="ln537"> </a>
+<a name="ln538">  ScopedTrackedConsumption(ScopedTrackedConsumption&amp;&amp; rhs)</a>
+<a name="ln539">      : tracker_(std::move(rhs.tracker_)), consumption_(rhs.consumption_) {</a>
+<a name="ln540">    rhs.consumption_ = 0;</a>
+<a name="ln541">  }</a>
+<a name="ln542"> </a>
+<a name="ln543">  void operator=(ScopedTrackedConsumption&amp;&amp; rhs) {</a>
+<a name="ln544">    if (rhs) {</a>
+<a name="ln545">      DCHECK(!*this);</a>
+<a name="ln546">      tracker_ = std::move(rhs.tracker_);</a>
+<a name="ln547">      consumption_ = rhs.consumption_;</a>
+<a name="ln548">      rhs.consumption_ = 0;</a>
+<a name="ln549">    } else if (tracker_) {</a>
+<a name="ln550">      tracker_-&gt;Release(consumption_);</a>
+<a name="ln551">      tracker_ = nullptr;</a>
+<a name="ln552">    }</a>
+<a name="ln553">  }</a>
+<a name="ln554"> </a>
+<a name="ln555">  void Reset(int64_t new_consumption) {</a>
+<a name="ln556">    // Consume(-x) is the same as Release(x).</a>
+<a name="ln557">    tracker_-&gt;Consume(new_consumption - consumption_);</a>
+<a name="ln558">    consumption_ = new_consumption;</a>
+<a name="ln559">  }</a>
+<a name="ln560"> </a>
+<a name="ln561">  void Swap(ScopedTrackedConsumption* rhs) {</a>
+<a name="ln562">    std::swap(tracker_, rhs-&gt;tracker_);</a>
+<a name="ln563">    std::swap(consumption_, rhs-&gt;consumption_);</a>
+<a name="ln564">  }</a>
+<a name="ln565"> </a>
+<a name="ln566">  explicit operator bool() const {</a>
+<a name="ln567">    return tracker_ != nullptr;</a>
+<a name="ln568">  }</a>
+<a name="ln569"> </a>
+<a name="ln570">  ~ScopedTrackedConsumption() {</a>
+<a name="ln571">    if (tracker_) {</a>
+<a name="ln572">      tracker_-&gt;Release(consumption_);</a>
+<a name="ln573">    }</a>
+<a name="ln574">  }</a>
+<a name="ln575"> </a>
+<a name="ln576">  void Add(int64_t delta) {</a>
+<a name="ln577">    tracker_-&gt;Consume(delta);</a>
+<a name="ln578">    consumption_ += delta;</a>
+<a name="ln579">  }</a>
+<a name="ln580"> </a>
+<a name="ln581">  int64_t consumption() const { return consumption_; }</a>
+<a name="ln582"> </a>
+<a name="ln583">  const MemTrackerPtr&amp; mem_tracker() { return tracker_; }</a>
+<a name="ln584"> </a>
+<a name="ln585"> private:</a>
+<a name="ln586">  MemTrackerPtr tracker_;</a>
+<a name="ln587">  int64_t consumption_;</a>
+<a name="ln588">};</a>
+<a name="ln589"> </a>
+<a name="ln590">template &lt;class F&gt;</a>
+<a name="ln591">int64_t AbsRelMemLimit(int64_t value, const F&amp; f) {</a>
+<a name="ln592">  if (value &lt; 0) {</a>
+<a name="ln593">    return f() * std::min&lt;int64_t&gt;(-value, 100) / 100;</a>
+<a name="ln594">  }</a>
+<a name="ln595">  if (value == 0) {</a>
+<a name="ln596">    return -1;</a>
+<a name="ln597">  }</a>
+<a name="ln598">  return value;</a>
+<a name="ln599">}</a>
+<a name="ln600"> </a>
+<a name="ln601">struct MemTrackerData {</a>
+<a name="ln602">  MemTrackerPtr tracker;</a>
+<a name="ln603">  // Depth of this tracker in hierarchy, i.e. root have depth = 0, his children 1 and so on.</a>
+<a name="ln604">  int depth;</a>
+<a name="ln605">  // Some mem trackers does not report their consumption to parent, so their consumption does not</a>
+<a name="ln606">  // participate in limit calculation or parent. We accumulate such consumption in field below.</a>
+<a name="ln607">  size_t consumption_excluded_from_ancestors = 0;</a>
+<a name="ln608">};</a>
+<a name="ln609"> </a>
+<a name="ln610">const MemTrackerData&amp; CollectMemTrackerData(const MemTrackerPtr&amp; tracker, int depth,</a>
+<a name="ln611">                                            std::vector&lt;MemTrackerData&gt;* output);</a>
+<a name="ln612"> </a>
+<a name="ln613">std::string DumpMemoryUsage();</a>
+<a name="ln614"> </a>
+<a name="ln615">// Checks whether it is ok to proceed with action having specified score under current memory</a>
+<a name="ln616">// conditions.</a>
+<a name="ln617">// Returns true when action should proceed, false if it should be rejected.</a>
+<a name="ln618">// score - score to reject action, should be in the range (0.0, 1.0],</a>
+<a name="ln619">// the higher the score - the greater probability that action should be rejected.</a>
+<a name="ln620">// Score 0.0 is a special value, meaning that random value should be picked for score.</a>
+<a name="ln621">//</a>
+<a name="ln622">// Suppose we have soft limit A and hard limit B. Where A &lt; B.</a>
+<a name="ln623">// And current memory usage X.</a>
+<a name="ln624">//</a>
+<a name="ln625">// If X &lt; A =&gt; this function always return true.</a>
+<a name="ln626">// If X &gt;= B =&gt; this function always return false.</a>
+<a name="ln627">// If A &lt; X &lt; B, then we reject if used score &gt; (B - X) / (B - A).</a>
+<a name="ln628">bool CheckMemoryPressureWithLogging(</a>
+<a name="ln629">    const MemTrackerPtr&amp; mem_tracker, double score, const char* error_prefix);</a>
+<a name="ln630"> </a>
+<a name="ln631">} // namespace yb</a>
+<a name="ln632"> </a>
+<a name="ln633">#endif // YB_UTIL_MEM_TRACKER_H</a>
+
+</code></pre>
+<div class="balloon" rel="529"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="545"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v521/" target="_blank">V521</a> Such expressions using the ',' operator are dangerous. Make sure the expression is correct.</p></div>
+<div class="balloon" rel="601"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the compiler generated constructor. Consider inspecting: depth.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,143 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>dynamic_bloom.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Copyright (c) 2011-present, Facebook, Inc. All rights reserved.</a>
+<a name="ln2">// This source code is licensed under the BSD-style license found in the</a>
+<a name="ln3">// LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln4">// of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln5">//</a>
+<a name="ln6">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln7">//</a>
+<a name="ln8">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln11">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln12">//</a>
+<a name="ln13">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln14">//</a>
+<a name="ln15">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln16">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln17">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln18">// under the License.</a>
+<a name="ln19">//</a>
+<a name="ln20"> </a>
+<a name="ln21">#include &quot;dynamic_bloom.h&quot;</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &lt;algorithm&gt;</a>
+<a name="ln24"> </a>
+<a name="ln25">#include &quot;yb/rocksdb/port/port.h&quot;</a>
+<a name="ln26">#include &quot;yb/util/slice.h&quot;</a>
+<a name="ln27">#include &quot;yb/rocksdb/util/allocator.h&quot;</a>
+<a name="ln28">#include &quot;yb/rocksdb/util/hash.h&quot;</a>
+<a name="ln29"> </a>
+<a name="ln30">namespace rocksdb {</a>
+<a name="ln31"> </a>
+<a name="ln32">namespace {</a>
+<a name="ln33"> </a>
+<a name="ln34">uint32_t GetTotalBitsForLocality(uint32_t total_bits) {</a>
+<a name="ln35">  uint32_t num_blocks =</a>
+<a name="ln36">      (total_bits + CACHE_LINE_SIZE * 8 - 1) / (CACHE_LINE_SIZE * 8);</a>
+<a name="ln37"> </a>
+<a name="ln38">  // Make num_blocks an odd number to make sure more bits are involved</a>
+<a name="ln39">  // when determining which block.</a>
+<a name="ln40">  if (num_blocks % 2 == 0) {</a>
+<a name="ln41">    num_blocks++;</a>
+<a name="ln42">  }</a>
+<a name="ln43"> </a>
+<a name="ln44">  return num_blocks * (CACHE_LINE_SIZE * 8);</a>
+<a name="ln45">}</a>
+<a name="ln46">}</a>
+<a name="ln47"> </a>
+<a name="ln48">DynamicBloom::DynamicBloom(Allocator* allocator, uint32_t total_bits,</a>
+<a name="ln49">                           uint32_t locality, uint32_t num_probes,</a>
+<a name="ln50">                           uint32_t (*hash_func)(const Slice&amp; key),</a>
+<a name="ln51">                           size_t huge_page_tlb_size,</a>
+<a name="ln52">                           Logger* logger)</a>
+<a name="ln53">    : DynamicBloom(num_probes, hash_func) {</a>
+<a name="ln54">  SetTotalBits(allocator, total_bits, locality, huge_page_tlb_size, logger);</a>
+<a name="ln55">}</a>
+<a name="ln56"> </a>
+<a name="ln57">DynamicBloom::DynamicBloom(uint32_t num_probes,</a>
+<a name="ln58">                           uint32_t (*hash_func)(const Slice&amp; key))</a>
+<a name="ln59">    : kTotalBits(0),</a>
+<a name="ln60">      kNumBlocks(0),</a>
+<a name="ln61">      kNumProbes(num_probes),</a>
+<a name="ln62">      hash_func_(hash_func == nullptr ? &amp;BloomHash : hash_func) {}</a>
+<a name="ln63"> </a>
+<a name="ln64">void DynamicBloom::SetRawData(unsigned char* raw_data, uint32_t total_bits,</a>
+<a name="ln65">                              uint32_t num_blocks) {</a>
+<a name="ln66">  data_ = reinterpret_cast&lt;std::atomic&lt;uint8_t&gt;*&gt;(raw_data);</a>
+<a name="ln67">  kTotalBits = total_bits;</a>
+<a name="ln68">  kNumBlocks = num_blocks;</a>
+<a name="ln69">}</a>
+<a name="ln70"> </a>
+<a name="ln71">void DynamicBloom::SetTotalBits(Allocator* allocator,</a>
+<a name="ln72">                                uint32_t total_bits, uint32_t locality,</a>
+<a name="ln73">                                size_t huge_page_tlb_size,</a>
+<a name="ln74">                                Logger* logger) {</a>
+<a name="ln75">  kTotalBits = (locality &gt; 0) ? GetTotalBitsForLocality(total_bits)</a>
+<a name="ln76">                              : (total_bits + 7) / 8 * 8;</a>
+<a name="ln77">  kNumBlocks = (locality &gt; 0) ? (kTotalBits / (CACHE_LINE_SIZE * 8)) : 0;</a>
+<a name="ln78"> </a>
+<a name="ln79">  assert(kNumBlocks &gt; 0 || kTotalBits &gt; 0);</a>
+<a name="ln80">  assert(kNumProbes &gt; 0);</a>
+<a name="ln81"> </a>
+<a name="ln82">  uint32_t sz = kTotalBits / 8;</a>
+<a name="ln83">  if (kNumBlocks &gt; 0) {</a>
+<a name="ln84">    sz += CACHE_LINE_SIZE - 1;</a>
+<a name="ln85">  }</a>
+<a name="ln86">  assert(allocator);</a>
+<a name="ln87"> </a>
+<a name="ln88">  char* raw = allocator-&gt;AllocateAligned(sz, huge_page_tlb_size, logger);</a>
+<a name="ln89">  memset(raw, 0, sz);</a>
+<a name="ln90">  auto cache_line_offset = reinterpret_cast&lt;uintptr_t&gt;(raw) % CACHE_LINE_SIZE;</a>
+<a name="ln91">  if (kNumBlocks &gt; 0 &amp;&amp; cache_line_offset &gt; 0) {</a>
+<a name="ln92">    raw += CACHE_LINE_SIZE - cache_line_offset;</a>
+<a name="ln93">  }</a>
+<a name="ln94">  data_ = reinterpret_cast&lt;std::atomic&lt;uint8_t&gt;*&gt;(raw);</a>
+<a name="ln95">}</a>
+<a name="ln96"> </a>
+<a name="ln97">}  // rocksdb</a>
+
+</code></pre>
+<div class="balloon" rel="57"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: data_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>

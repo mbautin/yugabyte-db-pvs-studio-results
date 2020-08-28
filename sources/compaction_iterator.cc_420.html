@@ -1,0 +1,496 @@
+
+<html>
+<head>
+
+  <meta http-equiv="Content-Type" content="text/html; charset=US-ASCII" />
+  <title>compaction_iterator.cc</title>
+
+  <link rel="stylesheet" href="../style.css"/>
+  <script src="../jquery-3.2.1.min.js"></script>
+</head>
+<body>
+
+<pre><code class = "cpp">
+<a name="ln1">// Use of this source code is governed by a BSD-style license that can be</a>
+<a name="ln2">// found in the LICENSE file. See the AUTHORS file for names of contributors.</a>
+<a name="ln3">//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.</a>
+<a name="ln4">//  This source code is licensed under the BSD-style license found in the</a>
+<a name="ln5">//  LICENSE file in the root directory of this source tree. An additional grant</a>
+<a name="ln6">//  of patent rights can be found in the PATENTS file in the same directory.</a>
+<a name="ln7">//</a>
+<a name="ln8">// The following only applies to changes made to this file as part of YugaByte development.</a>
+<a name="ln9">//</a>
+<a name="ln10">// Portions Copyright (c) YugaByte, Inc.</a>
+<a name="ln11">//</a>
+<a name="ln12">// Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except</a>
+<a name="ln13">// in compliance with the License.  You may obtain a copy of the License at</a>
+<a name="ln14">//</a>
+<a name="ln15">// http://www.apache.org/licenses/LICENSE-2.0</a>
+<a name="ln16">//</a>
+<a name="ln17">// Unless required by applicable law or agreed to in writing, software distributed under the License</a>
+<a name="ln18">// is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express</a>
+<a name="ln19">// or implied.  See the License for the specific language governing permissions and limitations</a>
+<a name="ln20">// under the License.</a>
+<a name="ln21">//</a>
+<a name="ln22"> </a>
+<a name="ln23">#include &quot;yb/rocksdb/db/compaction_iterator.h&quot;</a>
+<a name="ln24">#include &quot;yb/rocksdb/table/internal_iterator.h&quot;</a>
+<a name="ln25"> </a>
+<a name="ln26">namespace rocksdb {</a>
+<a name="ln27"> </a>
+<a name="ln28">CompactionIterator::CompactionIterator(</a>
+<a name="ln29">    InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,</a>
+<a name="ln30">    SequenceNumber last_sequence, std::vector&lt;SequenceNumber&gt;* snapshots,</a>
+<a name="ln31">    SequenceNumber earliest_write_conflict_snapshot,</a>
+<a name="ln32">    bool expect_valid_internal_key, Compaction* compaction,</a>
+<a name="ln33">    CompactionFilter* compaction_filter, LogBuffer* log_buffer)</a>
+<a name="ln34">    : input_(input),</a>
+<a name="ln35">      cmp_(cmp),</a>
+<a name="ln36">      merge_helper_(merge_helper),</a>
+<a name="ln37">      snapshots_(snapshots),</a>
+<a name="ln38">      earliest_write_conflict_snapshot_(earliest_write_conflict_snapshot),</a>
+<a name="ln39">      expect_valid_internal_key_(expect_valid_internal_key),</a>
+<a name="ln40">      compaction_(compaction),</a>
+<a name="ln41">      compaction_filter_(compaction_filter),</a>
+<a name="ln42">      log_buffer_(log_buffer),</a>
+<a name="ln43">      merge_out_iter_(merge_helper_) {</a>
+<a name="ln44">  assert(compaction_filter_ == nullptr || compaction_ != nullptr);</a>
+<a name="ln45">  bottommost_level_ =</a>
+<a name="ln46">      compaction_ == nullptr ? false : compaction_-&gt;bottommost_level();</a>
+<a name="ln47">  if (compaction_ != nullptr) {</a>
+<a name="ln48">    level_ptrs_ = std::vector&lt;size_t&gt;(compaction_-&gt;number_levels(), 0);</a>
+<a name="ln49">  }</a>
+<a name="ln50"> </a>
+<a name="ln51">  if (snapshots_-&gt;size() == 0) {</a>
+<a name="ln52">    // optimize for fast path if there are no snapshots</a>
+<a name="ln53">    visible_at_tip_ = last_sequence;</a>
+<a name="ln54">    earliest_snapshot_ = visible_at_tip_;</a>
+<a name="ln55">    latest_snapshot_ = 0;</a>
+<a name="ln56">  } else {</a>
+<a name="ln57">    visible_at_tip_ = 0;</a>
+<a name="ln58">    earliest_snapshot_ = snapshots_-&gt;at(0);</a>
+<a name="ln59">    latest_snapshot_ = snapshots_-&gt;back();</a>
+<a name="ln60">  }</a>
+<a name="ln61">  if (compaction_filter_ != nullptr &amp;&amp; compaction_filter_-&gt;IgnoreSnapshots()) {</a>
+<a name="ln62">    ignore_snapshots_ = true;</a>
+<a name="ln63">  } else {</a>
+<a name="ln64">    ignore_snapshots_ = false;</a>
+<a name="ln65">  }</a>
+<a name="ln66">}</a>
+<a name="ln67"> </a>
+<a name="ln68">void CompactionIterator::ResetRecordCounts() {</a>
+<a name="ln69">  iter_stats_.num_record_drop_user = 0;</a>
+<a name="ln70">  iter_stats_.num_record_drop_hidden = 0;</a>
+<a name="ln71">  iter_stats_.num_record_drop_obsolete = 0;</a>
+<a name="ln72">}</a>
+<a name="ln73"> </a>
+<a name="ln74">void CompactionIterator::SeekToFirst() {</a>
+<a name="ln75">  NextFromInput();</a>
+<a name="ln76">  PrepareOutput();</a>
+<a name="ln77">}</a>
+<a name="ln78"> </a>
+<a name="ln79">void CompactionIterator::Next() {</a>
+<a name="ln80">  // If there is a merge output, return it before continuing to process the</a>
+<a name="ln81">  // input.</a>
+<a name="ln82">  if (merge_out_iter_.Valid()) {</a>
+<a name="ln83">    merge_out_iter_.Next();</a>
+<a name="ln84"> </a>
+<a name="ln85">    // Check if we returned all records of the merge output.</a>
+<a name="ln86">    if (merge_out_iter_.Valid()) {</a>
+<a name="ln87">      key_ = merge_out_iter_.key();</a>
+<a name="ln88">      value_ = merge_out_iter_.value();</a>
+<a name="ln89">      bool valid_key __attribute__((__unused__)) =</a>
+<a name="ln90">          ParseInternalKey(key_, &amp;ikey_);</a>
+<a name="ln91">      // MergeUntil stops when it encounters a corrupt key and does not</a>
+<a name="ln92">      // include them in the result, so we expect the keys here to be valid.</a>
+<a name="ln93">      assert(valid_key);</a>
+<a name="ln94">      // Keep current_key_ in sync.</a>
+<a name="ln95">      current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);</a>
+<a name="ln96">      key_ = current_key_.GetKey();</a>
+<a name="ln97">      ikey_.user_key = current_key_.GetUserKey();</a>
+<a name="ln98">      valid_ = true;</a>
+<a name="ln99">    } else {</a>
+<a name="ln100">      // MergeHelper moves the iterator to the first record after the merged</a>
+<a name="ln101">      // records, so even though we reached the end of the merge output, we do</a>
+<a name="ln102">      // not want to advance the iterator.</a>
+<a name="ln103">      NextFromInput();</a>
+<a name="ln104">    }</a>
+<a name="ln105">  } else {</a>
+<a name="ln106">    // Only advance the input iterator if there is no merge output and the</a>
+<a name="ln107">    // iterator is not already at the next record.</a>
+<a name="ln108">    if (!at_next_) {</a>
+<a name="ln109">      input_-&gt;Next();</a>
+<a name="ln110">    }</a>
+<a name="ln111">    NextFromInput();</a>
+<a name="ln112">  }</a>
+<a name="ln113"> </a>
+<a name="ln114">  if (valid_) {</a>
+<a name="ln115">    // Record that we've ouputted a record for the current key.</a>
+<a name="ln116">    has_outputted_key_ = true;</a>
+<a name="ln117">  }</a>
+<a name="ln118"> </a>
+<a name="ln119">  PrepareOutput();</a>
+<a name="ln120">}</a>
+<a name="ln121"> </a>
+<a name="ln122">void CompactionIterator::NextFromInput() {</a>
+<a name="ln123">  at_next_ = false;</a>
+<a name="ln124">  valid_ = false;</a>
+<a name="ln125"> </a>
+<a name="ln126">  while (!valid_ &amp;&amp; input_-&gt;Valid()) {</a>
+<a name="ln127">    key_ = input_-&gt;key();</a>
+<a name="ln128">    value_ = input_-&gt;value();</a>
+<a name="ln129">    iter_stats_.num_input_records++;</a>
+<a name="ln130"> </a>
+<a name="ln131">    if (!ParseInternalKey(key_, &amp;ikey_)) {</a>
+<a name="ln132">      // If `expect_valid_internal_key_` is false, return the corrupted key</a>
+<a name="ln133">      // and let the caller decide what to do with it.</a>
+<a name="ln134">      // TODO(noetzli): We should have a more elegant solution for this.</a>
+<a name="ln135">      if (expect_valid_internal_key_) {</a>
+<a name="ln136">        assert(!&quot;Corrupted internal key not expected.&quot;);</a>
+<a name="ln137">        status_ = STATUS(Corruption, &quot;Corrupted internal key not expected.&quot;);</a>
+<a name="ln138">        break;</a>
+<a name="ln139">      }</a>
+<a name="ln140">      key_ = current_key_.SetKey(key_);</a>
+<a name="ln141">      has_current_user_key_ = false;</a>
+<a name="ln142">      current_user_key_sequence_ = kMaxSequenceNumber;</a>
+<a name="ln143">      current_user_key_snapshot_ = 0;</a>
+<a name="ln144">      iter_stats_.num_input_corrupt_records++;</a>
+<a name="ln145">      valid_ = true;</a>
+<a name="ln146">      break;</a>
+<a name="ln147">    }</a>
+<a name="ln148"> </a>
+<a name="ln149">    // Update input statistics</a>
+<a name="ln150">    if (ikey_.type == kTypeDeletion || ikey_.type == kTypeSingleDeletion) {</a>
+<a name="ln151">      iter_stats_.num_input_deletion_records++;</a>
+<a name="ln152">    }</a>
+<a name="ln153">    iter_stats_.total_input_raw_key_bytes += key_.size();</a>
+<a name="ln154">    iter_stats_.total_input_raw_value_bytes += value_.size();</a>
+<a name="ln155"> </a>
+<a name="ln156">    // Check whether the user key changed. After this if statement current_key_</a>
+<a name="ln157">    // is a copy of the current input key (maybe converted to a delete by the</a>
+<a name="ln158">    // compaction filter). ikey_.user_key is pointing to the copy.</a>
+<a name="ln159">    if (!has_current_user_key_ ||</a>
+<a name="ln160">        !cmp_-&gt;Equal(ikey_.user_key, current_user_key_)) {</a>
+<a name="ln161">      // First occurrence of this user key</a>
+<a name="ln162">      key_ = current_key_.SetKey(key_, &amp;ikey_);</a>
+<a name="ln163">      current_user_key_ = ikey_.user_key;</a>
+<a name="ln164">      has_current_user_key_ = true;</a>
+<a name="ln165">      has_outputted_key_ = false;</a>
+<a name="ln166">      current_user_key_sequence_ = kMaxSequenceNumber;</a>
+<a name="ln167">      current_user_key_snapshot_ = 0;</a>
+<a name="ln168"> </a>
+<a name="ln169">      // apply the compaction filter to the first occurrence of the user key</a>
+<a name="ln170">      if (compaction_filter_ != nullptr &amp;&amp; ikey_.type == kTypeValue &amp;&amp;</a>
+<a name="ln171">          (visible_at_tip_ || ikey_.sequence &gt; latest_snapshot_ ||</a>
+<a name="ln172">           ignore_snapshots_)) {</a>
+<a name="ln173">        // If the user has specified a compaction filter and the sequence</a>
+<a name="ln174">        // number is greater than any external snapshot, then invoke the</a>
+<a name="ln175">        // filter. If the return value of the compaction filter is true,</a>
+<a name="ln176">        // replace the entry with a deletion marker.</a>
+<a name="ln177">        bool value_changed = false;</a>
+<a name="ln178">        bool to_delete = false;</a>
+<a name="ln179">        compaction_filter_value_.clear();</a>
+<a name="ln180">        to_delete = compaction_filter_-&gt;Filter(</a>
+<a name="ln181">            compaction_-&gt;level(), ikey_.user_key, value_,</a>
+<a name="ln182">            &amp;compaction_filter_value_, &amp;value_changed) != FilterDecision::kKeep;</a>
+<a name="ln183">        if (to_delete) {</a>
+<a name="ln184">          // convert the current key to a delete</a>
+<a name="ln185">          ikey_.type = kTypeDeletion;</a>
+<a name="ln186">          current_key_.UpdateInternalKey(ikey_.sequence, kTypeDeletion);</a>
+<a name="ln187">          // no value associated with delete</a>
+<a name="ln188">          value_.clear();</a>
+<a name="ln189">          iter_stats_.num_record_drop_user++;</a>
+<a name="ln190">        } else if (value_changed) {</a>
+<a name="ln191">          value_ = compaction_filter_value_;</a>
+<a name="ln192">        }</a>
+<a name="ln193">      }</a>
+<a name="ln194">    } else {</a>
+<a name="ln195">      // Update the current key to reflect the new sequence number/type without</a>
+<a name="ln196">      // copying the user key.</a>
+<a name="ln197">      // TODO(rven): Compaction filter does not process keys in this path</a>
+<a name="ln198">      // Need to have the compaction filter process multiple versions</a>
+<a name="ln199">      // if we have versions on both sides of a snapshot</a>
+<a name="ln200">      current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);</a>
+<a name="ln201">      key_ = current_key_.GetKey();</a>
+<a name="ln202">      ikey_.user_key = current_key_.GetUserKey();</a>
+<a name="ln203">    }</a>
+<a name="ln204"> </a>
+<a name="ln205">    // If there are no snapshots, then this kv affect visibility at tip.</a>
+<a name="ln206">    // Otherwise, search though all existing snapshots to find the earliest</a>
+<a name="ln207">    // snapshot that is affected by this kv.</a>
+<a name="ln208">    SequenceNumber last_sequence __attribute__((__unused__)) =</a>
+<a name="ln209">        current_user_key_sequence_;</a>
+<a name="ln210">    current_user_key_sequence_ = ikey_.sequence;</a>
+<a name="ln211">    SequenceNumber last_snapshot = current_user_key_snapshot_;</a>
+<a name="ln212">    SequenceNumber prev_snapshot = 0;  // 0 means no previous snapshot</a>
+<a name="ln213">    current_user_key_snapshot_ =</a>
+<a name="ln214">        visible_at_tip_ ? visible_at_tip_</a>
+<a name="ln215">                        : FindEarliestVisibleSnapshot(ikey_.sequence, &amp;prev_snapshot);</a>
+<a name="ln216"> </a>
+<a name="ln217">    if (clear_and_output_next_key_) {</a>
+<a name="ln218">      // In the previous iteration we encountered a single delete that we could</a>
+<a name="ln219">      // not compact out.  We will keep this Put, but can drop it's data.</a>
+<a name="ln220">      // (See Optimization 3, below.)</a>
+<a name="ln221">      assert(ikey_.type == kTypeValue);</a>
+<a name="ln222">      assert(current_user_key_snapshot_ == last_snapshot);</a>
+<a name="ln223"> </a>
+<a name="ln224">      value_.clear();</a>
+<a name="ln225">      valid_ = true;</a>
+<a name="ln226">      clear_and_output_next_key_ = false;</a>
+<a name="ln227">    } else if (ikey_.type == kTypeSingleDeletion) {</a>
+<a name="ln228">      // We can compact out a SingleDelete if:</a>
+<a name="ln229">      // 1) We encounter the corresponding PUT -OR- we know that this key</a>
+<a name="ln230">      //    doesn't appear past this output level</a>
+<a name="ln231">      // =AND=</a>
+<a name="ln232">      // 2) We've already returned a record in this snapshot -OR-</a>
+<a name="ln233">      //    there are no earlier earliest_write_conflict_snapshot.</a>
+<a name="ln234">      //</a>
+<a name="ln235">      // Rule 1 is needed for SingleDelete correctness.  Rule 2 is needed to</a>
+<a name="ln236">      // allow Transactions to do write-conflict checking (if we compacted away</a>
+<a name="ln237">      // all keys, then we wouldn't know that a write happened in this</a>
+<a name="ln238">      // snapshot).  If there is no earlier snapshot, then we know that there</a>
+<a name="ln239">      // are no active transactions that need to know about any writes.</a>
+<a name="ln240">      //</a>
+<a name="ln241">      // Optimization 3:</a>
+<a name="ln242">      // If we encounter a SingleDelete followed by a PUT and Rule 2 is NOT</a>
+<a name="ln243">      // true, then we must output a SingleDelete.  In this case, we will decide</a>
+<a name="ln244">      // to also output the PUT.  While we are compacting less by outputting the</a>
+<a name="ln245">      // PUT now, hopefully this will lead to better compaction in the future</a>
+<a name="ln246">      // when Rule 2 is later true (Ie, We are hoping we can later compact out</a>
+<a name="ln247">      // both the SingleDelete and the Put, while we couldn't if we only</a>
+<a name="ln248">      // outputted the SingleDelete now).</a>
+<a name="ln249">      // In this case, we can save space by removing the PUT's value as it will</a>
+<a name="ln250">      // never be read.</a>
+<a name="ln251">      //</a>
+<a name="ln252">      // Deletes and Merges are not supported on the same key that has a</a>
+<a name="ln253">      // SingleDelete as it is not possible to correctly do any partial</a>
+<a name="ln254">      // compaction of such a combination of operations.  The result of mixing</a>
+<a name="ln255">      // those operations for a given key is documented as being undefined.  So</a>
+<a name="ln256">      // we can choose how to handle such a combinations of operations.  We will</a>
+<a name="ln257">      // try to compact out as much as we can in these cases.</a>
+<a name="ln258"> </a>
+<a name="ln259">      // The easiest way to process a SingleDelete during iteration is to peek</a>
+<a name="ln260">      // ahead at the next key.</a>
+<a name="ln261">      ParsedInternalKey next_ikey;</a>
+<a name="ln262">      input_-&gt;Next();</a>
+<a name="ln263"> </a>
+<a name="ln264">      // Check whether the next key exists, is not corrupt, and is the same key</a>
+<a name="ln265">      // as the single delete.</a>
+<a name="ln266">      if (input_-&gt;Valid() &amp;&amp; ParseInternalKey(input_-&gt;key(), &amp;next_ikey) &amp;&amp;</a>
+<a name="ln267">          cmp_-&gt;Equal(ikey_.user_key, next_ikey.user_key)) {</a>
+<a name="ln268">        // Check whether the next key belongs to the same snapshot as the</a>
+<a name="ln269">        // SingleDelete.</a>
+<a name="ln270">        if (prev_snapshot == 0 || next_ikey.sequence &gt; prev_snapshot) {</a>
+<a name="ln271">          if (next_ikey.type == kTypeSingleDeletion) {</a>
+<a name="ln272">            // We encountered two SingleDeletes in a row.  This could be due to</a>
+<a name="ln273">            // unexpected user input.</a>
+<a name="ln274">            // Skip the first SingleDelete and let the next iteration decide how</a>
+<a name="ln275">            // to handle the second SingleDelete</a>
+<a name="ln276"> </a>
+<a name="ln277">            // First SingleDelete has been skipped since we already called</a>
+<a name="ln278">            // input_-&gt;Next().</a>
+<a name="ln279">            ++iter_stats_.num_record_drop_obsolete;</a>
+<a name="ln280">          } else if ((ikey_.sequence &lt;= earliest_write_conflict_snapshot_) ||</a>
+<a name="ln281">                     has_outputted_key_) {</a>
+<a name="ln282">            // Found a matching value, we can drop the single delete and the</a>
+<a name="ln283">            // value.  It is safe to drop both records since we've already</a>
+<a name="ln284">            // outputted a key in this snapshot, or there is no earlier</a>
+<a name="ln285">            // snapshot (Rule 2 above).</a>
+<a name="ln286"> </a>
+<a name="ln287">            // Note: it doesn't matter whether the second key is a Put or if it</a>
+<a name="ln288">            // is an unexpected Merge or Delete.  We will compact it out</a>
+<a name="ln289">            // either way.</a>
+<a name="ln290">            ++iter_stats_.num_record_drop_hidden;</a>
+<a name="ln291">            ++iter_stats_.num_record_drop_obsolete;</a>
+<a name="ln292">            // Already called input_-&gt;Next() once.  Call it a second time to</a>
+<a name="ln293">            // skip past the second key.</a>
+<a name="ln294">            input_-&gt;Next();</a>
+<a name="ln295">          } else {</a>
+<a name="ln296">            // Found a matching value, but we cannot drop both keys since</a>
+<a name="ln297">            // there is an earlier snapshot and we need to leave behind a record</a>
+<a name="ln298">            // to know that a write happened in this snapshot (Rule 2 above).</a>
+<a name="ln299">            // Clear the value and output the SingleDelete. (The value will be</a>
+<a name="ln300">            // outputted on the next iteration.)</a>
+<a name="ln301">            ++iter_stats_.num_record_drop_hidden;</a>
+<a name="ln302"> </a>
+<a name="ln303">            // Setting valid_ to true will output the current SingleDelete</a>
+<a name="ln304">            valid_ = true;</a>
+<a name="ln305"> </a>
+<a name="ln306">            // Set up the Put to be outputted in the next iteration.</a>
+<a name="ln307">            // (Optimization 3).</a>
+<a name="ln308">            clear_and_output_next_key_ = true;</a>
+<a name="ln309">          }</a>
+<a name="ln310">        } else {</a>
+<a name="ln311">          // We hit the next snapshot without hitting a put, so the iterator</a>
+<a name="ln312">          // returns the single delete.</a>
+<a name="ln313">          valid_ = true;</a>
+<a name="ln314">        }</a>
+<a name="ln315">      } else {</a>
+<a name="ln316">        // We are at the end of the input, could not parse the next key, or hit</a>
+<a name="ln317">        // the next key. The iterator returns the single delete if the key</a>
+<a name="ln318">        // possibly exists beyond the current output level.  We set</a>
+<a name="ln319">        // has_current_user_key to false so that if the iterator is at the next</a>
+<a name="ln320">        // key, we do not compare it again against the previous key at the next</a>
+<a name="ln321">        // iteration. If the next key is corrupt, we return before the</a>
+<a name="ln322">        // comparison, so the value of has_current_user_key does not matter.</a>
+<a name="ln323">        has_current_user_key_ = false;</a>
+<a name="ln324">        if (compaction_ != nullptr &amp;&amp; ikey_.sequence &lt;= earliest_snapshot_ &amp;&amp;</a>
+<a name="ln325">            compaction_-&gt;KeyNotExistsBeyondOutputLevel(ikey_.user_key,</a>
+<a name="ln326">                                                       &amp;level_ptrs_)) {</a>
+<a name="ln327">          // Key doesn't exist outside of this range.</a>
+<a name="ln328">          // Can compact out this SingleDelete.</a>
+<a name="ln329">          ++iter_stats_.num_record_drop_obsolete;</a>
+<a name="ln330">        } else {</a>
+<a name="ln331">          // Output SingleDelete</a>
+<a name="ln332">          valid_ = true;</a>
+<a name="ln333">        }</a>
+<a name="ln334">      }</a>
+<a name="ln335"> </a>
+<a name="ln336">      if (valid_) {</a>
+<a name="ln337">        at_next_ = true;</a>
+<a name="ln338">      }</a>
+<a name="ln339">    } else if (last_snapshot == current_user_key_snapshot_) {</a>
+<a name="ln340">      // If the earliest snapshot is which this key is visible in</a>
+<a name="ln341">      // is the same as the visibility of a previous instance of the</a>
+<a name="ln342">      // same key, then this kv is not visible in any snapshot.</a>
+<a name="ln343">      // Hidden by an newer entry for same user key</a>
+<a name="ln344">      // TODO: why not &gt; ?</a>
+<a name="ln345">      //</a>
+<a name="ln346">      // Note: Dropping this key will not affect TransactionDB write-conflict</a>
+<a name="ln347">      // checking since there has already been a record returned for this key</a>
+<a name="ln348">      // in this snapshot.</a>
+<a name="ln349">      assert(last_sequence &gt;= current_user_key_sequence_);</a>
+<a name="ln350">      ++iter_stats_.num_record_drop_hidden;  // (A)</a>
+<a name="ln351">      input_-&gt;Next();</a>
+<a name="ln352">    } else if (compaction_ != nullptr &amp;&amp; ikey_.type == kTypeDeletion &amp;&amp;</a>
+<a name="ln353">               ikey_.sequence &lt;= earliest_snapshot_ &amp;&amp;</a>
+<a name="ln354">               compaction_-&gt;KeyNotExistsBeyondOutputLevel(ikey_.user_key,</a>
+<a name="ln355">                                                          &amp;level_ptrs_)) {</a>
+<a name="ln356">      // TODO(noetzli): This is the only place where we use compaction_</a>
+<a name="ln357">      // (besides the constructor). We should probably get rid of this</a>
+<a name="ln358">      // dependency and find a way to do similar filtering during flushes.</a>
+<a name="ln359">      //</a>
+<a name="ln360">      // For this user key:</a>
+<a name="ln361">      // (1) there is no data in higher levels</a>
+<a name="ln362">      // (2) data in lower levels will have larger sequence numbers</a>
+<a name="ln363">      // (3) data in layers that are being compacted here and have</a>
+<a name="ln364">      //     smaller sequence numbers will be dropped in the next</a>
+<a name="ln365">      //     few iterations of this loop (by rule (A) above).</a>
+<a name="ln366">      // Therefore this deletion marker is obsolete and can be dropped.</a>
+<a name="ln367">      //</a>
+<a name="ln368">      // Note:  Dropping this Delete will not affect TransactionDB</a>
+<a name="ln369">      // write-conflict checking since it is earlier than any snapshot.</a>
+<a name="ln370">      ++iter_stats_.num_record_drop_obsolete;</a>
+<a name="ln371">      input_-&gt;Next();</a>
+<a name="ln372">    } else if (ikey_.type == kTypeMerge) {</a>
+<a name="ln373">      if (!merge_helper_-&gt;HasOperator()) {</a>
+<a name="ln374">        LOG_TO_BUFFER(log_buffer_, &quot;Options::merge_operator is null.&quot;);</a>
+<a name="ln375">        status_ = STATUS(InvalidArgument,</a>
+<a name="ln376">            &quot;merge_operator is not properly initialized.&quot;);</a>
+<a name="ln377">        return;</a>
+<a name="ln378">      }</a>
+<a name="ln379"> </a>
+<a name="ln380">      // We know the merge type entry is not hidden, otherwise we would</a>
+<a name="ln381">      // have hit (A)</a>
+<a name="ln382">      // We encapsulate the merge related state machine in a different</a>
+<a name="ln383">      // object to minimize change to the existing flow.</a>
+<a name="ln384">      WARN_NOT_OK(merge_helper_-&gt;MergeUntil(input_, prev_snapshot, bottommost_level_),</a>
+<a name="ln385">                  &quot;Merge until failed&quot;);</a>
+<a name="ln386">      merge_out_iter_.SeekToFirst();</a>
+<a name="ln387"> </a>
+<a name="ln388">      if (merge_out_iter_.Valid()) {</a>
+<a name="ln389">        // NOTE: key, value, and ikey_ refer to old entries.</a>
+<a name="ln390">        //       These will be correctly set below.</a>
+<a name="ln391">        key_ = merge_out_iter_.key();</a>
+<a name="ln392">        value_ = merge_out_iter_.value();</a>
+<a name="ln393">        bool valid_key __attribute__((__unused__)) =</a>
+<a name="ln394">            ParseInternalKey(key_, &amp;ikey_);</a>
+<a name="ln395">        // MergeUntil stops when it encounters a corrupt key and does not</a>
+<a name="ln396">        // include them in the result, so we expect the keys here to valid.</a>
+<a name="ln397">        assert(valid_key);</a>
+<a name="ln398">        // Keep current_key_ in sync.</a>
+<a name="ln399">        current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);</a>
+<a name="ln400">        key_ = current_key_.GetKey();</a>
+<a name="ln401">        ikey_.user_key = current_key_.GetUserKey();</a>
+<a name="ln402">        valid_ = true;</a>
+<a name="ln403">      } else {</a>
+<a name="ln404">        // all merge operands were filtered out. reset the user key, since the</a>
+<a name="ln405">        // batch consumed by the merge operator should not shadow any keys</a>
+<a name="ln406">        // coming after the merges</a>
+<a name="ln407">        has_current_user_key_ = false;</a>
+<a name="ln408">      }</a>
+<a name="ln409">    } else {</a>
+<a name="ln410">      valid_ = true;</a>
+<a name="ln411">    }</a>
+<a name="ln412">  }</a>
+<a name="ln413">}</a>
+<a name="ln414"> </a>
+<a name="ln415">void CompactionIterator::PrepareOutput() {</a>
+<a name="ln416">  // Zeroing out the sequence number leads to better compression.</a>
+<a name="ln417">  // If this is the bottommost level (no files in lower levels)</a>
+<a name="ln418">  // and the earliest snapshot is larger than this seqno</a>
+<a name="ln419">  // and the userkey differs from the last userkey in compaction</a>
+<a name="ln420">  // then we can squash the seqno to zero.</a>
+<a name="ln421"> </a>
+<a name="ln422">  // This is safe for TransactionDB write-conflict checking since transactions</a>
+<a name="ln423">  // only care about sequence number larger than any active snapshots.</a>
+<a name="ln424">  if (bottommost_level_ &amp;&amp; valid_ &amp;&amp; ikey_.sequence &lt; earliest_snapshot_ &amp;&amp;</a>
+<a name="ln425">      ikey_.type != kTypeMerge &amp;&amp;</a>
+<a name="ln426">      !cmp_-&gt;Equal(compaction_-&gt;GetLargestUserKey(), ikey_.user_key)) {</a>
+<a name="ln427">    assert(ikey_.type != kTypeDeletion &amp;&amp; ikey_.type != kTypeSingleDeletion);</a>
+<a name="ln428">    ikey_.sequence = 0;</a>
+<a name="ln429">    current_key_.UpdateInternalKey(0, ikey_.type);</a>
+<a name="ln430">  }</a>
+<a name="ln431">}</a>
+<a name="ln432"> </a>
+<a name="ln433">inline SequenceNumber CompactionIterator::FindEarliestVisibleSnapshot(</a>
+<a name="ln434">    SequenceNumber in, SequenceNumber* prev_snapshot) {</a>
+<a name="ln435">  assert(snapshots_-&gt;size());</a>
+<a name="ln436">  SequenceNumber prev __attribute__((unused)) = 0;</a>
+<a name="ln437">  for (const auto cur : *snapshots_) {</a>
+<a name="ln438">    assert(prev &lt;= cur);</a>
+<a name="ln439">    if (cur &gt;= in) {</a>
+<a name="ln440">      *prev_snapshot = prev;</a>
+<a name="ln441">      return cur;</a>
+<a name="ln442">    }</a>
+<a name="ln443">    prev = cur;</a>
+<a name="ln444">    assert(prev);</a>
+<a name="ln445">  }</a>
+<a name="ln446">  *prev_snapshot = prev;</a>
+<a name="ln447">  return kMaxSequenceNumber;</a>
+<a name="ln448">}</a>
+<a name="ln449"> </a>
+<a name="ln450">}  // namespace rocksdb</a>
+
+</code></pre>
+<div class="balloon" rel="28"><p><span style="font-size:18px">&uarr;</span> <a href="https://www.viva64.com/en/w/v730/" target="_blank">V730</a> Not all members of a class are initialized inside the constructor. Consider inspecting: current_user_key_sequence_, current_user_key_snapshot_.</p></div>
+
+<link rel="stylesheet" href="highlight.css">
+<script src="highlight.pack.js"></script>
+<script src="highlightjs-line-numbers.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script>hljs.initLineNumbersOnLoad();</script>
+<script>
+  $(document).ready(function() {
+      $('.balloon').each(function () {
+          var bl = $(this);
+          var line = bl.attr('rel');
+          var text = $('a[name="ln'+line+'"]').text();
+
+          var space_count = 0;
+          for(var i = 0; i<text.length; i++){
+              var char = text[i];
+              if((char !== ' ')&&(char !== '\t'))break;
+              if(char === '\t')space_count++;
+              space_count++;
+          }
+
+          bl.css('margin-left', space_count*8);
+          $('a[name="ln'+line+'"]').after(bl);
+      });
+
+      window.location = window.location;
+  });
+</script>
+</body>
+</html>
